@@ -1,0 +1,13 @@
+# Copy to .dev.vars (gitignored) for local development.
+
+# Bearer token the app and Shortcuts send. Needed from M2. Generate: openssl rand -base64 32
+AUTH_TOKEN=
+
+# Web Push public key. Needed from M3. Generate the pair: npx web-push generate-vapid-keys
+VAPID_PUBLIC_KEY=
+
+# Web Push private key from the same pair. Needed from M3.
+VAPID_PRIVATE_KEY=
+
+# Contact for push services, a mailto: URL, e.g. mailto:you@example.com. Needed from M3.
+VAPID_SUBJECT=

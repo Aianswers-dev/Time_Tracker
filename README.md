@@ -16,8 +16,8 @@ of where your day went.
 
 ## Status
 
-Design is complete. No application code exists yet. Start with
-[docs/07-roadmap.md](docs/07-roadmap.md), milestone M0.
+The M0 scaffold is in place. M1 (core tracking, local only) is next. See
+[docs/07-roadmap.md](docs/07-roadmap.md).
 
 ## Documentation
 
@@ -37,12 +37,43 @@ Agents working in this repo should also read [CLAUDE.md](CLAUDE.md).
 
 ## Quick start
 
-Filled in during milestone M0 once the workspace exists. Planned commands:
+### Prerequisites
+
+- Node 22 (check [.nvmrc](.nvmrc))
+- pnpm 10: run `corepack enable` to use the version pinned in `package.json`
+
+### Commands
 
 ```sh
-pnpm install
-pnpm dev        # Vite dev server + wrangler dev with local D1
-pnpm test       # Vitest across packages
-pnpm build      # builds the PWA into the Worker's static assets
-pnpm deploy     # wrangler deploy
+pnpm install              # Install dependencies
+pnpm dev                  # Vite on :5173 proxying /api to wrangler dev on :8787 with local D1
+pnpm test                 # Vitest across packages
+pnpm lint                 # ESLint and Prettier
+pnpm typecheck            # TypeScript checks
+pnpm build                # builds the PWA into the Worker's static assets
+pnpm run deploy           # pnpm deploy is a pnpm built-in, so use run
 ```
+
+### Local development
+
+`pnpm dev` applies the local D1 migrations, then starts `wrangler dev` on :8787
+and Vite on :5173. Open `http://localhost:5173`. Vite proxies `/api` to the
+Worker, so `curl localhost:5173/api/health` returns `{ "ok": true, ... }`.
+
+Secrets are not read before M2. When they are, copy the example file first:
+
+```sh
+cp apps/server/.dev.vars.example apps/server/.dev.vars
+```
+
+While `pnpm dev` runs, trigger the cron handler by hand:
+
+```sh
+curl "http://localhost:8787/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"
+```
+
+### Repo layout
+
+- `apps/web`: React PWA, Tailwind, service worker
+- `apps/server`: Hono on Workers, D1 database, cron handler
+- `packages/shared`: types, zod schemas and all time math, with Vitest tests

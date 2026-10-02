@@ -157,7 +157,7 @@ response includes `"nextSince"` and the client pages.
 Not an HTTP route. `wrangler.toml` declares `crons = ["* * * * *"]`. The
 handler runs the flow described in `02-architecture.md` "Nudge evaluation".
 Locally, `wrangler dev --test-scheduled` exposes
-`GET /__scheduled?cron=*+*+*+*+*`.
+`GET /cdn-cgi/handler/scheduled?cron=*+*+*+*+*`.
 
 ## Web Push payload
 

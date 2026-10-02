@@ -158,11 +158,11 @@ actual refresh cadence.
   Vite dev server with `/api` proxied to `localhost:8787`.
 - `pnpm build` builds the PWA into `apps/server/public`, which `wrangler.toml`
   declares as the assets directory.
-- `pnpm deploy` runs `wrangler deploy`.
+- `pnpm run deploy` runs `wrangler deploy`.
 - Migrations: `drizzle-kit generate` produces SQL; `wrangler d1 migrations
   apply` runs it locally or remotely.
 - Trigger the cron locally with
-  `curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"`.
+  `curl "http://localhost:8787/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"`.
 - CI (GitHub Actions) on every PR: install, lint, typecheck, test, build.
   Deploys are manual from the owner's machine.
 
