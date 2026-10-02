@@ -1,0 +1,9 @@
+pnpm-lock.yaml
+apps/server/public
+apps/server/drizzle/meta
+**/dist
+**/dev-dist
+**/.wrangler
+**/coverage
+# Hand-written docs keep their aligned code comments and tables.
+*.md
