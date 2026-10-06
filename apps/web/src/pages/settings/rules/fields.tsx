@@ -146,15 +146,18 @@ export function DurationInput({ id, label, value, onChange, error, hint }: Durat
           aria-describedby={error ? errorId : undefined}
           onChange={(e) => onChange({ ...value, value: e.target.value })}
         />
-        <select
-          aria-label={`${label} unit`}
-          className={`${inputClass} w-32 shrink-0`}
-          value={value.unit}
-          onChange={(e) => onChange({ ...value, unit: e.target.value === 'h' ? 'h' : 'min' })}
-        >
-          <option value="min">minutes</option>
-          <option value="h">hours</option>
-        </select>
+        {/* inputClass sets w-full, so the fixed width goes on a wrapper. */}
+        <span className="w-36 shrink-0">
+          <select
+            aria-label={`${label} unit`}
+            className={inputClass}
+            value={value.unit}
+            onChange={(e) => onChange({ ...value, unit: e.target.value === 'h' ? 'h' : 'min' })}
+          >
+            <option value="min">minutes</option>
+            <option value="h">hours</option>
+          </select>
+        </span>
       </div>
       {hint && !error && <p className="mt-1.5 text-xs text-muted">{hint}</p>}
       <FieldError id={errorId}>{error}</FieldError>

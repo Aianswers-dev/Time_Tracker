@@ -412,9 +412,28 @@ describe('checkPushHealth', () => {
     expect((await meta()).endpoint).toBe('https://web.push.apple.com/a');
   });
 
-  it('waits for the service worker without failing', async () => {
+  it('skips without a service worker registration', async () => {
     env.registered = false;
     expect(await checkPushHealth()).toEqual({ status: 'no_worker' });
+  });
+
+  it('waits for a worker that is still installing', async () => {
+    await alreadyRegistered('https://web.push.apple.com/a', 'sub-a');
+    env.current = null; // iOS dropped it.
+    const installing = { active: null, pushManager };
+    let activate: (r: typeof registration) => void = () => undefined;
+    const ready = new Promise<typeof registration>((resolve) => {
+      activate = resolve;
+    });
+    vi.stubGlobal('navigator', {
+      userAgent: 'test',
+      serviceWorker: { getRegistration: () => Promise.resolve(installing), ready },
+    });
+    const pending = checkPushHealth();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(pushManager.subscribe).not.toHaveBeenCalled();
+    activate(registration);
+    expect(await pending).toEqual({ status: 'repaired', action: 'resubscribed' });
   });
 });
 

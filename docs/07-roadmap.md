@@ -115,6 +115,26 @@ Definition of done:
 - Test notification button works. Reinstalling the app re-subscribes
   without a duplicate subscription row.
 
+M3 client status (web app):
+
+- Done: service worker `push` and `notificationclick` handlers
+  (`apps/web/src/push/swHandlers.ts`, unit tested with malformed payloads);
+  the push client (`apps/web/src/push/`): enable from the tap, disable,
+  launch and foreground health check that re-subscribes when iOS dropped
+  the subscription or the server's VAPID key changed and deletes the
+  replaced server row; Settings → Notifications in every state, with the
+  server's delivery status and the test button; the rules manager and the
+  "Still on it?" stale check section, one outbox op per save. Driven
+  end to end in Chromium with stubbed `PushManager` and `Notification` and
+  a faked `/api`.
+- Needs a real iPhone (cannot be checked headless): every definition of
+  done line above, and whether iOS allows the background re-subscribe
+  without a tap (docs/06, known quirks).
+- A reinstall wipes the app's storage, so the new install cannot know the
+  old subscription id; the old row disappears when the push service
+  answers 404 or 410 to the server's next send, or the owner removes it
+  under "Also sending to" in Settings → Notifications.
+
 ## M4 · Dashboards and export
 
 Tasks:

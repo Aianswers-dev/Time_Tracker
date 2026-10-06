@@ -268,7 +268,10 @@ export async function checkPushHealth(): Promise<PushHealth> {
     if (!isPushSupported()) return { status: 'unsupported' };
     if (Notification.permission !== 'granted') return { status: 'not_granted' };
     if (!(await getToken())) return { status: 'not_connected' };
-    const registration = await activeRegistration(0);
+    // No registration at all (development): nothing to check. One still
+    // installing (first launch, or right after an update): wait for it.
+    if (!(await navigator.serviceWorker.getRegistration())) return { status: 'no_worker' };
+    const registration = await activeRegistration(WORKER_WAIT_MS);
     if (!registration) return { status: 'no_worker' };
 
     const [storedId, storedEndpoint] = await Promise.all([

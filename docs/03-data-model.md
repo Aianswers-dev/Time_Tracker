@@ -91,7 +91,9 @@ interface OutboxEntry {
 }
 
 interface Meta {            // client only, key/value
-  key: 'token' | 'lastSync' | 'installedAt' | 'seededAt' | 'pushSubscriptionId';
+  key: 'token' | 'lastSync' | 'installedAt' | 'seededAt'
+     | 'pushSubscriptionId'   // the server's id for this phone's push subscription
+     | 'pushEndpoint';        // the endpoint registered under that id (docs/06)
   value: string;
 }
 ```
