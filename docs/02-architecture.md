@@ -228,11 +228,14 @@ actual refresh cadence.
   `GET /api/snapshot` without `since`, then one transaction clears
   `categories`, `segments`, `rules` and `settings` and writes the snapshot
   (rows touched by pending ops keep their local copy, as above). Guard: if
-  the server has no live categories but this phone has some, nothing is
-  wiped; the round fails with "Your server has no categories, so this phone
-  kept its data instead of replacing it" and the flag stays set. Reset
-  discards the outbox inside that same transaction, so a refused Reset keeps
-  the outbox too.
+  the server has no live categories but this phone has some, or the
+  snapshot lacks (even as a deleted row) a category this phone has live
+  entries in (a server that lost its data and got a rename or a switch back
+  since), nothing is wiped; the round fails with "Your server is missing
+  data this phone has, so this phone kept its data instead of replacing it",
+  `serverEmpty` is set (Settings offers the upload) and the flag stays set.
+  Reset discards the outbox inside that same transaction, so a refused
+  Reset keeps the outbox too.
 - **State for the UI.** Dexie `meta` holds `lastSync` (server time, the
   pull cursor), `lastSyncedAt` (device time, for display), `tokenRejected`,
   `syncError` (`{ message, at, kind }`, kind `retry`, `problem` or `notice`,
