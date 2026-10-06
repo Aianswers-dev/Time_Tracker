@@ -50,6 +50,14 @@ export function settingsUpsertOp(settings: Settings, now: string): Op {
   return build({ type: 'settings.upsert', payload: settings }, now);
 }
 
+const outboxListeners = new Set<() => void>();
+
+/** Call `listener` after every enqueue (the sync engine flushes about 1 s later). */
+export function onEnqueue(listener: () => void): () => void {
+  outboxListeners.add(listener);
+  return () => outboxListeners.delete(listener);
+}
+
 /** Queue ops in order. Call inside the same rw transaction as the data write. */
 export async function enqueue(...ops: Op[]): Promise<void> {
   const rows: OutboxRow[] = ops.map((op) => ({
@@ -59,4 +67,5 @@ export async function enqueue(...ops: Op[]): Promise<void> {
     lastError: null,
   }));
   await db.outbox.bulkAdd(rows);
+  for (const listener of outboxListeners) listener();
 }

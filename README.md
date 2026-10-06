@@ -16,9 +16,10 @@ of where your day went.
 
 ## Status
 
-M1 (core tracking, local only) is in place: the Now, Today and Settings
-screens work offline from IndexedDB and queue every change in an outbox. M2
-(server, sync and auth) is next. See [docs/07-roadmap.md](docs/07-roadmap.md).
+M1 (core tracking, local only) and M2 (server, sync and auth) are in place:
+the Now, Today and Settings screens work offline from IndexedDB, and once a
+token is saved every change syncs to the Worker and back. See
+[docs/07-roadmap.md](docs/07-roadmap.md).
 
 ## Documentation
 
@@ -61,11 +62,34 @@ pnpm run deploy           # pnpm deploy is a pnpm built-in, so use run
 and Vite on :5173. Open `http://localhost:5173`. Vite proxies `/api` to the
 Worker, so `curl localhost:5173/api/health` returns `{ "ok": true, ... }`.
 
-Secrets are not read before M2. When they are, copy the example file first:
+The API needs a token from M2 on: every `/api` route except `/api/health`
+answers `401` until `AUTH_TOKEN` is set. Copy the example file and fill it in:
 
 ```sh
 cp apps/server/.dev.vars.example apps/server/.dev.vars
+openssl rand -base64 32   # paste as AUTH_TOKEN
 ```
+
+The app works without it; sync is off until you connect. Open Settings →
+Sync (or tap the banner on the Now screen), paste the same token and tap
+Connect. The phone's changes go up first, then the server's copy replaces
+the local data. "Sync now", "Disconnect" and "Reset local data and
+re-download" live in the same section.
+
+### Server tests
+
+`pnpm test` includes them; to run only the server's:
+
+```sh
+pnpm --filter @time-tracker/server test
+```
+
+They start the real Worker in workerd with wrangler's `createTestHarness`,
+backed by an in-memory local D1 with the migrations in `apps/server/drizzle`
+applied, and call it over HTTP. No Cloudflare account, network or
+`.dev.vars` is needed (the tests set their own `AUTH_TOKEN`), and your
+`wrangler dev` database is not touched. Each test file starts its own Worker
+and every table is emptied before each test.
 
 While `pnpm dev` runs, trigger the cron handler by hand:
 

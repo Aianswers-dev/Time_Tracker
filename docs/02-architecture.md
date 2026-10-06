@@ -89,9 +89,9 @@ while the app is open. Nudges for the new segment cannot fire until the op
 reaches the server. This is a known and accepted limitation.
 
 **3. App open or focus.** Flush the outbox first, then
-`GET /api/snapshot?since=<lastSync>` and merge rows into Dexie, keeping
-whichever copy has the later `updatedAt`. Store the returned `serverTime` as
-the new `lastSync`.
+`GET /api/snapshot?since=<lastSync>` and write the returned rows into Dexie:
+the server's copy wins, except rows touched by ops still waiting in the
+outbox. Store the returned `serverTime` as the new `lastSync`.
 
 **4. Nudge evaluation (cron).** Load the open segment, its category, enabled
 rules for that category, settings, today's minutes for that category, and the
@@ -121,10 +121,15 @@ actual refresh cadence.
   restamped. Deletes are soft: an upsert with `deletedAt` set.
 - The server adds a `synced_at` column to every synced table: server time of
   the last write. It is the snapshot cursor, so phone clock drift cannot make
-  a change invisible to the next pull.
+  a change invisible to the next pull. The snapshot re-reads the 10 seconds
+  before `since`, so a write that committed while the previous snapshot was
+  being read is not skipped.
 - One user action produces one op. The outbox holds ordered ops
-  `{ opId, type, payload, createdAt }`, sent in batches of up to 200 and
-  applied in order, each atomically.
+  `{ opId, type, payload, createdAt }`, sent in batches of up to 50 (the
+  server accepts 200) and applied in order, each atomically. The server
+  applies at most 15 ops per request (D1 allows 50 queries per request on the
+  Free plan) and answers only those; the client keeps the unanswered ops and
+  sends them again straight away.
 - Upserts are last-write-wins: the server applies an incoming row when its
   `updatedAt` is at least the stored one, otherwise acknowledges and ignores it.
 - A `switch` op carries the new segment's id, so a replay after a timeout is
@@ -144,6 +149,60 @@ actual refresh cadence.
   is not paged.
 - The server is authoritative for the invariants. It checks I1 and I2 after
   applying each op and rejects the whole op with `conflict` if they fail.
+
+### The client sync engine (`apps/web/src/sync/`)
+
+- **One round at a time.** `scheduler.ts` runs rounds single-flight: a
+  trigger during a round makes that round go again when it finishes instead
+  of starting a second one, and Reset waits for the running round.
+- **Triggers.** App start, the page becoming visible, the `online` event,
+  every 30 s while visible, and 1 s after the last outbox write (`enqueue`
+  in `data/outbox.ts` notifies the scheduler). Nothing runs without a token
+  or while `navigator.onLine` is false (except Sync now).
+- **Flush** (`engine.ts`). Ops go in `seq` order, 50 per request, and every
+  response is validated with `opsResponseSchema`. `ok: true` deletes the
+  row. `ok: false` deletes it too, queues a toast ("Couldn't sync: switch
+  to Relaxing") and flags a full resync. Ops without a result are sent again
+  at once, until the outbox is empty; a request that applies nothing counts
+  as a failure. A `413` halves the batch.
+- **Failures.** No answer, a `5xx` or any other refused request keeps every
+  op, bumps its `attempts`, records `lastError`, and retries after 2 s, 4 s,
+  8 s ... capped at 60 s. Interval and outbox triggers wait out the backoff;
+  focus, `online` and Sync now do not. A `401` stops syncing and marks the
+  token rejected (meta `tokenRejected`) until a new token is saved; the
+  outbox is kept.
+- **Pull.** Only after a flush that emptied the outbox. One Dexie
+  transaction writes every returned row (soft-deleted ones included) and the
+  settings row if present. Rows touched by ops queued while the request was
+  in flight keep their local copy: ids named by `segments.upsert`,
+  `category.upsert` and `rule.upsert`, the settings for `settings.upsert`,
+  and for a `switch` the new segment plus every segment still open or ending
+  at or after its `at` (the switch closed or trimmed those locally). When
+  anything was skipped, `lastSync` stays put so the next pull reads those
+  rows again, and another round follows at once.
+- **Full resync.** After any failed op, on every Connect, and for Reset:
+  `GET /api/snapshot` without `since`, then one transaction clears
+  `categories`, `segments`, `rules` and `settings` and writes the snapshot
+  (rows touched by pending ops keep their local copy, as above). Guard: if
+  the server has no live categories but this phone has some, nothing is
+  wiped; the round fails with "Your server has no categories, so this phone
+  kept its data instead of replacing it" and the flag stays set. Reset
+  discards the outbox inside that same transaction, so a refused Reset keeps
+  the outbox too.
+- **State for the UI.** Dexie `meta` holds `lastSync` (server time, the
+  pull cursor), `lastSyncedAt` (device time, for display), `tokenRejected`,
+  `syncError` (`{ message, at, kind }`, kind `retry`, `problem` or `notice`,
+  cleared by the next clean round), `needsFullResync` and
+  `connectBannerDismissed`. Whether a round is running and when the next
+  retry is due live in memory (`runtime.ts`). `useSyncStatus()` combines
+  them with the outbox count for the Settings section and the status pill.
+- **First connect and seeding.** The seed is queued as upserts with fixed
+  ids and `updatedAt` 2000-01-01. On an empty server it becomes the
+  canonical set. On a server that already has data (a reinstall), the ids
+  match the existing rows and any row the owner edited is newer, so
+  last-write-wins ignores the seed op for it (an unedited seed row is
+  rewritten as it was). The full resync that follows brings everything else
+  down: no duplicate categories.
 
 ## Time handling
 
@@ -167,7 +226,8 @@ actual refresh cadence.
 ## Security
 
 - Every `/api/*` route except `/api/health` requires
-  `Authorization: Bearer <AUTH_TOKEN>`. Compare in constant time.
+  `Authorization: Bearer <AUTH_TOKEN>`. Compare in constant time. An unset
+  or empty `AUTH_TOKEN` rejects every request.
 - Reject request bodies over 1 MB. No rate limiting is needed for one user.
 - The VAPID private key never leaves the Worker. The public key is served by
   `GET /api/push/vapid-public-key`.
@@ -188,6 +248,10 @@ actual refresh cadence.
   apply` runs it locally or remotely.
 - Trigger the cron locally with
   `curl "http://localhost:8787/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"`.
+- Server tests (`pnpm --filter @time-tracker/server test`) run the real
+  Worker in workerd through wrangler's `createTestHarness`, with an in-memory
+  local D1 and the migrations in `apps/server/drizzle` applied. No Cloudflare
+  account or network access is needed.
 - CI (GitHub Actions) on every PR: install, lint, typecheck, test, build.
   Deploys are manual from the owner's machine.
 
@@ -200,6 +264,7 @@ actual refresh cadence.
 | Cron Triggers | Available on free plan | 1 trigger, every minute |
 | D1 reads | 5,000,000 rows / day | Cron reads under 20 rows per minute |
 | D1 writes | 100,000 rows / day | Dozens per day |
+| D1 queries per request | 50 | `/api/ops` applies at most 15 ops of at most 3 calls each; other routes make at most 4 |
 | D1 storage | 5 GB | Under 10 MB after years of use |
 | Static assets | Free | One small SPA |
 

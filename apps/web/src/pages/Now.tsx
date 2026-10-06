@@ -20,6 +20,7 @@ import {
 import { switchTo, undoAction, type UndoToken } from '../data/segmentActions';
 import { useNow } from '../lib/useNow';
 import { BackdateSheet, type BackdateMode } from './now/BackdateSheet';
+import { ConnectBanner } from './now/ConnectBanner';
 import { CategoryTile } from './now/CategoryTile';
 
 export function Now() {
@@ -106,6 +107,7 @@ export function Now() {
 
   return (
     <main className="flex flex-col gap-4 px-4 pt-4">
+      <ConnectBanner />
       <section
         className="rounded-3xl border border-line bg-surface p-4"
         aria-label="Current activity"

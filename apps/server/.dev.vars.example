@@ -1,6 +1,7 @@
 # Copy to .dev.vars (gitignored) for local development.
 
-# Bearer token the app and Shortcuts send. Needed from M2. Generate: openssl rand -base64 32
+# Bearer token the app and Shortcuts send. Required from M2: while it is unset or empty,
+# every /api route except /api/health answers 401. Generate: openssl rand -base64 32
 AUTH_TOKEN=
 
 # Web Push public key. Needed from M3. Generate the pair: npx web-push generate-vapid-keys

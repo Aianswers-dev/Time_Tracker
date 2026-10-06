@@ -75,7 +75,8 @@ Tasks:
 - Endpoints: `/api/state`, `/api/switch`, `/api/ops`, `/api/snapshot`, the
   convenience reads, `/api/export.csv`, `/api/export.json`.
 - Server-side validation of I1 and I2 on ops, with tests using a local D1
-  (Miniflare via `vitest-pool-workers` or `wrangler dev` in CI).
+  (wrangler's `createTestHarness`: the real Worker in workerd with an
+  in-memory D1; see `apps/server/test/harness.ts`).
 - Client: login screen, outbox flusher with backoff, snapshot merge, sync
   status in Settings, "Reset local data and re-download".
 - Seeding: when the server has no categories and the client pushes its seed
@@ -88,6 +89,17 @@ Definition of done:
 - Deleting the PWA and reinstalling restores all history from the snapshot.
 - `POST /api/switch` by name works from a Shortcut.
 - Server tests cover each op type, idempotent replay, and overlap rejection.
+
+Status: server and client built. The client sync engine (`apps/web/src/sync/`)
+has unit tests for batching, partial results, refused ops, backoff, 401,
+pulls, the full-resync guard, single flight and triggers. An end-to-end run
+with Playwright against `wrangler dev` (390x844 touch viewport) checked:
+connect, switches reaching the server, two offline switches landing within a
+second of going online, a segment edit, a `POST /api/switch` by name showing
+up in the app at the next 30 s pull, a fresh browser profile restoring the
+full history with no duplicate categories, Reset, and a rejected token. The
+items that need the owner's iPhone (install, real network changes) are still
+to be checked on the device.
 
 ## M3 · Nudges
 
