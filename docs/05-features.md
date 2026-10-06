@@ -116,15 +116,42 @@ Monday.
   data (the server lost its database), the section offers "Upload this
   phone's data": it queues settings, categories, rules and every segment
   (oldest first, at most 100 per op), syncs, and leaves local data as is.
-- **Notifications (M3).** If not running standalone: show "Install to Home
-  Screen first" with the Share → Add to Home Screen steps. If standalone:
-  a toggle that requests permission and subscribes, the subscription status,
-  and a "Send test notification" button. Shown even when permission was
-  denied, with a note on how to re-enable in iOS Settings.
-- **Rules (M3).** List of rules grouped by category. Add or edit: kind
-  (session or daily), threshold, repeat, quiet hours, custom message, enabled.
-  Stale check settings (threshold, repeat, quiet hours) in their own section.
-  Seeded defaults from `01-decisions.md` on first run.
+- **Notifications (M3).** Shows one of these, checked in order:
+  - Not standalone: "Install to Home Screen first" with the Share → Add to
+    Home Screen steps. A desktop browser that supports push also gets the
+    controls below, for debugging; iPhone Safari (no push in a tab) does not.
+  - Standalone on an iOS version without web push: "Needs iOS 16.4 or later".
+  - No token: "Connect to your server first" with a button that scrolls to
+    Sync.
+  - Permission denied: how to re-enable it in iOS Settings → Notifications →
+    Time Tracker (iOS never asks again from the web).
+  - Otherwise a "Nudges on this phone" switch that requests permission and
+    subscribes (docs/06). When on: the server's status for this phone from
+    `GET /api/push/subscriptions` (last delivered, failed deliveries; "Not
+    delivering" in red when nothing was ever delivered and sends have
+    failed), any other subscriptions the server holds with a remove button,
+    and "Send test notification". If the server does not know this phone's
+    subscription id, the section registers it again once by itself, then
+    offers "Register again". A failure of the background health check
+    (docs/06 step 5) shows here with "Try again". Every failure is a
+    sentence on screen, never silent.
+- **Rules (M3).** Rules grouped by category in category order; an archived
+  category's rules are greyed with "Archived · won't nudge". Each row reads
+  in plain language ("Nudges you after 1h of Relaxing in a row, then every
+  30m") and has its own enabled switch. Add and edit in a bottom sheet:
+  category, kind (session limit or daily budget, each with a one-line
+  explanation), threshold in minutes or hours, repeat once or every N
+  minutes, optional quiet hours, optional custom message (replaces the body,
+  200 characters), enabled, and a live preview. Delete asks for
+  confirmation and soft-deletes. Values are checked with the shared
+  `ruleSchema` before saving and problems show next to the field; quiet
+  hours with equal start and end are refused because they would never
+  apply. Every save, switch flip and delete writes one `rule.upsert` op.
+- **Still on it? (M3).** The stale check in its own section: a summary
+  ("Asks “Still on it?” when anything except Sleep runs 5h without a switch,
+  then every 1h"), an enabled switch, and a sheet for threshold, repeat and
+  quiet hours. Each save writes one `settings.upsert` op. Seeded defaults
+  from `01-decisions.md` on first run.
 - **Export (M4).** Buttons for CSV and JSON for a chosen range, calling the
   export endpoints and triggering a download. Offline: generate from Dexie.
 - **About (M1).** App version, build hash, link to the repo.
@@ -132,8 +159,11 @@ Monday.
 ## Notifications (M3)
 
 - Delivered as Web Push to the installed PWA. The service worker renders the
-  payload; nothing is computed on the device.
-- Tapping a notification opens or focuses the app on `/`.
+  payload; nothing is computed on the device. Every push shows a
+  notification: a payload that is not JSON shows its text, and missing or
+  malformed fields fall back to the title "Time Tracker" and a generic body.
+- Tapping a notification focuses an open window and navigates it to
+  `data.url` (same origin only, else `/`), or opens the app there.
 - Repeats for the same rule replace the previous banner via `tag`.
 - No action buttons (iOS ignores them). "Snooze" is a future idea, not in
   scope.

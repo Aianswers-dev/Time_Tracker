@@ -20,6 +20,8 @@ ensureSeeded().catch((err: unknown) => {
 
 // Outbox flush and snapshot pull (docs/02 "Sync details"). Off until a token is saved.
 startSync();
+// M3: keep this phone's push subscription registered (iOS can drop it). Lazy, off the Now chunk.
+void import('./push/watch').then((m) => m.watchPushHealth(), console.error);
 
 const root = document.getElementById('root');
 if (!root) throw new Error('Missing #root element');
