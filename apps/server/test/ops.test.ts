@@ -274,6 +274,22 @@ describe('switch op', () => {
     expect(await allSegments(server.db())).toEqual([]);
   });
 
+  it("a phone clock running minutes fast still switches, at the server's now", async () => {
+    const [a] = await seedCategories(1);
+    const id = uuidv7();
+    const phoneNow = iso(Date.now() + 5 * MIN);
+    const before = Date.now();
+    const r = await one({
+      ...op.switch({ categoryId: a!.id, at: phoneNow, newSegmentId: id, source: 'app' }),
+      createdAt: phoneNow,
+    });
+    expect(r).toMatchObject({ ok: true });
+    const row = await segmentRow(server.db(), id);
+    expect(row?.endedAt).toBeNull();
+    expect(Date.parse(row!.startedAt)).toBeGreaterThanOrEqual(before);
+    expect(Date.parse(row!.startedAt)).toBeLessThanOrEqual(Date.now());
+  });
+
   it('`at` a few seconds ahead is clamped to now', async () => {
     const [a] = await seedCategories(1);
     const id = uuidv7();

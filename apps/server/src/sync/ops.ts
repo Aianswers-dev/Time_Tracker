@@ -2,6 +2,7 @@ import {
   applyRows,
   checkInvariants,
   findOpen,
+  FUTURE_TOLERANCE_MS,
   opSchema,
   toIso,
   toMs,
@@ -160,10 +161,18 @@ function wins(
  */
 async function applySwitchOp(
   db: Db,
-  p: Extract<Op, { type: 'switch' }>['payload'],
+  payload: Extract<Op, { type: 'switch' }>['payload'],
   madeAt: string,
   now: string,
 ): Promise<void> {
+  // `at` comes from the phone's clock. Judge it against when the phone made
+  // the switch (the op's createdAt, same clock) rather than the server's now,
+  // so a phone clock running fast does not make every switch "in the future";
+  // then clamp it to the server's now as the shared code would.
+  if (toMs(payload.at) > toMs(madeAt) + FUTURE_TOLERANCE_MS) {
+    throw new OpFailure('switch_in_future', 'That time is in the future');
+  }
+  const p = { ...payload, at: toIso(Math.min(toMs(payload.at), toMs(now))) };
   const windowStart = switchWindowStart(p.at, now);
   const [existing, categoryRows, overlappingRows] = await db.batch([
     select.segmentsByIds(db, [p.newSegmentId]),
