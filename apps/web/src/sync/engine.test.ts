@@ -456,10 +456,9 @@ describe('full resync', () => {
     tick();
     await switchTo(CAT.sleep);
     await requestSync();
-    // Offline: switch to Relaxing. Before it is flushed a Shortcut switches the server to Relaxing too.
+    // A Shortcut switches the server to Relaxing. The phone, offline and not
+    // knowing, switches to Relaxing too.
     tick();
-    const refused = await switchTo(CAT.relaxing);
-    tick(5 * 60_000);
     const live = [...server.segments.values()].map((s) => s.row).filter((s) => !s.deletedAt);
     const shortcut = switchCategory(
       live,
@@ -467,6 +466,8 @@ describe('full resync', () => {
       { now: toIso(Date.now()), newId: () => uuidv7() },
     );
     server.put({ segments: shortcut.rows });
+    tick(5 * 60_000);
+    const refused = await switchTo(CAT.relaxing);
     // Back online: the switch is a conflict, and while the full resync is in
     // flight the owner switches to Housework, which closes the refused segment.
     tick(5 * 60_000);
