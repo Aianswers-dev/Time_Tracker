@@ -45,7 +45,7 @@ pnpm dev          # web on :5173 proxying /api to wrangler dev on :8787
 pnpm test
 pnpm lint && pnpm typecheck
 pnpm build
-pnpm deploy
+pnpm run deploy   # pnpm deploy is a pnpm built-in, so use run
 ```
 
 ## Before opening a PR

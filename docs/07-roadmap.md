@@ -171,7 +171,7 @@ Done once, before M2 can be deployed:
 4. Before M3: generate VAPID keys (`npx web-push generate-vapid-keys`) and set
    `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` (your
    `mailto:` address) with `wrangler secret put`.
-5. `pnpm deploy`, then `wrangler d1 migrations apply time-tracker --remote`.
+5. `pnpm run deploy`, then `wrangler d1 migrations apply time-tracker --remote`.
 6. Open the `workers.dev` URL in Safari, Add to Home Screen, paste the token.
 7. Enable notifications from Settings inside the app, send a test.
 8. Set up Shortcuts from `06-ios.md`.

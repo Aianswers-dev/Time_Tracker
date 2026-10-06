@@ -1,0 +1,2 @@
+-- M0 ships no tables, so this first migration is intentionally empty.
+-- Drizzle generates the real schema in M2 as the next migration.

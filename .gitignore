@@ -12,3 +12,5 @@ coverage/
 *.log
 .turbo/
 .vite/
+dev-dist/
+apps/server/public/
