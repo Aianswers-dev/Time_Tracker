@@ -60,11 +60,14 @@ payload, handles `notificationclick` by focusing or opening the app.
 Pure TypeScript, no runtime dependencies beyond zod and a date library.
 
 - Types and zod schemas for every entity and every API payload.
-- Time helpers: `dayKeyOf`, `dayRange`, `splitByDay`.
-- Segment operations: `switchCategory`, `moveBoundary`, `insertSegment`,
-  `splitSegment`, `changeCategory`, `deleteSegment`, `undoSwitch`.
-- Aggregation: `totalsForRange`, `timelineForDay`, `hourHeatmap`.
-- Rule engine: `evaluateRules(input, now) -> Notification[]`.
+- Time helpers: `dayKeyOf`, `dayRange`, `splitByDay`, day key arithmetic,
+  `localDateTimeToMs`, quiet-hour windows, formatting.
+- Segment operations: `switchCategory`, `backdateOpen`, `editSegment`,
+  `splitSegment`, `insertSegment`, `deleteSegment`, `undoRows`,
+  `checkInvariants`.
+- Aggregation: `totalsForRange`, `timelineForDay`, `dailyTotals`,
+  `hourHeatmap`, `budgetStatus`, `movingAverage`.
+- Rule engine: `evaluateRules(input) -> PendingNotification[]`.
 
 The server runs the rule engine; the client runs the same totals code for
 dashboards. One implementation, tested once.
@@ -149,6 +152,11 @@ actual refresh cadence.
 - Totals split segments at logical day boundaries. The open segment is treated
   as ending at `now` for all computations.
 - Library: `date-fns` with `@date-fns/tz`. Do not hand-roll timezone math.
+  One exception: do not build instants from local wall-clock fields with the
+  `TZDate` constructor or mutate a `TZDate` (`subDays` and friends). For
+  repeated and skipped local times its answer depends on the runtime's own
+  timezone, so the phone and the Worker disagree. `time.ts` converts with
+  `tzOffset` instead; reading fields from `new TZDate(ms, tz)` is fine.
 - Daylight saving transitions are handled by the library; the one test that
   matters is a segment spanning a DST change still summing to the correct
   number of real minutes.

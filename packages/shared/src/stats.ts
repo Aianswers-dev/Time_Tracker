@@ -20,7 +20,12 @@ import { TZDate } from '@date-fns/tz';
 
 type Instant = ISO | number;
 
-function liveOverlapping(segments: readonly Segment[], from: number, to: number, nowMs: number): Segment[] {
+function liveOverlapping(
+  segments: readonly Segment[],
+  from: number,
+  to: number,
+  nowMs: number,
+): Segment[] {
   return segments.filter((s) => {
     if (s.deletedAt !== null) return false;
     const start = toMs(s.startedAt);
@@ -83,7 +88,9 @@ export function totalsForRange(
 }
 
 /** Category totals sorted by time, largest first. */
-export function sortedTotals(byCategory: Record<string, number>): Array<{ categoryId: string; ms: number }> {
+export function sortedTotals(
+  byCategory: Record<string, number>,
+): Array<{ categoryId: string; ms: number }> {
   return Object.entries(byCategory)
     .map(([categoryId, ms]) => ({ categoryId, ms }))
     .sort((a, b) => b.ms - a.ms || a.categoryId.localeCompare(b.categoryId));

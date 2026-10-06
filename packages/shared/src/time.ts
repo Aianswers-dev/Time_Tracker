@@ -1,5 +1,5 @@
-import { TZDate } from '@date-fns/tz';
-import { format, subDays } from 'date-fns';
+import { TZDate, tzOffset } from '@date-fns/tz';
+import { format } from 'date-fns';
 
 /** ISO 8601 UTC timestamp with milliseconds, e.g. "2026-10-02T03:15:00.000Z". */
 export type ISO = string;
@@ -32,6 +32,44 @@ export function toIso(t: ISO | Date | number): ISO {
 }
 
 /**
+ * The UTC offset of `timezone` at instant `ms`, in milliseconds (positive east
+ * of UTC). Uses Intl through `tzOffset`, so it does not depend on the runtime's
+ * own timezone.
+ */
+function offsetMs(timezone: string, ms: number): number {
+  const minutes = tzOffset(timezone, new Date(ms));
+  if (Number.isNaN(minutes)) throw new RangeError(`Unknown timezone: ${timezone}`);
+  return Math.round(minutes * MINUTE_MS);
+}
+
+/** The local wall-clock time at `ms` in `timezone`, encoded as a UTC epoch value. */
+function wallClockMs(ms: number, timezone: string): number {
+  return ms + offsetMs(timezone, ms);
+}
+
+/**
+ * The instant at which the local wall clock in `timezone` reads `wall` (a
+ * wall-clock time encoded as a UTC epoch value). When clocks go back and the
+ * time happens twice, the first occurrence. When clocks go forward over it, the
+ * time is shifted forward by the gap (02:30 becomes 03:30), as JavaScript's
+ * `Date` does.
+ *
+ * Built on offsets rather than TZDate's wall-clock constructor, whose answer
+ * for repeated and skipped times depends on the runtime's own timezone, so the
+ * phone and the server would disagree.
+ */
+function instantOfWallClock(wall: number, timezone: string): number {
+  const before = offsetMs(timezone, wall - DAY_MS);
+  const after = offsetMs(timezone, wall + DAY_MS);
+  const candidates = [wall - before, wall - after].sort((a, b) => a - b);
+  for (const t of candidates) {
+    if (wallClockMs(t, timezone) === wall) return t;
+  }
+  // Skipped by a forward transition: read the wall time with the offset in force before it.
+  return wall - before;
+}
+
+/**
  * The logical day a moment belongs to: convert it to the settings timezone, step
  * back dayStartHour hours of wall-clock time, and take the calendar date. With
  * dayStartHour 4, a 01:00 moment belongs to the previous day.
@@ -40,9 +78,9 @@ export function toIso(t: ISO | Date | number): ISO {
  * the boundary stays at dayStartHour local time on daylight saving change days.
  */
 export function dayKeyOf(t: ISO | Date | number, settings: DaySettings): DayKey {
-  const local = new TZDate(toMs(t), settings.timezone);
-  const day = local.getHours() < settings.dayStartHour ? subDays(local, 1) : local;
-  return format(day, 'yyyy-MM-dd');
+  const wall = new Date(wallClockMs(toMs(t), settings.timezone));
+  const date = wall.toISOString().slice(0, 10);
+  return wall.getUTCHours() < settings.dayStartHour ? addDaysToKey(date, -1) : date;
 }
 
 function parseDayKey(dayKey: DayKey): { y: number; m: number; d: number } {
@@ -99,13 +137,16 @@ export interface MsRange {
 /**
  * The instants a logical day covers: from `dayStartHour` local time on `dayKey`
  * to `dayStartHour` local time on the next calendar day. Usually 24 hours, 23 or
- * 25 on daylight saving change days.
+ * 25 on daylight saving change days. If `dayStartHour` happens twice (clocks
+ * going back), the day starts at the first one, matching `dayKeyOf`.
  */
 export function dayRange(dayKey: DayKey, settings: DaySettings): MsRange {
   const { y, m, d } = parseDayKey(dayKey);
-  const start = new TZDate(y, m - 1, d, settings.dayStartHour, 0, 0, 0, settings.timezone);
-  const end = new TZDate(y, m - 1, d + 1, settings.dayStartHour, 0, 0, 0, settings.timezone);
-  return { start: start.getTime(), end: end.getTime() };
+  const h = settings.dayStartHour;
+  return {
+    start: instantOfWallClock(Date.UTC(y, m - 1, d, h), settings.timezone),
+    end: instantOfWallClock(Date.UTC(y, m - 1, d + 1, h), settings.timezone),
+  };
 }
 
 /** The range covering logical days `from` through `to`, both inclusive. */
@@ -156,23 +197,16 @@ export function localDate(t: ISO | Date | number, timezone: string): string {
 
 /**
  * Convert a local calendar date and wall-clock time in a timezone to an instant.
- * `date` is "YYYY-MM-DD", `time` is "HH:MM" or "HH:MM:SS".
+ * `date` is "YYYY-MM-DD", `time` is "HH:MM" or "HH:MM:SS". A time that happens
+ * twice (clocks going back) gives the first occurrence; a time skipped by
+ * clocks going forward is shifted forward by the gap.
  */
 export function localDateTimeToMs(date: string, time: string, timezone: string): number {
   const { y, m, d } = parseDayKey(date);
   const match = /^(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(time);
   if (!match) throw new Error(`Invalid time: ${time}`);
-  const local = new TZDate(
-    y,
-    m - 1,
-    d,
-    Number(match[1]),
-    Number(match[2]),
-    Number(match[3] ?? 0),
-    0,
-    timezone,
-  );
-  return local.getTime();
+  const wall = Date.UTC(y, m - 1, d, Number(match[1]), Number(match[2]), Number(match[3] ?? 0));
+  return instantOfWallClock(wall, timezone);
 }
 
 /**

@@ -4,6 +4,7 @@ apps/server/drizzle/meta
 **/dist
 **/dev-dist
 **/.wrangler
+.claude/worktrees
 **/coverage
 # Hand-written docs keep their aligned code comments and tables.
 *.md

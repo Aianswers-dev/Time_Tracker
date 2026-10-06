@@ -1,5 +1,21 @@
-import type { Category, NotificationKind, NotificationLogEntry, Rule, Segment, Settings } from './entities';
-import { dayKeyOf, formatDuration, isInQuietWindow, localHHMM, MINUTE_MS, toMs, wholeMinutes, type ISO } from './time';
+import type {
+  Category,
+  NotificationKind,
+  NotificationLogEntry,
+  Rule,
+  Segment,
+  Settings,
+} from './entities';
+import {
+  dayKeyOf,
+  formatDuration,
+  isInQuietWindow,
+  localHHMM,
+  MINUTE_MS,
+  toMs,
+  wholeMinutes,
+  type ISO,
+} from './time';
 
 /**
  * The nudge rule engine from docs/03-data-model.md. Pure: the server's cron
@@ -52,6 +68,11 @@ function lastSentMs(entries: readonly NotificationLogEntry[]): number | null {
   return last;
 }
 
+/** The rule's custom body, or null when it has none. A blank message counts as none. */
+function customBody(rule: Rule): string | null {
+  return rule.message !== null && rule.message.trim() !== '' ? rule.message : null;
+}
+
 function isDue(
   over: boolean,
   last: number | null,
@@ -86,7 +107,9 @@ export function evaluateRules(input: RuleEngineInput): PendingNotification[] {
   for (const rule of rules.filter((r) => r.kind === 'session')) {
     if (isInQuietWindow(hhmm, rule.quietStart, rule.quietEnd)) continue;
     const last = lastSentMs(
-      input.log.filter((e) => e.kind === 'session' && e.ruleId === rule.id && e.segmentId === open.id),
+      input.log.filter(
+        (e) => e.kind === 'session' && e.ruleId === rule.id && e.segmentId === open.id,
+      ),
     );
     if (!isDue(sessionMin >= rule.thresholdMin, last, rule.repeatEveryMin, nowMs)) continue;
     const duration = formatDuration(sessionMs);
@@ -96,7 +119,9 @@ export function evaluateRules(input: RuleEngineInput): PendingNotification[] {
       segmentId: open.id,
       dayKey: null,
       title: `${name} for ${duration}`,
-      body: rule.message ?? `You've been on ${name} for ${duration} straight. Time to switch it up.`,
+      body:
+        customBody(rule) ??
+        `You've been on ${name} for ${duration} straight. Time to switch it up.`,
       tag: `session:${rule.id}`,
     });
   }
@@ -114,7 +139,7 @@ export function evaluateRules(input: RuleEngineInput): PendingNotification[] {
       dayKey: today,
       title: `${formatDuration(input.todayMs)} of ${name} today`,
       body:
-        rule.message ??
+        customBody(rule) ??
         `That's past your ${formatDuration(rule.thresholdMin * MINUTE_MS)} budget for today.`,
       tag: `daily:${rule.id}`,
     });

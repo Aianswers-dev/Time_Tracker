@@ -210,10 +210,13 @@ or throws a typed error. Tests assert the invariants after each operation.
 - `dayKeyOf(t, settings)`: convert `t` to `settings.timezone`, subtract
   `dayStartHour` hours, format as `YYYY-MM-DD`.
 - `dayRange(dayKey, settings)`: `[start, end)` as UTC instants, where `start`
-  is `dayKey` at `dayStartHour` local and `end` is the next day's.
-- `splitByDay(segment, now, settings)`: slices one segment (open segments end
-  at `now`) into `{ dayKey, startedAt, endedAt, minutes }` pieces at logical
-  day boundaries.
+  is `dayKey` at `dayStartHour` local and `end` is the next day's. When
+  `dayStartHour` happens twice (clocks going back) the day starts at the
+  first; when it is skipped, at the moment the clocks jump. So `t` is in
+  `dayRange(k)` exactly when `dayKeyOf(t) === k`.
+- `splitByDay(start, end, settings)`: slices the span [start, end) in epoch
+  milliseconds (pass `now` as the end for the open segment) into
+  `{ dayKey, start, end }` pieces at logical day boundaries.
 
 ## Segment operations (`packages/shared/src/segments.ts`)
 
@@ -239,7 +242,10 @@ two. Any trimmed closed segment left shorter than one second is deleted (I5).
 - `editSegment({ id, categoryId?, startedAt?, endedAt?, note? })`: boundaries
   behave like dragging. Moving the start later or the end earlier pulls a
   touching neighbour along. Moving the start earlier or the end later clears
-  what was there. The open segment's end cannot be set (switch instead).
+  what was there. A pulled neighbour only takes over time the segment gave
+  up: when an edit moves the segment past its old end (or before its old
+  start), the time in between keeps whatever was there. The open segment's
+  end cannot be set (switch instead).
   The UI previews the returned rows to show what else will change.
 - `splitSegment({ id, at, secondCategoryId })`: end the segment at `at`,
   create a second segment from `at` to the original end. If the original was
@@ -259,15 +265,28 @@ two. Any trimmed closed segment left shorter than one second is deleted (I5).
 
 ## Aggregation (`packages/shared/src/stats.ts`)
 
-- `totalsForRange(segments, from, to, now)`: minutes per category plus
-  untracked minutes, computed by clipping segments to the range.
-- `timelineForDay(segments, dayKey, now, settings)`: ordered blocks for the
-  Today bar, with explicit `untracked` blocks for gaps.
-- `dailyTotals(segments, dayKeys, now, settings)`: per-day map for stacked
-  bars.
-- `hourHeatmap(segments, dayKeys, now, settings)`: 24 x categories matrix of
-  minutes, in local hours.
-- `budgetStatus(rules, dailyTotals)`: for each daily rule, days under and over.
+All durations are milliseconds; the UI formats them.
+
+- `totalsForRange(segments, from, to, now)`: `{ byCategory, trackedMs,
+  untrackedMs }` by clipping segments to the range. Untracked time only counts
+  after the earliest segment in the input and before now, so pass the full
+  history (or at least the earliest live segment) when untracked matters.
+- `sortedTotals(byCategory)`: category totals, largest first.
+- `todayMsFor(segments, categoryId, dayKey, settings, now)`: one category's
+  time in one logical day.
+- `timelineForDay(segments, dayKey, settings, now)`: ordered blocks for the
+  Today bar, with explicit gap blocks for untracked time.
+- `dailyTotals(segments, dayKeys, settings, now)`: per-day map of per-category
+  time, for stacked bars.
+- `hourHeatmap(segments, from, to, timezone, now)`: per category, 24 numbers of
+  time in each local hour of day.
+- `budgetStatus(rules, daily, dayKeys)`: for each enabled daily rule, days
+  under and over and the current streak under budget.
+- `movingAverage(values, window)`: trailing average for trend lines.
+
+Inserting a closed block inside the running segment splits it, and the
+still-running tail gets a new id. Session rules and the stale check restart
+for the tail, which matches their meaning: one unbroken stretch.
 
 ## Rule engine (`packages/shared/src/rules.ts`)
 
@@ -282,7 +301,7 @@ interface RuleEngineInput {
   log: NotificationLog[];        // rows for this segment id or today's dayKey
 }
 
-interface Notification {
+interface PendingNotification {
   kind: 'session' | 'daily' | 'stale';
   ruleId: string | null;
   segmentId: string | null;
@@ -292,7 +311,7 @@ interface Notification {
   tag: string;                   // collapses repeats on the device
 }
 
-function evaluateRules(input: RuleEngineInput): Notification[];
+function evaluateRules(input: RuleEngineInput): PendingNotification[];
 ```
 
 Semantics, evaluated once a minute:

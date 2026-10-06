@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { healthResponseSchema, apiErrorSchema, errorCodeSchema } from './api';
+import {
+  healthResponseSchema,
+  apiErrorSchema,
+  errorCodeSchema,
+  opsRequestSchema,
+  switchRequestSchema,
+} from './api';
+import { MAX_OPS_PER_REQUEST } from './ops';
 
 describe('healthResponseSchema', () => {
   it('accepts valid health response with ok: true and ISO datetime', () => {
@@ -217,5 +224,57 @@ describe('errorCodeSchema', () => {
     expect(errorCodeSchema.safeParse(123).success).toBe(false);
     expect(errorCodeSchema.safeParse(null).success).toBe(false);
     expect(errorCodeSchema.safeParse(undefined).success).toBe(false);
+  });
+});
+
+describe('switchRequestSchema', () => {
+  const CAT = '0199b6d2-3c4a-7def-8123-000000000001';
+
+  it('needs a category name or id', () => {
+    expect(switchRequestSchema.safeParse({}).success).toBe(false);
+    expect(switchRequestSchema.safeParse({ at: '2026-10-02T03:15:00Z' }).success).toBe(false);
+    expect(switchRequestSchema.safeParse({ categoryName: 'Relaxing' }).success).toBe(true);
+    expect(switchRequestSchema.safeParse({ categoryId: CAT }).success).toBe(true);
+  });
+
+  it('defaults source to shortcut and keeps an explicit one', () => {
+    expect(switchRequestSchema.parse({ categoryName: 'Relaxing' }).source).toBe('shortcut');
+    expect(switchRequestSchema.parse({ categoryId: CAT, source: 'app' }).source).toBe('app');
+  });
+
+  it('trims the name, rejects a blank name and a non-UUID id', () => {
+    expect(switchRequestSchema.parse({ categoryName: '  Relaxing ' }).categoryName).toBe(
+      'Relaxing',
+    );
+    expect(switchRequestSchema.safeParse({ categoryName: '   ' }).success).toBe(false);
+    expect(switchRequestSchema.safeParse({ categoryId: 'relaxing' }).success).toBe(false);
+    expect(switchRequestSchema.safeParse({ categoryName: 'X', id: 'abc' }).success).toBe(false);
+  });
+
+  it('normalises `at`', () => {
+    expect(switchRequestSchema.parse({ categoryName: 'X', at: '2026-10-02T03:15:00Z' }).at).toBe(
+      '2026-10-02T03:15:00.000Z',
+    );
+  });
+});
+
+describe('opsRequestSchema', () => {
+  it('takes 1 to MAX_OPS_PER_REQUEST ops', () => {
+    const op = {
+      opId: '0199b6d2-3c4a-7def-8123-456789abcdef',
+      createdAt: '2026-10-02T03:15:00.000Z',
+      type: 'switch',
+      payload: {
+        categoryId: '0199b6d2-3c4a-7def-8123-000000000001',
+        at: '2026-10-02T03:15:00.000Z',
+        newSegmentId: '0199b6d2-3c4a-7def-8123-000000000002',
+        source: 'app',
+      },
+    };
+    const req = (n: number) => ({ ops: Array.from({ length: n }, () => op) });
+    expect(opsRequestSchema.safeParse(req(0)).success).toBe(false);
+    expect(opsRequestSchema.safeParse(req(1)).success).toBe(true);
+    expect(opsRequestSchema.safeParse(req(MAX_OPS_PER_REQUEST)).success).toBe(true);
+    expect(opsRequestSchema.safeParse(req(MAX_OPS_PER_REQUEST + 1)).success).toBe(false);
   });
 });
