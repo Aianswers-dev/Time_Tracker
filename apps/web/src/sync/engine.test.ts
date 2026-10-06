@@ -4,6 +4,7 @@ import {
   SEED_CATEGORIES,
   SEED_RULES,
   SETTINGS_ID,
+  switchCategory,
   toIso,
   uuidv7,
   type Category,
@@ -448,6 +449,44 @@ describe('full resync', () => {
     expect((await requestSync()).status).toBe('ok');
     expect(await getMeta(SYNC_META.serverEmpty)).toBeUndefined();
     expect((await liveSegments()).map((s) => s.id).sort()).toEqual([open.id, shortcut.id].sort());
+  });
+
+  it('drops a refused switch’s segment even when an op made during the resync closed it', async () => {
+    const server = await connected();
+    tick();
+    await switchTo(CAT.sleep);
+    await requestSync();
+    // Offline: switch to Relaxing. Before it is flushed a Shortcut switches the server to Relaxing too.
+    tick();
+    const refused = await switchTo(CAT.relaxing);
+    tick(5 * 60_000);
+    const live = [...server.segments.values()].map((s) => s.row).filter((s) => !s.deletedAt);
+    const shortcut = switchCategory(
+      live,
+      { categoryId: CAT.relaxing, source: 'shortcut' },
+      { now: toIso(Date.now()), newId: () => uuidv7() },
+    );
+    server.put({ segments: shortcut.rows });
+    // Back online: the switch is a conflict, and while the full resync is in
+    // flight the owner switches to Housework, which closes the refused segment.
+    tick(5 * 60_000);
+    server.duringSnapshot = async () => {
+      if (server.snapshotCalls().at(-1)?.path !== '/api/snapshot') return;
+      server.duringSnapshot = null;
+      tick(1_000);
+      await switchTo(CAT.housework);
+    };
+    expect((await syncRound()).status).toBe('ok');
+    expect(checkInvariants(await db.segments.toArray())).toEqual([]);
+
+    expect(await syncRound()).toEqual({ status: 'ok', again: false });
+    const local = await liveSegments();
+    expect(local.some((s) => s.id === refused.opened?.id)).toBe(false);
+    expect(checkInvariants(local)).toEqual([]);
+    const shape = (rows: typeof local) =>
+      rows.map((s) => `${s.id} ${s.startedAt} ${s.endedAt}`).sort();
+    const remote = [...server.segments.values()].map((s) => s.row).filter((s) => !s.deletedAt);
+    expect(shape(local)).toEqual(shape(remote));
   });
 
   it('reset discards the outbox and re-downloads everything', async () => {

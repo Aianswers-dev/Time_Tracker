@@ -1,4 +1,6 @@
 import {
+  applyRows,
+  checkInvariants,
   switchCategory,
   toIso,
   toMs,
@@ -18,8 +20,8 @@ import { vi } from 'vitest';
  * mocked `fetch`. It keeps rows in memory with a `syncedAt` like the real
  * server, applies ops the same way in spirit (a switch runs the shared
  * `switchCategory` with the server's clock, unknown categories are
- * `validation_failed` and a switch to the category already open under
- * another id is `conflict`), answers at most `maxApplied` ops per request
+ * `validation_failed`, a switch to the category already open under another
+ * id is `conflict` and so is an upsert that breaks I1, I2 or I5), answers at most `maxApplied` ops per request
  * and returns the 10 s overlap on `since` pulls.
  */
 
@@ -140,6 +142,9 @@ export function fakeServer(token = 'secret'): FakeServer {
         if (winners.some((r) => !server.categories.has(r.categoryId))) {
           return { code: 'validation_failed', message: 'Unknown category' };
         }
+        const live = [...server.segments.values()].map((s) => s.row);
+        const problems = checkInvariants(applyRows(live, winners));
+        if (problems.length > 0) return { code: 'conflict', message: problems.join('; ') };
         server.put({ segments: winners });
         return undefined;
       }

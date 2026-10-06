@@ -249,11 +249,18 @@ async function fullResync(discardThroughSeq?: number): Promise<boolean> {
     const pending = await pendingOps();
     const t = touchedBy(pending);
     if (await serverLostEntries(snap, t)) throw new SyncFailure('problem', EMPTY_SERVER_MESSAGE);
+    // A segment a pending switch closed is kept only if the server has it. One
+    // the server never had came from a refused op (the reason for this
+    // resync); no pending op will send it, so keeping it would leave it on
+    // this phone for good, overlapping the server's rows.
+    const onServer = new Set(snap.segments.map((s) => s.id));
     const keep =
       pending.length === 0
         ? { segments: [], categories: [], rules: [] }
         : {
-            segments: (await db.segments.toArray()).filter((s) => segmentTouched(t, s)),
+            segments: (await db.segments.toArray()).filter(
+              (s) => t.segments.has(s.id) || (segmentTouched(t, s) && onServer.has(s.id)),
+            ),
             categories: (await db.categories.toArray()).filter((c) => categoryTouched(t, c)),
             rules: (await db.rules.toArray()).filter((r) => ruleTouched(t, r)),
           };
