@@ -1,5 +1,21 @@
-import type { Category, NotificationKind, NotificationLogEntry, Rule, Segment, Settings } from './entities';
-import { dayKeyOf, formatDuration, isInQuietWindow, localHHMM, MINUTE_MS, toMs, wholeMinutes, type ISO } from './time';
+import type {
+  Category,
+  NotificationKind,
+  NotificationLogEntry,
+  Rule,
+  Segment,
+  Settings,
+} from './entities';
+import {
+  dayKeyOf,
+  formatDuration,
+  isInQuietWindow,
+  localHHMM,
+  MINUTE_MS,
+  toMs,
+  wholeMinutes,
+  type ISO,
+} from './time';
 
 /**
  * The nudge rule engine from docs/03-data-model.md. Pure: the server's cron
@@ -86,7 +102,9 @@ export function evaluateRules(input: RuleEngineInput): PendingNotification[] {
   for (const rule of rules.filter((r) => r.kind === 'session')) {
     if (isInQuietWindow(hhmm, rule.quietStart, rule.quietEnd)) continue;
     const last = lastSentMs(
-      input.log.filter((e) => e.kind === 'session' && e.ruleId === rule.id && e.segmentId === open.id),
+      input.log.filter(
+        (e) => e.kind === 'session' && e.ruleId === rule.id && e.segmentId === open.id,
+      ),
     );
     if (!isDue(sessionMin >= rule.thresholdMin, last, rule.repeatEveryMin, nowMs)) continue;
     const duration = formatDuration(sessionMs);
@@ -96,7 +114,8 @@ export function evaluateRules(input: RuleEngineInput): PendingNotification[] {
       segmentId: open.id,
       dayKey: null,
       title: `${name} for ${duration}`,
-      body: rule.message ?? `You've been on ${name} for ${duration} straight. Time to switch it up.`,
+      body:
+        rule.message ?? `You've been on ${name} for ${duration} straight. Time to switch it up.`,
       tag: `session:${rule.id}`,
     });
   }

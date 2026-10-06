@@ -119,7 +119,12 @@ class Working {
     if (this.rows.has(seg.id) || this.original.has(seg.id)) {
       throw new SegmentOpError('invalid_range', `Segment id ${seg.id} already exists`);
     }
-    const row: Segment = { ...seg, createdAt: this.ctx.now, updatedAt: this.ctx.now, deletedAt: null };
+    const row: Segment = {
+      ...seg,
+      createdAt: this.ctx.now,
+      updatedAt: this.ctx.now,
+      deletedAt: null,
+    };
     this.rows.set(row.id, row);
     this.created.add(row.id);
     this.touched.add(row.id);
@@ -142,7 +147,11 @@ class Working {
 
   /** The live segment that ends exactly where `atMs` is, excluding `exceptId`. */
   endingAt(atMs: number, exceptId: string): Segment | null {
-    return this.live().find((s) => s.id !== exceptId && s.endedAt !== null && toMs(s.endedAt) === atMs) ?? null;
+    return (
+      this.live().find(
+        (s) => s.id !== exceptId && s.endedAt !== null && toMs(s.endedAt) === atMs,
+      ) ?? null
+    );
   }
 
   /** The live segment that starts exactly at `atMs`, excluding `exceptId`. */
@@ -367,7 +376,8 @@ export function editSegment(
   } else {
     if (newEnd > nowMs) throw new SegmentOpError('in_future', 'End is in the future');
     if (newEnd <= newStart) throw new SegmentOpError('invalid_range', 'End must be after start');
-    if (newEnd - newStart < MIN_SEGMENT_MS) throw new SegmentOpError('too_short', 'Entry is too short');
+    if (newEnd - newStart < MIN_SEGMENT_MS)
+      throw new SegmentOpError('too_short', 'Entry is too short');
   }
 
   if (newStart > oldStart) {
@@ -503,7 +513,11 @@ export function deleteSegment(
  * rows the operation created are deleted. `prior` is the segment list the
  * operation ran against.
  */
-export function undoRows(prior: readonly Segment[], changed: readonly Segment[], now: ISO): Segment[] {
+export function undoRows(
+  prior: readonly Segment[],
+  changed: readonly Segment[],
+  now: ISO,
+): Segment[] {
   const before = new Map(prior.map((s) => [s.id, s]));
   return changed.map((row) => {
     const old = before.get(row.id);
