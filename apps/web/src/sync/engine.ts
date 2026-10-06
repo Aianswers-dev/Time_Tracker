@@ -20,7 +20,7 @@ import { db, type OutboxRow } from '../db';
 import { describeOp, failureSummary } from './describe';
 import { deleteMeta, getMeta, setMeta, setSyncError, SYNC_META } from './meta';
 import { emitSyncNotice } from './runtime';
-import { categoryTouched, ruleTouched, segmentTouched, touchedBy } from './touched';
+import { categoryTouched, ruleTouched, segmentTouched, touchedBy, type Touched } from './touched';
 
 /**
  * One sync round (docs/02 "Sync details"): flush the outbox to
@@ -35,8 +35,9 @@ const OPS_TIMEOUT_MS = 30_000;
 const PULL_TIMEOUT_MS = 30_000;
 const FULL_TIMEOUT_MS = 120_000;
 
+/** The full resync found a server that lost its data (no categories, or not the ones in use). */
 export const EMPTY_SERVER_MESSAGE =
-  'Your server has no categories, so this phone kept its data instead of replacing it.';
+  'Your server is missing data this phone has, so this phone kept its data instead of replacing it.';
 
 export type RoundOutcome =
   /** No token: sync is off. */
@@ -199,10 +200,35 @@ async function pull(): Promise<boolean> {
 }
 
 /**
+ * Whether the full snapshot lacks a category this phone has live entries in.
+ * Deletes are soft, so a healthy server knows every category the phone ever
+ * sent, deleted or not. One it has never seen means the server lost its data
+ * and got some of it back from later ops (a rename, a switch): replacing
+ * would delete the history in that category, as with an empty server. Rows
+ * touched by ops still waiting in the outbox do not count.
+ */
+async function serverLostEntries(snap: SnapshotResponse, t: Touched): Promise<boolean> {
+  const known = new Set(snap.categories.map((c) => c.id));
+  const unknown = await db.categories
+    .filter((c) => c.deletedAt === null && !known.has(c.id) && !categoryTouched(t, c))
+    .toArray();
+  for (const c of unknown) {
+    const used = await db.segments
+      .where('categoryId')
+      .equals(c.id)
+      .filter((s) => s.deletedAt === null && !segmentTouched(t, s))
+      .first();
+    if (used) return true;
+  }
+  return false;
+}
+
+/**
  * Replace the local synced tables with the server's full snapshot, in one
  * transaction. Refuses (and changes nothing) when the server has no
- * categories but this phone has some: wiping would lose everything the
- * server never received. `discardThroughSeq` drops queued ops up to that seq
+ * categories but this phone has some, or lacks a category this phone has
+ * entries in (`serverLostEntries`): wiping would lose everything the server
+ * never received. `discardThroughSeq` drops queued ops up to that seq
  * (Reset). Ops queued after that keep their rows, as in `pull`.
  */
 async function fullResync(discardThroughSeq?: number): Promise<boolean> {
@@ -222,6 +248,7 @@ async function fullResync(discardThroughSeq?: number): Promise<boolean> {
 
     const pending = await pendingOps();
     const t = touchedBy(pending);
+    if (await serverLostEntries(snap, t)) throw new SyncFailure('problem', EMPTY_SERVER_MESSAGE);
     const keep =
       pending.length === 0
         ? { segments: [], categories: [], rules: [] }
