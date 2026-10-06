@@ -59,6 +59,24 @@ describe('segmentsOverlapping', () => {
     const recent = await liveSegmentsOverlapping(db, T - DAY, Number.POSITIVE_INFINITY);
     expect(recent.map((s) => s.id)).toEqual([crossing.id, inside.id, open.id]);
   });
+
+  it('does not return the whole later history for a window in the past', async () => {
+    // Editing an old segment, exporting an old month or GET /api/segments for
+    // an old range: every row the query returns is parsed and checked in the
+    // Worker, against the Free plan's 10 ms of CPU per request.
+    const db = server.db();
+    const cat = makeCategory();
+    await insertCategories(db, [cat]);
+    const rows = Array.from({ length: 60 }, (_, i) =>
+      makeSegment(cat.id, iso(T - (60 - i) * DAY), iso(T - (59 - i) * DAY)),
+    );
+    await insertSegments(db, [...rows, makeSegment(cat.id, iso(T), null)]);
+
+    const from = T - 50 * DAY + HOUR;
+    const to = from + HOUR;
+    const returned = await select.segmentsOverlapping(db, from, to);
+    expect(returned.map((r) => r.id)).toEqual([rows[10]!.id]);
+  });
 });
 
 describe('keepOverlapping', () => {

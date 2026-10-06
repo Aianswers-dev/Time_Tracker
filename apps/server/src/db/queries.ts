@@ -71,15 +71,28 @@ export const select = {
    * Live segments overlapping [fromMs, toMs), as a superset: pass the rows
    * through `keepOverlapping` for the exact window and oldest-first order.
    *
-   * With a finite `fromMs` the SQL filters on the end only and does not sort,
-   * so SQLite answers from `segments_ended` and reads just the recent rows. A
+   * With a finite `fromMs` the SQL does not sort and SQLite answers from
+   * `segments_ended`, reading just the rows that end after `fromMs`. A plain
    * bound on `started_at` or an ORDER BY on it makes SQLite walk
    * `segments_started` across the whole history instead, on every switch and
-   * every widget refresh.
+   * every widget refresh. A finite `toMs` is still applied, as `+started_at`
+   * (the unary plus keeps SQLite from using an index for it), so a window in
+   * the past returns its own rows, not every row since: those are parsed and
+   * checked in the Worker against the Free plan's 10 ms of CPU.
    */
   segmentsOverlapping: (db: Db, fromMs: number, toMs: number) =>
     Number.isFinite(fromMs)
-      ? db.select().from(segments).where(overlapping(fromMs, Number.POSITIVE_INFINITY))
+      ? db
+          .select()
+          .from(segments)
+          .where(
+            Number.isFinite(toMs)
+              ? and(
+                  overlapping(fromMs, Number.POSITIVE_INFINITY),
+                  sql`+${segments.startedAt} < ${toIso(toMs)}`,
+                )
+              : overlapping(fromMs, Number.POSITIVE_INFINITY),
+          )
       : db
           .select()
           .from(segments)
