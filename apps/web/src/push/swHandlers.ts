@@ -39,13 +39,18 @@ function text(v: unknown, max: number): string | null {
 /**
  * A same-origin path to open, from whatever the payload's `data.url` holds.
  * Anything else (missing, malformed, another origin) opens the Now screen.
+ *
+ * Leading slashes are collapsed to one: a same-origin URL such as
+ * `https://<origin>//evil.example/` has the pathname `//evil.example/`, which
+ * would resolve to another origin when used as a path.
  */
 export function safeUrl(url: unknown, origin: string): string {
   if (typeof url !== 'string' || url.trim() === '') return '/';
   try {
     const parsed = new URL(url, origin);
     if (parsed.origin !== origin) return '/';
-    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    const path = `/${parsed.pathname.replace(/^\/+/, '')}${parsed.search}${parsed.hash}`;
+    return new URL(path, origin).origin === origin ? path : '/';
   } catch {
     return '/';
   }
