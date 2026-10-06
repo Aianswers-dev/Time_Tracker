@@ -115,10 +115,15 @@ actual refresh cadence.
   restamped. Deletes are soft: an upsert with `deletedAt` set.
 - The server adds a `synced_at` column to every synced table: server time of
   the last write. It is the snapshot cursor, so phone clock drift cannot make
-  a change invisible to the next pull.
+  a change invisible to the next pull. The snapshot re-reads the 10 seconds
+  before `since`, so a write that committed while the previous snapshot was
+  being read is not skipped.
 - One user action produces one op. The outbox holds ordered ops
   `{ opId, type, payload, createdAt }`, sent in batches of up to 200 and
-  applied in order, each atomically.
+  applied in order, each atomically. The server applies at most 15 ops per
+  request (D1 allows 50 queries per request on the Free plan) and answers
+  only those; the client keeps the unanswered ops and sends them again
+  straight away.
 - Upserts are last-write-wins: the server applies an incoming row when its
   `updatedAt` is at least the stored one, otherwise acknowledges and ignores it.
 - A `switch` op carries the new segment's id, so a replay after a timeout is
@@ -156,7 +161,8 @@ actual refresh cadence.
 ## Security
 
 - Every `/api/*` route except `/api/health` requires
-  `Authorization: Bearer <AUTH_TOKEN>`. Compare in constant time.
+  `Authorization: Bearer <AUTH_TOKEN>`. Compare in constant time. An unset
+  or empty `AUTH_TOKEN` rejects every request.
 - Reject request bodies over 1 MB. No rate limiting is needed for one user.
 - The VAPID private key never leaves the Worker. The public key is served by
   `GET /api/push/vapid-public-key`.
@@ -177,6 +183,10 @@ actual refresh cadence.
   apply` runs it locally or remotely.
 - Trigger the cron locally with
   `curl "http://localhost:8787/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"`.
+- Server tests (`pnpm --filter @time-tracker/server test`) run the real
+  Worker in workerd through wrangler's `createTestHarness`, with an in-memory
+  local D1 and the migrations in `apps/server/drizzle` applied. No Cloudflare
+  account or network access is needed.
 - CI (GitHub Actions) on every PR: install, lint, typecheck, test, build.
   Deploys are manual from the owner's machine.
 
@@ -189,6 +199,7 @@ actual refresh cadence.
 | Cron Triggers | Available on free plan | 1 trigger, every minute |
 | D1 reads | 5,000,000 rows / day | Cron reads under 20 rows per minute |
 | D1 writes | 100,000 rows / day | Dozens per day |
+| D1 queries per request | 50 | `/api/ops` applies at most 15 ops of at most 3 calls each; other routes make at most 4 |
 | D1 storage | 5 GB | Under 10 MB after years of use |
 | Static assets | Free | One small SPA |
 

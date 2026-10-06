@@ -1,4 +1,5 @@
-import { app, type Env } from './app';
+import { app } from './app';
+import type { Env } from './env';
 
 export { app };
 export type { Env };
