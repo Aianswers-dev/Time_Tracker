@@ -19,6 +19,14 @@ export const MAX_OPS_PER_REQUEST = 200;
 /** Most segment rows in one `segments.upsert` op. */
 export const MAX_ROWS_PER_OP = 100;
 
+/**
+ * Most `segments.upsert` rows the server applies in one `POST /api/ops`
+ * (always at least the first op). Building and checking rows is the Worker's
+ * main CPU cost against the Free plan's 10 ms; the client sizes its batches
+ * to match so it does not upload rows the server would only send back.
+ */
+export const MAX_SEGMENT_ROWS_PER_REQUEST = 200;
+
 const opBase = {
   opId: z.uuid(),
   createdAt: isoSchema,

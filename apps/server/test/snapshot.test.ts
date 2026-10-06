@@ -52,7 +52,9 @@ describe('GET /api/snapshot', () => {
     expect(Date.parse(body.serverTime)).toBeGreaterThanOrEqual(before);
     expect(body.categories).toHaveLength(2);
     expect(body.categories).toContainEqual(gone);
-    expect(body.segments).toEqual([deleted, live]);
+    // Ordered by write time then id (the paging order), not by start.
+    expect(body.segments).toHaveLength(2);
+    expect(body.segments).toEqual(expect.arrayContaining([deleted, live]));
     expect(body.rules).toEqual([rule]);
     expect(body.settings).toEqual(settings);
   });
@@ -104,5 +106,76 @@ describe('GET /api/snapshot', () => {
       (await server.get(`/api/snapshot?since=${encodeURIComponent(first.serverTime)}`)).json,
     );
     expect(next.settings).not.toBeNull();
+  });
+
+  it('pages segments by write time and id, so ties are neither skipped nor repeated', async () => {
+    const cat = makeCategory();
+    await insertCategories(server.db(), [cat]);
+    // Seven segments written in one batch (same synced_at), three written later.
+    const tied = Array.from({ length: 7 }, (_, i) =>
+      makeSegment(cat.id, ago((20 - i) * HOUR), ago((20 - i) * HOUR - 30 * MIN)),
+    );
+    await insertSegments(server.db(), tied, iso(Date.now() - 5 * MIN));
+    const later = Array.from({ length: 3 }, (_, i) =>
+      makeSegment(cat.id, ago((10 - i) * HOUR), ago((10 - i) * HOUR - 30 * MIN)),
+    );
+    await insertSegments(server.db(), later, iso(Date.now() - MIN));
+
+    const seen: string[] = [];
+    let path = '/api/snapshot?limit=3';
+    let pages = 0;
+    for (;;) {
+      const res = await server.get(path);
+      expect(res.status).toBe(200);
+      const body = snapshotResponseSchema.parse(res.json);
+      pages++;
+      expect(body.segments.length).toBeLessThanOrEqual(3);
+      // Categories, rules and settings come only on the first page.
+      expect(body.categories).toHaveLength(pages === 1 ? 1 : 0);
+      seen.push(...body.segments.map((s) => s.id));
+      if (!body.nextCursor) break;
+      path = `/api/snapshot?limit=3&cursor=${encodeURIComponent(body.nextCursor)}`;
+    }
+    expect(pages).toBe(4);
+    expect(new Set(seen).size).toBe(seen.length);
+    expect(new Set(seen)).toEqual(new Set([...tied, ...later].map((s) => s.id)));
+  });
+
+  it('pages after `since` too, and refuses a cursor it did not hand out', async () => {
+    const cat = makeCategory();
+    await insertCategories(server.db(), [cat]);
+    await insertSegments(
+      server.db(),
+      [makeSegment(cat.id, ago(30 * HOUR), ago(29 * HOUR))],
+      iso(Date.now() - 2 * HOUR),
+    );
+    const since = iso(Date.now() - HOUR);
+    const fresh = Array.from({ length: 4 }, (_, i) =>
+      makeSegment(cat.id, ago((8 - i) * HOUR), ago((8 - i) * HOUR - 10 * MIN)),
+    );
+    await insertSegments(server.db(), fresh, iso(Date.now() - 10 * MIN));
+
+    const first = snapshotResponseSchema.parse(
+      (await server.get(`/api/snapshot?since=${encodeURIComponent(since)}&limit=3`)).json,
+    );
+    expect(first.segments).toHaveLength(3);
+    expect(first.nextCursor).toEqual(expect.any(String));
+    const second = snapshotResponseSchema.parse(
+      (
+        await server.get(
+          `/api/snapshot?since=${encodeURIComponent(since)}&limit=3&cursor=${encodeURIComponent(first.nextCursor ?? '')}`,
+        )
+      ).json,
+    );
+    expect(second.segments).toHaveLength(1);
+    expect(second.nextCursor ?? null).toBeNull();
+    expect(new Set([...first.segments, ...second.segments].map((s) => s.id))).toEqual(
+      new Set(fresh.map((s) => s.id)),
+    );
+
+    for (const bad of ['nope', '2026-01-01T00:00:00.000Z', `x|${uuidv7()}`, 'a|b|c']) {
+      const res = await server.get(`/api/snapshot?cursor=${encodeURIComponent(bad)}`);
+      expect(res.status, bad).toBe(400);
+    }
   });
 });

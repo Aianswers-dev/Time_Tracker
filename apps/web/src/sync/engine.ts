@@ -1,6 +1,7 @@
 import {
   MAX_OPS_PER_REQUEST,
   MAX_ROWS_PER_OP,
+  MAX_SEGMENT_ROWS_PER_REQUEST,
   opsResponseSchema,
   snapshotResponseSchema,
   SETTINGS_ID,
@@ -104,10 +105,27 @@ async function settleOps(seqs: readonly number[], anyFailed: boolean): Promise<v
  * answer (it applies a prefix of each request) are sent again at once. A
  * failed request leaves every op queued and throws.
  */
+/**
+ * The leading ops of `rows` whose segment rows fit in what the server applies
+ * per request (MAX_SEGMENT_ROWS_PER_REQUEST), and always the first op. Sending
+ * more would upload rows the server can only leave unanswered.
+ */
+export function capBySegmentRows(rows: readonly OutboxRow[]): OutboxRow[] {
+  const out: OutboxRow[] = [];
+  let total = 0;
+  for (const row of rows) {
+    const n = row.op.type === 'segments.upsert' ? row.op.payload.rows.length : 0;
+    if (out.length > 0 && total + n > MAX_SEGMENT_ROWS_PER_REQUEST) break;
+    out.push(row);
+    total += n;
+  }
+  return out;
+}
+
 async function flush(failed: string[]): Promise<void> {
   let size = FLUSH_BATCH;
   for (;;) {
-    const batch = await db.outbox.orderBy('seq').limit(size).toArray();
+    const batch = capBySegmentRows(await db.outbox.orderBy('seq').limit(size).toArray());
     const first = batch[0];
     if (first === undefined) return;
 
@@ -167,12 +185,44 @@ function snapshotPath(since: string | undefined): string {
  * keep their local copy, and `lastSync` stays put so the next pull reads them
  * again. Returns true when such ops exist (another round should follow).
  */
+/** Most snapshot pages one download follows, a guard against a server that never stops. */
+const MAX_SNAPSHOT_PAGES = 1000;
+
+/**
+ * Every row written after `since` (everything when undefined), following the
+ * server's pages. Categories, rules, settings and `serverTime` come from the
+ * first page; segments from all of them. Nothing is applied until the last
+ * page arrives, so a failure part way leaves local data untouched.
+ */
+async function fetchSnapshot(
+  since: string | undefined,
+  timeoutMs: number,
+): Promise<SnapshotResponse> {
+  const first = await apiFetch(snapshotPath(since), {
+    schema: snapshotResponseSchema,
+    signal: requestTimeout(timeoutMs),
+  });
+  const segments = [...first.segments];
+  let cursor = first.nextCursor ?? null;
+  for (let page = 1; cursor !== null; page++) {
+    if (page >= MAX_SNAPSHOT_PAGES) {
+      throw new SyncFailure('retry', 'The server sent more pages than expected');
+    }
+    const params = new URLSearchParams({ cursor });
+    if (since !== undefined) params.set('since', since);
+    const next = await apiFetch(`/api/snapshot?${params.toString()}`, {
+      schema: snapshotResponseSchema,
+      signal: requestTimeout(timeoutMs),
+    });
+    segments.push(...next.segments);
+    cursor = next.nextCursor ?? null;
+  }
+  return { ...first, segments, nextCursor: null };
+}
+
 async function pull(): Promise<boolean> {
   const since = await getMeta(SYNC_META.lastSync);
-  const snap = await apiFetch(snapshotPath(since), {
-    schema: snapshotResponseSchema,
-    signal: requestTimeout(since === undefined ? FULL_TIMEOUT_MS : PULL_TIMEOUT_MS),
-  });
+  const snap = await fetchSnapshot(since, since === undefined ? FULL_TIMEOUT_MS : PULL_TIMEOUT_MS);
   return db.transaction('rw', SYNCED, async () => {
     const pending = await pendingOps();
     const t = touchedBy(pending);
@@ -232,10 +282,7 @@ async function serverLostEntries(snap: SnapshotResponse, t: Touched): Promise<bo
  * (Reset). Ops queued after that keep their rows, as in `pull`.
  */
 async function fullResync(discardThroughSeq?: number): Promise<boolean> {
-  const snap: SnapshotResponse = await apiFetch('/api/snapshot', {
-    schema: snapshotResponseSchema,
-    signal: requestTimeout(FULL_TIMEOUT_MS),
-  });
+  const snap: SnapshotResponse = await fetchSnapshot(undefined, FULL_TIMEOUT_MS);
   return db.transaction('rw', SYNCED, async () => {
     const serverHasCategories = snap.categories.some((c) => c.deletedAt === null);
     if (!serverHasCategories) {

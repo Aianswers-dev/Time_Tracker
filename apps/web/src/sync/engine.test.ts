@@ -8,6 +8,7 @@ import {
   toIso,
   uuidv7,
   type Category,
+  type Op,
 } from '@time-tracker/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getToken, setToken } from '../api/client';
@@ -18,7 +19,13 @@ import { updateSettings } from '../data/settingsActions';
 import { CAT, liveSegments, resetDb, seg } from '../data/testUtils';
 import { db } from '../db';
 import { connect, disconnect, uploadThisPhone } from './actions';
-import { EMPTY_SERVER_MESSAGE, FLUSH_BATCH, queueFullUpload, syncRound } from './engine';
+import {
+  capBySegmentRows,
+  EMPTY_SERVER_MESSAGE,
+  FLUSH_BATCH,
+  queueFullUpload,
+  syncRound,
+} from './engine';
 import { getMeta, parseSyncError, setMeta, SYNC_META } from './meta';
 import { getSyncRuntime, onSyncNotice } from './runtime';
 import { backoffDelay, requestReset, requestSync, stopSync } from './scheduler';
@@ -662,6 +669,67 @@ describe('upload this phone', () => {
       false,
     );
     expect(ops.some((op) => op.type === 'segments.upsert')).toBe(false);
+  });
+});
+
+describe('paged snapshots and batch size', () => {
+  it('a full resync follows every snapshot page and applies them together', async () => {
+    const server = await connected();
+    await requestSync();
+    const rows = Array.from({ length: 11 }, (_, i) =>
+      seg(CAT.relaxing, T0 - (30 - 2 * i) * 3_600_000, T0 - (29 - 2 * i) * 3_600_000),
+    );
+    server.put({ segments: rows });
+    server.snapshotPageSize = 4;
+    await setMeta(SYNC_META.needsFullResync, '1');
+    const callsBefore = server.snapshotCalls().length;
+
+    expect(await requestSync()).toEqual({ status: 'ok', again: false });
+    expect(server.snapshotCalls().length - callsBefore).toBe(3);
+    expect((await liveSegments()).map((s) => s.id).sort()).toEqual(rows.map((r) => r.id).sort());
+    expect(await db.categories.count()).toBe(10);
+  });
+
+  it('an incremental pull follows pages too', async () => {
+    const server = await connected();
+    await requestSync();
+    tick();
+    const rows = Array.from({ length: 5 }, (_, i) =>
+      seg(CAT.housework, T0 - (12 - 2 * i) * 3_600_000, T0 - (11 - 2 * i) * 3_600_000),
+    );
+    server.put({ segments: rows });
+    server.snapshotPageSize = 2;
+    expect(await requestSync()).toEqual({ status: 'ok', again: false });
+    const local = new Set((await liveSegments()).map((s) => s.id));
+    for (const r of rows) expect(local.has(r.id)).toBe(true);
+  });
+
+  it('caps each request at what the server applies in segment rows, but always sends one op', () => {
+    const rowsOf = (n: number) => Array.from({ length: n }, () => seg(CAT.relaxing, T0, T0 + 1000));
+    const upsert = (n: number, seq: number) => ({
+      seq,
+      opId: uuidv7(),
+      op: { type: 'segments.upsert', payload: { rows: rowsOf(n) } } as unknown as Op,
+      attempts: 0,
+      lastError: null,
+    });
+    const other = (seq: number) => ({
+      seq,
+      opId: uuidv7(),
+      op: { type: 'switch', payload: {} } as unknown as Op,
+      attempts: 0,
+      lastError: null,
+    });
+    expect(
+      capBySegmentRows([upsert(100, 1), upsert(100, 2), upsert(50, 3)]).map((r) => r.seq),
+    ).toEqual([1, 2]);
+    expect(
+      capBySegmentRows([other(1), upsert(100, 2), other(3), upsert(100, 4), upsert(1, 5)]).map(
+        (r) => r.seq,
+      ),
+    ).toEqual([1, 2, 3, 4]);
+    expect(capBySegmentRows([upsert(100, 1)]).map((r) => r.seq)).toEqual([1]);
+    expect(capBySegmentRows([])).toEqual([]);
   });
 });
 

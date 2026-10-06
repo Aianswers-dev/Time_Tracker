@@ -3,6 +3,7 @@ import {
   checkInvariants,
   findOpen,
   FUTURE_TOLERANCE_MS,
+  MAX_SEGMENT_ROWS_PER_REQUEST,
   opSchema,
   toIso,
   toMs,
@@ -55,7 +56,7 @@ export const D1_CALL_BUDGET = 45;
 export const MAX_OPS_APPLIED_PER_REQUEST = Math.floor(D1_CALL_BUDGET / MAX_D1_CALLS_PER_OP);
 
 /** `segments.upsert` rows applied per request. The rest are sent again, like ops past the D1 budget. */
-export const MAX_SEGMENT_ROWS_PER_REQUEST = 200;
+export { MAX_SEGMENT_ROWS_PER_REQUEST };
 
 /** The rows a `segments.upsert` op carries, read before it is validated; 0 for other ops. */
 function segmentRowCount(raw: RawOp): number {

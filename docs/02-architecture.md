@@ -192,8 +192,12 @@ actual refresh cadence.
   still waiting in the outbox. The outbox is flushed first, so the server copy
   already includes every local change.
 - A year of use is roughly 5 to 10 thousand segments, which IndexedDB handles
-  comfortably, so the client keeps the full history locally and the snapshot
-  is not paged.
+  comfortably, so the client keeps the full history locally. The snapshot is
+  paged (500 segments a page by default) so a full download stays inside the
+  Worker's 10 ms CPU budget; the client follows `nextCursor` to the end and
+  applies everything in one transaction. Outbox batches are likewise capped at
+  200 segment rows, what the server applies per request, so a bulk upload does
+  not resend rows the server leaves unanswered.
 - The server is authoritative for the invariants. It checks I1 and I2 after
   applying each op and rejects the whole op with `conflict` if they fail.
 

@@ -210,7 +210,7 @@ Details of each op type:
 
 ### Snapshot (the client pull)
 
-`GET /api/snapshot?since=<ISO, optional>`
+`GET /api/snapshot?since=<ISO, optional>&cursor=<optional>&limit=<optional>`
 
 ```json
 {
@@ -218,15 +218,24 @@ Details of each op type:
   "categories": [ ... ],
   "segments": [ ... ],
   "rules": [ ... ],
-  "settings": { ... } | null
+  "settings": { ... } | null,
+  "nextCursor": "<opaque>" | null
 }
 ```
 
 Rows with `synced_at > since - 10 s`, including soft-deleted rows. Without
 `since`, everything. `settings` is null when unchanged since `since` or never
-set. Not paged: a year of use is well under a few MB. The four tables are read
-in one D1 batch, so they are a consistent view. `synced_at` itself is never
-sent.
+set. `synced_at` itself is never sent.
+
+Segments are paged so a full download of a long history stays inside the
+Worker's CPU budget: at most `limit` per page (default 500, `SNAPSHOT_PAGE_SIZE`
+in shared, at most 2000), ordered by `(synced_at, id)`. While `nextCursor` is a
+string, request again with `cursor=<nextCursor>` and the same `since`; later
+pages carry only segments (categories and rules empty, settings null). A
+cursor this server did not hand out is `400 validation_failed`. The client
+keeps the first page's `serverTime` as its next `since`, and applies nothing
+until the last page arrives. On the first page the four tables are read in one
+D1 batch, so they are a consistent view.
 
 `serverTime` is read before the data. The 10 second overlap covers a write
 that stamped its `synced_at` just before that moment but committed just after

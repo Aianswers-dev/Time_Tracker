@@ -55,6 +55,8 @@ export interface FakeServer {
   intercept: (call: Call) => Response | Promise<Response> | undefined;
   /** Runs while a snapshot request is in flight, before it answers. */
   duringSnapshot: (() => Promise<void>) | null;
+  /** Segments per snapshot page, as the real server pages them. */
+  snapshotPageSize: number;
   opsBodies: () => Op[][];
   snapshotCalls: () => Call[];
   put: (rows: { categories?: Category[]; segments?: Segment[]; rules?: Rule[] }) => void;
@@ -85,6 +87,7 @@ export function fakeServer(token = 'secret'): FakeServer {
     failOp: () => undefined,
     intercept: () => undefined,
     duringSnapshot: null,
+    snapshotPageSize: 500,
     opsBodies: () =>
       server.calls.filter((c) => c.path === '/api/ops').map((c) => (c.body as { ops: Op[] }).ops),
     snapshotCalls: () => server.calls.filter((c) => c.path.startsWith('/api/snapshot')),
@@ -195,16 +198,30 @@ export function fakeServer(token = 'secret'): FakeServer {
     if (call.path.startsWith('/api/snapshot')) {
       const serverTime = toIso(Date.now());
       if (server.duringSnapshot) await server.duringSnapshot();
-      const since = new URL(call.path, 'http://x').searchParams.get('since');
+      const params = new URL(call.path, 'http://x').searchParams;
+      const since = params.get('since');
+      const cursor = params.get('cursor');
       const after = since === null ? -Infinity : toMs(since) - 10_000;
       const pick = <T>(m: Map<string, Stored<T>>) =>
         [...m.values()].filter((s) => s.syncedAt > after).map((s) => s.row);
+      // Segments in (syncedAt, id) order, paged after the cursor, as the real server does.
+      const key = (s: Stored<Segment>) => `${String(s.syncedAt).padStart(16, '0')}|${s.row.id}`;
+      const ordered = [...server.segments.values()]
+        .filter((s) => s.syncedAt > after)
+        .sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0))
+        .filter((s) => cursor === null || key(s) > cursor);
+      const page = ordered.slice(0, server.snapshotPageSize);
+      const last = page[page.length - 1];
       const body: SnapshotResponse = {
         serverTime,
-        categories: pick(server.categories),
-        segments: pick(server.segments),
-        rules: pick(server.rules),
-        settings: server.settings && server.settings.syncedAt > after ? server.settings.row : null,
+        categories: cursor === null ? pick(server.categories) : [],
+        segments: page.map((s) => s.row),
+        rules: cursor === null ? pick(server.rules) : [],
+        settings:
+          cursor === null && server.settings && server.settings.syncedAt > after
+            ? server.settings.row
+            : null,
+        nextCursor: ordered.length > page.length && last ? key(last) : null,
       };
       return json(200, body);
     }
