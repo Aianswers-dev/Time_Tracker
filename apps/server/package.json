@@ -14,6 +14,7 @@
     "db:migrate:remote": "wrangler d1 migrations apply DB --remote"
   },
   "dependencies": {
+    "@block65/webcrypto-web-push": "^2.0.0",
     "@time-tracker/shared": "workspace:*",
     "drizzle-orm": "^0.45.3",
     "hono": "^4.13.12",

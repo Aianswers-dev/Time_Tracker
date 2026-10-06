@@ -5,6 +5,7 @@ import {
   precacheAndRoute,
 } from 'workbox-precaching';
 import { NavigationRoute, registerRoute } from 'workbox-routing';
+import { handleNotificationClick, handlePush } from './push/swHandlers';
 
 declare const self: ServiceWorkerGlobalScope & {
   __WB_MANIFEST: Array<string | { url: string; revision: string | null }>;
@@ -25,4 +26,14 @@ registerRoute(
   new NavigationRoute(createHandlerBoundToURL('/index.html'), { denylist: [/^\/api\//] }),
 );
 
-// M3: push and notificationclick handlers go here.
+// Push (docs/06): every push shows a notification, even a malformed one, because
+// iOS punishes a push that shows nothing. The logic lives in push/swHandlers.ts.
+self.addEventListener('push', (event) => {
+  event.waitUntil(handlePush(event.data, self.registration, self.location.origin));
+});
+
+// Tapping a nudge focuses the app (or opens it) on the payload's data.url.
+// No action buttons: iOS ignores them.
+self.addEventListener('notificationclick', (event) => {
+  event.waitUntil(handleNotificationClick(event.notification, self.clients, self.location.origin));
+});
