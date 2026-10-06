@@ -17,6 +17,9 @@ ensureSeeded().catch((err: unknown) => {
   console.error('Seeding failed', err);
 });
 
+// M3: keep this phone's push subscription registered (iOS can drop it). Lazy, off the Now chunk.
+void import('./push/watch').then((m) => m.watchPushHealth(), console.error);
+
 const root = document.getElementById('root');
 if (!root) throw new Error('Missing #root element');
 
