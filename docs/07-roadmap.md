@@ -192,6 +192,15 @@ Definition of done:
 - Widget shows the live category on the Home Screen and lock screen.
 - "I'm relaxing" to Siri switches the tracker.
 
+M5 status: the widget script handles small and medium Home Screen widgets and
+rectangular, inline and circular Lock Screen widgets, with an offline cache
+and clear errors; it was exercised against stubbed Scriptable APIs in ten
+scenarios. 06-ios.md has step-by-step Shortcuts, automation and widget setup.
+A GitHub Actions **Deploy** workflow and [08-deploy.md](08-deploy.md) let the
+owner deploy without a computer. Still to do on the owner's device: confirm
+the widget and the Siri phrase work, and correct 06-ios.md where iOS differs.
+The read-only `WIDGET_TOKEN` was not built; the widget uses the app token.
+
 ## Backlog (not scheduled)
 
 - ntfy.sh fallback for notifications.
@@ -204,28 +213,22 @@ Definition of done:
 
 ## Owner setup tasks (not for the agent)
 
-Done once, before M2 can be deployed:
+Follow [08-deploy.md](08-deploy.md). It takes a fresh Cloudflare account to the
+installed app from a phone: three GitHub secrets (`CLOUDFLARE_API_TOKEN`,
+`CLOUDFLARE_ACCOUNT_ID`, `APP_TOKEN`), then the **Deploy** workflow, which
+finds or creates the D1 database, applies migrations before deploying, and
+sets `AUTH_TOKEN` from `APP_TOKEN`. Push notifications need no setup: the
+Worker generates its VAPID key pair on first use and stores it in D1.
 
-1. Create a free Cloudflare account. Install `wrangler`, run `wrangler login`.
-2. `wrangler d1 create time-tracker` and paste the database id into
-   `apps/server/wrangler.toml`.
-3. Generate a token: `openssl rand -base64 32`. Then
-   `wrangler secret put AUTH_TOKEN`.
-4. Nothing to do for push notifications: the Worker generates its VAPID key
-   pair on first use and stores it in D1. Optional, only if you want your own
-   pair or contact address: `wrangler secret put` `VAPID_PUBLIC_KEY` and
-   `VAPID_PRIVATE_KEY` (both, from `npx web-push generate-vapid-keys`) and
-   `VAPID_SUBJECT` (a `mailto:` or `https:` URL). Setting or changing the keys
-   after the app has subscribed makes it re-subscribe on its next launch.
-5. `pnpm run deploy`, then `wrangler d1 migrations apply time-tracker --remote`.
-6. Open the `workers.dev` URL in Safari, Add to Home Screen, paste the token.
-7. Enable notifications from Settings inside the app, send a test.
-8. Set up Shortcuts from `06-ios.md`.
+Optional, only if you want your own push key pair or contact address:
+`wrangler secret put` `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` (both, from
+`npx web-push generate-vapid-keys`) and `VAPID_SUBJECT` (a `mailto:` or
+`https:` URL). Setting or changing the keys after the app has subscribed makes
+it re-subscribe on its next launch.
 
-Upgrading a deploy whose release adds a migration (M3 adds
-`0001_server_config`): apply the migrations first with
-`wrangler d1 migrations apply time-tracker --remote`, then `pnpm run deploy`.
-New tables and indexes do not affect the running code, but new code needs
-them: until they exist every cron run fails.
+Deploying by hand instead: apply migrations first
+(`wrangler d1 migrations apply time-tracker --remote`), then
+`pnpm run deploy`. New code needs new tables; until they exist every cron run
+fails. 08-deploy.md has the full command list.
 
 Secrets are never committed. Local development uses `apps/server/.dev.vars`.

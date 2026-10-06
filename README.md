@@ -24,6 +24,13 @@ and the `/api/push/*` endpoints are ready for the app. Push needs no setup:
 the Worker generates its own VAPID keys. See
 [docs/07-roadmap.md](docs/07-roadmap.md).
 
+## Get it on your iPhone
+
+Follow [docs/08-deploy.md](docs/08-deploy.md): create a free Cloudflare
+account, add three secrets to this repository, run the **Deploy** workflow,
+then add the app to your Home Screen from Safari. About 15 minutes, all from
+a phone.
+
 ## Documentation
 
 Read in order.
@@ -37,6 +44,7 @@ Read in order.
 | [05-features.md](docs/05-features.md) | Screen by screen feature spec with acceptance criteria |
 | [06-ios.md](docs/06-ios.md) | iOS constraints, install and push flow, Shortcuts recipes, Scriptable widget |
 | [07-roadmap.md](docs/07-roadmap.md) | Milestones, task breakdown, definition of done, owner setup tasks |
+| [08-deploy.md](docs/08-deploy.md) | Deploy from GitHub and install on the iPhone, no computer needed |
 
 Agents working in this repo should also read [CLAUDE.md](CLAUDE.md).
 
