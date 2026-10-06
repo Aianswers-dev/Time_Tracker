@@ -122,7 +122,9 @@ outbox. Store the returned `serverTime` as the new `lastSync`.
 5. One write batch: a `notification_log` row for each notification, plus a
    prune of log rows older than 60 days (except the open segment's). The log
    is written before anything is sent, so a crash mid-send cannot cause a
-   duplicate on the next minute.
+   duplicate on the next minute. Each row is inserted only if no row for the
+   same notification appeared since the run's read, and only inserted rows
+   are sent, so two overlapping runs (a cron delivered twice) send it once.
 6. Send each notification to each subscription (subscriptions in parallel,
    notifications to one subscription in order), at most 6 sends per run. When
    more are due than fit, the extra notifications are neither logged nor sent
