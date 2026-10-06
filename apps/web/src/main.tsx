@@ -4,6 +4,7 @@ import { RouterProvider } from 'react-router/dom';
 import { ensureSeeded } from './data/seed';
 import './index.css';
 import { router } from './router';
+import { startSync } from './sync/scheduler';
 
 if (import.meta.env.PROD) {
   void import('virtual:pwa-register').then(({ registerSW }) => {
@@ -16,6 +17,9 @@ if (import.meta.env.PROD) {
 ensureSeeded().catch((err: unknown) => {
   console.error('Seeding failed', err);
 });
+
+// Outbox flush and snapshot pull (docs/02 "Sync details"). Off until a token is saved.
+startSync();
 
 const root = document.getElementById('root');
 if (!root) throw new Error('Missing #root element');

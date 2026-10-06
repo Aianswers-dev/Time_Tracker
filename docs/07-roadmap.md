@@ -90,6 +90,17 @@ Definition of done:
 - `POST /api/switch` by name works from a Shortcut.
 - Server tests cover each op type, idempotent replay, and overlap rejection.
 
+Status: server and client built. The client sync engine (`apps/web/src/sync/`)
+has unit tests for batching, partial results, refused ops, backoff, 401,
+pulls, the full-resync guard, single flight and triggers. An end-to-end run
+with Playwright against `wrangler dev` (390x844 touch viewport) checked:
+connect, switches reaching the server, two offline switches landing within a
+second of going online, a segment edit, a `POST /api/switch` by name showing
+up in the app at the next 30 s pull, a fresh browser profile restoring the
+full history with no duplicate categories, Reset, and a rejected token. The
+items that need the owner's iPhone (install, real network changes) are still
+to be checked on the device.
+
 ## M3 · Nudges
 
 Tasks:

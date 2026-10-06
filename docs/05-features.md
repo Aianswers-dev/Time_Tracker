@@ -9,16 +9,28 @@ Milestone tags (M1, M2, ...) map to `07-roadmap.md`.
   "Time", `display: standalone`, portrait orientation, theme colour, 192 and
   512 px icons plus an Apple touch icon. Lighthouse installability passes.
 - **Offline (M1).** The app shell loads with no network. All four screens work
-  from Dexie alone. A thin status pill shows "Offline" (M1) and, when the
-  outbox is non-empty, "N changes pending" (M2, when the outbox flushes).
+  from Dexie alone. A thin status pill shows "Offline" (M1), or "Offline · N
+  changes pending" when connected with unsent changes. Online (M2) it shows
+  "N changes pending" when connected and the outbox has not emptied for more
+  than 10 seconds, and "Sync problem" after an error that needs the owner (a
+  rejected token, a request the server refused, an empty server). Tapping
+  either opens the Settings sync section. A change the server refuses is
+  dropped and named in a toast ("Couldn't sync: switch to Relaxing").
 - **Dark mode (M1).** Follows the system. Category colours remain readable on
   both backgrounds.
 - **Touch targets (M1).** Every tappable control is at least 56 px tall.
 - **Cold start (M1).** The Now screen is interactive within one second on a
   warm service worker. A local switch applies within 50 ms.
-- **Login (M2).** If no token is stored, the app shows a single screen: paste
-  the token, tap Save. It calls `GET /api/categories` to validate. Until then
-  the app works locally and sync is simply off, so M1 is usable before M2.
+- **Login (M2).** There is no separate login screen: the app works locally
+  and sync is simply off until a token is saved, so M1 is usable before M2.
+  While no token is stored the Now screen shows a dismissible banner,
+  "Connect to your server to get nudges and keep a backup", linking to the
+  Settings sync section (dismissal is remembered). Connect checks the token
+  with `GET /api/settings` and saves it only if the server accepts it, then
+  syncs: the outbox goes up first, seed included, and a full snapshot
+  replaces the local tables. On an empty server the seed becomes the
+  canonical set; on a server with data (a reinstall) the seed's fixed ids and
+  2000-01-01 timestamps lose to the server's rows, so nothing is duplicated.
 
 ## Now screen `/` (M1)
 
@@ -90,8 +102,17 @@ Monday.
 - **Day start and timezone (M1).** Hour picker; timezone defaults to the
   device and is editable from the IANA list. Changing either re-renders all
   stats, no data migration needed because storage is UTC.
-- **Sync (M2).** Token field, "Sync now", last sync time, pending op count,
-  "Reset local data and re-download" with confirmation.
+- **Sync (M2).** Not connected: a password-type token field (paste friendly,
+  with a show toggle) and Connect, plus how many local changes will upload.
+  Connected: status, last sync time, changes waiting to upload, the last
+  error with the retry countdown, "Sync now", "Disconnect" (forgets the
+  token, keeps local data and the outbox) and "Reset local data and
+  re-download" with a confirmation sheet that says how many unsent changes
+  will be lost. Reset discards the outbox and replaces local data with the
+  server's full snapshot, but changes nothing when the server has no
+  categories. After a `401` the section shows "Token rejected — paste it
+  again" with the token field; syncing stays off until a new token is
+  saved.
 - **Notifications (M3).** If not running standalone: show "Install to Home
   Screen first" with the Share → Add to Home Screen steps. If standalone:
   a toggle that requests permission and subscribes, the subscription status,
