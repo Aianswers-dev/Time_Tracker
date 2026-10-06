@@ -60,11 +60,14 @@ payload, handles `notificationclick` by focusing or opening the app.
 Pure TypeScript, no runtime dependencies beyond zod and a date library.
 
 - Types and zod schemas for every entity and every API payload.
-- Time helpers: `dayKeyOf`, `dayRange`, `splitByDay`.
-- Segment operations: `switchCategory`, `moveBoundary`, `insertSegment`,
-  `splitSegment`, `changeCategory`, `deleteSegment`, `undoSwitch`.
-- Aggregation: `totalsForRange`, `timelineForDay`, `hourHeatmap`.
-- Rule engine: `evaluateRules(input, now) -> Notification[]`.
+- Time helpers: `dayKeyOf`, `dayRange`, `splitByDay`, day key arithmetic,
+  `localDateTimeToMs`, quiet-hour windows, formatting.
+- Segment operations: `switchCategory`, `backdateOpen`, `editSegment`,
+  `splitSegment`, `insertSegment`, `deleteSegment`, `undoRows`,
+  `checkInvariants`.
+- Aggregation: `totalsForRange`, `timelineForDay`, `dailyTotals`,
+  `hourHeatmap`, `budgetStatus`, `movingAverage`.
+- Rule engine: `evaluateRules(input) -> PendingNotification[]`.
 
 The server runs the rule engine; the client runs the same totals code for
 dashboards. One implementation, tested once.
