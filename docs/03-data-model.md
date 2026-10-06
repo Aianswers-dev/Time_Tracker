@@ -328,6 +328,10 @@ two. Any trimmed closed segment left shorter than one second is deleted (I5).
   - Otherwise clears `[at, ∞)` (so the open segment closes at `at`, and a
     backdated switch trims or removes whatever came after `at`) and opens a
     new segment at `at`.
+  - `madeAt` (optional, for a switch applied later, such as an outbox op):
+    live segments starting after both `at` and `madeAt` were recorded after
+    the switch was made and stay. The new segment fills `[at, first such
+    start)` and is closed; there is no no-op check in that case.
 - `backdateOpen({ startedAt })`: move the open segment's start. Earlier clears
   what was there. Later pulls a touching previous segment's end along, or
   leaves a gap if there was one already.

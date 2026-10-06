@@ -6,8 +6,8 @@ import {
   type SegmentSource,
   type SwitchResult,
 } from '@time-tracker/shared';
-import { runBatch, type Db } from '../db/client';
-import { upsertSegments } from '../db/writes';
+import type { Db } from '../db/client';
+import { writeSegments } from '../db/writes';
 
 export interface SwitchInput {
   categoryId: string;
@@ -16,6 +16,8 @@ export interface SwitchInput {
   /** Id for the new segment. Generated when absent. */
   newSegmentId?: string;
   source: SegmentSource;
+  /** When the switch was made, for an op applied later. See shared `switchCategory`. */
+  madeAt?: string;
 }
 
 /**
@@ -46,6 +48,7 @@ export function computeSwitch(
       at: input.at,
       newSegmentId: input.newSegmentId,
       source: input.source,
+      madeAt: input.madeAt,
     },
     { now, newId: () => uuidv7() },
   );
@@ -54,5 +57,5 @@ export function computeSwitch(
 /** Write a switch result as one batch. Server-computed rows skip the LWW guard. */
 export async function writeSwitch(db: Db, result: SwitchResult, now: string): Promise<void> {
   if (result.noop) return;
-  await runBatch(db, upsertSegments(db, result.rows, { syncedAt: now, lww: false }));
+  await writeSegments(db, result.rows, { syncedAt: now, lww: false });
 }

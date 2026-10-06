@@ -127,6 +127,7 @@ Agents add entries here as
 - [ ] D1 on the Workers Free plan allows 50 queries per Worker invocation
   (the Workers limits page says 1,000 for internal services; the D1 page says
   50), so one `POST /api/ops` request cannot apply a 200-op outbox batch. —
-  The server applies at most 15 ops per request and answers only those; the
-  client resends the unanswered ops immediately. Stays on the free tier, no
+  The server applies at most 15 ops (and at most 200 segment rows, for the
+  10 ms CPU limit) per request and answers only those; the client resends the
+  unanswered ops immediately. Stays on the free tier, no
   decision changes. (M2)

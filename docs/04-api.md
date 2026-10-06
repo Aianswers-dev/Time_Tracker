@@ -100,8 +100,10 @@ switch is not untracked.
 `categoryId` wins. Name matching is case-insensitive, ignores surrounding
 whitespace and Unicode composition differences. Unknown name → `404`. Same
 category as the open segment → `200 { "noop": true, ... }`. `source` defaults
-to `shortcut`. `at` defaults to now and may be in the past (a backdated
-switch, cleared with the same shared `switchCategory` the app uses). `id` is
+to `shortcut`. `at` defaults to now and may be up to 24 hours in the past (a
+backdated switch, cleared with the same shared `switchCategory` the app uses).
+An older `at` is `400 validation_failed`, so a Shortcut with a wrong date
+cannot clear history; older changes are made in the app, which previews them. `id` is
 the new segment's id: a retried request with an `id` that already exists
 changes nothing and answers `200` with `noop: true` and "Switched to {name}".
 
@@ -138,10 +140,14 @@ validated on its own with the shared `opSchema`, so a malformed op gets
 `ok: false` with `validation_failed` in its result and does not block the
 rest.
 
-**At most 15 ops are applied per request.** D1 on the Workers Free plan allows
-50 queries per Worker invocation, and each op makes up to 3 D1 calls. The
-results then cover only a prefix of the ops sent: ops without a result were
-not attempted and stay in the outbox. The client sends them again straight
+**At most 15 ops, and at most 200 `segments.upsert` rows, are applied per
+request** (always at least the first op). D1 on the Workers Free plan allows
+50 queries per Worker invocation, and each op makes up to 3 D1 calls.
+Building, validating and checking segment rows is the Worker's main CPU cost
+against the Free plan's 10 ms, so segment upserts bind one prepared statement
+per row instead of going through Drizzle, and the row cap keeps a bulk upload
+inside the budget. The results then cover only a prefix of the ops sent: ops
+without a result were not attempted and stay in the outbox. The client sends them again straight
 away (not after the 30 s retry timer) until the outbox is empty or a request
 fails. Malformed ops cost no D1 calls and always get a result.
 
@@ -159,7 +165,7 @@ user action is one op, applied atomically.
 
 | type | payload | server behaviour |
 | --- | --- | --- |
-| `switch` | `{ categoryId, at, newSegmentId, source }` | If `newSegmentId` already exists: ok, no-op (replay). If the server's open segment already has `categoryId` under a different id: `conflict` (state diverged, client resyncs). Else run shared `switchCategory` against server state and write the result. `at` more than 60 s ahead: `switch_in_future`. |
+| `switch` | `{ categoryId, at, newSegmentId, source }` | If `newSegmentId` already exists: ok, no-op (replay). If the server's open segment already has `categoryId` under a different id and started before the switch was made: `conflict` (state diverged, client resyncs). Else run shared `switchCategory` (with `madeAt` = the op's `createdAt`) against server state and write the result. `at` more than 60 s ahead: `switch_in_future`. |
 | `segments.upsert` | `{ rows: Segment[] }` (1 to 100) | Every edit, undo and delete. Apply each row by last-write-wins, then check I1 and I2 across the affected time window. Any violation rejects the whole op with `conflict`. |
 | `category.upsert` | `Category` | Last-write-wins upsert. Setting `deletedAt` while live segments reference the category: `conflict` (the UI archives instead). |
 | `rule.upsert` | `Rule` | Last-write-wins upsert. Unknown `categoryId`: `validation_failed`. |
@@ -178,9 +184,14 @@ Details of each op type:
   soft-deleted ones included, so a switch the client later undid is not
   re-applied. A missing or deleted `categoryId` is `validation_failed`. The
   server loads the live segments that end after `at` (plus the open one),
-  runs the shared `switchCategory` with its own clock as `now`, and writes the
-  rows it returns. Those rows carry the server's time as `updatedAt` and skip
-  the last-write-wins guard, because they describe the current state.
+  runs the shared `switchCategory` with its own clock as `now` and the op's
+  `createdAt` (capped at now) as `madeAt`, and writes the rows it returns.
+  Segments that started after the switch was made (a Shortcut switch while
+  the phone was offline) stay, and the new segment ends where the first of
+  them starts. The rows carry that same `madeAt` as `updatedAt`, the time the
+  phone made the change, so ops queued after it (an Undo, an edit) are newer
+  and win last-write-wins. They skip the last-write-wins guard, because they
+  describe the current state.
 - `segments.upsert`: the same id twice in one op is `validation_failed`. A
   row whose category does not exist, or a live row whose category is deleted,
   is `validation_failed`. The affected window runs from the earliest start to
@@ -199,7 +210,7 @@ Details of each op type:
 
 ### Snapshot (the client pull)
 
-`GET /api/snapshot?since=<ISO, optional>`
+`GET /api/snapshot?since=<ISO, optional>&cursor=<optional>&limit=<optional>`
 
 ```json
 {
@@ -207,15 +218,24 @@ Details of each op type:
   "categories": [ ... ],
   "segments": [ ... ],
   "rules": [ ... ],
-  "settings": { ... } | null
+  "settings": { ... } | null,
+  "nextCursor": "<opaque>" | null
 }
 ```
 
 Rows with `synced_at > since - 10 s`, including soft-deleted rows. Without
 `since`, everything. `settings` is null when unchanged since `since` or never
-set. Not paged: a year of use is well under a few MB. The four tables are read
-in one D1 batch, so they are a consistent view. `synced_at` itself is never
-sent.
+set. `synced_at` itself is never sent.
+
+Segments are paged so a full download of a long history stays inside the
+Worker's CPU budget: at most `limit` per page (default 500, `SNAPSHOT_PAGE_SIZE`
+in shared, at most 2000), ordered by `(synced_at, id)`. While `nextCursor` is a
+string, request again with `cursor=<nextCursor>` and the same `since`; later
+pages carry only segments (categories and rules empty, settings null). A
+cursor this server did not hand out is `400 validation_failed`. The client
+keeps the first page's `serverTime` as its next `since`, and applies nothing
+until the last page arrives. On the first page the four tables are read in one
+D1 batch, so they are a consistent view.
 
 `serverTime` is read before the data. The 10 second overlap covers a write
 that stamped its `synced_at` just before that moment but committed just after
@@ -301,7 +321,7 @@ such subscription exists (so a retry is harmless).
 
 **`POST /api/push/test`** (no body needed) → `200 { "sent": n, "failed": n }`
 (`pushTestResponseSchema`). Sends a "Test notification" (tag `test`) to every
-subscription, at most six, through the same path as nudges, and records the
+subscription, at most three, through the same path as nudges, and records the
 outcomes (404 and 410 delete the subscription and count as failed). `sent`
 counts messages the push service accepted (2xx); delivery to the device is up
 to the push service. With no subscriptions: `{ "sent": 0, "failed": 0 }`.

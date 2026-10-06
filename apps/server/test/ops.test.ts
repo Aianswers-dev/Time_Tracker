@@ -114,7 +114,7 @@ describe('switch op', () => {
     ]);
     const opened = await segmentRow(server.db(), s2);
     expect(opened).toMatchObject({ source: 'app', note: null, deletedAt: null });
-    // Rows the server computes carry the server's time, and synced_at is set on every write.
+    // Rows carry the op's time (here just after `start`), and synced_at is set on every write.
     expect(Date.parse(opened!.updatedAt)).toBeGreaterThanOrEqual(start);
     expect(Date.parse(opened!.syncedAt)).toBeGreaterThanOrEqual(start);
     expect(Date.parse((await segmentRow(server.db(), s1))!.syncedAt)).toBeGreaterThanOrEqual(start);
@@ -176,6 +176,75 @@ describe('switch op', () => {
     expect(xRows[0]?.source).toBe('shortcut');
   });
 
+  it('a switch that waited offline keeps a later Shortcut switch', async () => {
+    const [w, t, x] = await seedCategories(3);
+    const wStart = ago(60 * MIN);
+    await insertSegments(server.db(), [makeSegment(w!.id, wStart, null)]);
+
+    // 30 minutes ago the phone switched to T offline; 10 minutes ago a
+    // Shortcut switched the server to X. Now the phone's op arrives.
+    const tAt = ago(30 * MIN);
+    const xAt = ago(10 * MIN);
+    const shortcut = await server.post('/api/switch', { categoryName: x!.name, at: xAt });
+    expect(shortcut.status).toBe(200);
+    const r = await one({
+      ...op.switch({ categoryId: t!.id, at: tAt, newSegmentId: uuidv7(), source: 'app' }),
+      createdAt: tAt,
+    });
+    expect(r).toMatchObject({ ok: true });
+    expect(await timeline(server.db())).toEqual([
+      [w!.id, wStart, tAt],
+      [t!.id, tAt, xAt],
+      [x!.id, xAt, null],
+    ]);
+  });
+
+  it('a switch that waited offline and a later Shortcut switch to the same category both stay', async () => {
+    const [w, t] = await seedCategories(2);
+    const wStart = ago(60 * MIN);
+    await insertSegments(server.db(), [makeSegment(w!.id, wStart, null)]);
+    const tAt = ago(30 * MIN);
+    const laterAt = ago(10 * MIN);
+    await server.post('/api/switch', { categoryName: t!.name, at: laterAt });
+    const r = await one({
+      ...op.switch({ categoryId: t!.id, at: tAt, newSegmentId: uuidv7(), source: 'app' }),
+      createdAt: tAt,
+    });
+    expect(r).toMatchObject({ ok: true });
+    expect(await timeline(server.db())).toEqual([
+      [w!.id, wStart, tAt],
+      [t!.id, tAt, laterAt],
+      [t!.id, laterAt, null],
+    ]);
+  });
+
+  it('an Undo queued after a switch in the same flush wins over the switch', async () => {
+    const [a, b] = await seedCategories(2);
+    const aSeg = makeSegment(a!.id, ago(60 * MIN), null, { updatedAt: ago(60 * MIN) });
+    await insertSegments(server.db(), [aSeg]);
+
+    // Offline, 10 minutes ago: switch to B, then Undo 5 s later. Both arrive now.
+    const switchedAt = ago(10 * MIN);
+    const undoneAt = iso(Date.parse(switchedAt) + 5_000);
+    const newId = uuidv7();
+    const opened = makeSegment(b!.id, switchedAt, null, { id: newId, updatedAt: switchedAt });
+    const sw = {
+      ...op.switch({ categoryId: b!.id, at: switchedAt, newSegmentId: newId, source: 'app' }),
+      createdAt: switchedAt,
+    };
+    const undo = {
+      ...op.segments([
+        { ...aSeg, updatedAt: undoneAt },
+        { ...opened, deletedAt: undoneAt, updatedAt: undoneAt },
+      ]),
+      createdAt: undoneAt,
+    };
+    expect(results(await server.ops([sw, undo])).every((x) => x.ok)).toBe(true);
+    expect(await timeline(server.db())).toEqual([[a!.id, aSeg.startedAt, null]]);
+    // The switch's rows carried the time the phone made it, so the Undo won.
+    expect((await segmentRow(server.db(), newId))?.deletedAt).toBe(undoneAt);
+  });
+
   it('a backdated switch trims what came after `at`', async () => {
     const [a, b, c] = await seedCategories(3);
     const t0 = ago(3 * HOUR);
@@ -203,6 +272,22 @@ describe('switch op', () => {
     );
     expect(r).toMatchObject({ ok: false, error: { code: 'switch_in_future' } });
     expect(await allSegments(server.db())).toEqual([]);
+  });
+
+  it("a phone clock running minutes fast still switches, at the server's now", async () => {
+    const [a] = await seedCategories(1);
+    const id = uuidv7();
+    const phoneNow = iso(Date.now() + 5 * MIN);
+    const before = Date.now();
+    const r = await one({
+      ...op.switch({ categoryId: a!.id, at: phoneNow, newSegmentId: id, source: 'app' }),
+      createdAt: phoneNow,
+    });
+    expect(r).toMatchObject({ ok: true });
+    const row = await segmentRow(server.db(), id);
+    expect(row?.endedAt).toBeNull();
+    expect(Date.parse(row!.startedAt)).toBeGreaterThanOrEqual(before);
+    expect(Date.parse(row!.startedAt)).toBeLessThanOrEqual(Date.now());
   });
 
   it('`at` a few seconds ahead is clamped to now', async () => {

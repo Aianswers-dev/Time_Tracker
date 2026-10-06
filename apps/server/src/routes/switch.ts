@@ -40,6 +40,9 @@ function resolveCategory(
   return candidates.find((c) => isActive(c) && normalizeName(c.name) === wanted) ?? null;
 }
 
+/** How far back a `POST /api/switch` may set `at`. */
+export const MAX_SWITCH_BACKDATE_MS = 24 * 60 * 60 * 1000;
+
 /**
  * `POST /api/switch`: switch by name for Shortcuts and Siri. Runs the same
  * shared `switchCategory` as the app, with the server's clock. Two D1 calls:
@@ -49,6 +52,18 @@ switchRoutes.post('/switch', async (c) => {
   const req = await readJson(c, switchRequestSchema);
   const db = createDb(c.env.DB);
   const now = new Date().toISOString();
+
+  // A backdated switch clears everything after `at`. A Shortcut with a wrong
+  // `at` (an epoch value, a date typo) must not wipe history; older changes
+  // are made in the app, which previews what they remove.
+  if (req.at !== undefined && Date.parse(now) - Date.parse(req.at) > MAX_SWITCH_BACKDATE_MS) {
+    throw new ApiException(
+      400,
+      'validation_failed',
+      'at is more than 24 hours ago. Change older entries in the app.',
+      { issues: [{ path: 'at', message: 'More than 24 hours ago' }] },
+    );
+  }
 
   const windowStart = switchWindowStart(req.at, now);
   const [candidateRows, existing, overlappingRows] = await db.batch([

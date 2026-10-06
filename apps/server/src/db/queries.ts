@@ -71,15 +71,28 @@ export const select = {
    * Live segments overlapping [fromMs, toMs), as a superset: pass the rows
    * through `keepOverlapping` for the exact window and oldest-first order.
    *
-   * With a finite `fromMs` the SQL filters on the end only and does not sort,
-   * so SQLite answers from `segments_ended` and reads just the recent rows. A
+   * With a finite `fromMs` the SQL does not sort and SQLite answers from
+   * `segments_ended`, reading just the rows that end after `fromMs`. A plain
    * bound on `started_at` or an ORDER BY on it makes SQLite walk
    * `segments_started` across the whole history instead, on every switch and
-   * every widget refresh.
+   * every widget refresh. A finite `toMs` is still applied, as `+started_at`
+   * (the unary plus keeps SQLite from using an index for it), so a window in
+   * the past returns its own rows, not every row since: those are parsed and
+   * checked in the Worker against the Free plan's 10 ms of CPU.
    */
   segmentsOverlapping: (db: Db, fromMs: number, toMs: number) =>
     Number.isFinite(fromMs)
-      ? db.select().from(segments).where(overlapping(fromMs, Number.POSITIVE_INFINITY))
+      ? db
+          .select()
+          .from(segments)
+          .where(
+            Number.isFinite(toMs)
+              ? and(
+                  overlapping(fromMs, Number.POSITIVE_INFINITY),
+                  sql`+${segments.startedAt} < ${toIso(toMs)}`,
+                )
+              : overlapping(fromMs, Number.POSITIVE_INFINITY),
+          )
       : db
           .select()
           .from(segments)
@@ -293,36 +306,103 @@ export async function liveRules(db: Db): Promise<Rule[]> {
  * Rows written after `since` (server time), soft-deleted rows included. No
  * `since`: everything. One D1 batch, so the four reads see the same state.
  */
-export async function rowsSyncedAfter(db: Db, since: string | null) {
-  const [categoryRows, segmentRows, ruleRows, settingsRows] = await db.batch([
-    db
-      .select()
-      .from(categories)
-      .where(since === null ? undefined : gt(categories.syncedAt, since))
-      .orderBy(asc(categories.sortOrder), asc(categories.id)),
-    db
-      .select()
-      .from(segments)
-      .where(since === null ? undefined : gt(segments.syncedAt, since))
-      .orderBy(asc(segments.startedAt), asc(segments.id)),
-    db
-      .select()
-      .from(rules)
-      .where(since === null ? undefined : gt(rules.syncedAt, since))
-      .orderBy(asc(rules.createdAt), asc(rules.id)),
-    db
-      .select()
-      .from(settings)
-      .where(
-        since === null
-          ? eq(settings.id, SETTINGS_ID)
-          : and(eq(settings.id, SETTINGS_ID), gt(settings.syncedAt, since)),
-      ),
-  ]);
-  return {
-    categories: categoryRows.map(categoryFromRow),
-    segments: segmentRows.map(segmentFromRow),
-    rules: ruleRows.map(ruleFromRow),
-    settings: firstSettings(settingsRows),
-  };
+/** A position in the snapshot's segment order: the server's write time, then the id. */
+export interface SnapshotCursor {
+  syncedAt: string;
+  id: string;
+}
+
+const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function encodeSnapshotCursor(c: SnapshotCursor): string {
+  return `${c.syncedAt}|${c.id}`;
+}
+
+/** The cursor a previous page handed out, or null when it is not one. */
+export function decodeSnapshotCursor(value: string): SnapshotCursor | null {
+  const [syncedAt, id, extra] = value.split('|');
+  if (extra !== undefined || !syncedAt || !id) return null;
+  if (!ISO_UTC.test(syncedAt) || !UUID.test(id)) return null;
+  return { syncedAt, id };
+}
+
+export interface SnapshotPage {
+  categories: Category[];
+  segments: Segment[];
+  rules: Rule[];
+  settings: Settings | null;
+  nextCursor: string | null;
+}
+
+/**
+ * One page of rows written after `since` (or everything when null). Segments
+ * come in (synced_at, id) order, at most `limit` per page, continuing after
+ * `cursor`; the first page (no cursor) also carries every changed category,
+ * rule and the settings row, which are few. Paging keeps a full download of a
+ * long history inside the Worker's CPU budget.
+ */
+export async function snapshotPage(
+  db: Db,
+  since: string | null,
+  cursor: SnapshotCursor | null,
+  limit: number,
+): Promise<SnapshotPage> {
+  const segmentWhere = cursor
+    ? or(
+        gt(segments.syncedAt, cursor.syncedAt),
+        and(eq(segments.syncedAt, cursor.syncedAt), gt(segments.id, cursor.id)),
+      )
+    : since === null
+      ? undefined
+      : gt(segments.syncedAt, since);
+  const segmentQuery = db
+    .select()
+    .from(segments)
+    .where(segmentWhere)
+    .orderBy(asc(segments.syncedAt), asc(segments.id))
+    .limit(limit + 1);
+
+  let segmentRows: Awaited<typeof segmentQuery>;
+  let rest: Omit<SnapshotPage, 'segments' | 'nextCursor'>;
+  if (cursor) {
+    segmentRows = await segmentQuery;
+    rest = { categories: [], rules: [], settings: null };
+  } else {
+    const [categoryRows, pageRows, ruleRows, settingsRows] = await db.batch([
+      db
+        .select()
+        .from(categories)
+        .where(since === null ? undefined : gt(categories.syncedAt, since))
+        .orderBy(asc(categories.sortOrder), asc(categories.id)),
+      segmentQuery,
+      db
+        .select()
+        .from(rules)
+        .where(since === null ? undefined : gt(rules.syncedAt, since))
+        .orderBy(asc(rules.createdAt), asc(rules.id)),
+      db
+        .select()
+        .from(settings)
+        .where(
+          since === null
+            ? eq(settings.id, SETTINGS_ID)
+            : and(eq(settings.id, SETTINGS_ID), gt(settings.syncedAt, since)),
+        ),
+    ]);
+    segmentRows = pageRows;
+    rest = {
+      categories: categoryRows.map(categoryFromRow),
+      rules: ruleRows.map(ruleFromRow),
+      settings: firstSettings(settingsRows),
+    };
+  }
+
+  const page = segmentRows.slice(0, limit);
+  const last = page[page.length - 1];
+  const nextCursor =
+    segmentRows.length > limit && last
+      ? encodeSnapshotCursor({ syncedAt: last.syncedAt, id: last.id })
+      : null;
+  return { ...rest, segments: page.map(segmentFromRow), nextCursor };
 }

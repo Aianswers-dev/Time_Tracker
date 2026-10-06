@@ -1,4 +1,6 @@
 import {
+  applyRows,
+  checkInvariants,
   switchCategory,
   toIso,
   toMs,
@@ -17,8 +19,12 @@ import { vi } from 'vitest';
  * Test helper, not imported by the app: a stand-in for the Worker behind a
  * mocked `fetch`. It keeps rows in memory with a `syncedAt` like the real
  * server, applies ops the same way in spirit (a switch runs the shared
- * `switchCategory`), answers at most `maxApplied` ops per request and
- * returns the 10 s overlap on `since` pulls.
+ * `switchCategory` with the server's clock and the op's `createdAt` as
+ * `madeAt`, stamping the rows with that time, unknown categories are
+ * `validation_failed`, a switch to the category already open under another
+ * id is `conflict` and so is an upsert that breaks I1, I2 or I5), answers at
+ * most `maxApplied` ops per request and returns the 10 s overlap on `since`
+ * pulls.
  */
 
 export interface Call {
@@ -49,6 +55,8 @@ export interface FakeServer {
   intercept: (call: Call) => Response | Promise<Response> | undefined;
   /** Runs while a snapshot request is in flight, before it answers. */
   duringSnapshot: (() => Promise<void>) | null;
+  /** Segments per snapshot page, as the real server pages them. */
+  snapshotPageSize: number;
   opsBodies: () => Op[][];
   snapshotCalls: () => Call[];
   put: (rows: { categories?: Category[]; segments?: Segment[]; rules?: Rule[] }) => void;
@@ -79,6 +87,7 @@ export function fakeServer(token = 'secret'): FakeServer {
     failOp: () => undefined,
     intercept: () => undefined,
     duringSnapshot: null,
+    snapshotPageSize: 500,
     opsBodies: () =>
       server.calls.filter((c) => c.path === '/api/ops').map((c) => (c.body as { ops: Op[] }).ops),
     snapshotCalls: () => server.calls.filter((c) => c.path.startsWith('/api/snapshot')),
@@ -98,14 +107,33 @@ export function fakeServer(token = 'secret'): FakeServer {
     return !stored || incoming.updatedAt >= stored.row.updatedAt;
   }
 
-  function apply(op: Op): void {
+  /** A live (not deleted) category the server knows, as the real server checks. */
+  function knownCategory(id: string): boolean {
+    const c = server.categories.get(id);
+    return c !== undefined && c.row.deletedAt === null;
+  }
+
+  /** Apply one op like the real server; return its error, if any. */
+  function apply(op: Op): OpResult['error'] | undefined {
     const now = Date.now();
     switch (op.type) {
       case 'switch': {
-        if (server.segments.has(op.payload.newSegmentId)) return;
+        if (server.segments.has(op.payload.newSegmentId)) return undefined;
+        if (!knownCategory(op.payload.categoryId)) {
+          return { code: 'validation_failed', message: 'Unknown category' };
+        }
         const live = [...server.segments.values()]
           .map((s) => s.row)
           .filter((s) => s.deletedAt === null);
+        const madeAtMs = Math.min(toMs(op.createdAt), now);
+        const open = live.find((s) => s.endedAt === null);
+        if (
+          open &&
+          open.categoryId === op.payload.categoryId &&
+          toMs(open.startedAt) <= Math.max(toMs(op.payload.at), madeAtMs)
+        ) {
+          return { code: 'conflict', message: 'Already on that category under another segment' };
+        }
         const result = switchCategory(
           live,
           {
@@ -113,28 +141,40 @@ export function fakeServer(token = 'secret'): FakeServer {
             at: op.payload.at,
             newSegmentId: op.payload.newSegmentId,
             source: op.payload.source,
+            madeAt: toIso(madeAtMs),
           },
           { now: toIso(now), newId: () => uuidv7() },
         );
-        server.put({ segments: result.rows });
-        return;
+        server.put({ segments: result.rows.map((r) => ({ ...r, updatedAt: toIso(madeAtMs) })) });
+        return undefined;
       }
-      case 'segments.upsert':
-        server.put({ segments: op.payload.rows.filter((r) => wins(r, server.segments.get(r.id))) });
-        return;
+      case 'segments.upsert': {
+        const winners = op.payload.rows.filter((r) => wins(r, server.segments.get(r.id)));
+        if (winners.some((r) => !server.categories.has(r.categoryId))) {
+          return { code: 'validation_failed', message: 'Unknown category' };
+        }
+        const live = [...server.segments.values()].map((s) => s.row);
+        const problems = checkInvariants(applyRows(live, winners));
+        if (problems.length > 0) return { code: 'conflict', message: problems.join('; ') };
+        server.put({ segments: winners });
+        return undefined;
+      }
       case 'category.upsert':
         if (wins(op.payload, server.categories.get(op.payload.id))) {
           server.put({ categories: [op.payload] });
         }
-        return;
+        return undefined;
       case 'rule.upsert':
+        if (!server.categories.has(op.payload.categoryId)) {
+          return { code: 'validation_failed', message: 'Unknown category' };
+        }
         if (wins(op.payload, server.rules.get(op.payload.id))) server.put({ rules: [op.payload] });
-        return;
+        return undefined;
       case 'settings.upsert':
         if (wins(op.payload, server.settings ?? undefined)) {
           server.settings = { row: op.payload, syncedAt: now };
         }
-        return;
+        return undefined;
     }
   }
 
@@ -149,13 +189,8 @@ export function fakeServer(token = 'secret'): FakeServer {
       const ops = (call.body as { ops: Op[] }).ops;
       const results: OpResult[] = [];
       for (const op of ops.slice(0, server.maxApplied)) {
-        const error = server.failOp(op);
-        if (error) {
-          results.push({ opId: op.opId, ok: false, error });
-          continue;
-        }
-        apply(op);
-        results.push({ opId: op.opId, ok: true });
+        const error = server.failOp(op) ?? apply(op);
+        results.push(error ? { opId: op.opId, ok: false, error } : { opId: op.opId, ok: true });
       }
       return json(200, { results, serverTime: toIso(Date.now()) });
     }
@@ -163,16 +198,30 @@ export function fakeServer(token = 'secret'): FakeServer {
     if (call.path.startsWith('/api/snapshot')) {
       const serverTime = toIso(Date.now());
       if (server.duringSnapshot) await server.duringSnapshot();
-      const since = new URL(call.path, 'http://x').searchParams.get('since');
+      const params = new URL(call.path, 'http://x').searchParams;
+      const since = params.get('since');
+      const cursor = params.get('cursor');
       const after = since === null ? -Infinity : toMs(since) - 10_000;
       const pick = <T>(m: Map<string, Stored<T>>) =>
         [...m.values()].filter((s) => s.syncedAt > after).map((s) => s.row);
+      // Segments in (syncedAt, id) order, paged after the cursor, as the real server does.
+      const key = (s: Stored<Segment>) => `${String(s.syncedAt).padStart(16, '0')}|${s.row.id}`;
+      const ordered = [...server.segments.values()]
+        .filter((s) => s.syncedAt > after)
+        .sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0))
+        .filter((s) => cursor === null || key(s) > cursor);
+      const page = ordered.slice(0, server.snapshotPageSize);
+      const last = page[page.length - 1];
       const body: SnapshotResponse = {
         serverTime,
-        categories: pick(server.categories),
-        segments: pick(server.segments),
-        rules: pick(server.rules),
-        settings: server.settings && server.settings.syncedAt > after ? server.settings.row : null,
+        categories: cursor === null ? pick(server.categories) : [],
+        segments: page.map((s) => s.row),
+        rules: cursor === null ? pick(server.rules) : [],
+        settings:
+          cursor === null && server.settings && server.settings.syncedAt > after
+            ? server.settings.row
+            : null,
+        nextCursor: ordered.length > page.length && last ? key(last) : null,
       };
       return json(200, body);
     }

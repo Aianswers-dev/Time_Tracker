@@ -1,7 +1,14 @@
 import { opsResponseSchema, uuidv7, type Op } from '@time-tracker/shared';
 import { describe, expect, it } from 'vitest';
 import { createDb } from '../src/db/client';
-import { applyOp, MAX_D1_CALLS_PER_OP, MAX_OPS_APPLIED_PER_REQUEST } from '../src/sync/ops';
+import { writeSegments } from '../src/db/writes';
+import { toOpFailure } from '../src/sync/errors';
+import {
+  applyOp,
+  MAX_D1_CALLS_PER_OP,
+  MAX_OPS_APPLIED_PER_REQUEST,
+  MAX_SEGMENT_ROWS_PER_REQUEST,
+} from '../src/sync/ops';
 import {
   HOUR,
   MIN,
@@ -16,6 +23,7 @@ import {
   makeSegment,
   makeSettings,
   op,
+  segmentRow,
   useTestServer,
 } from './harness';
 
@@ -113,5 +121,65 @@ describe('database constraints', () => {
     await expect(
       insertSegments(server.db(), [makeSegment(uuidv7(), ago(2 * HOUR), ago(HOUR))]),
     ).rejects.toThrow();
+  });
+});
+
+describe('segment writes (prepared statement, not Drizzle)', () => {
+  it('keeps the last-write-wins guard in SQL, and skips it for switch rows', async () => {
+    const cat = makeCategory();
+    await insertCategories(server.db(), [cat]);
+    const stored = makeSegment(cat.id, ago(3 * HOUR), ago(2 * HOUR), {
+      note: 'newer',
+      updatedAt: ago(0),
+    });
+    await insertSegments(server.db(), [stored]);
+    const older = { ...stored, note: 'older', updatedAt: ago(HOUR) };
+
+    await writeSegments(server.db(), [older], { syncedAt: ago(0), lww: true });
+    expect((await segmentRow(server.db(), stored.id))?.note).toBe('newer');
+
+    await writeSegments(server.db(), [older], { syncedAt: ago(0), lww: false });
+    const row = await segmentRow(server.db(), stored.id);
+    expect(row).toMatchObject({ note: 'older', updatedAt: older.updatedAt });
+  });
+
+  it('writes every column, and a second open segment is a conflict', async () => {
+    const cat = makeCategory();
+    await insertCategories(server.db(), [cat]);
+    const open = makeSegment(cat.id, ago(2 * HOUR), null, { note: 'n', source: 'shortcut' });
+    const syncedAt = ago(0);
+    await writeSegments(server.db(), [open], { syncedAt, lww: true });
+    expect(await segmentRow(server.db(), open.id)).toEqual({ ...open, syncedAt });
+
+    const second = makeSegment(cat.id, ago(HOUR), null);
+    const err: unknown = await writeSegments(server.db(), [second], {
+      syncedAt,
+      lww: true,
+    }).catch((e: unknown) => e);
+    expect(toOpFailure(err)?.code).toBe('conflict');
+  });
+});
+
+describe('rows per request', () => {
+  it(`applies ${MAX_SEGMENT_ROWS_PER_REQUEST} segments.upsert rows per request, and always the first op`, async () => {
+    const cat = makeCategory();
+    await insertCategories(server.db(), [cat]);
+    const dayStart = Date.parse('2026-01-01T00:00:00.000Z');
+    const ops = Array.from({ length: 4 }, (_, k) =>
+      op.segments(
+        Array.from({ length: 100 }, (_, i) => {
+          const start = dayStart + (k * 100 + i) * 10 * MIN;
+          return makeSegment(cat.id, iso(start), iso(start + 5 * MIN));
+        }),
+      ),
+    );
+    const first = opsResponseSchema.parse((await server.ops(ops)).json);
+    expect(first.results).toHaveLength(MAX_SEGMENT_ROWS_PER_REQUEST / 100);
+    expect(first.results.every((r) => r.ok)).toBe(true);
+
+    const rest = ops.slice(first.results.length);
+    const second = opsResponseSchema.parse((await server.ops(rest)).json);
+    expect(second.results.map((r) => r.opId)).toEqual(rest.map((o) => o.opId));
+    expect((await allSegments(server.db())).length).toBe(400);
   });
 });

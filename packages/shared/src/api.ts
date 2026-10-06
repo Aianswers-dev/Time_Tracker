@@ -109,9 +109,18 @@ export const opsResponseSchema = z.object({
 });
 export type OpsResponse = z.infer<typeof opsResponseSchema>;
 
+/** Segments per `GET /api/snapshot` page. Keeps each response well inside the Worker's CPU budget. */
+export const SNAPSHOT_PAGE_SIZE = 500;
+
 /**
- * `GET /api/snapshot?since=`: every row the server wrote after `since`
+ * `GET /api/snapshot?since=&cursor=`: every row the server wrote after `since`
  * (server time), including soft-deleted rows. Without `since`, everything.
+ *
+ * Segments come in pages of at most SNAPSHOT_PAGE_SIZE, ordered by the
+ * server's write time. While `nextCursor` is a string, ask again with
+ * `cursor=<nextCursor>` (and the same `since`) for the next page. Categories,
+ * rules and settings come only on the first page, and the first page's
+ * `serverTime` is the cursor for the next pull.
  */
 export const snapshotResponseSchema = z.object({
   serverTime: isoSchema,
@@ -119,6 +128,8 @@ export const snapshotResponseSchema = z.object({
   segments: z.array(segmentSchema),
   rules: z.array(ruleSchema),
   settings: settingsSchema.nullable(),
+  /** Present and non-null when more segments remain. */
+  nextCursor: z.string().min(1).nullable().optional(),
 });
 export type SnapshotResponse = z.infer<typeof snapshotResponseSchema>;
 

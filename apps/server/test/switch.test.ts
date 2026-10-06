@@ -115,6 +115,23 @@ describe('POST /api/switch', () => {
     expect(await allSegments(server.db())).toEqual(before);
   });
 
+  it('refuses to backdate more than 24 hours, so a bad Shortcut cannot wipe history', async () => {
+    const { sleep, relaxing } = await seed();
+    await server.post('/api/switch', { categoryId: sleep.id, at: ago(20 * HOUR) });
+    await server.post('/api/switch', { categoryId: relaxing.id, at: ago(10 * HOUR) });
+    const before = await allSegments(server.db());
+
+    for (const at of [ago(25 * HOUR), '1970-01-01T00:00:00.000Z']) {
+      const res = await server.post('/api/switch', { categoryName: 'Sleep', at });
+      expect(res.status, at).toBe(400);
+      expect(apiErrorSchema.parse(res.json).error.code).toBe('validation_failed');
+    }
+    expect(await allSegments(server.db())).toEqual(before);
+
+    const ok = await server.post('/api/switch', { categoryName: 'Sleep', at: ago(23 * HOUR) });
+    expect(ok.status).toBe(200);
+  });
+
   it('a time more than a minute ahead is 400 switch_in_future', async () => {
     await seed();
     const res = await server.post('/api/switch', {

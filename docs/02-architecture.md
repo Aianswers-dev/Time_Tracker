@@ -122,9 +122,11 @@ outbox. Store the returned `serverTime` as the new `lastSync`.
 5. One write batch: a `notification_log` row for each notification, plus a
    prune of log rows older than 60 days (except the open segment's). The log
    is written before anything is sent, so a crash mid-send cannot cause a
-   duplicate on the next minute.
+   duplicate on the next minute. Each row is inserted only if no row for the
+   same notification appeared since the run's read, and only inserted rows
+   are sent, so two overlapping runs (a cron delivered twice) send it once.
 6. Send each notification to each subscription (subscriptions in parallel,
-   notifications to one subscription in order), at most 6 sends per run. When
+   notifications to one subscription in order), at most 3 sends per run. When
    more are due than fit, the extra notifications are neither logged nor sent
    and go out a minute later. One bad subscription never stops the others.
 7. One batch recording each subscription's outcome: 404 or 410 deletes it;
@@ -139,7 +141,7 @@ outbox. Store the returned `serverTime` as the new `lastSync`.
    and endpoints are never logged.
 
 So a run makes 1 D1 call when nothing is due and at most 4 when it sends
-(3 once the key pair exists), and at most 6 push subrequests.
+(3 once the key pair exists), and at most 3 push subrequests.
 
 **5. Push received.** The service worker shows the notification using
 `title`, `body`, `tag`, and `data.url` from the payload. Tapping focuses an
@@ -167,14 +169,19 @@ actual refresh cadence.
 - One user action produces one op. The outbox holds ordered ops
   `{ opId, type, payload, createdAt }`, sent in batches of up to 50 (the
   server accepts 200) and applied in order, each atomically. The server
-  applies at most 15 ops per request (D1 allows 50 queries per request on the
-  Free plan) and answers only those; the client keeps the unanswered ops and
-  sends them again straight away.
+  applies at most 15 ops and at most 200 segment rows per request (D1 allows
+  50 queries and the Worker 10 ms of CPU per request on the Free plan) and
+  answers only those; the client keeps the unanswered ops and sends them again
+  straight away.
 - Upserts are last-write-wins: the server applies an incoming row when its
   `updatedAt` is at least the stored one, otherwise acknowledges and ignores it.
 - A `switch` op carries the new segment's id, so a replay after a timeout is
   a no-op. The server runs the shared `switchCategory` against its own state,
-  so an offline switch still lands correctly after a Shortcut switch.
+  with the op's `createdAt` as `madeAt`: a switch that waited offline still
+  lands, and a Shortcut switch made in the meantime stays (the offline
+  segment ends where it starts). Its rows carry the op's `createdAt` (capped
+  at the server's time) as `updatedAt`, so an edit or Undo queued after the
+  switch wins last-write-wins against them.
 - Failed ops (any `ok: false` result) are dropped from the outbox, a toast
   names the change that did not sync, and the client does a full resync:
   it replaces its local synced tables with a full snapshot. The server is the
@@ -185,8 +192,12 @@ actual refresh cadence.
   still waiting in the outbox. The outbox is flushed first, so the server copy
   already includes every local change.
 - A year of use is roughly 5 to 10 thousand segments, which IndexedDB handles
-  comfortably, so the client keeps the full history locally and the snapshot
-  is not paged.
+  comfortably, so the client keeps the full history locally. The snapshot is
+  paged (500 segments a page by default) so a full download stays inside the
+  Worker's 10 ms CPU budget; the client follows `nextCursor` to the end and
+  applies everything in one transaction. Outbox batches are likewise capped at
+  200 segment rows, what the server applies per request, so a bulk upload does
+  not resend rows the server leaves unanswered.
 - The server is authoritative for the invariants. It checks I1 and I2 after
   applying each op and rejects the whole op with `conflict` if they fail.
 
@@ -224,11 +235,14 @@ actual refresh cadence.
   `GET /api/snapshot` without `since`, then one transaction clears
   `categories`, `segments`, `rules` and `settings` and writes the snapshot
   (rows touched by pending ops keep their local copy, as above). Guard: if
-  the server has no live categories but this phone has some, nothing is
-  wiped; the round fails with "Your server has no categories, so this phone
-  kept its data instead of replacing it" and the flag stays set. Reset
-  discards the outbox inside that same transaction, so a refused Reset keeps
-  the outbox too.
+  the server has no live categories but this phone has some, or the
+  snapshot lacks (even as a deleted row) a category this phone has live
+  entries in (a server that lost its data and got a rename or a switch back
+  since), nothing is wiped; the round fails with "Your server is missing
+  data this phone has, so this phone kept its data instead of replacing it",
+  `serverEmpty` is set (Settings offers the upload) and the flag stays set.
+  Reset discards the outbox inside that same transaction, so a refused
+  Reset keeps the outbox too.
 - **State for the UI.** Dexie `meta` holds `lastSync` (server time, the
   pull cursor), `lastSyncedAt` (device time, for display), `tokenRejected`,
   `syncError` (`{ message, at, kind }`, kind `retry`, `problem` or `notice`,
@@ -302,8 +316,8 @@ actual refresh cadence.
 | Resource | Free limit | Expected use |
 | --- | --- | --- |
 | Worker requests | 100,000 / day | Cron 1,440 + app traffic well under 2,000 |
-| Worker CPU | 10 ms / invocation | Rule evaluation is negligible. Each push send costs an ECDH key pair, ECDH, HKDF, AES-GCM over 4 KB and an ECDSA signature (about 3 ms measured in Node); at most 6 sends per invocation |
-| Subrequests | 50 / invocation | Cron: at most 6 push sends plus at most 4 D1 calls |
+| Worker CPU | 10 ms / invocation | Rule evaluation is negligible. Each push send costs an ECDH key pair, ECDH, HKDF, AES-GCM over 4 KB and an ECDSA signature (about 3 ms measured in Node); at most 3 sends per invocation. Segment upserts bind prepared statements rather than Drizzle (about 150 µs per row saved), `/api/ops` applies at most 200 segment rows per request, and CSV export formats local times with one Intl lookup per UTC day |
+| Subrequests | 50 / invocation | Cron: at most 3 push sends plus at most 4 D1 calls |
 | Cron Triggers | Available on free plan | 1 trigger, every minute |
 | D1 reads | 5,000,000 rows / day | Cron reads the open segment's rows plus the last 48 hours of segments through indexes: tens of rows per minute, under 150,000 a day |
 | D1 writes | 100,000 rows / day | Dozens per day |

@@ -1,0 +1,7 @@
+# Response headers for the app's static files (Workers static assets).
+# API responses come from the Worker and set their own headers.
+/*
+  X-Frame-Options: DENY
+  Content-Security-Policy: frame-ancestors 'none'
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer

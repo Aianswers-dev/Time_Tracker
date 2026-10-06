@@ -460,12 +460,12 @@ describe('D1 and send budgets', () => {
       makeRule(relax.id, { kind: 'daily', thresholdMin: 60, repeatEveryMin: 30 }),
     ]);
     await insertSegments(server.db(), [makeSegment(relax.id, iso(T - 60 * MIN), null)]);
-    for (let i = 0; i < 3; i++) await subscribe();
+    await subscribe();
 
     // First send ever: the key pair is generated and stored (one extra call).
     const first = countingD1(server.rawDb());
     const run = await runAt(T, { d1: first.d1 });
-    expect(run.report).toMatchObject({ outcome: 'sent', sent: 6, deferred: [] });
+    expect(run.report).toMatchObject({ outcome: 'sent', sent: 2, deferred: [] });
     expect(first.calls()).toBe(4);
     expect(
       await server
@@ -477,7 +477,7 @@ describe('D1 and send budgets', () => {
 
     const second = countingD1(server.rawDb());
     const repeat = await runAt(T + 30 * MIN, { d1: second.d1 });
-    expect(repeat.report.sent).toBe(6);
+    expect(repeat.report.sent).toBe(2);
     expect(second.calls()).toBe(3);
     // Same keys both times.
     expect(repeat.vapids[0]?.publicKey).toBe(run.vapids[0]?.publicKey);
@@ -489,13 +489,13 @@ describe('D1 and send budgets', () => {
     const daily = makeRule(relax.id, { kind: 'daily', thresholdMin: 60, repeatEveryMin: null });
     await insertRules(server.db(), [session, daily]);
     await insertSegments(server.db(), [makeSegment(relax.id, iso(T - 60 * MIN), null)]);
-    for (let i = 0; i < 4; i++) await subscribe();
+    for (let i = 0; i < 2; i++) await subscribe();
 
-    // Three notifications due, four subscriptions: one notification per run.
+    // Three notifications due, two subscriptions: one notification per run.
     const fired: string[] = [];
     for (let minute = 0; minute < 3; minute++) {
       const run = await runAt(T + minute * MIN);
-      expect(run.sent).toHaveLength(4);
+      expect(run.sent).toHaveLength(2);
       expect(run.report.fired).toHaveLength(1);
       expect(run.report.deferred).toHaveLength(2 - minute);
       expect(await logRows()).toHaveLength(minute + 1);
@@ -505,10 +505,10 @@ describe('D1 and send budgets', () => {
     expect((await runAt(T + 3 * MIN)).report.outcome).toBe('nothing_due');
 
     // More subscriptions than the budget: only the budget's worth are tried.
-    for (let i = 0; i < 4; i++) await subscribe();
+    for (let i = 0; i < 3; i++) await subscribe();
     await insertRules(server.db(), [makeRule(relax.id, { thresholdMin: 1, repeatEveryMin: null })]);
     const crowded = await runAt(T + 4 * MIN);
-    expect(crowded.report.subscriptions).toBe(8);
+    expect(crowded.report.subscriptions).toBe(5);
     expect(crowded.sent).toHaveLength(MAX_PUSH_SENDS_PER_INVOCATION);
   });
 
@@ -604,6 +604,29 @@ describe('VAPID subject and keys', () => {
 });
 
 describe('notification log', () => {
+  it('two overlapping runs (a cron delivered twice) send each notification once', async () => {
+    const { relax } = await setup();
+    const session = makeRule(relax.id, { kind: 'session', thresholdMin: 60, repeatEveryMin: 30 });
+    const daily = makeRule(relax.id, { kind: 'daily', thresholdMin: 60, repeatEveryMin: null });
+    await insertRules(server.db(), [session, daily]);
+    await insertSegments(server.db(), [makeSegment(relax.id, iso(T - 60 * MIN), null)]);
+    await subscribe();
+
+    const [a, b] = await Promise.all([runAt(T), runAt(T)]);
+    expect([...a.sent, ...b.sent].map((m) => m.payload.tag).sort()).toEqual(
+      [`daily:${daily.id}`, `session:${session.id}`].sort(),
+    );
+    expect(await logRows()).toHaveLength(2);
+    expect([...a.report.fired, ...b.report.fired].sort()).toEqual(
+      [`daily:${daily.id}`, `session:${session.id}`].sort(),
+    );
+
+    // The repeat 30 minutes later is claimed once too.
+    const [c, d] = await Promise.all([runAt(T + 30 * MIN), runAt(T + 30 * MIN)]);
+    expect([...c.sent, ...d.sent].map((m) => m.payload.tag)).toEqual([`session:${session.id}`]);
+    expect(await logRows()).toHaveLength(3);
+  });
+
   it(`prunes rows older than ${LOG_RETENTION_DAYS} days when it writes, but keeps the open segment's`, async () => {
     const { relax } = await setup();
     const rule = makeRule(relax.id, { thresholdMin: 60, repeatEveryMin: null });

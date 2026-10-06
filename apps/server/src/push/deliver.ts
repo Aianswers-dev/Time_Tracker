@@ -7,13 +7,14 @@ import type { PushOptions, PushOutcome, PushSender } from './sender';
 /**
  * Sending payloads to stored subscriptions and recording how each went.
  *
- * Budget: each send is one subrequest and costs a few milliseconds of CPU for
- * the ECDH, AES-GCM and ECDSA work. The Workers Free plan allows 50
- * subrequests and 10 ms of CPU per invocation, so one invocation makes at most
+ * Budget: each send is one subrequest and costs about 3 ms of CPU for the
+ * ECDH, AES-GCM and ECDSA work. The Workers Free plan allows 50 subrequests
+ * and 10 ms of CPU per invocation, so one invocation makes at most
  * MAX_PUSH_SENDS_PER_INVOCATION sends. With one phone subscribed that is every
- * nudge a minute can produce.
+ * nudge a minute can produce (session, daily and stale); anything beyond waits
+ * a minute.
  */
-export const MAX_PUSH_SENDS_PER_INVOCATION = 6;
+export const MAX_PUSH_SENDS_PER_INVOCATION = 3;
 
 /** Nudges are stale after a while; a push service drops them after this. */
 export const PUSH_TTL_SECONDS = 15 * 60;

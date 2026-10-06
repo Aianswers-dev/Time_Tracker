@@ -1,6 +1,7 @@
 import {
   MAX_OPS_PER_REQUEST,
   MAX_ROWS_PER_OP,
+  MAX_SEGMENT_ROWS_PER_REQUEST,
   opsResponseSchema,
   snapshotResponseSchema,
   SETTINGS_ID,
@@ -20,7 +21,7 @@ import { db, type OutboxRow } from '../db';
 import { describeOp, failureSummary } from './describe';
 import { deleteMeta, getMeta, setMeta, setSyncError, SYNC_META } from './meta';
 import { emitSyncNotice } from './runtime';
-import { categoryTouched, ruleTouched, segmentTouched, touchedBy } from './touched';
+import { categoryTouched, ruleTouched, segmentTouched, touchedBy, type Touched } from './touched';
 
 /**
  * One sync round (docs/02 "Sync details"): flush the outbox to
@@ -35,8 +36,9 @@ const OPS_TIMEOUT_MS = 30_000;
 const PULL_TIMEOUT_MS = 30_000;
 const FULL_TIMEOUT_MS = 120_000;
 
+/** The full resync found a server that lost its data (no categories, or not the ones in use). */
 export const EMPTY_SERVER_MESSAGE =
-  'Your server has no categories, so this phone kept its data instead of replacing it.';
+  'Your server is missing data this phone has, so this phone kept its data instead of replacing it.';
 
 export type RoundOutcome =
   /** No token: sync is off. */
@@ -103,10 +105,27 @@ async function settleOps(seqs: readonly number[], anyFailed: boolean): Promise<v
  * answer (it applies a prefix of each request) are sent again at once. A
  * failed request leaves every op queued and throws.
  */
+/**
+ * The leading ops of `rows` whose segment rows fit in what the server applies
+ * per request (MAX_SEGMENT_ROWS_PER_REQUEST), and always the first op. Sending
+ * more would upload rows the server can only leave unanswered.
+ */
+export function capBySegmentRows(rows: readonly OutboxRow[]): OutboxRow[] {
+  const out: OutboxRow[] = [];
+  let total = 0;
+  for (const row of rows) {
+    const n = row.op.type === 'segments.upsert' ? row.op.payload.rows.length : 0;
+    if (out.length > 0 && total + n > MAX_SEGMENT_ROWS_PER_REQUEST) break;
+    out.push(row);
+    total += n;
+  }
+  return out;
+}
+
 async function flush(failed: string[]): Promise<void> {
   let size = FLUSH_BATCH;
   for (;;) {
-    const batch = await db.outbox.orderBy('seq').limit(size).toArray();
+    const batch = capBySegmentRows(await db.outbox.orderBy('seq').limit(size).toArray());
     const first = batch[0];
     if (first === undefined) return;
 
@@ -166,12 +185,44 @@ function snapshotPath(since: string | undefined): string {
  * keep their local copy, and `lastSync` stays put so the next pull reads them
  * again. Returns true when such ops exist (another round should follow).
  */
+/** Most snapshot pages one download follows, a guard against a server that never stops. */
+const MAX_SNAPSHOT_PAGES = 1000;
+
+/**
+ * Every row written after `since` (everything when undefined), following the
+ * server's pages. Categories, rules, settings and `serverTime` come from the
+ * first page; segments from all of them. Nothing is applied until the last
+ * page arrives, so a failure part way leaves local data untouched.
+ */
+async function fetchSnapshot(
+  since: string | undefined,
+  timeoutMs: number,
+): Promise<SnapshotResponse> {
+  const first = await apiFetch(snapshotPath(since), {
+    schema: snapshotResponseSchema,
+    signal: requestTimeout(timeoutMs),
+  });
+  const segments = [...first.segments];
+  let cursor = first.nextCursor ?? null;
+  for (let page = 1; cursor !== null; page++) {
+    if (page >= MAX_SNAPSHOT_PAGES) {
+      throw new SyncFailure('retry', 'The server sent more pages than expected');
+    }
+    const params = new URLSearchParams({ cursor });
+    if (since !== undefined) params.set('since', since);
+    const next = await apiFetch(`/api/snapshot?${params.toString()}`, {
+      schema: snapshotResponseSchema,
+      signal: requestTimeout(timeoutMs),
+    });
+    segments.push(...next.segments);
+    cursor = next.nextCursor ?? null;
+  }
+  return { ...first, segments, nextCursor: null };
+}
+
 async function pull(): Promise<boolean> {
   const since = await getMeta(SYNC_META.lastSync);
-  const snap = await apiFetch(snapshotPath(since), {
-    schema: snapshotResponseSchema,
-    signal: requestTimeout(since === undefined ? FULL_TIMEOUT_MS : PULL_TIMEOUT_MS),
-  });
+  const snap = await fetchSnapshot(since, since === undefined ? FULL_TIMEOUT_MS : PULL_TIMEOUT_MS);
   return db.transaction('rw', SYNCED, async () => {
     const pending = await pendingOps();
     const t = touchedBy(pending);
@@ -199,17 +250,39 @@ async function pull(): Promise<boolean> {
 }
 
 /**
+ * Whether the full snapshot lacks a category this phone has live entries in.
+ * Deletes are soft, so a healthy server knows every category the phone ever
+ * sent, deleted or not. One it has never seen means the server lost its data
+ * and got some of it back from later ops (a rename, a switch): replacing
+ * would delete the history in that category, as with an empty server. Rows
+ * touched by ops still waiting in the outbox do not count.
+ */
+async function serverLostEntries(snap: SnapshotResponse, t: Touched): Promise<boolean> {
+  const known = new Set(snap.categories.map((c) => c.id));
+  const unknown = await db.categories
+    .filter((c) => c.deletedAt === null && !known.has(c.id) && !categoryTouched(t, c))
+    .toArray();
+  for (const c of unknown) {
+    const used = await db.segments
+      .where('categoryId')
+      .equals(c.id)
+      .filter((s) => s.deletedAt === null && !segmentTouched(t, s))
+      .first();
+    if (used) return true;
+  }
+  return false;
+}
+
+/**
  * Replace the local synced tables with the server's full snapshot, in one
  * transaction. Refuses (and changes nothing) when the server has no
- * categories but this phone has some: wiping would lose everything the
- * server never received. `discardThroughSeq` drops queued ops up to that seq
+ * categories but this phone has some, or lacks a category this phone has
+ * entries in (`serverLostEntries`): wiping would lose everything the server
+ * never received. `discardThroughSeq` drops queued ops up to that seq
  * (Reset). Ops queued after that keep their rows, as in `pull`.
  */
 async function fullResync(discardThroughSeq?: number): Promise<boolean> {
-  const snap: SnapshotResponse = await apiFetch('/api/snapshot', {
-    schema: snapshotResponseSchema,
-    signal: requestTimeout(FULL_TIMEOUT_MS),
-  });
+  const snap: SnapshotResponse = await fetchSnapshot(undefined, FULL_TIMEOUT_MS);
   return db.transaction('rw', SYNCED, async () => {
     const serverHasCategories = snap.categories.some((c) => c.deletedAt === null);
     if (!serverHasCategories) {
@@ -222,11 +295,19 @@ async function fullResync(discardThroughSeq?: number): Promise<boolean> {
 
     const pending = await pendingOps();
     const t = touchedBy(pending);
+    if (await serverLostEntries(snap, t)) throw new SyncFailure('problem', EMPTY_SERVER_MESSAGE);
+    // A segment a pending switch closed is kept only if the server has it. One
+    // the server never had came from a refused op (the reason for this
+    // resync); no pending op will send it, so keeping it would leave it on
+    // this phone for good, overlapping the server's rows.
+    const onServer = new Set(snap.segments.map((s) => s.id));
     const keep =
       pending.length === 0
         ? { segments: [], categories: [], rules: [] }
         : {
-            segments: (await db.segments.toArray()).filter((s) => segmentTouched(t, s)),
+            segments: (await db.segments.toArray()).filter(
+              (s) => t.segments.has(s.id) || (segmentTouched(t, s) && onServer.has(s.id)),
+            ),
             categories: (await db.categories.toArray()).filter((c) => categoryTouched(t, c)),
             rules: (await db.rules.toArray()).filter((r) => ruleTouched(t, r)),
           };

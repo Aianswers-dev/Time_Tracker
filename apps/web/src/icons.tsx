@@ -128,7 +128,10 @@ export const CATEGORY_ICON_NAMES: readonly string[] = Object.keys(CATEGORY_ICON_
 export const FALLBACK_ICON: LucideIcon = CircleHelp;
 
 export function iconFor(name: string): LucideIcon {
-  return CATEGORY_ICON_MAP[name] ?? FALLBACK_ICON;
+  // Own keys only: "constructor" or "__proto__" must not reach createElement.
+  return Object.hasOwn(CATEGORY_ICON_MAP, name)
+    ? (CATEGORY_ICON_MAP[name] ?? FALLBACK_ICON)
+    : FALLBACK_ICON;
 }
 
 /**

@@ -2,7 +2,10 @@ import {
   applyRows,
   checkInvariants,
   findOpen,
+  FUTURE_TOLERANCE_MS,
+  MAX_SEGMENT_ROWS_PER_REQUEST,
   opSchema,
+  toIso,
   toMs,
   type Category,
   type Op,
@@ -21,7 +24,7 @@ import {
   segmentMap,
   select,
 } from '../db/queries';
-import { upsertCategory, upsertRule, upsertSegments, upsertSettings } from '../db/writes';
+import { upsertCategory, upsertRule, upsertSettings, writeSegments } from '../db/writes';
 import { summarizeIssues, zodIssues } from '../http';
 import { OpFailure, toOpFailure } from './errors';
 import { computeSwitch, switchWindowStart, writeSwitch } from './switch';
@@ -35,6 +38,12 @@ import { computeSwitch, switchWindowStart, writeSwitch } from './switch';
  * makes at most MAX_D1_CALLS_PER_OP calls (its reads go in one batch, its
  * writes in another), and a request applies at most MAX_OPS_APPLIED_PER_REQUEST
  * ops. Ops past that get no result; the client sends them again.
+ *
+ * The Free plan also allows 10 ms of CPU per request, and validating, checking
+ * and writing a segment row costs tens of microseconds. So a request applies
+ * at most MAX_SEGMENT_ROWS_PER_REQUEST rows of `segments.upsert` ops, except
+ * that the first op is always applied: one op is atomic and has at most
+ * MAX_ROWS_PER_OP rows.
  */
 
 /** Most D1 calls (queries or batches) any single op makes. */
@@ -45,6 +54,17 @@ export const D1_CALL_BUDGET = 45;
 
 /** Ops applied per request. Results stop after this many; the rest are sent again. */
 export const MAX_OPS_APPLIED_PER_REQUEST = Math.floor(D1_CALL_BUDGET / MAX_D1_CALLS_PER_OP);
+
+/** `segments.upsert` rows applied per request. The rest are sent again, like ops past the D1 budget. */
+export { MAX_SEGMENT_ROWS_PER_REQUEST };
+
+/** The rows a `segments.upsert` op carries, read before it is validated; 0 for other ops. */
+function segmentRowCount(raw: RawOp): number {
+  if (raw.type !== 'segments.upsert') return 0;
+  const payload = raw.payload;
+  if (typeof payload !== 'object' || payload === null || !('rows' in payload)) return 0;
+  return Array.isArray(payload.rows) ? payload.rows.length : 0;
+}
 
 /** The server's clock, as an ISO string. Read once per op. */
 export type Clock = () => string;
@@ -75,7 +95,11 @@ function isCallLimitError(err: unknown): boolean {
 export async function applyOps(db: Db, ops: readonly RawOp[], clock: Clock): Promise<OpResult[]> {
   const results: OpResult[] = [];
   let applied = 0;
+  let rowsApplied = 0;
   for (const raw of ops) {
+    // Checked before validating, which is most of an op's CPU cost.
+    const rows = segmentRowCount(raw);
+    if (applied > 0 && rowsApplied + rows > MAX_SEGMENT_ROWS_PER_REQUEST) break;
     const parsed = opSchema.safeParse(raw);
     if (!parsed.success) {
       const message = summarizeIssues(zodIssues(parsed.error));
@@ -84,6 +108,7 @@ export async function applyOps(db: Db, ops: readonly RawOp[], clock: Clock): Pro
     }
     if (applied >= MAX_OPS_APPLIED_PER_REQUEST) break;
     applied += 1;
+    rowsApplied += rows;
     const op = parsed.data;
     try {
       await applyOp(db, op, clock());
@@ -107,7 +132,7 @@ export async function applyOps(db: Db, ops: readonly RawOp[], clock: Clock): Pro
 export async function applyOp(db: Db, op: Op, now: string): Promise<void> {
   switch (op.type) {
     case 'switch':
-      return applySwitchOp(db, op.payload, now);
+      return applySwitchOp(db, op.payload, op.createdAt, now);
     case 'segments.upsert':
       return applySegmentsUpsert(db, op.payload.rows, now);
     case 'category.upsert':
@@ -127,12 +152,28 @@ function wins(
   return !stored || incoming.updatedAt >= stored.updatedAt;
 }
 
-/** Two D1 calls: one read batch, one write batch. A replay is one. */
+/**
+ * Two D1 calls: one read batch, one write batch. A replay is one.
+ *
+ * `madeAt` is the op's `createdAt`: when the phone made the switch. The op may
+ * arrive much later (the phone was offline or the app was closed before the
+ * outbox flushed), so segments that started after it was made, such as a
+ * Shortcut switch in the meantime, stay (shared `switchCategory`, `madeAt`).
+ */
 async function applySwitchOp(
   db: Db,
-  p: Extract<Op, { type: 'switch' }>['payload'],
+  payload: Extract<Op, { type: 'switch' }>['payload'],
+  madeAt: string,
   now: string,
 ): Promise<void> {
+  // `at` comes from the phone's clock. Judge it against when the phone made
+  // the switch (the op's createdAt, same clock) rather than the server's now,
+  // so a phone clock running fast does not make every switch "in the future";
+  // then clamp it to the server's now as the shared code would.
+  if (toMs(payload.at) > toMs(madeAt) + FUTURE_TOLERANCE_MS) {
+    throw new OpFailure('switch_in_future', 'That time is in the future');
+  }
+  const p = { ...payload, at: toIso(Math.min(toMs(payload.at), toMs(now))) };
   const windowStart = switchWindowStart(p.at, now);
   const [existing, categoryRows, overlappingRows] = await db.batch([
     select.segmentsByIds(db, [p.newSegmentId]),
@@ -152,18 +193,39 @@ async function applySwitchOp(
 
   const current = currentRows.map(segmentFromRow);
   const open = findOpen(current);
-  if (open && open.categoryId === p.categoryId) {
+  const madeAtMs = Math.min(toMs(madeAt), toMs(now));
+  if (
+    open &&
+    open.categoryId === p.categoryId &&
+    toMs(open.startedAt) <= Math.max(toMs(p.at), madeAtMs)
+  ) {
     // Something else (a Shortcut, another flush) already switched to this
-    // category. Adding ours would be a different history; the client resyncs.
+    // category before this switch was made. Adding ours would be a different
+    // history; the client resyncs.
     throw new OpFailure('conflict', `Already on ${category.name} under another segment`);
   }
 
   const result = computeSwitch(
     current,
-    { categoryId: p.categoryId, at: p.at, newSegmentId: p.newSegmentId, source: p.source },
+    {
+      categoryId: p.categoryId,
+      at: p.at,
+      newSegmentId: p.newSegmentId,
+      source: p.source,
+      madeAt: toIso(madeAtMs),
+    },
     now,
   );
-  await writeSwitch(db, result, now);
+  // The rows record the phone's change, so they carry the phone's time like
+  // every other op (capped at the server's), not the time the op arrived.
+  // Otherwise an edit or Undo queued after this switch, while offline or in
+  // the same flush, would be older than these rows and lose last-write-wins.
+  const stamp = toIso(madeAtMs);
+  await writeSwitch(
+    db,
+    { ...result, rows: result.rows.map((r) => ({ ...r, updatedAt: stamp })) },
+    now,
+  );
 }
 
 function endMs(s: Segment): number {
@@ -220,7 +282,7 @@ async function applySegmentsUpsert(db: Db, rows: readonly Segment[], now: string
     throw new OpFailure('conflict', `Rejected: ${shown}${more}`);
   }
 
-  await runBatch(db, upsertSegments(db, winners, { syncedAt: now, lww: true }));
+  await writeSegments(db, winners, { syncedAt: now, lww: true });
 }
 
 /** Two D1 calls. */

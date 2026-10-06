@@ -1,6 +1,7 @@
 import {
   isoSchema,
   MAX_OPS_PER_REQUEST,
+  SNAPSHOT_PAGE_SIZE,
   toIso,
   toMs,
   type OpsResponse,
@@ -9,9 +10,9 @@ import {
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { createDb } from '../db/client';
-import { rowsSyncedAfter } from '../db/queries';
+import { decodeSnapshotCursor, snapshotPage } from '../db/queries';
 import type { AppEnv } from '../env';
-import { readJson, readQuery } from '../http';
+import { ApiException, readJson, readQuery } from '../http';
 import { applyOps, systemClock } from '../sync/ops';
 
 export const syncRoutes = new Hono<AppEnv>();
@@ -45,16 +46,27 @@ syncRoutes.post('/ops', async (c) => {
  */
 export const SNAPSHOT_OVERLAP_MS = 10_000;
 
-const snapshotQuerySchema = z.object({ since: isoSchema.optional() });
+const snapshotQuerySchema = z.object({
+  since: isoSchema.optional(),
+  /** `nextCursor` from the previous page. */
+  cursor: z.string().max(200).optional(),
+  limit: z.coerce.number().int().min(1).max(2000).optional(),
+});
 
 syncRoutes.get('/snapshot', async (c) => {
-  const { since } = readQuery(c, snapshotQuerySchema);
+  const query = readQuery(c, snapshotQuerySchema);
   // Read the clock before the data, so nothing written after the reads can
   // carry a synced_at earlier than the cursor handed back.
   const serverTime = new Date().toISOString();
+  const cursor = query.cursor === undefined ? null : decodeSnapshotCursor(query.cursor);
+  if (query.cursor !== undefined && cursor === null) {
+    throw new ApiException(400, 'validation_failed', 'Invalid snapshot cursor', {
+      issues: [{ path: 'cursor', message: 'Not a cursor this server handed out' }],
+    });
+  }
   const db = createDb(c.env.DB);
-  const after = since === undefined ? null : toIso(toMs(since) - SNAPSHOT_OVERLAP_MS);
-  const rows = await rowsSyncedAfter(db, after);
-  const body: SnapshotResponse = { serverTime, ...rows };
+  const since = query.since === undefined ? null : toIso(toMs(query.since) - SNAPSHOT_OVERLAP_MS);
+  const page = await snapshotPage(db, since, cursor, query.limit ?? SNAPSHOT_PAGE_SIZE);
+  const body: SnapshotResponse = { serverTime, ...page };
   return c.json(body);
 });
