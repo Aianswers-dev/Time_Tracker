@@ -2,7 +2,7 @@ import type { Category, Rule, Segment, Settings } from '@time-tracker/shared';
 import { sql } from 'drizzle-orm';
 import type { Db, Statement } from './client';
 import { categoryToRow, ruleToRow, segmentToRow, settingsToRow } from './mapping';
-import { categories, rules, segments, settings } from './schema';
+import { categories, rules, settings } from './schema';
 
 /**
  * Upsert statements for one D1 batch. Every write stamps `synced_at` with the
@@ -20,17 +20,51 @@ export interface UpsertOptions {
   lww: boolean;
 }
 
-export function upsertSegment(db: Db, s: Segment, opts: UpsertOptions): Statement {
-  const row = segmentToRow(s, opts.syncedAt);
-  const { id: _id, ...set } = row;
-  return db
-    .insert(segments)
-    .values(row)
-    .onConflictDoUpdate({
-      target: segments.id,
-      set,
-      setWhere: opts.lww ? sql`excluded.updated_at >= ${segments.updatedAt}` : undefined,
-    });
+/**
+ * Segment upserts are the one write that comes in bulk (up to 100 rows per
+ * `segments.upsert` op, many ops when a phone uploads its history), so they
+ * skip Drizzle's query builder: building one statement costs about 150 µs,
+ * 15 ms or more for 100 rows, over the Workers Free plan's 10 ms of CPU for
+ * the whole request. One prepared statement bound per row costs microseconds.
+ * Same columns, conflict target and guard as the Drizzle upserts below.
+ */
+const SEGMENT_COLUMNS = [
+  'id',
+  'category_id',
+  'started_at',
+  'ended_at',
+  'note',
+  'source',
+  'created_at',
+  'updated_at',
+  'deleted_at',
+  'synced_at',
+] as const;
+
+const SEGMENT_UPSERT_SQL =
+  `INSERT INTO segments (${SEGMENT_COLUMNS.join(', ')}) ` +
+  `VALUES (${SEGMENT_COLUMNS.map(() => '?').join(', ')}) ` +
+  `ON CONFLICT (id) DO UPDATE SET ` +
+  SEGMENT_COLUMNS.slice(1)
+    .map((c) => `${c} = excluded.${c}`)
+    .join(', ');
+
+const SEGMENT_LWW_GUARD = ' WHERE excluded.updated_at >= segments.updated_at';
+
+function segmentParams(s: Segment, syncedAt: string): unknown[] {
+  const r = segmentToRow(s, syncedAt);
+  return [
+    r.id,
+    r.categoryId,
+    r.startedAt,
+    r.endedAt,
+    r.note,
+    r.source,
+    r.createdAt,
+    r.updatedAt,
+    r.deletedAt,
+    r.syncedAt,
+  ];
 }
 
 export function upsertCategory(db: Db, c: Category, opts: UpsertOptions): Statement {
@@ -88,6 +122,25 @@ export function orderForOneOpen(rows: readonly Segment[]): Segment[] {
   return [...rows.filter((s) => !opensSegment(s)), ...rows.filter(opensSegment)];
 }
 
-export function upsertSegments(db: Db, rows: readonly Segment[], opts: UpsertOptions): Statement[] {
-  return orderForOneOpen(rows).map((s) => upsertSegment(db, s, opts));
+/** One upsert per row, in `orderForOneOpen` order, for a single D1 batch. */
+export function upsertSegments(
+  db: Db,
+  rows: readonly Segment[],
+  opts: UpsertOptions,
+): D1PreparedStatement[] {
+  if (rows.length === 0) return [];
+  const statement = db.$client.prepare(
+    opts.lww ? SEGMENT_UPSERT_SQL + SEGMENT_LWW_GUARD : SEGMENT_UPSERT_SQL,
+  );
+  return orderForOneOpen(rows).map((s) => statement.bind(...segmentParams(s, opts.syncedAt)));
+}
+
+/** Write segment rows as one D1 batch: a single transaction, all or nothing. */
+export async function writeSegments(
+  db: Db,
+  rows: readonly Segment[],
+  opts: UpsertOptions,
+): Promise<void> {
+  const statements = upsertSegments(db, rows, opts);
+  if (statements.length > 0) await db.$client.batch(statements);
 }
