@@ -327,6 +327,10 @@ response has `Content-Disposition: attachment; filename="time-tracker-<date>.<ex
   non-deleted segments overlapping the range, every non-deleted category
   (archived included) and rule, and the stored settings or `null`.
 
+The app's Settings → Export builds the same two files from Dexie
+(`apps/web/src/lib/export.ts`) instead of calling these routes, so it works
+offline and without a token. The routes remain for Shortcuts and scripts.
+
 ### Scheduled handler
 
 Not an HTTP route. `wrangler.toml` declares `crons = ["* * * * *"]`. The
