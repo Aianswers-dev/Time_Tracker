@@ -6,12 +6,17 @@ import {
   type DaySettings,
   type TimelineBlock,
 } from '@time-tracker/shared';
+import { blockKey } from './blocks';
 
 interface Props {
   timeline: DayTimeline;
   settings: DaySettings;
   categories: ReadonlyMap<string, Category>;
+  /** Key of the selected block (see `blockKey`), or null. */
+  selected: string | null;
   onSelect: (block: TimelineBlock) => void;
+  /** Accessible name for a block, e.g. "Housework, 06:28–07:13". */
+  describe: (block: TimelineBlock) => string;
 }
 
 const TICK_OFFSETS = [0, 6, 12, 18, 24] as const;
@@ -23,9 +28,11 @@ function pct(ms: number, timeline: DayTimeline): number {
 /**
  * The logical day as one horizontal bar from dayStartHour to the next
  * dayStartHour: coloured blocks for entries, hatched blocks for untracked gaps,
- * a line at now. Tiny blocks keep a minimum width so they stay visible.
+ * a line at now. Blocks keep a minimum width so short ones stay visible, and a
+ * 2 px gap in the bar colour separates neighbours, so similar colours never
+ * merge. Tapping a block selects it; the screen then names it.
  */
-export function DayBar({ timeline, settings, categories, onSelect }: Props) {
+export function DayBar({ timeline, settings, categories, selected, onSelect, describe }: Props) {
   const ticks = TICK_OFFSETS.map((k) => {
     const hour = settings.dayStartHour + k;
     const date = hour >= 24 ? addDaysToKey(timeline.dayKey, 1) : timeline.dayKey;
@@ -43,24 +50,27 @@ export function DayBar({ timeline, settings, categories, onSelect }: Props) {
         {timeline.blocks.map((b) => {
           const left = pct(b.start, timeline);
           const width = pct(b.end, timeline) - left;
-          const category = b.kind === 'segment' ? categories.get(b.categoryId) : undefined;
-          const label =
-            b.kind === 'gap' ? 'Untracked time' : `${category?.name ?? 'Unknown'} entry`;
+          const key = blockKey(b);
+          const isSelected = key === selected;
+          const color =
+            b.kind === 'segment' ? (categories.get(b.categoryId)?.color ?? '#5b6677') : undefined;
           return (
             <button
-              key={b.kind === 'segment' ? b.segmentId : `gap-${b.start}`}
+              key={key}
               type="button"
-              aria-label={label}
+              aria-label={describe(b)}
+              aria-pressed={isSelected}
               onClick={() => onSelect(b)}
-              className={`absolute inset-y-0 border-r border-[var(--surface)] ${
-                b.kind === 'gap' ? 'hatched' : ''
-              }`}
-              style={{
-                left: `${left}%`,
-                width: `max(4px, ${width}%)`,
-                backgroundColor: b.kind === 'segment' ? (category?.color ?? '#6b7a90') : undefined,
-              }}
-            />
+              className="absolute inset-y-0 px-px"
+              style={{ left: `${left}%`, width: `max(4px, ${width}%)` }}
+            >
+              <span
+                className={`block h-full w-full rounded-[3px] transition-opacity ${
+                  b.kind === 'gap' ? 'hatched' : ''
+                } ${selected !== null && !isSelected ? 'opacity-35' : ''}`}
+                style={{ backgroundColor: color }}
+              />
+            </button>
           );
         })}
         {timeline.now !== null && (

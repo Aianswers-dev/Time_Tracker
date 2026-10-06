@@ -231,7 +231,7 @@ function EditView({
         <Button onClick={onSplit}>
           <Scissors size={18} aria-hidden /> Split
         </Button>
-        <Button onClick={onDelete} className="text-danger">
+        <Button onClick={onDelete} variant="danger-soft">
           <Trash2 size={18} aria-hidden /> Delete
         </Button>
       </div>

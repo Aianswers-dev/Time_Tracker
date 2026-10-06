@@ -1,11 +1,12 @@
 import type { ButtonHTMLAttributes, ReactNode } from 'react';
 
-type Variant = 'primary' | 'secondary' | 'danger' | 'ghost';
+type Variant = 'primary' | 'secondary' | 'danger' | 'danger-soft' | 'ghost';
 
 const VARIANTS: Record<Variant, string> = {
   primary: 'bg-accent text-accent-fg',
   secondary: 'bg-surface-2 text-fg',
   danger: 'bg-danger text-danger-fg',
+  'danger-soft': 'bg-surface-2 text-danger',
   ghost: 'bg-transparent text-fg',
 };
 

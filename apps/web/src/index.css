@@ -15,7 +15,7 @@
   --warn-bg: #fff4d6;
   --warn-fg: #6b4a00;
   --overlay: rgb(11 13 18 / 0.45);
-  --hatch-a: #d5d9e1;
+  --hatch-a: #c9ced8;
   --hatch-b: #eef0f4;
   --now: #12151c;
   --shadow: 0 8px 30px rgb(11 13 18 / 0.14);
@@ -89,6 +89,17 @@ body {
   padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
 }
 
+/* With the black-translucent status bar the page runs under the clock and
+   battery. This strip keeps scrolled content from showing through there. */
+.statusbar-shield {
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: env(safe-area-inset-top);
+  background-color: var(--bg);
+  z-index: 30;
+  pointer-events: none;
+}
+
 /* Room for the fixed tab bar and the home indicator below the page content. */
 .pb-tabbar {
   padding-bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom) + 16px);
@@ -101,10 +112,6 @@ body {
 
 .above-tabbar {
   bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom) + 12px);
-}
-
-.safe-top {
-  top: calc(env(safe-area-inset-top) + 8px);
 }
 
 .sheet-pad-bottom {

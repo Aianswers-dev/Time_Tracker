@@ -16,8 +16,9 @@ of where your day went.
 
 ## Status
 
-The M0 scaffold is in place. M1 (core tracking, local only) is next. See
-[docs/07-roadmap.md](docs/07-roadmap.md).
+M1 (core tracking, local only) is in place: the Now, Today and Settings
+screens work offline from IndexedDB and queue every change in an outbox. M2
+(server, sync and auth) is next. See [docs/07-roadmap.md](docs/07-roadmap.md).
 
 ## Documentation
 

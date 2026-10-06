@@ -6,8 +6,9 @@ import { ToastProvider } from './ToastProvider';
 export function Layout() {
   return (
     <ToastProvider>
-      <StatusPill />
+      <div className="statusbar-shield" aria-hidden />
       <div className="pb-tabbar mx-auto flex min-h-[calc(100dvh-env(safe-area-inset-top))] w-full max-w-md flex-col">
+        <StatusPill />
         <Outlet />
       </div>
       <TabBar />

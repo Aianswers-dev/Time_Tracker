@@ -83,16 +83,15 @@ interface NotificationLog {
 
 // Client only
 interface OutboxEntry {
-  opId: string;
-  type: OpType;             // see 04-api.md
-  payload: unknown;
-  createdAt: ISO;
+  seq: number;              // auto-increment, replay order
+  opId: string;             // same as op.opId, indexed
+  op: Op;                   // the shared op exactly as POST /api/ops sends it (04-api.md)
   attempts: number;
   lastError: string | null;
 }
 
 interface Meta {            // client only, key/value
-  key: 'token' | 'lastSync' | 'installedAt' | 'pushSubscriptionId';
+  key: 'token' | 'lastSync' | 'installedAt' | 'seededAt' | 'pushSubscriptionId';
   value: string;
 }
 ```
@@ -191,7 +190,23 @@ CREATE INDEX notif_kind_segment ON notification_log(kind, segment_id, sent_at);
 
 The Dexie schema on the client mirrors `categories`, `segments`, `rules`,
 `settings` and adds `outbox` and `meta`. Dexie uses camelCase field names;
-the server maps to snake_case columns.
+the server maps to snake_case columns. Version 1 (M0) has only `meta`;
+version 2 (M1) adds the rest:
+
+```ts
+categories: 'id, sortOrder'
+segments:   'id, startedAt, categoryId'
+rules:      'id, categoryId'
+settings:   'id'
+outbox:     '++seq, opId'
+```
+
+The client never loads the whole segment history for an action or a screen.
+It reads, by the `startedAt` index, every segment starting within seven days
+either side of the affected time, plus the nearest live segment on each side
+of that window and the open segment (the live segment with the latest start).
+Segments never overlap, so this is exactly what the shared operations and the
+day views need.
 
 ## Invariants
 

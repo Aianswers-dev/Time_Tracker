@@ -49,6 +49,7 @@ export function CategoriesSection() {
       {editing && (editing.kind === 'new' || current) && (
         <CategoryEditorSheet
           category={editing.kind === 'edit' ? current : undefined}
+          existing={categories}
           onClose={() => setEditing(null)}
         />
       )}

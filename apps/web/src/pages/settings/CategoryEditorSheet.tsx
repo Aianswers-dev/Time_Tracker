@@ -21,19 +21,33 @@ import { labelColorFor } from '../../lib/contrast';
 interface Props {
   /** Undefined to add a new category. */
   category?: Category;
+  /** All live categories, so a new one starts with an unused colour and icon. */
+  existing: readonly Category[];
   onClose: () => void;
 }
 
-function nextPaletteColor(): string {
-  return CATEGORY_PALETTE[10] ?? CATEGORY_PALETTE[0] ?? '#6b7a90';
+/** The first option no existing category uses, else the first option. */
+function firstUnused(options: readonly string[], used: readonly string[]): string {
+  const taken = new Set(used.map((u) => u.toLowerCase()));
+  return options.find((o) => !taken.has(o.toLowerCase())) ?? options[0] ?? '';
 }
 
-export function CategoryEditorSheet({ category, onClose }: Props) {
+export function CategoryEditorSheet({ category, existing, onClose }: Props) {
   const toast = useToast();
   const [draft, setDraft] = useState<CategoryDraft>(() => ({
     name: category?.name ?? '',
-    color: category?.color ?? nextPaletteColor(),
-    icon: category?.icon ?? 'sparkles',
+    color:
+      category?.color ??
+      firstUnused(
+        CATEGORY_PALETTE,
+        existing.map((c) => c.color),
+      ),
+    icon:
+      category?.icon ??
+      firstUnused(
+        CATEGORY_ICON_NAMES,
+        existing.map((c) => c.icon),
+      ),
     exemptFromStaleCheck: category?.exemptFromStaleCheck ?? false,
   }));
   const [error, setError] = useState<string | null>(null);
@@ -212,7 +226,7 @@ export function CategoryEditorSheet({ category, onClose }: Props) {
             {/* Deleting is only offered for a category that was never used. */}
             {segmentCount === 0 && (
               <Button
-                className="text-danger"
+                variant="danger-soft"
                 disabled={busy}
                 onClick={() =>
                   void attempt(() => deleteCategory(category.id), `${category.name} deleted`)

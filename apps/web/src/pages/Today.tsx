@@ -16,10 +16,12 @@ import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { useMemo, useRef, useState, type PointerEvent } from 'react';
 import { useSearchParams } from 'react-router';
 import { CategoryBadge, UntrackedBadge } from '../components/CategoryBadge';
+import { Button } from '../components/ui';
 import { useCategories, useCategoryMap, useSegmentsAround, useSettings } from '../data/hooks';
 import { dayLabel, timeOnDay } from '../lib/format';
 import { useNow } from '../lib/useNow';
 import { AssignSheet } from './today/AssignSheet';
+import { blockKey } from './today/blocks';
 import { DayBar } from './today/DayBar';
 import { EditSheet } from './today/EditSheet';
 
@@ -36,6 +38,8 @@ export function Today() {
   const now = useNow(10_000);
   const [params, setParams] = useSearchParams();
   const [sheet, setSheet] = useState<SheetState | null>(null);
+  // The bar block the owner tapped, per day, so it can be named below the bar.
+  const [picked, setPicked] = useState<{ dayKey: string; key: string } | null>(null);
   const swipe = useRef<{ x: number; y: number } | null>(null);
 
   const todayKey = settings ? dayKeyOf(now, settings) : null;
@@ -77,7 +81,7 @@ export function Today() {
     setParams(next === todayKey ? {} : { day: next }, { replace: true });
   }
 
-  function onSelect(block: TimelineBlock) {
+  function openBlock(block: TimelineBlock) {
     if (block.kind === 'gap') setSheet({ kind: 'assign', start: block.start, end: block.end });
     else setSheet({ kind: 'edit', segmentId: block.segmentId });
   }
@@ -100,6 +104,22 @@ export function Today() {
   const rows = [...timeline.blocks].reverse();
   const totalRows = sortedTotals(totals.byCategory);
   const editing = sheet?.kind === 'edit' ? segById.get(sheet.segmentId) : undefined;
+  const selectedKey = picked?.dayKey === dayKey ? picked.key : null;
+  const selectedBlock = timeline.blocks.find((b) => blockKey(b) === selectedKey) ?? null;
+
+  /** Name and full time range of a block: the whole entry, not just the part in this day. */
+  function describe(b: TimelineBlock): { name: string; range: string; ms: number } {
+    if (!dayKey || !settings) return { name: '', range: '', ms: 0 };
+    if (b.kind === 'gap') {
+      const range = `${timeOnDay(b.start, dayKey, settings)}–${timeOnDay(b.end, dayKey, settings)}`;
+      return { name: 'Untracked', range, ms: b.end - b.start };
+    }
+    const seg = segById.get(b.segmentId);
+    const start = seg ? toMs(seg.startedAt) : b.start;
+    const end = seg?.endedAt ? toMs(seg.endedAt) : b.open ? now : b.end;
+    const range = `${timeOnDay(start, dayKey, settings)}–${b.open ? 'now' : timeOnDay(end, dayKey, settings)}`;
+    return { name: byId.get(b.categoryId)?.name ?? 'Unknown', range, ms: end - start };
+  }
 
   return (
     <main
@@ -134,7 +154,28 @@ export function Today() {
         </button>
       </header>
 
-      <DayBar timeline={timeline} settings={settings} categories={byId} onSelect={onSelect} />
+      <div className="flex flex-col gap-2">
+        <DayBar
+          timeline={timeline}
+          settings={settings}
+          categories={byId}
+          selected={selectedKey}
+          onSelect={(b) => setPicked({ dayKey, key: blockKey(b) })}
+          describe={(b) => {
+            const d = describe(b);
+            return `${d.name}, ${d.range}`;
+          }}
+        />
+        <BlockInfo
+          block={selectedBlock}
+          info={selectedBlock ? describe(selectedBlock) : null}
+          category={
+            selectedBlock?.kind === 'segment' ? byId.get(selectedBlock.categoryId) : undefined
+          }
+          hasBlocks={timeline.blocks.length > 0}
+          onOpen={openBlock}
+        />
+      </div>
 
       <section aria-labelledby="entries-h">
         <h2
@@ -156,7 +197,7 @@ export function Today() {
                     segment={segById.get(b.segmentId)}
                     dayKey={dayKey}
                     now={now}
-                    onOpen={() => onSelect(b)}
+                    onOpen={() => openBlock(b)}
                     byId={byId}
                     settings={settings}
                   />
@@ -164,7 +205,7 @@ export function Today() {
                   <button
                     type="button"
                     className="flex min-h-16 w-full items-center gap-3 px-3 py-2 text-left active:bg-surface-2"
-                    onClick={() => onSelect(b)}
+                    onClick={() => openBlock(b)}
                   >
                     <UntrackedBadge />
                     <span className="min-w-0 flex-1">
@@ -201,7 +242,7 @@ export function Today() {
                   <span
                     aria-hidden
                     className="size-3 shrink-0 rounded-full"
-                    style={{ backgroundColor: c?.color ?? '#6b7a90' }}
+                    style={{ backgroundColor: c?.color ?? '#5b6677' }}
                   />
                   <span className="min-w-0 flex-1 truncate">{c?.name ?? 'Unknown'}</span>
                   <span className="tabular font-medium">{formatDuration(ms)}</span>
@@ -275,5 +316,42 @@ function EntryRow({ segment, dayKey, now, onOpen, byId, settings }: EntryRowProp
       </span>
       <span className="tabular text-sm font-medium">{formatDuration(end - start)}</span>
     </button>
+  );
+}
+
+interface BlockInfoProps {
+  block: TimelineBlock | null;
+  info: { name: string; range: string; ms: number } | null;
+  category: Category | undefined;
+  hasBlocks: boolean;
+  onOpen: (block: TimelineBlock) => void;
+}
+
+/** Names the bar block the owner tapped, with a button to edit or assign it. */
+function BlockInfo({ block, info, category, hasBlocks, onOpen }: BlockInfoProps) {
+  if (!block || !info) {
+    return (
+      <p className="flex min-h-16 items-center justify-center text-sm text-muted">
+        {hasBlocks ? 'Tap a block in the bar to see what it is.' : ' '}
+      </p>
+    );
+  }
+  return (
+    <div
+      className="flex min-h-16 items-center gap-3 rounded-2xl border border-line bg-surface py-1 pr-1 pl-3"
+      data-testid="block-info"
+      aria-live="polite"
+    >
+      {category ? <CategoryBadge category={category} size={36} /> : <UntrackedBadge size={36} />}
+      <span className="min-w-0 flex-1">
+        <span className="block truncate font-semibold">{info.name}</span>
+        <span className="tabular block text-sm text-muted">
+          {info.range} · {formatDuration(info.ms)}
+        </span>
+      </span>
+      <Button onClick={() => onOpen(block)} className="px-4">
+        {block.kind === 'gap' ? 'Assign' : 'Edit'}
+      </Button>
+    </div>
   );
 }

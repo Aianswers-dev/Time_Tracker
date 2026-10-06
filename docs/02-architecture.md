@@ -40,7 +40,10 @@ Routes:
 State lives in Dexie tables that mirror the server tables, plus an `outbox`
 table and a `meta` table (token, lastSync). React reads Dexie through
 `dexie-react-hooks` (`useLiveQuery`), so every screen updates when the data
-changes with no extra state library.
+changes with no extra state library. Every user action is one Dexie
+transaction that writes the changed rows and appends one outbox op
+(`apps/web/src/data/`). The Now screen is in the main bundle; Today, Stats
+and Settings are lazy route chunks, all precached by the service worker.
 
 Service worker (`vite-plugin-pwa`, `injectManifest` so we control the file):
 precaches the app shell, handles `push` by showing a notification from the
