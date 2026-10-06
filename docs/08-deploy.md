@@ -69,8 +69,8 @@ From now on the **Deploy** workflow also runs by itself after every merge into
 3. Open **Time** from your Home Screen. Always use this icon, not Safari:
    notifications only work in the installed app.
 4. Go to **Settings → Sync**, paste your app password and tap **Connect**.
-5. Go to **Settings → Notifications**, tap **Enable notifications** and allow
-   them. Tap **Send test notification** to check.
+5. Go to **Settings → Notifications**, turn on **Nudges on this phone** and
+   allow notifications. Tap **Send test notification** to check.
 6. Pick what you are doing on the **Now** screen. Tracking has started.
 
 ## 6. Optional extras
@@ -96,7 +96,7 @@ From now on the **Deploy** workflow also runs by itself after every merge into
 | Deploy fails mentioning a `workers.dev` subdomain | Open **Workers & Pages** in the Cloudflare dashboard once and pick a subdomain, then run Deploy again. |
 | Deploy fails with an authentication error | The API token or Account ID is wrong, or the token was deleted. Create a new token and update the secret. |
 | The app says "token rejected" | The password in the app differs from `APP_TOKEN`. Paste it again. |
-| No "Enable notifications" button | The app was opened in Safari. Open it from the Home Screen icon. |
+| No "Nudges on this phone" switch | The app was opened in Safari. Open it from the Home Screen icon. |
 | Notifications were denied | iOS will not ask again. Turn them on in **iOS Settings → Notifications → Time**. |
 
 ## Deploying from a computer instead

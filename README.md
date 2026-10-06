@@ -55,6 +55,7 @@ Read in order.
 | [06-ios.md](docs/06-ios.md) | iOS constraints, install and push flow, Shortcuts recipes, Scriptable widget |
 | [07-roadmap.md](docs/07-roadmap.md) | Milestones, task breakdown, definition of done, owner setup tasks |
 | [08-deploy.md](docs/08-deploy.md) | Deploy from GitHub and install on the iPhone, no computer needed |
+| [HANDOFF.md](HANDOFF.md) | Current state, decisions made during the build, known gaps, how to continue |
 
 Agents working in this repo should also read [CLAUDE.md](CLAUDE.md).
 
