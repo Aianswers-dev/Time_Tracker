@@ -21,6 +21,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # Nothing later pushes, so do not leave GITHUB_TOKEN in .git/config
+          # where install scripts and test code could read it.
+          persist-credentials: false
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
