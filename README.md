@@ -16,13 +16,23 @@ of where your day went.
 
 ## Status
 
-M1 (core tracking, local only) and M2 (server, sync and auth) are in place:
-the Now, Today and Settings screens work offline from IndexedDB, and once a
-token is saved every change syncs to the Worker and back. M3 (nudges) has its
-server half: the once-a-minute cron evaluates the rules and sends Web Push,
-and the `/api/push/*` endpoints are ready for the app. Push needs no setup:
-the Worker generates its own VAPID keys. See
-[docs/07-roadmap.md](docs/07-roadmap.md).
+All milestones (M0 to M5) are built. What is left needs the owner's iPhone:
+deploy (docs/08-deploy.md), install, and confirm push delivery, the widget
+and the Siri phrase on the device.
+
+- **Track.** Tap a category on the Now screen; the timer runs from the start
+  time, so it is right even after the app was closed. Undo, backdate, and
+  edit, split, delete or fill gaps on the Today timeline. Works offline.
+- **Sync.** Paste your app password once; every change syncs to your
+  Cloudflare Worker and back. Shortcuts and Siri switch through the API.
+- **Nudges.** Session limits ("1h of Relaxing in a row"), daily budgets
+  ("3h of Relaxing today") and a "Still on it?" check, with quiet hours, sent
+  as push notifications by a once-a-minute cron.
+- **Dashboards.** Totals, each day stacked by category, an hour-of-day
+  heatmap, budget streaks and trends, plus CSV and JSON export.
+- **Widget.** A Scriptable script for Home Screen and Lock Screen widgets.
+
+See [docs/07-roadmap.md](docs/07-roadmap.md) for details per milestone.
 
 ## Get it on your iPhone
 
