@@ -16,9 +16,10 @@ of where your day went.
 
 ## Status
 
-M1 (core tracking, local only) is in place: the Now, Today and Settings
-screens work offline from IndexedDB and queue every change in an outbox. M2
-(server, sync and auth) is next. See [docs/07-roadmap.md](docs/07-roadmap.md).
+M1 (core tracking, local only) and M2 (server, sync and auth) are in place:
+the Now, Today and Settings screens work offline from IndexedDB, and once a
+token is saved every change syncs to the Worker and back. See
+[docs/07-roadmap.md](docs/07-roadmap.md).
 
 ## Documentation
 
@@ -68,6 +69,12 @@ answers `401` until `AUTH_TOKEN` is set. Copy the example file and fill it in:
 cp apps/server/.dev.vars.example apps/server/.dev.vars
 openssl rand -base64 32   # paste as AUTH_TOKEN
 ```
+
+The app works without it; sync is off until you connect. Open Settings →
+Sync (or tap the banner on the Now screen), paste the same token and tap
+Connect. The phone's changes go up first, then the server's copy replaces
+the local data. "Sync now", "Disconnect" and "Reset local data and
+re-download" live in the same section.
 
 ### Server tests
 

@@ -226,7 +226,7 @@ because the client overwrites with the server's copy.
 ### Convenience reads (debugging, Shortcuts)
 
 - `GET /api/categories` → `Category[]`: active categories (not archived,
-  not deleted) by `sortOrder`. The login screen uses it to check the token.
+  not deleted) by `sortOrder`.
 - `GET /api/segments?from=<ISO>&to=<ISO>` → `Segment[]`: non-deleted
   segments overlapping `[from, to)`, oldest first. The open segment counts as
   running forever. Both bounds required, `from < to`, max range 92 days,
@@ -234,7 +234,8 @@ because the client overwrites with the server's copy.
 - `GET /api/rules` → `Rule[]`: non-deleted rules, oldest first.
 - `GET /api/settings` → `Settings`: the stored settings, or the defaults the
   server uses before any are stored (`timezone` "UTC", `dayStartHour` 4,
-  `updatedAt` 2000-01-01).
+  `updatedAt` 2000-01-01). The app's Connect button calls it to check a
+  token before saving it.
 
 ### Push
 
