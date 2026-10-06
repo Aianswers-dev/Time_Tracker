@@ -177,6 +177,44 @@ describe('undo', () => {
     await expect(undoAction(second.undo)).rejects.toThrow(/Too late/);
     expect((await findOpenSegment())?.categoryId).toBe(CAT.relaxing);
   });
+
+  it('refuses when the restored rows would overlap something added since', async () => {
+    const a = seg(CAT.sleep, T0 - 3 * HOUR_MS, T0 - 2 * HOUR_MS);
+    const b = seg(CAT.housework, T0 - 2 * HOUR_MS, T0 - HOUR_MS);
+    const c = seg(CAT.relaxing, T0 - HOUR_MS, null);
+    await db.segments.bulkPut([a, b, c]);
+    // Delete b and leave a gap, then fill the gap with something else.
+    const deleted = await applySegmentAction({ kind: 'delete', id: b.id, fill: 'none' });
+    setNow(T0 + 2_000);
+    await applySegmentAction({
+      kind: 'insert',
+      categoryId: CAT.hobbies,
+      startedAt: b.startedAt,
+      endedAt: b.endedAt ?? '',
+    });
+    if (!deleted.undo) throw new Error('expected an undo token');
+    const queued = (await allOps()).length;
+
+    await expect(undoAction(deleted.undo)).rejects.toThrow(/Too late/);
+    expect((await db.segments.get(b.id))?.deletedAt).not.toBeNull();
+    expect(await allOps()).toHaveLength(queued);
+    await expectValid();
+  });
+
+  it('stamps the undo later than the rows it replaces, even when their clock is ahead', async () => {
+    await switchTo(CAT.sleep);
+    setNow(T0 + HOUR_MS);
+    const second = await switchTo(CAT.housework);
+    if (!second.undo) throw new Error('expected an undo token');
+    // A sync replaced the rows with the server's copy, stamped by a clock 5 s ahead.
+    const serverStamp = toIso(T0 + HOUR_MS + 5_000);
+    await db.segments.bulkPut(second.rows.map((r) => ({ ...r, updatedAt: serverStamp })));
+    setNow(T0 + HOUR_MS + 2_000);
+
+    const undone = await undoAction(second.undo);
+    for (const row of undone.rows) expect(row.updatedAt > serverStamp).toBe(true);
+    await expectValid();
+  });
 });
 
 describe('segment edits each queue one segments.upsert op', () => {
