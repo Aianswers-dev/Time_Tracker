@@ -1,4 +1,5 @@
 import {
+  DAY_MS,
   isoSchema,
   localDate,
   localHHMM,
@@ -56,9 +57,65 @@ export function csvField(value: string | number): string {
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
-/** "2026-10-02 13:15", wall-clock time in the settings timezone. */
-function localDateTime(iso: string, timezone: string): string {
-  return `${localDate(iso, timezone)} ${localHHMM(iso, timezone)}`;
+const pad2 = (n: number): string => String(n).padStart(2, '0');
+
+/**
+ * "2026-10-02 13:15", wall-clock time in `timezone`: the same text as the
+ * shared `localDate` and `localHHMM`, at a fraction of the CPU. Those build a
+ * TZDate and run date-fns `format` on every call, about 80 µs for the four per
+ * row, so a year of segments took several hundred ms of CPU against the
+ * Workers Free limit of 10 ms per request.
+ *
+ * Here Intl is asked for the UTC offset once per UTC day: when the offsets at
+ * the day's two midnights agree, every instant of the day has that offset
+ * (no zone changes and changes back within a day), and the wall clock is
+ * plain arithmetic. Days with a transition ask Intl for each instant. Times
+ * before 1970, where zones used odd-second local mean time, use the shared
+ * helpers.
+ */
+export function localDateTimeFormatter(timezone: string): (ms: number) => string {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  });
+  /** The local wall clock at `ms` (whole seconds) as a UTC epoch value. */
+  const wallClock = (ms: number): number => {
+    const p: Partial<Record<Intl.DateTimeFormatPartTypes, string>> = {};
+    for (const part of fmt.formatToParts(ms)) p[part.type] = part.value;
+    return Date.UTC(
+      Number(p.year),
+      Number(p.month) - 1,
+      Number(p.day),
+      Number(p.hour),
+      Number(p.minute),
+      Number(p.second),
+    );
+  };
+  const offsets = new Map<number, number>();
+  /** The offset at the start of UTC day `day` (days since the epoch). */
+  const offsetAtMidnight = (day: number): number => {
+    let offset = offsets.get(day);
+    if (offset === undefined) {
+      offset = wallClock(day * DAY_MS) - day * DAY_MS;
+      offsets.set(day, offset);
+    }
+    return offset;
+  };
+  return (ms) => {
+    if (ms < 0) return `${localDate(ms, timezone)} ${localHHMM(ms, timezone)}`;
+    const day = Math.floor(ms / DAY_MS);
+    const offset = offsetAtMidnight(day);
+    const wall = offset === offsetAtMidnight(day + 1) ? ms + offset : wallClock(ms);
+    const d = new Date(wall);
+    const date = `${String(d.getUTCFullYear()).padStart(4, '0')}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+    return `${date} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`;
+  };
 }
 
 export function segmentsCsv(
@@ -67,13 +124,14 @@ export function segmentsCsv(
   timezone: string,
   nowMs: number,
 ): string {
+  const localDateTime = localDateTimeFormatter(timezone);
   const lines = [CSV_COLUMNS.join(',')];
   for (const s of segments) {
     const end = s.endedAt === null ? nowMs : toMs(s.endedAt);
     lines.push(
       [
-        localDateTime(s.startedAt, timezone),
-        s.endedAt === null ? '' : localDateTime(s.endedAt, timezone),
+        localDateTime(toMs(s.startedAt)),
+        s.endedAt === null ? '' : localDateTime(end),
         categories.get(s.categoryId)?.name ?? '',
         wholeMinutes(end - toMs(s.startedAt)),
         s.note ?? '',

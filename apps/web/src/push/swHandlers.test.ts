@@ -125,6 +125,23 @@ describe('safeUrl', () => {
     expect(safeUrl(undefined, ORIGIN)).toBe('/');
     expect(safeUrl(42, ORIGIN)).toBe('/');
   });
+
+  it('never returns a path that resolves to another origin', () => {
+    // A same-origin URL whose path starts with two slashes (or a backslash,
+    // which URL parsing turns into one) has a pathname like "//evil.example/x",
+    // which is a protocol-relative URL once resolved against the origin again.
+    for (const url of [
+      `${ORIGIN}//evil.example/x`,
+      `${ORIGIN}/\\evil.example/x`,
+      '/\\evil.example/x',
+      '/%2F/evil.example',
+      `${ORIGIN}///evil.example`,
+    ]) {
+      const path = safeUrl(url, ORIGIN);
+      expect(path.startsWith('/'), url).toBe(true);
+      expect(new URL(path, ORIGIN).origin, url).toBe(ORIGIN);
+    }
+  });
 });
 
 describe('notificationclick handler', () => {
@@ -184,6 +201,33 @@ describe('notificationclick handler', () => {
       ORIGIN,
     );
     expect(all.openWindow.mock.calls).toEqual([[`${ORIGIN}/`], [`${ORIGIN}/`]]);
+  });
+
+  it('never opens or navigates off-origin through a double-slash path', async () => {
+    const opened: string[] = [];
+    const none = {
+      matchAll: vi.fn(() => Promise.resolve([])),
+      openWindow: vi.fn((url: string) => {
+        opened.push(url);
+        return Promise.resolve(undefined);
+      }),
+    } satisfies ClientsLike;
+    await handleNotificationClick(
+      { data: { url: `${ORIGIN}//evil.example/phish` }, close: vi.fn() },
+      none,
+      ORIGIN,
+    );
+    expect(opened).toHaveLength(1);
+    expect(new URL(opened[0] ?? '').origin).toBe(ORIGIN);
+
+    const app = client(`${ORIGIN}/settings`);
+    await handleNotificationClick(
+      { data: { url: '/\\evil.example/phish' }, close: vi.fn() },
+      clients([app]),
+      ORIGIN,
+    );
+    const navigated = app.navigate.mock.calls[0]?.[0] ?? `${ORIGIN}/`;
+    expect(new URL(navigated).origin).toBe(ORIGIN);
   });
 
   it('opens a window when focusing fails, and survives a failed navigate', async () => {
