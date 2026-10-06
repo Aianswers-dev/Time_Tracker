@@ -100,8 +100,10 @@ switch is not untracked.
 `categoryId` wins. Name matching is case-insensitive, ignores surrounding
 whitespace and Unicode composition differences. Unknown name → `404`. Same
 category as the open segment → `200 { "noop": true, ... }`. `source` defaults
-to `shortcut`. `at` defaults to now and may be in the past (a backdated
-switch, cleared with the same shared `switchCategory` the app uses). `id` is
+to `shortcut`. `at` defaults to now and may be up to 24 hours in the past (a
+backdated switch, cleared with the same shared `switchCategory` the app uses).
+An older `at` is `400 validation_failed`, so a Shortcut with a wrong date
+cannot clear history; older changes are made in the app, which previews them. `id` is
 the new segment's id: a retried request with an `id` that already exists
 changes nothing and answers `200` with `noop: true` and "Switched to {name}".
 
@@ -138,10 +140,14 @@ validated on its own with the shared `opSchema`, so a malformed op gets
 `ok: false` with `validation_failed` in its result and does not block the
 rest.
 
-**At most 15 ops are applied per request.** D1 on the Workers Free plan allows
-50 queries per Worker invocation, and each op makes up to 3 D1 calls. The
-results then cover only a prefix of the ops sent: ops without a result were
-not attempted and stay in the outbox. The client sends them again straight
+**At most 15 ops, and at most 200 `segments.upsert` rows, are applied per
+request** (always at least the first op). D1 on the Workers Free plan allows
+50 queries per Worker invocation, and each op makes up to 3 D1 calls.
+Building, validating and checking segment rows is the Worker's main CPU cost
+against the Free plan's 10 ms, so segment upserts bind one prepared statement
+per row instead of going through Drizzle, and the row cap keeps a bulk upload
+inside the budget. The results then cover only a prefix of the ops sent: ops
+without a result were not attempted and stay in the outbox. The client sends them again straight
 away (not after the 30 s retry timer) until the outbox is empty or a request
 fails. Malformed ops cost no D1 calls and always get a result.
 
@@ -301,7 +307,7 @@ such subscription exists (so a retry is harmless).
 
 **`POST /api/push/test`** (no body needed) → `200 { "sent": n, "failed": n }`
 (`pushTestResponseSchema`). Sends a "Test notification" (tag `test`) to every
-subscription, at most six, through the same path as nudges, and records the
+subscription, at most three, through the same path as nudges, and records the
 outcomes (404 and 410 delete the subscription and count as failed). `sent`
 counts messages the push service accepted (2xx); delivery to the device is up
 to the push service. With no subscriptions: `{ "sent": 0, "failed": 0 }`.

@@ -124,7 +124,7 @@ outbox. Store the returned `serverTime` as the new `lastSync`.
    is written before anything is sent, so a crash mid-send cannot cause a
    duplicate on the next minute.
 6. Send each notification to each subscription (subscriptions in parallel,
-   notifications to one subscription in order), at most 6 sends per run. When
+   notifications to one subscription in order), at most 3 sends per run. When
    more are due than fit, the extra notifications are neither logged nor sent
    and go out a minute later. One bad subscription never stops the others.
 7. One batch recording each subscription's outcome: 404 or 410 deletes it;
@@ -139,7 +139,7 @@ outbox. Store the returned `serverTime` as the new `lastSync`.
    and endpoints are never logged.
 
 So a run makes 1 D1 call when nothing is due and at most 4 when it sends
-(3 once the key pair exists), and at most 6 push subrequests.
+(3 once the key pair exists), and at most 3 push subrequests.
 
 **5. Push received.** The service worker shows the notification using
 `title`, `body`, `tag`, and `data.url` from the payload. Tapping focuses an
@@ -167,9 +167,10 @@ actual refresh cadence.
 - One user action produces one op. The outbox holds ordered ops
   `{ opId, type, payload, createdAt }`, sent in batches of up to 50 (the
   server accepts 200) and applied in order, each atomically. The server
-  applies at most 15 ops per request (D1 allows 50 queries per request on the
-  Free plan) and answers only those; the client keeps the unanswered ops and
-  sends them again straight away.
+  applies at most 15 ops and at most 200 segment rows per request (D1 allows
+  50 queries and the Worker 10 ms of CPU per request on the Free plan) and
+  answers only those; the client keeps the unanswered ops and sends them again
+  straight away.
 - Upserts are last-write-wins: the server applies an incoming row when its
   `updatedAt` is at least the stored one, otherwise acknowledges and ignores it.
 - A `switch` op carries the new segment's id, so a replay after a timeout is
@@ -302,8 +303,8 @@ actual refresh cadence.
 | Resource | Free limit | Expected use |
 | --- | --- | --- |
 | Worker requests | 100,000 / day | Cron 1,440 + app traffic well under 2,000 |
-| Worker CPU | 10 ms / invocation | Rule evaluation is negligible. Each push send costs an ECDH key pair, ECDH, HKDF, AES-GCM over 4 KB and an ECDSA signature (about 3 ms measured in Node); at most 6 sends per invocation |
-| Subrequests | 50 / invocation | Cron: at most 6 push sends plus at most 4 D1 calls |
+| Worker CPU | 10 ms / invocation | Rule evaluation is negligible. Each push send costs an ECDH key pair, ECDH, HKDF, AES-GCM over 4 KB and an ECDSA signature (about 3 ms measured in Node); at most 3 sends per invocation. Segment upserts bind prepared statements rather than Drizzle (about 150 µs per row saved), `/api/ops` applies at most 200 segment rows per request, and CSV export formats local times with one Intl lookup per UTC day |
+| Subrequests | 50 / invocation | Cron: at most 3 push sends plus at most 4 D1 calls |
 | Cron Triggers | Available on free plan | 1 trigger, every minute |
 | D1 reads | 5,000,000 rows / day | Cron reads the open segment's rows plus the last 48 hours of segments through indexes: tens of rows per minute, under 150,000 a day |
 | D1 writes | 100,000 rows / day | Dozens per day |

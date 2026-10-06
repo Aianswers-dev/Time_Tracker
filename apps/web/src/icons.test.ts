@@ -19,6 +19,12 @@ describe('category icons', () => {
   it('fall back for unknown names', () => {
     expect(iconFor('no-such-icon')).toBe(FALLBACK_ICON);
   });
+
+  it('fall back for names of inherited object properties', () => {
+    for (const name of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf']) {
+      expect(iconFor(name), name).toBe(FALLBACK_ICON);
+    }
+  });
 });
 
 describe('label colour', () => {
