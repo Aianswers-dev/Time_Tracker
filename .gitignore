@@ -14,3 +14,5 @@ coverage/
 .vite/
 dev-dist/
 apps/server/public/
+# Agent worktrees created during development
+.claude/worktrees/

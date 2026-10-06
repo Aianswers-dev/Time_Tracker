@@ -13,6 +13,7 @@ export default defineConfig([
     '**/dev-dist',
     '**/coverage',
     '**/.wrangler',
+    '.claude/worktrees',
     'apps/server/public',
     'apps/server/drizzle',
   ]),

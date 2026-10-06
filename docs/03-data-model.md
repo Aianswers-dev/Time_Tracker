@@ -49,8 +49,9 @@ interface Settings {
   id: 'singleton';
   timezone: string;         // IANA, e.g. "Australia/Sydney"
   dayStartHour: number;     // 0..23, default 4
+  staleEnabled: boolean;    // default true
   staleAfterMin: number;    // default 300
-  staleRepeatMin: number;   // default 60
+  staleRepeatMin: number | null;   // default 60, null = once per segment
   staleQuietStart: HHMM | null;
   staleQuietEnd: HHMM | null;
   updatedAt: ISO;
@@ -82,23 +83,25 @@ interface NotificationLog {
 
 // Client only
 interface OutboxEntry {
-  opId: string;
-  type: OpType;             // see 04-api.md
-  payload: unknown;
-  createdAt: ISO;
+  seq: number;              // auto-increment, replay order
+  opId: string;             // same as op.opId, indexed
+  op: Op;                   // the shared op exactly as POST /api/ops sends it (04-api.md)
   attempts: number;
   lastError: string | null;
 }
 
 interface Meta {            // client only, key/value
-  key: 'token' | 'lastSync' | 'installedAt' | 'pushSubscriptionId';
+  key: 'token' | 'lastSync' | 'installedAt' | 'seededAt' | 'pushSubscriptionId';
   value: string;
 }
 ```
 
 ## SQL schema (D1 / SQLite)
 
-Drizzle is the source of truth; this is the intended shape.
+Drizzle is the source of truth; this is the intended shape. Every synced table
+(`categories`, `segments`, `rules`, `settings`) also has
+`synced_at TEXT NOT NULL`, the server time of the last write, indexed. It is
+the `GET /api/snapshot?since=` cursor and is never sent to the client.
 
 ```sql
 CREATE TABLE categories (
@@ -130,7 +133,7 @@ CREATE INDEX segments_cat_started ON segments(category_id, started_at);
 -- Enforces invariant I1 at the database level.
 CREATE UNIQUE INDEX segments_one_open
   ON segments(ended_at) WHERE ended_at IS NULL AND deleted_at IS NULL;
-CREATE INDEX segments_updated ON segments(updated_at);
+CREATE INDEX segments_synced ON segments(synced_at);
 
 CREATE TABLE rules (
   id TEXT PRIMARY KEY,
@@ -151,8 +154,9 @@ CREATE TABLE settings (
   id TEXT PRIMARY KEY CHECK (id = 'singleton'),
   timezone TEXT NOT NULL,
   day_start_hour INTEGER NOT NULL DEFAULT 4,
+  stale_enabled INTEGER NOT NULL DEFAULT 1,
   stale_after_min INTEGER NOT NULL DEFAULT 300,
-  stale_repeat_min INTEGER NOT NULL DEFAULT 60,
+  stale_repeat_min INTEGER DEFAULT 60,
   stale_quiet_start TEXT,
   stale_quiet_end TEXT,
   updated_at TEXT NOT NULL
@@ -186,7 +190,23 @@ CREATE INDEX notif_kind_segment ON notification_log(kind, segment_id, sent_at);
 
 The Dexie schema on the client mirrors `categories`, `segments`, `rules`,
 `settings` and adds `outbox` and `meta`. Dexie uses camelCase field names;
-the server maps to snake_case columns.
+the server maps to snake_case columns. Version 1 (M0) has only `meta`;
+version 2 (M1) adds the rest:
+
+```ts
+categories: 'id, sortOrder'
+segments:   'id, startedAt, categoryId'
+rules:      'id, categoryId'
+settings:   'id'
+outbox:     '++seq, opId'
+```
+
+The client never loads the whole segment history for an action or a screen.
+It reads, by the `startedAt` index, every segment starting within seven days
+either side of the affected time, plus the nearest live segment on each side
+of that window and the open segment (the live segment with the latest start).
+Segments never overlap, so this is exactly what the shared operations and the
+day views need.
 
 ## Invariants
 
@@ -205,54 +225,83 @@ or throws a typed error. Tests assert the invariants after each operation.
 - `dayKeyOf(t, settings)`: convert `t` to `settings.timezone`, subtract
   `dayStartHour` hours, format as `YYYY-MM-DD`.
 - `dayRange(dayKey, settings)`: `[start, end)` as UTC instants, where `start`
-  is `dayKey` at `dayStartHour` local and `end` is the next day's.
-- `splitByDay(segment, now, settings)`: slices one segment (open segments end
-  at `now`) into `{ dayKey, startedAt, endedAt, minutes }` pieces at logical
-  day boundaries.
+  is `dayKey` at `dayStartHour` local and `end` is the next day's. When
+  `dayStartHour` happens twice (clocks going back) the day starts at the
+  first; when it is skipped, at the moment the clocks jump. So `t` is in
+  `dayRange(k)` exactly when `dayKeyOf(t) === k`.
+- `splitByDay(start, end, settings)`: slices the span [start, end) in epoch
+  milliseconds (pass `now` as the end for the open segment) into
+  `{ dayKey, start, end }` pieces at logical day boundaries.
 
 ## Segment operations (`packages/shared/src/segments.ts`)
 
-All take the current non-deleted segments plus a `now` and return changes.
+All take the current segments (soft-deleted rows are ignored), parameters, and
+a context `{ now, newId }`. They return `{ rows, noop }`: every changed row in
+its new state with `updatedAt = now`, including created rows and deleted rows
+(with `deletedAt = now`). They never mutate their input and throw a
+`SegmentOpError` with a `code` on invalid input. A shared `clearRange` helper
+removes everything in a span: segments fully inside are deleted, segments
+overlapping an edge are trimmed, a segment containing the span is split in
+two. Any trimmed closed segment left shorter than one second is deleted (I5).
 
-- `switchCategory({ categoryId, at = now, newId, source })`
-  - If the open segment has the same `categoryId`: no-op.
-  - If `at < open.startedAt`: throw `SwitchBeforeOpenStart`.
-  - If `at > now + 60s`: throw `SwitchInFuture`.
-  - Close the open segment at `at` (if its length would be under one second,
-    delete it instead). Create a new open segment with `newId`.
-- `undoSwitch({ newSegmentId })`: delete the new segment, reopen the previous
-  one by setting `endedAt = null`. The UI offers this for 10 seconds after a
-  switch; the function itself has no time limit.
-- `backdateOpen({ startedAt })`: move the open segment's `startedAt` earlier
-  or later, and move the previous segment's `endedAt` to match. Validates
-  against the previous segment's `startedAt`.
-- `moveBoundary({ prevId, nextId, at })`: set `prev.endedAt = next.startedAt
-  = at`. Requires `prev.startedAt < at < (next.endedAt ?? now)`.
-- `changeCategory({ id, categoryId })`: recategorise without changing times.
+- `switchCategory({ categoryId, at = now, newSegmentId?, source })`
+  - Same category as the open segment: no-op.
+  - `at` up to 60 seconds in the future is clamped to now; later throws
+    `in_future`.
+  - Otherwise clears `[at, ∞)` (so the open segment closes at `at`, and a
+    backdated switch trims or removes whatever came after `at`) and opens a
+    new segment at `at`.
+- `backdateOpen({ startedAt })`: move the open segment's start. Earlier clears
+  what was there. Later pulls a touching previous segment's end along, or
+  leaves a gap if there was one already.
+- `editSegment({ id, categoryId?, startedAt?, endedAt?, note? })`: boundaries
+  behave like dragging. Moving the start later or the end earlier pulls a
+  touching neighbour along. Moving the start earlier or the end later clears
+  what was there. A pulled neighbour only takes over time the segment gave
+  up: when an edit moves the segment past its old end (or before its old
+  start), the time in between keeps whatever was there. The open segment's
+  end cannot be set (switch instead).
+  The UI previews the returned rows to show what else will change.
 - `splitSegment({ id, at, secondCategoryId })`: end the segment at `at`,
-  create a second segment from `at` to the original end with the given
-  category. If the original was open, the second is open.
-- `insertSegment({ categoryId, startedAt, endedAt })`: carve a closed segment
-  into existing history. Segments fully inside the range are deleted,
-  overlapping ones are truncated, a segment that fully contains the range is
-  split in two. `endedAt` must be `<= now`.
-- `deleteSegment({ id, fill: 'none' | 'prev' | 'next' })`: soft delete. With
-  `fill`, extend the neighbour to cover the gap. Deleting the open segment
-  with `fill: 'prev'` reopens the previous segment. Deleting the open segment
-  with `fill: 'none'` is refused (would violate P4), the UI offers switching
-  instead.
+  create a second segment from `at` to the original end. If the original was
+  open, the second is open. Both pieces must be at least one second, except
+  an open second piece.
+- `insertSegment({ categoryId, startedAt, endedAt, note? })`: clear the span
+  and add a closed segment. Used for gap assignment and logging after the
+  fact. `endedAt` must be `<= now`.
+- `deleteSegment({ id, fill: 'none' | 'prev' | 'next' })`: soft delete.
+  `prev` extends the previous segment over the freed time; `next` pulls the
+  next segment's start back. Deleting the open segment requires `prev` and
+  reopens the previous segment (P4).
+- `undoRows(prior, changedRows, now)`: rows that reverse an operation. The
+  Now screen's 10 second Undo uses it.
+- `checkInvariants(segments)`: human-readable violations of I1, I2, I5. Tests
+  run it after every operation; the server runs it before committing an op.
 
 ## Aggregation (`packages/shared/src/stats.ts`)
 
-- `totalsForRange(segments, from, to, now)`: minutes per category plus
-  untracked minutes, computed by clipping segments to the range.
-- `timelineForDay(segments, dayKey, now, settings)`: ordered blocks for the
-  Today bar, with explicit `untracked` blocks for gaps.
-- `dailyTotals(segments, dayKeys, now, settings)`: per-day map for stacked
-  bars.
-- `hourHeatmap(segments, dayKeys, now, settings)`: 24 x categories matrix of
-  minutes, in local hours.
-- `budgetStatus(rules, dailyTotals)`: for each daily rule, days under and over.
+All durations are milliseconds; the UI formats them.
+
+- `totalsForRange(segments, from, to, now)`: `{ byCategory, trackedMs,
+  untrackedMs }` by clipping segments to the range. Untracked time only counts
+  after the earliest segment in the input and before now, so pass the full
+  history (or at least the earliest live segment) when untracked matters.
+- `sortedTotals(byCategory)`: category totals, largest first.
+- `todayMsFor(segments, categoryId, dayKey, settings, now)`: one category's
+  time in one logical day.
+- `timelineForDay(segments, dayKey, settings, now)`: ordered blocks for the
+  Today bar, with explicit gap blocks for untracked time.
+- `dailyTotals(segments, dayKeys, settings, now)`: per-day map of per-category
+  time, for stacked bars.
+- `hourHeatmap(segments, from, to, timezone, now)`: per category, 24 numbers of
+  time in each local hour of day.
+- `budgetStatus(rules, daily, dayKeys)`: for each enabled daily rule, days
+  under and over and the current streak under budget.
+- `movingAverage(values, window)`: trailing average for trend lines.
+
+Inserting a closed block inside the running segment splits it, and the
+still-running tail gets a new id. Session rules and the stale check restart
+for the tail, which matches their meaning: one unbroken stretch.
 
 ## Rule engine (`packages/shared/src/rules.ts`)
 
@@ -263,11 +312,11 @@ interface RuleEngineInput {
   openSegment: Segment | null;
   category: Category | null;
   rules: Rule[];                 // enabled, for this category only
-  todayMinutes: number;          // this category, current logical day, incl. open segment to now
+  todayMs: number;               // this category, current logical day, incl. open segment to now
   log: NotificationLog[];        // rows for this segment id or today's dayKey
 }
 
-interface Notification {
+interface PendingNotification {
   kind: 'session' | 'daily' | 'stale';
   ruleId: string | null;
   segmentId: string | null;
@@ -277,7 +326,7 @@ interface Notification {
   tag: string;                   // collapses repeats on the device
 }
 
-function evaluateRules(input: RuleEngineInput): Notification[];
+function evaluateRules(input: RuleEngineInput): PendingNotification[];
 ```
 
 Semantics, evaluated once a minute:
@@ -286,10 +335,12 @@ Semantics, evaluated once a minute:
 2. Let `sessionMin = minutesBetween(openSegment.startedAt, now)`.
 3. **Session rules.** Dedupe key `(ruleId, segmentId)`. Fire when
    `sessionMin >= thresholdMin` and either no log row exists for the key, or
-   `repeatEveryMin` is set and `now - lastSentAt >= repeatEveryMin`.
+   `repeatEveryMin` is set and `now - lastSentAt >= repeatEveryMin` minus a
+   30 second tolerance for cron drift.
 4. **Daily rules.** Dedupe key `(ruleId, dayKeyOf(now))`. Fire when
    `todayMinutes >= thresholdMin` with the same repeat logic.
-5. **Stale check.** Skipped when `category.exemptFromStaleCheck`. Dedupe key
+5. **Stale check.** Skipped when `settings.staleEnabled` is false or
+   `category.exemptFromStaleCheck`. Dedupe key
    `('stale', segmentId)`. Fire when `sessionMin >= staleAfterMin`, repeat
    every `staleRepeatMin`.
 6. **Quiet hours.** A rule (or the stale check) inside its quiet window is
@@ -303,8 +354,9 @@ Semantics, evaluated once a minute:
      `"That's past your {threshold} budget for today."`
    - stale: title `"Still on {category}?"`, body
      `"It's been {duration}. Tap to update if you've moved on."`
-   - `tag` is `"{kind}:{ruleId ?? 'stale'}"` so a repeat replaces the previous
-     banner rather than stacking.
+   - `tag` is `"{kind}:{ruleId}"`, or `"stale"`, so a repeat replaces the
+     previous banner rather than stacking.
+   - A custom `rule.message` replaces the body; the title stays.
 
 Required tests (minimum):
 

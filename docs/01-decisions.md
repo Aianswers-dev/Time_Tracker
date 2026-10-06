@@ -37,9 +37,13 @@ editable later (rename, recolour, reorder, archive, add new).
 | 9 | Socialising | Friends, family, calls, going out | Pink | On |
 | 10 | Hobbies | Anything fun that is not Relaxing | Green | On |
 
-Colours must be distinguishable on a dark and a light background and are the
-only way categories are told apart on the timeline, so pick a palette with
-care. Final hex values are chosen during M1.
+Colours must be distinguishable on a dark and a light background. The final
+values are `CATEGORY_PALETTE` in `packages/shared/src/seed.ts`, chosen with the
+dataviz palette method: every colour is at least 3:1 against both themes'
+backgrounds and has a label colour reaching 4.5:1. With ten categories some
+pairs are inevitably close, so the timeline never relies on colour alone:
+blocks are separated by a thin gap and tapping one names it. Casual work uses
+a concierge bell icon rather than a coffee cup.
 
 **P6. Three nudge types, all supported.** Session limit (one unbroken
 stretch), daily budget (total for the logical day), stale check (any category
