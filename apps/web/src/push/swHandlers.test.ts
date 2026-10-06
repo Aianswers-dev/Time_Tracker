@@ -204,14 +204,21 @@ describe('notificationclick handler', () => {
   });
 
   it('never opens or navigates off-origin through a double-slash path', async () => {
-    const none = clients([]);
+    const opened: string[] = [];
+    const none = {
+      matchAll: vi.fn(() => Promise.resolve([])),
+      openWindow: vi.fn((url: string) => {
+        opened.push(url);
+        return Promise.resolve(undefined);
+      }),
+    } satisfies ClientsLike;
     await handleNotificationClick(
       { data: { url: `${ORIGIN}//evil.example/phish` }, close: vi.fn() },
       none,
       ORIGIN,
     );
-    const opened = none.openWindow.mock.calls[0]?.[0] as string;
-    expect(new URL(opened).origin).toBe(ORIGIN);
+    expect(opened).toHaveLength(1);
+    expect(new URL(opened[0] ?? '').origin).toBe(ORIGIN);
 
     const app = client(`${ORIGIN}/settings`);
     await handleNotificationClick(
