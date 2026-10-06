@@ -45,5 +45,21 @@ export default defineConfig([
     extends: [tseslint.configs.disableTypeChecked],
     languageOptions: { globals: globals.node },
   },
+  {
+    // Scriptable (iOS) widget scripts run in Scriptable's own runtime.
+    files: ['tools/scriptable/**/*.js'],
+    languageOptions: {
+      globals: {
+        Color: 'readonly',
+        DateFormatter: 'readonly',
+        FileManager: 'readonly',
+        Font: 'readonly',
+        ListWidget: 'readonly',
+        Request: 'readonly',
+        Script: 'readonly',
+        config: 'readonly',
+      },
+    },
+  },
   prettier,
 ]);
