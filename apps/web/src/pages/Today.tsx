@@ -18,7 +18,7 @@ import { useSearchParams } from 'react-router';
 import { CategoryBadge, UntrackedBadge } from '../components/CategoryBadge';
 import { Button } from '../components/ui';
 import { useCategories, useCategoryMap, useSegmentsAround, useSettings } from '../data/hooks';
-import { dayLabel, timeOnDay } from '../lib/format';
+import { dayLabel, shortDateLabel, timeOnDay } from '../lib/format';
 import { useNow } from '../lib/useNow';
 import { AssignSheet } from './today/AssignSheet';
 import { blockKey } from './today/blocks';
@@ -141,7 +141,9 @@ export function Today() {
           <h1 className="truncate text-xl font-semibold" data-testid="day-title">
             {dayLabel(dayKey, todayKey)}
           </h1>
-          <p className="tabular text-xs text-muted">{dayKey}</p>
+          {dayLabel(dayKey, todayKey) !== shortDateLabel(dayKey) && (
+            <p className="text-xs text-muted">{shortDateLabel(dayKey)}</p>
+          )}
         </div>
         <button
           type="button"

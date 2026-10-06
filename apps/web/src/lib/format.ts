@@ -29,6 +29,11 @@ export function weekdayOfKeyLabel(key: string): string {
   return weekdayFmt.format(keyToUtcDate(key));
 }
 
+/** "Mon 5 Oct" for a "YYYY-MM-DD" key. */
+export function shortDateLabel(key: DayKey): string {
+  return longFmt.format(keyToUtcDate(key));
+}
+
 /** "Today", "Yesterday" or "Mon 5 Oct". */
 export function dayLabel(dayKey: DayKey, todayKey: DayKey): string {
   if (dayKey === todayKey) return 'Today';
