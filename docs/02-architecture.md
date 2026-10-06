@@ -122,7 +122,9 @@ outbox. Store the returned `serverTime` as the new `lastSync`.
 5. One write batch: a `notification_log` row for each notification, plus a
    prune of log rows older than 60 days (except the open segment's). The log
    is written before anything is sent, so a crash mid-send cannot cause a
-   duplicate on the next minute.
+   duplicate on the next minute. Each row is inserted only if no row for the
+   same notification appeared since the run's read, and only inserted rows
+   are sent, so two overlapping runs (a cron delivered twice) send it once.
 6. Send each notification to each subscription (subscriptions in parallel,
    notifications to one subscription in order), at most 3 sends per run. When
    more are due than fit, the extra notifications are neither logged nor sent
@@ -175,7 +177,11 @@ actual refresh cadence.
   `updatedAt` is at least the stored one, otherwise acknowledges and ignores it.
 - A `switch` op carries the new segment's id, so a replay after a timeout is
   a no-op. The server runs the shared `switchCategory` against its own state,
-  so an offline switch still lands correctly after a Shortcut switch.
+  with the op's `createdAt` as `madeAt`: a switch that waited offline still
+  lands, and a Shortcut switch made in the meantime stays (the offline
+  segment ends where it starts). Its rows carry the op's `createdAt` (capped
+  at the server's time) as `updatedAt`, so an edit or Undo queued after the
+  switch wins last-write-wins against them.
 - Failed ops (any `ok: false` result) are dropped from the outbox, a toast
   names the change that did not sync, and the client does a full resync:
   it replaces its local synced tables with a full snapshot. The server is the
@@ -225,11 +231,14 @@ actual refresh cadence.
   `GET /api/snapshot` without `since`, then one transaction clears
   `categories`, `segments`, `rules` and `settings` and writes the snapshot
   (rows touched by pending ops keep their local copy, as above). Guard: if
-  the server has no live categories but this phone has some, nothing is
-  wiped; the round fails with "Your server has no categories, so this phone
-  kept its data instead of replacing it" and the flag stays set. Reset
-  discards the outbox inside that same transaction, so a refused Reset keeps
-  the outbox too.
+  the server has no live categories but this phone has some, or the
+  snapshot lacks (even as a deleted row) a category this phone has live
+  entries in (a server that lost its data and got a rename or a switch back
+  since), nothing is wiped; the round fails with "Your server is missing
+  data this phone has, so this phone kept its data instead of replacing it",
+  `serverEmpty` is set (Settings offers the upload) and the flag stays set.
+  Reset discards the outbox inside that same transaction, so a refused
+  Reset keeps the outbox too.
 - **State for the UI.** Dexie `meta` holds `lastSync` (server time, the
   pull cursor), `lastSyncedAt` (device time, for display), `tokenRejected`,
   `syncError` (`{ message, at, kind }`, kind `retry`, `problem` or `notice`,

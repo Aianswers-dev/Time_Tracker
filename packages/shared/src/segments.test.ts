@@ -233,6 +233,61 @@ describe('switchCategory', () => {
       'invalid_range',
     );
   });
+
+  describe('madeAt: a switch applied after it was made', () => {
+    it('keeps segments that started after it was made and fills up to them', () => {
+      // A open since 0. The phone switched to T at 30 while offline; a
+      // Shortcut switched to X at 45. The phone's op arrives at 60.
+      const segs = [seg('a', 'A', at(0), at(45)), seg('x', 'X', at(45), null)];
+      const { result, after } = runOp(segs, makeCtx(at(60)), (s, c) =>
+        switchCategory(s, { categoryId: 'T', at: at(30), madeAt: at(30), newSegmentId: 't' }, c),
+      );
+      expect(describeLive(after)).toEqual(['A 0-30', 'T 30-45', 'X 45-']);
+      expect(result.opened).toBeNull();
+      expect(row(result.rows, 't').endedAt).toBe(at(45));
+      expect(checkInvariants(after)).toEqual([]);
+    });
+
+    it('still clears what started between at and madeAt (a backdated switch)', () => {
+      // Made at 40 for "since 20": the B from 30 was known and is replaced; X from 50 is later.
+      const segs = [
+        seg('a', 'A', at(0), at(30)),
+        seg('b', 'B', at(30), at(50)),
+        seg('x', 'X', at(50), null),
+      ];
+      const { after } = runOp(segs, makeCtx(at(60)), (s, c) =>
+        switchCategory(s, { categoryId: 'T', at: at(20), madeAt: at(40) }, c),
+      );
+      expect(describeLive(after)).toEqual(['A 0-20', 'T 20-50', 'X 50-']);
+    });
+
+    it('a later segment of the same category is not a no-op', () => {
+      const segs = [seg('a', 'A', at(0), at(45)), seg('t', 'T', at(45), null)];
+      const { after } = runOp(segs, makeCtx(at(60)), (s, c) =>
+        switchCategory(s, { categoryId: 'T', at: at(30), madeAt: at(30) }, c),
+      );
+      expect(describeLive(after)).toEqual(['A 0-30', 'T 30-45', 'T 45-']);
+    });
+
+    it('nothing later: the usual switch', () => {
+      const segs = [seg('a', 'A', at(0), null)];
+      const { result, after } = runOp(segs, makeCtx(at(60)), (s, c) =>
+        switchCategory(s, { categoryId: 'T', at: at(30), madeAt: at(30) }, c),
+      );
+      expect(describeLive(after)).toEqual(['A 0-30', 'T 30-']);
+      expect(result.opened?.categoryId).toBe('T');
+    });
+
+    it('a later segment starting under a second after at leaves nothing behind', () => {
+      const segs = [seg('a', 'A', at(0), at(30, 0, 500)), seg('x', 'X', at(30, 0, 500), null)];
+      const { result, after } = runOp(segs, makeCtx(at(60)), (s, c) =>
+        switchCategory(s, { categoryId: 'T', at: at(30), madeAt: at(30), newSegmentId: 't' }, c),
+      );
+      expect(describeLive(after)).toEqual(['A 0-30', 'X 30+500ms-']);
+      expect(result.rows.some((r) => r.id === 't')).toBe(false);
+      expect(checkInvariants(after)).toEqual([]);
+    });
+  });
 });
 
 describe('backdateOpen', () => {

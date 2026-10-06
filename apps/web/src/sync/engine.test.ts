@@ -4,6 +4,7 @@ import {
   SEED_CATEGORIES,
   SEED_RULES,
   SETTINGS_ID,
+  switchCategory,
   toIso,
   uuidv7,
   type Category,
@@ -12,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getToken, setToken } from '../api/client';
 import { updateCategory } from '../data/categoryActions';
 import { ensureSeeded } from '../data/seed';
-import { switchTo } from '../data/segmentActions';
+import { switchTo, undoAction } from '../data/segmentActions';
 import { updateSettings } from '../data/settingsActions';
 import { CAT, liveSegments, resetDb, seg } from '../data/testUtils';
 import { db } from '../db';
@@ -267,6 +268,97 @@ describe('pull', () => {
     expect(await getMeta(SYNC_META.lastSync)).not.toBe(cursor);
   });
 
+  it('Undo of a switch still works after the switch synced and came back', async () => {
+    const server = await connected();
+    await requestSync();
+    tick();
+    const first = await switchTo(CAT.sleep);
+    await requestSync();
+    tick();
+    const second = await switchTo(CAT.housework);
+    // The outbox flushes about a second later; the server stamps the switch
+    // with its own clock and the pull brings that copy back.
+    tick(1_000);
+    await requestSync();
+    tick(2_000);
+    if (!second.undo) throw new Error('no undo token');
+
+    await undoAction(second.undo);
+    expect((await liveSegments()).filter((s) => s.endedAt === null).map((s) => s.id)).toEqual([
+      first.opened?.id,
+    ]);
+    await requestSync();
+    const serverOpen = [...server.segments.values()]
+      .map((s) => s.row)
+      .filter((s) => s.deletedAt === null && s.endedAt === null);
+    expect(serverOpen.map((s) => s.id)).toEqual([first.opened?.id]);
+    expect((await liveSegments()).filter((s) => s.endedAt === null).map((s) => s.id)).toEqual([
+      first.opened?.id,
+    ]);
+  });
+
+  it('an Undo made before the switch was flushed survives the flush', async () => {
+    const server = await connected();
+    await requestSync();
+    tick();
+    const first = await switchTo(CAT.sleep);
+    await requestSync();
+    tick();
+    const second = await switchTo(CAT.housework);
+    tick(500);
+    if (!second.undo) throw new Error('no undo token');
+    await undoAction(second.undo);
+    // Both ops reach the server later, in one request.
+    tick(60_000);
+    await requestSync();
+
+    const open = (s: { deletedAt: string | null; endedAt: string | null }) =>
+      s.deletedAt === null && s.endedAt === null;
+    expect((await liveSegments()).filter(open).map((s) => s.id)).toEqual([first.opened?.id]);
+    const serverOpen = [...server.segments.values()].map((s) => s.row).filter(open);
+    expect(serverOpen.map((s) => s.id)).toEqual([first.opened?.id]);
+  });
+
+  it('a switch that waited offline keeps a later Shortcut switch, on both sides', async () => {
+    const server = await connected();
+    tick();
+    await switchTo(CAT.sleep);
+    await requestSync();
+    // Offline: switch to Housework. The op waits in the outbox.
+    tick();
+    const offline = await switchTo(CAT.housework);
+    // 30 minutes later a Shortcut switches the server to Relaxing.
+    tick(30 * 60_000);
+    const live = [...server.segments.values()].map((s) => s.row).filter((s) => !s.deletedAt);
+    const shortcut = switchCategory(
+      live,
+      { categoryId: CAT.relaxing, source: 'shortcut' },
+      { now: toIso(Date.now()), newId: () => uuidv7() },
+    );
+    server.put({ segments: shortcut.rows });
+    // Back online.
+    tick();
+    expect(await requestSync()).toEqual({ status: 'ok', again: false });
+
+    const local = await liveSegments();
+    expect(checkInvariants(local)).toEqual([]);
+    const byCategory = (rows: typeof local) =>
+      rows
+        .slice()
+        .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
+        .map((s) => [s.categoryId, s.endedAt === null ? 'open' : 'closed']);
+    expect(byCategory(local)).toEqual([
+      [CAT.sleep, 'closed'],
+      [CAT.housework, 'closed'],
+      [CAT.relaxing, 'open'],
+    ]);
+    expect(local.find((s) => s.id === offline.opened?.id)?.endedAt).toBe(
+      shortcut.opened?.startedAt,
+    );
+    const serverLive = [...server.segments.values()].map((s) => s.row).filter((s) => !s.deletedAt);
+    expect(byCategory(serverLive)).toEqual(byCategory(local));
+  });
+
   it('keeps a pending settings change over the server copy', async () => {
     const server = await connected();
     await requestSync();
@@ -353,6 +445,111 @@ describe('full resync', () => {
     expect((await syncError())?.kind).toBe('problem');
     expect(await getMeta(SYNC_META.needsFullResync)).toBe('1');
     expect(server.snapshotCalls()).toHaveLength(1);
+  });
+
+  it('keeps local data when the server lost it but got a category back since', async () => {
+    const server = await connected();
+    for (let i = 0; i < 6; i++) {
+      tick();
+      await switchTo(i % 2 === 0 ? CAT.relaxing : CAT.contractWork);
+    }
+    await requestSync();
+    const history = await liveSegments();
+    expect(history).toHaveLength(6);
+
+    // The server loses everything. The phone does not notice: incremental
+    // pulls never wipe. Then a rename lands, so the server has one category.
+    server.categories.clear();
+    server.segments.clear();
+    server.rules.clear();
+    server.settings = null;
+    tick();
+    await updateCategory(CAT.hobbies, { name: 'Fun' });
+    expect((await requestSync()).status).toBe('ok');
+    expect(server.categories.size).toBe(1);
+
+    // A switch to a category the server lost is refused, which asks for a full resync.
+    tick();
+    await switchTo(CAT.housework);
+    const outcome = await requestSync();
+
+    expect(outcome).toMatchObject({ status: 'error', kind: 'problem' });
+    expect(await getMeta(SYNC_META.serverEmpty)).toBe('1');
+    const after = await liveSegments();
+    for (const s of history) expect(after.map((x) => x.id)).toContain(s.id);
+    expect(await db.categories.count()).toBe(10);
+
+    // Reset is refused the same way and keeps the outbox.
+    tick();
+    await switchTo(CAT.relaxing);
+    expect(await requestReset()).toMatchObject({ status: 'error', kind: 'problem' });
+    expect(await db.outbox.count()).toBe(1);
+
+    // Uploading this phone restores the server, and then the full resync goes through.
+    const local = (await liveSegments()).map((s) => s.id).sort();
+    expect((await uploadThisPhone()).outcome).toEqual({ status: 'ok', again: false });
+    expect(server.categories.size).toBe(10);
+    expect((await liveSegments()).map((s) => s.id).sort()).toEqual(local);
+    expect(await getMeta(SYNC_META.serverEmpty)).toBeUndefined();
+  });
+
+  it('a refused op on a healthy server still replaces the local rows it made', async () => {
+    const server = await connected();
+    tick();
+    await switchTo(CAT.relaxing);
+    await requestSync();
+    // A Shortcut switched the server to Housework meanwhile; the phone switches there too.
+    const open = [...server.segments.values()].map((s) => s.row).find((s) => !s.endedAt);
+    if (!open) throw new Error('no open segment');
+    tick();
+    const at = toIso(Date.now());
+    const shortcut = { ...open, id: uuidv7(), categoryId: CAT.housework, startedAt: at };
+    server.put({ segments: [{ ...open, endedAt: at, updatedAt: at }, shortcut] });
+    tick();
+    await switchTo(CAT.housework);
+
+    expect((await requestSync()).status).toBe('ok');
+    expect(await getMeta(SYNC_META.serverEmpty)).toBeUndefined();
+    expect((await liveSegments()).map((s) => s.id).sort()).toEqual([open.id, shortcut.id].sort());
+  });
+
+  it('drops a refused switch’s segment even when an op made during the resync closed it', async () => {
+    const server = await connected();
+    tick();
+    await switchTo(CAT.sleep);
+    await requestSync();
+    // A Shortcut switches the server to Relaxing. The phone, offline and not
+    // knowing, switches to Relaxing too.
+    tick();
+    const live = [...server.segments.values()].map((s) => s.row).filter((s) => !s.deletedAt);
+    const shortcut = switchCategory(
+      live,
+      { categoryId: CAT.relaxing, source: 'shortcut' },
+      { now: toIso(Date.now()), newId: () => uuidv7() },
+    );
+    server.put({ segments: shortcut.rows });
+    tick(5 * 60_000);
+    const refused = await switchTo(CAT.relaxing);
+    // Back online: the switch is a conflict, and while the full resync is in
+    // flight the owner switches to Housework, which closes the refused segment.
+    tick(5 * 60_000);
+    server.duringSnapshot = async () => {
+      if (server.snapshotCalls().at(-1)?.path !== '/api/snapshot') return;
+      server.duringSnapshot = null;
+      tick(1_000);
+      await switchTo(CAT.housework);
+    };
+    expect((await syncRound()).status).toBe('ok');
+    expect(checkInvariants(await db.segments.toArray())).toEqual([]);
+
+    expect(await syncRound()).toEqual({ status: 'ok', again: false });
+    const local = await liveSegments();
+    expect(local.some((s) => s.id === refused.opened?.id)).toBe(false);
+    expect(checkInvariants(local)).toEqual([]);
+    const shape = (rows: typeof local) =>
+      rows.map((s) => `${s.id} ${s.startedAt} ${s.endedAt}`).sort();
+    const remote = [...server.segments.values()].map((s) => s.row).filter((s) => !s.deletedAt);
+    expect(shape(local)).toEqual(shape(remote));
   });
 
   it('reset discards the outbox and re-downloads everything', async () => {

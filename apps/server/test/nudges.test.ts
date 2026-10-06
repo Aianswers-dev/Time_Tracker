@@ -604,6 +604,29 @@ describe('VAPID subject and keys', () => {
 });
 
 describe('notification log', () => {
+  it('two overlapping runs (a cron delivered twice) send each notification once', async () => {
+    const { relax } = await setup();
+    const session = makeRule(relax.id, { kind: 'session', thresholdMin: 60, repeatEveryMin: 30 });
+    const daily = makeRule(relax.id, { kind: 'daily', thresholdMin: 60, repeatEveryMin: null });
+    await insertRules(server.db(), [session, daily]);
+    await insertSegments(server.db(), [makeSegment(relax.id, iso(T - 60 * MIN), null)]);
+    await subscribe();
+
+    const [a, b] = await Promise.all([runAt(T), runAt(T)]);
+    expect([...a.sent, ...b.sent].map((m) => m.payload.tag).sort()).toEqual(
+      [`daily:${daily.id}`, `session:${session.id}`].sort(),
+    );
+    expect(await logRows()).toHaveLength(2);
+    expect([...a.report.fired, ...b.report.fired].sort()).toEqual(
+      [`daily:${daily.id}`, `session:${session.id}`].sort(),
+    );
+
+    // The repeat 30 minutes later is claimed once too.
+    const [c, d] = await Promise.all([runAt(T + 30 * MIN), runAt(T + 30 * MIN)]);
+    expect([...c.sent, ...d.sent].map((m) => m.payload.tag)).toEqual([`session:${session.id}`]);
+    expect(await logRows()).toHaveLength(3);
+  });
+
   it(`prunes rows older than ${LOG_RETENTION_DAYS} days when it writes, but keeps the open segment's`, async () => {
     const { relax } = await setup();
     const rule = makeRule(relax.id, { thresholdMin: 60, repeatEveryMin: null });

@@ -165,7 +165,7 @@ user action is one op, applied atomically.
 
 | type | payload | server behaviour |
 | --- | --- | --- |
-| `switch` | `{ categoryId, at, newSegmentId, source }` | If `newSegmentId` already exists: ok, no-op (replay). If the server's open segment already has `categoryId` under a different id: `conflict` (state diverged, client resyncs). Else run shared `switchCategory` against server state and write the result. `at` more than 60 s ahead: `switch_in_future`. |
+| `switch` | `{ categoryId, at, newSegmentId, source }` | If `newSegmentId` already exists: ok, no-op (replay). If the server's open segment already has `categoryId` under a different id and started before the switch was made: `conflict` (state diverged, client resyncs). Else run shared `switchCategory` (with `madeAt` = the op's `createdAt`) against server state and write the result. `at` more than 60 s ahead: `switch_in_future`. |
 | `segments.upsert` | `{ rows: Segment[] }` (1 to 100) | Every edit, undo and delete. Apply each row by last-write-wins, then check I1 and I2 across the affected time window. Any violation rejects the whole op with `conflict`. |
 | `category.upsert` | `Category` | Last-write-wins upsert. Setting `deletedAt` while live segments reference the category: `conflict` (the UI archives instead). |
 | `rule.upsert` | `Rule` | Last-write-wins upsert. Unknown `categoryId`: `validation_failed`. |
@@ -184,9 +184,14 @@ Details of each op type:
   soft-deleted ones included, so a switch the client later undid is not
   re-applied. A missing or deleted `categoryId` is `validation_failed`. The
   server loads the live segments that end after `at` (plus the open one),
-  runs the shared `switchCategory` with its own clock as `now`, and writes the
-  rows it returns. Those rows carry the server's time as `updatedAt` and skip
-  the last-write-wins guard, because they describe the current state.
+  runs the shared `switchCategory` with its own clock as `now` and the op's
+  `createdAt` (capped at now) as `madeAt`, and writes the rows it returns.
+  Segments that started after the switch was made (a Shortcut switch while
+  the phone was offline) stay, and the new segment ends where the first of
+  them starts. The rows carry that same `madeAt` as `updatedAt`, the time the
+  phone made the change, so ops queued after it (an Undo, an edit) are newer
+  and win last-write-wins. They skip the last-write-wins guard, because they
+  describe the current state.
 - `segments.upsert`: the same id twice in one op is `validation_failed`. A
   row whose category does not exist, or a live row whose category is deleted,
   is `validation_failed`. The affected window runs from the earliest start to

@@ -1,4 +1,6 @@
 import {
+  applyRows,
+  checkInvariants,
   switchCategory,
   toIso,
   toMs,
@@ -17,8 +19,12 @@ import { vi } from 'vitest';
  * Test helper, not imported by the app: a stand-in for the Worker behind a
  * mocked `fetch`. It keeps rows in memory with a `syncedAt` like the real
  * server, applies ops the same way in spirit (a switch runs the shared
- * `switchCategory`), answers at most `maxApplied` ops per request and
- * returns the 10 s overlap on `since` pulls.
+ * `switchCategory` with the server's clock and the op's `createdAt` as
+ * `madeAt`, stamping the rows with that time, unknown categories are
+ * `validation_failed`, a switch to the category already open under another
+ * id is `conflict` and so is an upsert that breaks I1, I2 or I5), answers at
+ * most `maxApplied` ops per request and returns the 10 s overlap on `since`
+ * pulls.
  */
 
 export interface Call {
@@ -98,14 +104,33 @@ export function fakeServer(token = 'secret'): FakeServer {
     return !stored || incoming.updatedAt >= stored.row.updatedAt;
   }
 
-  function apply(op: Op): void {
+  /** A live (not deleted) category the server knows, as the real server checks. */
+  function knownCategory(id: string): boolean {
+    const c = server.categories.get(id);
+    return c !== undefined && c.row.deletedAt === null;
+  }
+
+  /** Apply one op like the real server; return its error, if any. */
+  function apply(op: Op): OpResult['error'] | undefined {
     const now = Date.now();
     switch (op.type) {
       case 'switch': {
-        if (server.segments.has(op.payload.newSegmentId)) return;
+        if (server.segments.has(op.payload.newSegmentId)) return undefined;
+        if (!knownCategory(op.payload.categoryId)) {
+          return { code: 'validation_failed', message: 'Unknown category' };
+        }
         const live = [...server.segments.values()]
           .map((s) => s.row)
           .filter((s) => s.deletedAt === null);
+        const madeAtMs = Math.min(toMs(op.createdAt), now);
+        const open = live.find((s) => s.endedAt === null);
+        if (
+          open &&
+          open.categoryId === op.payload.categoryId &&
+          toMs(open.startedAt) <= Math.max(toMs(op.payload.at), madeAtMs)
+        ) {
+          return { code: 'conflict', message: 'Already on that category under another segment' };
+        }
         const result = switchCategory(
           live,
           {
@@ -113,28 +138,40 @@ export function fakeServer(token = 'secret'): FakeServer {
             at: op.payload.at,
             newSegmentId: op.payload.newSegmentId,
             source: op.payload.source,
+            madeAt: toIso(madeAtMs),
           },
           { now: toIso(now), newId: () => uuidv7() },
         );
-        server.put({ segments: result.rows });
-        return;
+        server.put({ segments: result.rows.map((r) => ({ ...r, updatedAt: toIso(madeAtMs) })) });
+        return undefined;
       }
-      case 'segments.upsert':
-        server.put({ segments: op.payload.rows.filter((r) => wins(r, server.segments.get(r.id))) });
-        return;
+      case 'segments.upsert': {
+        const winners = op.payload.rows.filter((r) => wins(r, server.segments.get(r.id)));
+        if (winners.some((r) => !server.categories.has(r.categoryId))) {
+          return { code: 'validation_failed', message: 'Unknown category' };
+        }
+        const live = [...server.segments.values()].map((s) => s.row);
+        const problems = checkInvariants(applyRows(live, winners));
+        if (problems.length > 0) return { code: 'conflict', message: problems.join('; ') };
+        server.put({ segments: winners });
+        return undefined;
+      }
       case 'category.upsert':
         if (wins(op.payload, server.categories.get(op.payload.id))) {
           server.put({ categories: [op.payload] });
         }
-        return;
+        return undefined;
       case 'rule.upsert':
+        if (!server.categories.has(op.payload.categoryId)) {
+          return { code: 'validation_failed', message: 'Unknown category' };
+        }
         if (wins(op.payload, server.rules.get(op.payload.id))) server.put({ rules: [op.payload] });
-        return;
+        return undefined;
       case 'settings.upsert':
         if (wins(op.payload, server.settings ?? undefined)) {
           server.settings = { row: op.payload, syncedAt: now };
         }
-        return;
+        return undefined;
     }
   }
 
@@ -149,13 +186,8 @@ export function fakeServer(token = 'secret'): FakeServer {
       const ops = (call.body as { ops: Op[] }).ops;
       const results: OpResult[] = [];
       for (const op of ops.slice(0, server.maxApplied)) {
-        const error = server.failOp(op);
-        if (error) {
-          results.push({ opId: op.opId, ok: false, error });
-          continue;
-        }
-        apply(op);
-        results.push({ opId: op.opId, ok: true });
+        const error = server.failOp(op) ?? apply(op);
+        results.push(error ? { opId: op.opId, ok: false, error } : { opId: op.opId, ok: true });
       }
       return json(200, { results, serverTime: toIso(Date.now()) });
     }

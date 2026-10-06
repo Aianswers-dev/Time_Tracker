@@ -9,8 +9,8 @@ import {
   uuidv7,
   type PendingNotification,
 } from '@time-tracker/shared';
-import { and, isNull, lt, ne, or } from 'drizzle-orm';
-import { runBatch, type Db, type Statement } from '../db/client';
+import { and, isNull, lt, ne, or, sql } from 'drizzle-orm';
+import type { Db } from '../db/client';
 import {
   categoryFromRow,
   notificationLogFromRow,
@@ -45,7 +45,10 @@ import type { Clock } from '../sync/ops';
  *    has normally happened already.)
  * 3. One write batch: a `notification_log` row per notification, written
  *    before anything is sent so a crash mid-send cannot cause a duplicate next
- *    minute, plus pruning log rows older than LOG_RETENTION_DAYS.
+ *    minute, plus pruning log rows older than LOG_RETENTION_DAYS. Each row is
+ *    only inserted if no other run logged the same notification since this
+ *    run's read, and only inserted rows are sent, so two overlapping runs
+ *    never both send it.
  * 4. One batch recording each subscription's outcome.
  *
  * Sends (subrequests) are capped at MAX_PUSH_SENDS_PER_INVOCATION. When more
@@ -104,17 +107,30 @@ export interface NudgeRunDeps {
   log?: (report: NudgeRunReport) => void;
 }
 
-function logRow(p: PendingNotification, now: string, nowMs: number) {
-  return {
-    id: uuidv7(nowMs),
-    kind: p.kind,
-    ruleId: p.ruleId,
-    segmentId: p.segmentId,
-    dayKey: p.dayKey,
-    sentAt: now,
-    title: p.title,
-    body: p.body,
-  };
+/**
+ * Write the log row for `p`, unless a row for the same notification exists
+ * that this run did not read: another run (a cron delivered twice, or a slow
+ * one overlapping the next minute) decided to send it after this run's read.
+ * Its batch is one transaction, so of two overlapping runs exactly one
+ * inserts (`changes` 1) and sends.
+ */
+function claimLogRow(
+  db: Db,
+  p: PendingNotification,
+  readIds: readonly string[],
+  now: string,
+  nowMs: number,
+) {
+  // Values in the table's column order: id, kind, rule_id, segment_id, day_key, sent_at, title, body.
+  return db.insert(notificationLog).select(sql`
+    SELECT ${uuidv7(nowMs)}, ${p.kind}, ${p.ruleId}, ${p.segmentId}, ${p.dayKey}, ${now},
+      ${p.title}, ${p.body}
+    WHERE NOT EXISTS (
+      SELECT 1 FROM notification_log
+      WHERE kind = ${p.kind} AND rule_id IS ${p.ruleId} AND segment_id IS ${p.segmentId}
+        AND day_key IS ${p.dayKey}
+        AND id NOT IN (SELECT value FROM json_each(${JSON.stringify(readIds)}))
+    )`);
 }
 
 /**
@@ -187,6 +203,7 @@ export async function runNudges(deps: NudgeRunDeps): Promise<NudgeRunReport> {
   const settings = orDefaultSettings(firstSettings(settingsRows));
   const categoryRow = categoryRows[0];
   const dayKey = dayKeyOf(nowMs, settings);
+  const logRows = [...segmentLogRows, ...dailyLogRows];
   const pending = evaluateRules({
     now,
     settings,
@@ -194,7 +211,7 @@ export async function runNudges(deps: NudgeRunDeps): Promise<NudgeRunReport> {
     category: categoryRow ? categoryFromRow(categoryRow) : null,
     rules: ruleRows.map(ruleFromRow),
     todayMs: todayMsFor(recentRows.map(segmentFromRow), open.categoryId, dayKey, settings, nowMs),
-    log: [...segmentLogRows, ...dailyLogRows].map(notificationLogFromRow),
+    log: logRows.map(notificationLogFromRow),
   });
   if (pending.length === 0) return finish('nothing_due');
 
@@ -209,16 +226,19 @@ export async function runNudges(deps: NudgeRunDeps): Promise<NudgeRunReport> {
   // Stay within the send budget: every target gets the same notifications.
   const targets = pickTargets(subscriptionRows);
   const perTarget = Math.max(1, Math.floor(MAX_PUSH_SENDS_PER_INVOCATION / targets.length));
-  const toSend = pending.slice(0, perTarget);
-  report.fired = toSend.map((p) => p.tag);
+  const due = pending.slice(0, perTarget);
   report.deferred = pending.slice(perTarget).map((p) => p.tag);
 
-  // 3. Log first, prune in the same batch.
-  const writes: Statement[] = toSend.map((p) =>
-    db.insert(notificationLog).values(logRow(p, now, nowMs)),
-  );
-  writes.push(pruneLog(db, nowMs, open.id));
-  await runBatch(db, writes);
+  // 3. Log first, prune in the same batch. Only notifications this run
+  // claimed are sent; another run already sends the rest.
+  const readIds = logRows.map((r) => r.id);
+  const results = await db.batch([
+    pruneLog(db, nowMs, open.id),
+    ...due.map((p) => claimLogRow(db, p, readIds, now, nowMs)),
+  ]);
+  const toSend = due.filter((_, i) => results[i + 1]?.meta.changes === 1);
+  report.fired = toSend.map((p) => p.tag);
+  if (toSend.length === 0) return finish('nothing_due');
 
   // 4. Send, then record each subscription's outcome.
   const delivery: DeliveryReport = await deliver(

@@ -1,11 +1,14 @@
 import {
+  applyRows,
   backdateOpen,
+  checkInvariants,
   deleteSegment,
   editSegment,
   insertSegment,
   SegmentOpError,
   splitSegment,
   switchCategory,
+  toIso,
   toMs,
   undoRows,
   uuidv7,
@@ -195,21 +198,52 @@ export function backdateOpenTo(startedAt: ISO): Promise<ActionOutcome> {
 }
 
 /**
- * Reverse an applied action. Refuses when any of its rows changed since, so a
+ * Whether a row still says what the action wrote. `updatedAt` and the exact
+ * `deletedAt` are left out on purpose: a sync in between replaces the rows
+ * with the server's copy, and the server stamps the rows of a switch with
+ * its own clock.
+ */
+function sameState(a: Segment, b: Segment): boolean {
+  return (
+    a.categoryId === b.categoryId &&
+    a.startedAt === b.startedAt &&
+    a.endedAt === b.endedAt &&
+    a.note === b.note &&
+    (a.deletedAt === null) === (b.deletedAt === null)
+  );
+}
+
+function tooLate(): SegmentOpError {
+  return new SegmentOpError('invalid_range', 'Too late to undo: that entry has changed since.');
+}
+
+/**
+ * Reverse an applied action. Refuses when any of its rows changed since, or
+ * when putting the old rows back would overlap something added since, so a
  * late Undo never overwrites a newer edit.
  */
 export async function undoAction(token: UndoToken): Promise<ActionOutcome> {
   return db.transaction('rw', db.segments, db.outbox, async () => {
-    const now = new Date().toISOString();
     const current = await db.segments.bulkGet(token.changed.map((r) => r.id));
     const moved = token.changed.some((row, i) => {
       const cur = current[i];
-      return !cur || cur.updatedAt !== row.updatedAt || cur.deletedAt !== row.deletedAt;
+      return !cur || !sameState(cur, row);
     });
-    if (moved) {
-      throw new SegmentOpError('invalid_range', 'Too late to undo: that entry has changed since.');
-    }
+    if (moved) throw tooLate();
+    // Later than every copy it replaces, so the server's last-write-wins keeps
+    // the undo even when its copy carries the server's (later) clock.
+    let nowMs = Date.now();
+    for (const cur of current) if (cur) nowMs = Math.max(nowMs, toMs(cur.updatedAt) + 1);
+    const now = toIso(nowMs);
     const rows = undoRows(token.prior, token.changed, now);
+
+    const spans = [...rows, ...token.changed];
+    const from = Math.min(...spans.map((s) => toMs(s.startedAt)));
+    const to = Math.max(...spans.map(endOf));
+    const around = await loadAround(from, to);
+    const before = new Set(checkInvariants(around));
+    if (checkInvariants(applyRows(around, rows)).some((p) => !before.has(p))) throw tooLate();
+
     await db.segments.bulkPut(rows);
     await enqueue(segmentsUpsertOp(rows, now));
     return { rows, noop: false, opened: null, undo: undoToken(token.changed, rows) };
