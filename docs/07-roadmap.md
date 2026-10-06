@@ -75,7 +75,8 @@ Tasks:
 - Endpoints: `/api/state`, `/api/switch`, `/api/ops`, `/api/snapshot`, the
   convenience reads, `/api/export.csv`, `/api/export.json`.
 - Server-side validation of I1 and I2 on ops, with tests using a local D1
-  (Miniflare via `vitest-pool-workers` or `wrangler dev` in CI).
+  (wrangler's `createTestHarness`: the real Worker in workerd with an
+  in-memory D1; see `apps/server/test/harness.ts`).
 - Client: login screen, outbox flusher with backoff, snapshot merge, sync
   status in Settings, "Reset local data and re-download".
 - Seeding: when the server has no categories and the client pushes its seed
