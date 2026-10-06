@@ -24,30 +24,81 @@ owner sets up by hand.
 
 The app detects standalone via `window.navigator.standalone === true` or the
 `(display-mode: standalone)` media query. When not standalone, the Settings
-notifications section shows the three steps above and the toggle is hidden.
+notifications section shows the three steps above. Safari tabs have no Push
+API, so on the iPhone the switch is hidden; a desktop browser with push
+support still gets it, for debugging.
 
 ## Push permission flow (M3)
 
-1. In standalone mode the owner taps "Enable notifications".
-2. `Notification.requestPermission()` is called from that tap handler.
+No owner setup is needed on the server: the Worker generates its VAPID key
+pair the first time the app asks for it (step 2) and uses
+`https://<the app's host>` as the VAPID subject Apple requires.
+
+The code is `apps/web/src/push/push.ts`.
+
+1. In standalone mode the owner turns on "Nudges on this phone" in Settings →
+   Notifications.
+2. `Notification.requestPermission()` is the first thing the tap handler
+   does, before anything is awaited, so iOS still sees the user gesture.
+   `GET /api/push/vapid-public-key` runs at the same time.
 3. On `granted`, `registration.pushManager.subscribe({ userVisibleOnly: true,
-   applicationServerKey })` with the VAPID public key from the API.
-4. `POST /api/push/subscriptions` with the subscription JSON.
-5. On every app launch, if permission is `granted` and there is no stored
-   subscription id, or `pushManager.getSubscription()` returns a different
-   endpoint, re-subscribe and re-post. iOS drops subscriptions when the app
-   is deleted and reinstalled.
-6. "Send test notification" calls `POST /api/push/test`.
+   applicationServerKey })` with the key decoded from base64url (it must be
+   a 65-byte uncompressed P-256 point, else Settings says to check
+   `VAPID_PUBLIC_KEY`). An existing subscription made with the same key is
+   reused; one made with another key is unsubscribed and replaced.
+4. `POST /api/push/subscriptions` with `PushSubscription.toJSON()` plus
+   `userAgent`. The answered id goes to meta `pushSubscriptionId` and the
+   endpoint to meta `pushEndpoint`. If an older id was stored and differs,
+   `DELETE /api/push/subscriptions/<old id>` removes the dead row.
+5. On every launch and whenever the app comes back to the foreground
+   (`visibilitychange`), if permission is `granted` and a token is stored,
+   a health check compares the phone with what was registered and with the
+   key the server serves (`push/watch.ts`, loaded lazily from `main.tsx`):
+   - registered, but `pushManager.getSubscription()` is empty (iOS drops
+     subscriptions on reinstall and sometimes on updates): subscribe and
+     re-post.
+   - the subscription's `options.applicationServerKey` differs from the
+     served key (the owner set new VAPID keys): unsubscribe, subscribe with
+     the new key, re-post, delete the old server row.
+   - the endpoint differs from `pushEndpoint`, or a subscription exists that
+     the server never got: re-post.
+   - no subscription and nothing registered: notifications are off.
+
+   The key check is one small GET per foreground; offline, with nothing else
+   to fix, the check counts as passed. A service worker that is still
+   installing (first launch) is waited for. Problems it cannot fix show in
+   Settings → Notifications with "Try again".
+6. "Send test notification" calls `POST /api/push/test` and reloads the
+   status.
+7. Turning the switch off unsubscribes the phone first, then calls
+   `DELETE /api/push/subscriptions/:id` and clears the meta rows. Offline,
+   the phone still turns off; the server drops the row the next time the
+   push service rejects a send.
 
 Known quirks:
 
 - A payload that is not valid JSON or that the service worker fails to render
-  shows nothing. Always send `{ title, body, tag, data: { url } }`.
+  shows nothing. Always send `{ title, body, tag, data: { url } }`. The
+  service worker (`apps/web/src/push/swHandlers.ts`) still guards against
+  it: it reads the payload defensively and shows a generic "Time Tracker"
+  notification rather than nothing, because Safari may also revoke a
+  subscription whose pushes stay invisible.
+- The background re-subscribe in step 5 runs without a tap. If iOS ever
+  refuses `pushManager.subscribe` outside a user gesture even with
+  permission granted, Settings shows the error and its "Try again" button
+  repeats the check from a tap. Not yet verified on a device.
+- Safari does not support the `pushsubscriptionchange` event, so the app
+  does not rely on it; the step 5 check covers a changed subscription the
+  next time the app opens.
 - If the owner denies permission, iOS will not ask again from the web. They
   must enable it under iOS Settings → Notifications → Time Tracker. The
   Settings screen says so.
 - Delivery is reliable in practice but not instant. Expect nudges within a
-  minute or two of the threshold.
+  minute or two of the threshold. Pushes carry a 15 minute TTL, so a phone
+  that is off for longer skips stale nudges instead of getting a burst.
+- The Worker logs one JSON line per cron run (`"event": "nudges"`) with the
+  outcome and any push service error, e.g. `HTTP 403 {"reason":"BadJwtToken"}`.
+  `wrangler tail` shows them when a nudge does not arrive.
 - Declarative Web Push (Safari 18.4+) could replace the service worker
   `push` handler later. Standard push is fine to start with.
 

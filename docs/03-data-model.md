@@ -57,16 +57,24 @@ interface Settings {
   updatedAt: ISO;
 }
 
-// Server only
+// Server only. One per browser that allowed notifications; unique by endpoint.
 interface PushSubscription {
-  id: string;
-  endpoint: string;
-  p256dh: string;
-  auth: string;
+  id: string;               // server-generated UUID v7, kept when the endpoint re-registers
+  endpoint: string;         // https URL of the push service
+  p256dh: string;           // client ECDH P-256 public key, base64url (65 bytes)
+  auth: string;             // client auth secret, base64url (16 bytes)
   userAgent: string | null;
   createdAt: ISO;
   lastSuccessAt: ISO | null;
-  failureCount: number;
+  failureCount: number;     // failed sends since the last success
+}
+
+// Server only. Key/value config the Worker manages itself.
+interface ServerConfig {
+  key: 'vapid_keys' | 'origin';
+  value: string;            // vapid_keys: JSON { publicKey, privateKey }, base64url
+                            // origin: "https://<host>", the default VAPID subject
+  updatedAt: ISO;
 }
 
 // Server only. Written before each send; the dedupe source of truth.
@@ -91,10 +99,12 @@ interface OutboxEntry {
 }
 
 interface Meta {            // client only, key/value
-  key: 'token' | 'lastSync' | 'installedAt' | 'seededAt' | 'pushSubscriptionId'
+  key: 'token' | 'lastSync' | 'installedAt' | 'seededAt'
+     | 'pushSubscriptionId'   // the server's id for this phone's push subscription
+     | 'pushEndpoint'         // the endpoint registered under that id (docs/06)
      // sync state, see 02-architecture.md "The client sync engine"
      | 'lastSyncedAt' | 'tokenRejected' | 'syncError' | 'needsFullResync'
-     | 'connectBannerDismissed';
+     | 'connectBannerDismissed' | 'serverEmpty';
   value: string;
 }
 ```
@@ -206,7 +216,41 @@ CREATE TABLE notification_log (
 CREATE INDEX notif_rule_segment ON notification_log(rule_id, segment_id, sent_at);
 CREATE INDEX notif_rule_day ON notification_log(rule_id, day_key, sent_at);
 CREATE INDEX notif_kind_segment ON notification_log(kind, segment_id, sent_at);
+-- 0001: the cron's daily-row read and the age prune.
+CREATE INDEX notif_kind_day ON notification_log(kind, day_key, sent_at);
+CREATE INDEX notif_sent ON notification_log(sent_at);
+
+-- 0001: never synced, never sent to the client.
+CREATE TABLE server_config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 ```
+
+Migrations: `0000_init.sql` creates everything above except what is marked
+0001; `0001_server_config.sql` adds `server_config` and the two notification
+log indexes.
+
+Notes on the server-only tables:
+
+- `push_subscriptions` is upserted on `endpoint`: registering the same
+  endpoint again keeps the row's id, replaces its keys and resets
+  `failure_count`. The cron deletes a row when the push service answers 404
+  or 410. Keys are stored as base64url without padding.
+- `notification_log` rows are written by the cron, one per notification,
+  before the push is sent. `id` is a server UUID v7 and `sent_at` is the
+  run's clock. Session and stale rows carry `segment_id`, daily rows
+  `day_key`. Every run that writes also deletes rows older than 60 days,
+  except rows for the open segment, so a segment left running for months
+  still dedupes. Quiet hours and the send budget never write a row: a skipped
+  notification is simply evaluated again the next minute.
+- `server_config` holds `vapid_keys` (the generated pair, written once with
+  `INSERT ... ON CONFLICT DO NOTHING` and read back in the same batch, so two
+  first requests agree on one pair) and `origin` (updated whenever the app
+  fetches the VAPID key, registers a subscription or sends a test, and only
+  written when it changed). The `VAPID_*` secrets, when set, take precedence
+  and leave this table alone.
 
 D1 enforces foreign keys, so a segment or rule can only point at a category
 row that exists (soft-deleted or not). The server checks this before writing

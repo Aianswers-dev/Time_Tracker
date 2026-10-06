@@ -13,7 +13,14 @@ import {
 } from '@time-tracker/shared';
 import { runBatch, type Db } from '../db/client';
 import { categoryFromRow, ruleFromRow, segmentFromRow } from '../db/mapping';
-import { categoryMap, firstSegment, firstSettings, segmentMap, select } from '../db/queries';
+import {
+  categoryMap,
+  firstSegment,
+  firstSettings,
+  keepOverlapping,
+  segmentMap,
+  select,
+} from '../db/queries';
 import { upsertCategory, upsertRule, upsertSegments, upsertSettings } from '../db/writes';
 import { summarizeIssues, zodIssues } from '../http';
 import { OpFailure, toOpFailure } from './errors';
@@ -126,11 +133,13 @@ async function applySwitchOp(
   p: Extract<Op, { type: 'switch' }>['payload'],
   now: string,
 ): Promise<void> {
-  const [existing, categoryRows, currentRows] = await db.batch([
+  const windowStart = switchWindowStart(p.at, now);
+  const [existing, categoryRows, overlappingRows] = await db.batch([
     select.segmentsByIds(db, [p.newSegmentId]),
     select.categoriesByIds(db, [p.categoryId]),
-    select.segmentsOverlapping(db, switchWindowStart(p.at, now), Number.POSITIVE_INFINITY),
+    select.segmentsOverlapping(db, windowStart, Number.POSITIVE_INFINITY),
   ]);
+  const currentRows = keepOverlapping(overlappingRows, windowStart, Number.POSITIVE_INFINITY);
 
   // A replay after a timeout: the segment already exists, in whatever state.
   if (existing.length > 0) return;
@@ -199,7 +208,9 @@ async function applySegmentsUpsert(db: Db, rows: readonly Segment[], now: string
 
   // Everything live in that window plus the open segment (for I1), with the
   // incoming rows applied on top, must satisfy the invariants.
-  const nearby = (await select.segmentsOverlapping(db, from, to)).map(segmentFromRow);
+  const nearby = keepOverlapping(await select.segmentsOverlapping(db, from, to), from, to).map(
+    segmentFromRow,
+  );
   const open = firstSegment(openRows);
   const before = open ? applyRows(nearby, [open]) : nearby;
   const problems = checkInvariants(applyRows(before, winners));

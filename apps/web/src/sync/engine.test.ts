@@ -16,8 +16,8 @@ import { switchTo } from '../data/segmentActions';
 import { updateSettings } from '../data/settingsActions';
 import { CAT, liveSegments, resetDb, seg } from '../data/testUtils';
 import { db } from '../db';
-import { connect, disconnect } from './actions';
-import { EMPTY_SERVER_MESSAGE, FLUSH_BATCH, syncRound } from './engine';
+import { connect, disconnect, uploadThisPhone } from './actions';
+import { EMPTY_SERVER_MESSAGE, FLUSH_BATCH, queueFullUpload, syncRound } from './engine';
 import { getMeta, parseSyncError, setMeta, SYNC_META } from './meta';
 import { getSyncRuntime, onSyncNotice } from './runtime';
 import { backoffDelay, requestReset, requestSync, stopSync } from './scheduler';
@@ -380,6 +380,91 @@ describe('full resync', () => {
     expect(await db.outbox.count()).toBe(SEED_OPS);
     expect(await db.categories.count()).toBe(10);
     expect(server.opsBodies()).toHaveLength(0);
+  });
+});
+
+describe('upload this phone', () => {
+  it('flags an empty server, uploads everything in order, and clears the flag', async () => {
+    // A phone that synced fully, then the server lost its data.
+    const server = await connected();
+    for (let i = 0; i < 230; i++) {
+      tick();
+      await switchTo(i % 2 === 0 ? CAT.relaxing : CAT.contractWork);
+    }
+    await requestSync();
+    expect(await db.outbox.count()).toBe(0);
+    const before = {
+      segments: await liveSegments(),
+      categories: await db.categories.count(),
+      rules: await db.rules.count(),
+    };
+    server.categories.clear();
+    server.segments.clear();
+    server.rules.clear();
+    server.settings = null;
+    await setMeta(SYNC_META.needsFullResync, '1');
+
+    expect(await requestSync()).toMatchObject({ status: 'error', message: EMPTY_SERVER_MESSAGE });
+    expect(await getMeta(SYNC_META.serverEmpty)).toBe('1');
+
+    const { queued, outcome } = await uploadThisPhone();
+    // Settings, 10 categories, 2 rules, then 230 segments in ops of at most 100 rows.
+    expect(queued).toBe(1 + 10 + 2 + 3);
+    expect(outcome).toEqual({ status: 'ok', again: false });
+
+    // Each request answers only 15 ops, so later requests repeat the unanswered ones.
+    const firstSends = new Map(
+      server
+        .opsBodies()
+        .flat()
+        .map((op) => [op.opId, op] as const),
+    );
+    const sent = [...firstSends.values()].slice(-queued);
+    expect(sent.map((op) => op.type)).toEqual([
+      'settings.upsert',
+      ...Array<string>(10).fill('category.upsert'),
+      'rule.upsert',
+      'rule.upsert',
+      'segments.upsert',
+      'segments.upsert',
+      'segments.upsert',
+    ]);
+    expect(server.categories.size).toBe(10);
+    expect(server.rules.size).toBe(2);
+    expect(server.settings).not.toBeNull();
+    const serverSegments = [...server.segments.values()].map((s) => s.row);
+    expect(serverSegments).toHaveLength(before.segments.length);
+    expect(checkInvariants(serverSegments)).toEqual([]);
+
+    // The phone kept everything, the flag and the error are gone.
+    expect(await liveSegments()).toEqual(before.segments);
+    expect(await db.categories.count()).toBe(before.categories);
+    expect(await db.rules.count()).toBe(before.rules);
+    expect(await getMeta(SYNC_META.serverEmpty)).toBeUndefined();
+    expect(await syncError()).toBeNull();
+    expect(await db.outbox.count()).toBe(0);
+  });
+
+  it('a clean sync clears a stale empty-server flag', async () => {
+    await connected();
+    await setMeta(SYNC_META.serverEmpty, '1');
+    expect(await requestSync()).toEqual({ status: 'ok', again: false });
+    expect(await getMeta(SYNC_META.serverEmpty)).toBeUndefined();
+  });
+
+  it('skips rows that point at deleted categories', async () => {
+    await connected();
+    const gone: Category = { ...SEED_CATEGORIES[0]!, id: uuidv7(), deletedAt: toIso(T0) };
+    await db.categories.put(gone);
+    await db.segments.put(seg(gone.id, T0 - 7_200_000, T0 - 3_600_000));
+    await db.outbox.clear();
+    const queued = await queueFullUpload();
+    const ops = (await db.outbox.toArray()).map((r) => r.op);
+    expect(queued).toBe(ops.length);
+    expect(ops.some((op) => op.type === 'category.upsert' && op.payload.id === gone.id)).toBe(
+      false,
+    );
+    expect(ops.some((op) => op.type === 'segments.upsert')).toBe(false);
   });
 });
 

@@ -50,6 +50,7 @@ export interface RequestOptions {
 const TABLES = [
   'notification_log',
   'push_subscriptions',
+  'server_config',
   'segments',
   'rules',
   'settings',
@@ -109,6 +110,11 @@ export function useTestServer(secrets: Record<string, string> = { AUTH_TOKEN: TO
     rawDb,
     /** Drizzle over the test database, for seeding and assertions. */
     db: (): Db => createDb(rawDb()),
+    /** The Worker, for dispatching events other than fetch (e.g. `scheduled`). */
+    worker: () => server.getWorker(),
+    /** Runtime log lines (console output) since the server started or `clearLogs`. */
+    logs: () => server.getLogs(),
+    clearLogs: () => server.clearLogs(),
     request,
     get: (path: string, opts?: RequestOptions) => request('GET', path, opts),
     post: (path: string, body: unknown, opts?: RequestOptions) =>
@@ -271,4 +277,37 @@ export async function timeline(db: Db): Promise<Array<[string, string, string | 
     .filter((s) => s.deletedAt === null)
     .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
     .map((s) => [s.categoryId, s.startedAt, s.endedAt]);
+}
+
+/**
+ * Wrap a D1 binding to count calls that reach D1: each executed statement and
+ * each batch. This is what the Workers Free limit of 50 D1 queries per
+ * request counts.
+ */
+export function countingD1(inner: D1Database): { d1: D1Database; calls: () => number } {
+  let calls = 0;
+  const real = new WeakMap<object, D1PreparedStatement>();
+  const wrap = (stmt: D1PreparedStatement): D1PreparedStatement => {
+    const wrapper = {
+      bind: (...values: unknown[]) => wrap(stmt.bind(...values)),
+      all: () => (calls++, stmt.all()),
+      run: () => (calls++, stmt.run()),
+      first: (column?: string) => (
+        calls++,
+        column === undefined ? stmt.first() : stmt.first(column)
+      ),
+      raw: (options?: { columnNames?: boolean }) => (calls++, stmt.raw(options as never)),
+    };
+    real.set(wrapper, stmt);
+    return wrapper as unknown as D1PreparedStatement;
+  };
+  const d1 = {
+    prepare: (query: string) => wrap(inner.prepare(query)),
+    batch: (statements: D1PreparedStatement[]) => {
+      calls++;
+      return inner.batch(statements.map((s) => real.get(s) ?? s));
+    },
+    exec: (query: string) => (calls++, inner.exec(query)),
+  } as unknown as D1Database;
+  return { d1, calls: () => calls };
 }

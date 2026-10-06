@@ -7,14 +7,17 @@ import {
   type Segment,
   type Settings,
 } from '@time-tracker/shared';
-import { and, asc, eq, gt, isNull, lt, or, sql, type SQL } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNull, lt, or, sql, type SQL } from 'drizzle-orm';
 import type { SQLiteColumn } from 'drizzle-orm/sqlite-core';
 import type { Db } from './client';
 import { categoryFromRow, ruleFromRow, segmentFromRow, settingsFromRow } from './mapping';
 import {
   categories,
+  notificationLog,
+  pushSubscriptions,
   rules,
   segments,
+  serverConfig,
   settings,
   type CategoryRow,
   type SegmentRow,
@@ -49,6 +52,11 @@ function overlapping(fromMs: number, toMs: number): SQL | undefined {
   return and(...conditions);
 }
 
+/** The live open segment: at most one row, by the `segments_one_open` index. */
+function isOpen(): SQL | undefined {
+  return and(isNull(segments.endedAt), isNull(segments.deletedAt));
+}
+
 export const select = {
   settings: (db: Db) => db.select().from(settings).where(eq(settings.id, SETTINGS_ID)).limit(1),
 
@@ -59,13 +67,33 @@ export const select = {
       .where(and(isNull(segments.endedAt), isNull(segments.deletedAt)))
       .limit(1),
 
-  /** Oldest first. */
+  /**
+   * Live segments overlapping [fromMs, toMs), as a superset: pass the rows
+   * through `keepOverlapping` for the exact window and oldest-first order.
+   *
+   * With a finite `fromMs` the SQL filters on the end only and does not sort,
+   * so SQLite answers from `segments_ended` and reads just the recent rows. A
+   * bound on `started_at` or an ORDER BY on it makes SQLite walk
+   * `segments_started` across the whole history instead, on every switch and
+   * every widget refresh.
+   */
   segmentsOverlapping: (db: Db, fromMs: number, toMs: number) =>
-    db
-      .select()
-      .from(segments)
-      .where(overlapping(fromMs, toMs))
-      .orderBy(asc(segments.startedAt), asc(segments.id)),
+    Number.isFinite(fromMs)
+      ? db.select().from(segments).where(overlapping(fromMs, Number.POSITIVE_INFINITY))
+      : db
+          .select()
+          .from(segments)
+          .where(overlapping(fromMs, toMs))
+          .orderBy(asc(segments.startedAt), asc(segments.id)),
+
+  /**
+   * Live segments that are open or end after `fromMs`, in no particular order.
+   * Without an ORDER BY or an upper bound SQLite reads just those rows through
+   * `segments_ended` (a MULTI-INDEX OR), where `segmentsOverlapping` walks
+   * `segments_started` over the whole history. For reads that run every minute.
+   */
+  segmentsEndingAfter: (db: Db, fromMs: number) =>
+    db.select().from(segments).where(overlapping(fromMs, Number.POSITIVE_INFINITY)),
 
   /** The live segment that started first, which marks when tracking began. */
   earliestLiveSegment: (db: Db) =>
@@ -117,6 +145,70 @@ export const select = {
       .from(rules)
       .where(isNull(rules.deletedAt))
       .orderBy(asc(rules.createdAt), asc(rules.id)),
+
+  // The nudge cron reads everything in one batch, before it knows the open
+  // segment, so these select relative to it with a subquery.
+
+  /** The open segment's category (any state), or no row. */
+  openSegmentCategory: (db: Db) =>
+    db
+      .select()
+      .from(categories)
+      .where(
+        inArray(
+          categories.id,
+          db.select({ id: segments.categoryId }).from(segments).where(isOpen()),
+        ),
+      ),
+
+  /** Enabled, non-deleted rules of the open segment's category, oldest first. */
+  openSegmentRules: (db: Db) =>
+    db
+      .select()
+      .from(rules)
+      .where(
+        and(
+          inArray(
+            rules.categoryId,
+            db.select({ id: segments.categoryId }).from(segments).where(isOpen()),
+          ),
+          eq(rules.enabled, 1),
+          isNull(rules.deletedAt),
+        ),
+      )
+      .orderBy(asc(rules.createdAt), asc(rules.id)),
+
+  /** Session and stale log rows of the open segment (index notif_kind_segment). */
+  openSegmentLog: (db: Db) =>
+    db
+      .select()
+      .from(notificationLog)
+      .where(
+        and(
+          inArray(notificationLog.kind, ['session', 'stale']),
+          inArray(
+            notificationLog.segmentId,
+            db.select({ id: segments.id }).from(segments).where(isOpen()),
+          ),
+        ),
+      ),
+
+  /** Daily log rows for any of `dayKeys` (index notif_kind_day). */
+  dailyLog: (db: Db, dayKeys: readonly string[]) =>
+    db
+      .select()
+      .from(notificationLog)
+      .where(and(eq(notificationLog.kind, 'daily'), idIn(notificationLog.dayKey, dayKeys))),
+
+  /** Oldest first. */
+  pushSubscriptions: (db: Db) =>
+    db
+      .select()
+      .from(pushSubscriptions)
+      .orderBy(asc(pushSubscriptions.createdAt), asc(pushSubscriptions.id)),
+
+  /** The whole table: a handful of rows. */
+  serverConfig: (db: Db) => db.select().from(serverConfig),
 };
 
 export function firstSettings(rows: readonly SettingsRow[]): Settings | null {
@@ -150,12 +242,31 @@ export async function effectiveSettings(db: Db): Promise<Settings> {
   return orDefaultSettings(await loadSettings(db));
 }
 
+/**
+ * The rows from `select.segmentsOverlapping` that really overlap
+ * [fromMs, toMs), oldest first (ties by id).
+ */
+export function keepOverlapping<
+  T extends { id: string; startedAt: string; endedAt: string | null },
+>(rows: readonly T[], fromMs: number, toMs: number): T[] {
+  return rows
+    .filter(
+      (r) =>
+        Date.parse(r.startedAt) < toMs && (r.endedAt === null || Date.parse(r.endedAt) > fromMs),
+    )
+    .sort((a, b) => {
+      const byStart = Date.parse(a.startedAt) - Date.parse(b.startedAt);
+      return byStart !== 0 ? byStart : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+}
+
 export async function liveSegmentsOverlapping(
   db: Db,
   fromMs: number,
   toMs: number,
 ): Promise<Segment[]> {
-  return (await select.segmentsOverlapping(db, fromMs, toMs)).map(segmentFromRow);
+  const rows = await select.segmentsOverlapping(db, fromMs, toMs);
+  return keepOverlapping(rows, fromMs, toMs).map(segmentFromRow);
 }
 
 export async function categoriesByIds(

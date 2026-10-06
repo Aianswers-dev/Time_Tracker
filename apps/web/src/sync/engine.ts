@@ -1,5 +1,6 @@
 import {
   MAX_OPS_PER_REQUEST,
+  MAX_ROWS_PER_OP,
   opsResponseSchema,
   snapshotResponseSchema,
   SETTINGS_ID,
@@ -8,6 +9,13 @@ import {
   type SnapshotResponse,
 } from '@time-tracker/shared';
 import { ApiError, apiFetch, getToken } from '../api/client';
+import {
+  categoryUpsertOp,
+  enqueue,
+  ruleUpsertOp,
+  segmentsUpsertOp,
+  settingsUpsertOp,
+} from '../data/outbox';
 import { db, type OutboxRow } from '../db';
 import { describeOp, failureSummary } from './describe';
 import { deleteMeta, getMeta, setMeta, setSyncError, SYNC_META } from './meta';
@@ -257,6 +265,7 @@ async function fullResync(discardThroughSeq?: number): Promise<boolean> {
 async function finishRound(failed: readonly string[]): Promise<void> {
   await db.transaction('rw', db.meta, async () => {
     await setMeta(SYNC_META.lastSyncedAt, new Date().toISOString());
+    await deleteMeta(SYNC_META.serverEmpty);
     const summary = failureSummary(failed);
     if (summary) await setSyncError(summary, 'notice');
     else await deleteMeta(SYNC_META.syncError);
@@ -276,6 +285,7 @@ async function failRound(err: unknown): Promise<RoundOutcome> {
     return { status: 'error', kind, message };
   }
   if (err instanceof SyncFailure) {
+    if (err.message === EMPTY_SERVER_MESSAGE) await setMeta(SYNC_META.serverEmpty, '1');
     await setSyncError(err.message, err.kind);
     return { status: 'error', kind: err.kind, message: err.message };
   }
@@ -326,4 +336,40 @@ export async function resetRound(): Promise<RoundOutcome> {
   } catch (err) {
     return await failRound(err);
   }
+}
+
+/**
+ * Queue this phone's whole history for a server that lost its data (the
+ * empty-server guard tripped). Settings and categories go first so rules and
+ * segments can reference them; segments go oldest first, at most
+ * MAX_ROWS_PER_OP rows per op, so the server's invariant check sees a valid
+ * timeline. Rows keep their own `updatedAt`, so on a server that does have
+ * data last-write-wins keeps whichever copy is newer. Local data does not
+ * change. Returns the number of ops queued; the next round sends them and
+ * then fully resyncs.
+ */
+export async function queueFullUpload(): Promise<number> {
+  const now = new Date().toISOString();
+  return db.transaction('rw', SYNCED, async () => {
+    const ops: Op[] = [];
+    const settings = await db.settings.get(SETTINGS_ID);
+    if (settings) ops.push(settingsUpsertOp(settings, now));
+    const categories = (await db.categories.toArray()).filter((c) => c.deletedAt === null);
+    const categoryIds = new Set(categories.map((c) => c.id));
+    for (const c of categories) ops.push(categoryUpsertOp(c, now));
+    for (const r of await db.rules.toArray()) {
+      if (r.deletedAt === null && categoryIds.has(r.categoryId)) ops.push(ruleUpsertOp(r, now));
+    }
+    const segments = (await db.segments.orderBy('startedAt').toArray()).filter(
+      (s) => s.deletedAt === null && categoryIds.has(s.categoryId),
+    );
+    for (let i = 0; i < segments.length; i += MAX_ROWS_PER_OP) {
+      ops.push(segmentsUpsertOp(segments.slice(i, i + MAX_ROWS_PER_OP), now));
+    }
+    await enqueue(...ops);
+    await deleteMeta(SYNC_META.serverEmpty);
+    await deleteMeta(SYNC_META.syncError);
+    await setMeta(SYNC_META.needsFullResync, '1');
+    return ops.length;
+  });
 }
