@@ -322,7 +322,9 @@ All durations are milliseconds; the UI formats them.
 - `timelineForDay(segments, dayKey, settings, now)`: ordered blocks for the
   Today bar, with explicit gap blocks for untracked time.
 - `dailyTotals(segments, dayKeys, settings, now)`: per-day map of per-category
-  time, for stacked bars.
+  time, for stacked bars. The Stats screen gets the same map by calling
+  `totalsForRange` over each day's `dayRange`, which needs one `dayRange` per
+  day instead of one per segment piece; a web test checks the two agree.
 - `hourHeatmap(segments, from, to, timezone, now)`: per category, 24 numbers of
   time in each local hour of day.
 - `budgetStatus(rules, daily, dayKeys)`: for each enabled daily rule, days

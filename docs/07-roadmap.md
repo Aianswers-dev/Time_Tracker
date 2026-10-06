@@ -134,6 +134,19 @@ Definition of done:
 - Stats bundle is a separate chunk; the Now screen bundle is unchanged in
   size within 5 KB from M3.
 
+Status (2026-10-06): built. The Stats screen and Export are in `apps/web`
+(`src/pages/Stats.tsx`, `src/pages/stats/`, `src/lib/export.ts`); behaviour
+is described in `05-features.md`. Charts are hand-rolled SVG with no new
+dependency, in a 13 KB gzipped Stats chunk; the Now route's JS grew by about
+2.3 KB gzipped because Rolldown regrouped modules the Now screen already
+loads into shared chunks. With 10,000 synthetic segments over a year in
+headless Chromium, every preset range renders in under 60 ms after a tab tap
+(under 300 ms with 4x CPU throttling) and a full-year custom range in about
+0.5 s (about 2 s at 4x, mostly the shared `hourHeatmap` and reading 10,000
+rows). Export builds files locally (see `05-features.md`), so the "wired to
+the endpoints" task became "matches the endpoints' formats", with tests
+for CSV quoting, timezone, the open segment and the JSON shape.
+
 ## M5 · iOS glue
 
 Tasks:
