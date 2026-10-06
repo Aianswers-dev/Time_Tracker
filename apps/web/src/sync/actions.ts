@@ -1,7 +1,7 @@
 import { settingsSchema } from '@time-tracker/shared';
 import { ApiError, apiFetch, clearToken, setToken } from '../api/client';
 import { db } from '../db';
-import { requestTimeout, type RoundOutcome } from './engine';
+import { queueFullUpload, requestTimeout, type RoundOutcome } from './engine';
 import { deleteMeta, setMeta, SYNC_META } from './meta';
 import { setSyncRuntime } from './runtime';
 import { requestReset, requestSync, resetBackoff } from './scheduler';
@@ -67,4 +67,14 @@ export function resetLocalData(): Promise<RoundOutcome> {
 
 export async function dismissConnectBanner(): Promise<void> {
   await setMeta(SYNC_META.bannerDismissed, '1');
+}
+
+/**
+ * For a server that lost its data: queue everything on this phone, then sync.
+ * Resolves with the number of changes queued and the outcome of the sync.
+ */
+export async function uploadThisPhone(): Promise<{ queued: number; outcome: RoundOutcome }> {
+  const queued = await queueFullUpload();
+  resetBackoff();
+  return { queued, outcome: await requestSync() };
 }

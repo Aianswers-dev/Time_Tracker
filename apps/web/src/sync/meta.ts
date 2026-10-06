@@ -17,6 +17,12 @@ export const SYNC_META = {
   needsFullResync: 'needsFullResync',
   /** '1' once the owner dismissed the "connect to your server" banner. */
   bannerDismissed: 'connectBannerDismissed',
+  /**
+   * '1' while the server answered a full resync with no categories although
+   * this phone has some (it lost its data). Settings then offers to upload
+   * this phone's data. Cleared by the next clean sync.
+   */
+  serverEmpty: 'serverEmpty',
 } as const;
 
 /**

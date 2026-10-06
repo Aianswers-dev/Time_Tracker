@@ -112,7 +112,10 @@ Monday.
   server's full snapshot, but changes nothing when the server has no
   categories. After a `401` the section shows "Token rejected — paste it
   again" with the token field; syncing stays off until a new token is
-  saved.
+  saved. When a full resync finds the server empty while this phone has
+  data (the server lost its database), the section offers "Upload this
+  phone's data": it queues settings, categories, rules and every segment
+  (oldest first, at most 100 per op), syncs, and leaves local data as is.
 - **Notifications (M3).** If not running standalone: show "Install to Home
   Screen first" with the Share → Add to Home Screen steps. If standalone:
   a toggle that requests permission and subscribes, the subscription status,
