@@ -6,9 +6,20 @@
   --fg: #12151c;
   --muted: #5b6372;
   --surface: #ffffff;
+  --surface-2: #eceef3;
   --border: #d9dde5;
   --accent: #2563eb;
   --accent-fg: #ffffff;
+  --danger: #c62a2f;
+  --danger-fg: #ffffff;
+  --warn-bg: #fff4d6;
+  --warn-fg: #6b4a00;
+  --overlay: rgb(11 13 18 / 0.45);
+  --hatch-a: #c9ced8;
+  --hatch-b: #eef0f4;
+  --now: #12151c;
+  --shadow: 0 8px 30px rgb(11 13 18 / 0.14);
+  --tabbar-h: 64px;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -17,9 +28,19 @@
     --fg: #eceff5;
     --muted: #9aa3b5;
     --surface: #151922;
+    --surface-2: #1e2330;
     --border: #272d3a;
     --accent: #6ea8fe;
     --accent-fg: #0b0d12;
+    --danger: #ff6b70;
+    --danger-fg: #0b0d12;
+    --warn-bg: #3a2f10;
+    --warn-fg: #ffd982;
+    --overlay: rgb(0 0 0 / 0.6);
+    --hatch-a: #2c3242;
+    --hatch-b: #161a23;
+    --now: #eceff5;
+    --shadow: 0 8px 30px rgb(0 0 0 / 0.5);
   }
 }
 
@@ -28,15 +49,24 @@
   --color-fg: var(--fg);
   --color-muted: var(--muted);
   --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
   --color-line: var(--border);
   --color-accent: var(--accent);
   --color-accent-fg: var(--accent-fg);
+  --color-danger: var(--danger);
+  --color-danger-fg: var(--danger-fg);
+  --color-warn-bg: var(--warn-bg);
+  --color-warn-fg: var(--warn-fg);
 }
 
 html,
 body,
 #root {
   min-height: 100%;
+}
+
+html {
+  background-color: var(--bg);
 }
 
 body {
@@ -52,6 +82,115 @@ body {
     Arial,
     sans-serif;
   -webkit-text-size-adjust: 100%;
-  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
-    env(safe-area-inset-left);
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+  /* The status bar is black-translucent, so content must clear it. The tab bar
+     and sheets handle the bottom inset themselves. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+}
+
+/* With the black-translucent status bar the page runs under the clock and
+   battery. This strip keeps scrolled content from showing through there. */
+.statusbar-shield {
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: env(safe-area-inset-top);
+  background-color: var(--bg);
+  z-index: 30;
+  pointer-events: none;
+}
+
+/* Room for the fixed tab bar and the home indicator below the page content. */
+.pb-tabbar {
+  padding-bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom) + 16px);
+}
+
+.tabbar {
+  height: calc(var(--tabbar-h) + env(safe-area-inset-bottom));
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.above-tabbar {
+  bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom) + 12px);
+}
+
+.sheet-pad-bottom {
+  padding-bottom: max(16px, env(safe-area-inset-bottom));
+}
+
+/* Long-press targets: no iOS callout, no text selection, no double-tap zoom. */
+.no-callout {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+}
+
+.hatched {
+  background-image: repeating-linear-gradient(135deg, var(--hatch-a) 0 3px, var(--hatch-b) 3px 7px);
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes sheet-in {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-sheet {
+  animation: sheet-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.animate-fade {
+  animation: fade-in 180ms ease-out;
+}
+
+.animate-toast {
+  animation: toast-in 180ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-sheet,
+  .animate-fade,
+  .animate-toast {
+    animation: none;
+  }
+}
+
+input[type='date'],
+input[type='time'] {
+  /* iOS sizes these to their content unless told otherwise. */
+  min-width: 0;
+  display: block;
+}
+
+select {
+  background-color: var(--surface);
+  color: var(--fg);
 }

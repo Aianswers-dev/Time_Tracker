@@ -9,8 +9,8 @@ Milestone tags (M1, M2, ...) map to `07-roadmap.md`.
   "Time", `display: standalone`, portrait orientation, theme colour, 192 and
   512 px icons plus an Apple touch icon. Lighthouse installability passes.
 - **Offline (M1).** The app shell loads with no network. All four screens work
-  from Dexie alone. A thin status pill shows "Offline" and, when the outbox is
-  non-empty, "N changes pending".
+  from Dexie alone. A thin status pill shows "Offline" (M1) and, when the
+  outbox is non-empty, "N changes pending" (M2, when the outbox flushes).
 - **Dark mode (M1).** Follows the system. Category colours remain readable on
   both backgrounds.
 - **Touch targets (M1).** Every tappable control is at least 56 px tall.
@@ -28,11 +28,14 @@ Milestone tags (M1, M2, ...) map to `07-roadmap.md`.
 - A two-column grid of category tiles in `sortOrder`. The active tile is
   highlighted. Archived categories are hidden.
 - **Tap a tile** switches immediately and shows a 10 second toast with Undo.
-  Undo calls `undoSwitch`.
+  Undo applies the shared `undoRows` to the rows the switch changed, and
+  refuses if any of them changed since.
 - **Tap the active tile** opens a sheet to backdate: "Started ... ago" with
   quick picks (5, 15, 30, 60 min) and a time picker. Applies `backdateOpen`.
 - **Long-press any tile** opens the same picker to switch with a backdated
-  start, for "I actually started cooking 20 minutes ago".
+  start, for "I actually started cooking 20 minutes ago". A picked clock time
+  later than now means yesterday. If the change would trim or remove other
+  entries, the sheet lists them before you confirm.
 - Today's total for each category appears in small text on its tile.
 - Switching the same category is a no-op with no toast.
 
@@ -41,15 +44,18 @@ Milestone tags (M1, M2, ...) map to `07-roadmap.md`.
 - A horizontal bar spanning the logical day from `dayStartHour` to the next
   `dayStartHour`, coloured blocks per segment, grey hatched blocks for
   untracked gaps, a marker for "now". Blocks under a few minutes still get a
-  minimum visual width.
+  minimum visual width, and neighbouring blocks are separated by a 2 px gap
+  so similar colours never merge. Tapping a block names it (category, time
+  range, duration) with an Edit or Assign button.
 - Left and right arrows or a swipe move to previous and next days.
 - Below the bar: a list of segments for the day, newest first, each showing
   category, start, end, duration, note. Tapping opens the edit sheet.
 - A totals list per category, sorted descending, with the untracked total at
   the end if non-zero.
-- **Edit sheet.** Change category, start time, end time, note. Save validates
-  with the shared operations and shows the error inline if the change would
-  overlap. Also offers Split (pick a time and a second category) and Delete
+- **Edit sheet.** Change category, start time, end time (each with a date,
+  since entries can cross midnight), note. Before saving it lists what else
+  the change would move, trim or remove. Save validates with the shared
+  operations and shows the error inline if the change is invalid. Also offers Split (pick a time and a second category) and Delete
   (with "fill from previous", "fill from next", or "leave gap").
 - **Tap an untracked gap** opens a sheet pre-filled with the gap's range to
   assign a category, using `insertSegment`.
@@ -76,7 +82,8 @@ Monday.
 
 ## Settings screen `/settings`
 
-- **Categories (M1).** List with drag to reorder. Add, rename, recolour (from
+- **Categories (M1).** List with up and down buttons to reorder (simpler and
+  more reliable than drag on iOS). Add, rename, recolour (from
   a fixed palette that passes contrast in both modes), pick an icon, toggle
   stale-check exemption, archive and unarchive. Deleting is only offered when
   the category has no segments.

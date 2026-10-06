@@ -16,10 +16,13 @@ of where your day went.
 
 ## Status
 
-M0 to M2 are in place: the scaffold, local tracking, and the server with sync
-and auth. M3 (nudges) has its server half: the once-a-minute cron evaluates the
-rules and sends Web Push, and the `/api/push/*` endpoints are ready for the
-app. Push needs no setup: the Worker generates its own VAPID keys. See
+M1 (core tracking, local only) is in place: the Now, Today and Settings
+screens work offline from IndexedDB and queue every change in an outbox. The
+M2 server (D1, auth, sync ops, state, switch, snapshot, export) is in place;
+the M2 client (login, outbox flush, snapshot merge) is in progress. M3
+(nudges) has its server half: the once-a-minute cron evaluates the rules and
+sends Web Push, and the `/api/push/*` endpoints are ready for the app. Push
+needs no setup: the Worker generates its own VAPID keys. See
 [docs/07-roadmap.md](docs/07-roadmap.md).
 
 ## Documentation
