@@ -3,6 +3,7 @@ import {
   checkInvariants,
   findOpen,
   opSchema,
+  toIso,
   toMs,
   type Category,
   type Op,
@@ -107,7 +108,7 @@ export async function applyOps(db: Db, ops: readonly RawOp[], clock: Clock): Pro
 export async function applyOp(db: Db, op: Op, now: string): Promise<void> {
   switch (op.type) {
     case 'switch':
-      return applySwitchOp(db, op.payload, now);
+      return applySwitchOp(db, op.payload, op.createdAt, now);
     case 'segments.upsert':
       return applySegmentsUpsert(db, op.payload.rows, now);
     case 'category.upsert':
@@ -127,10 +128,18 @@ function wins(
   return !stored || incoming.updatedAt >= stored.updatedAt;
 }
 
-/** Two D1 calls: one read batch, one write batch. A replay is one. */
+/**
+ * Two D1 calls: one read batch, one write batch. A replay is one.
+ *
+ * `madeAt` is the op's `createdAt`: when the phone made the switch. The op may
+ * arrive much later (the phone was offline or the app was closed before the
+ * outbox flushed), so segments that started after it was made, such as a
+ * Shortcut switch in the meantime, stay (shared `switchCategory`, `madeAt`).
+ */
 async function applySwitchOp(
   db: Db,
   p: Extract<Op, { type: 'switch' }>['payload'],
+  madeAt: string,
   now: string,
 ): Promise<void> {
   const windowStart = switchWindowStart(p.at, now);
@@ -152,18 +161,39 @@ async function applySwitchOp(
 
   const current = currentRows.map(segmentFromRow);
   const open = findOpen(current);
-  if (open && open.categoryId === p.categoryId) {
+  const madeAtMs = Math.min(toMs(madeAt), toMs(now));
+  if (
+    open &&
+    open.categoryId === p.categoryId &&
+    toMs(open.startedAt) <= Math.max(toMs(p.at), madeAtMs)
+  ) {
     // Something else (a Shortcut, another flush) already switched to this
-    // category. Adding ours would be a different history; the client resyncs.
+    // category before this switch was made. Adding ours would be a different
+    // history; the client resyncs.
     throw new OpFailure('conflict', `Already on ${category.name} under another segment`);
   }
 
   const result = computeSwitch(
     current,
-    { categoryId: p.categoryId, at: p.at, newSegmentId: p.newSegmentId, source: p.source },
+    {
+      categoryId: p.categoryId,
+      at: p.at,
+      newSegmentId: p.newSegmentId,
+      source: p.source,
+      madeAt: toIso(madeAtMs),
+    },
     now,
   );
-  await writeSwitch(db, result, now);
+  // The rows record the phone's change, so they carry the phone's time like
+  // every other op (capped at the server's), not the time the op arrived.
+  // Otherwise an edit or Undo queued after this switch, while offline or in
+  // the same flush, would be older than these rows and lose last-write-wins.
+  const stamp = toIso(madeAtMs);
+  await writeSwitch(
+    db,
+    { ...result, rows: result.rows.map((r) => ({ ...r, updatedAt: stamp })) },
+    now,
+  );
 }
 
 function endMs(s: Segment): number {

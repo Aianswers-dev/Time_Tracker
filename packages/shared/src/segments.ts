@@ -275,10 +275,18 @@ export interface SwitchParams {
   /** Id for the new segment, so a replayed switch is recognisable. */
   newSegmentId?: string;
   source?: SegmentSource;
+  /**
+   * When the switch was made, for one applied later (an outbox op that waited
+   * while the phone was offline). Live segments starting after both `at` and
+   * `madeAt` were recorded after it, for example by a Shortcut, and stay: the
+   * new segment ends where the first of them starts instead of staying open.
+   * Absent means now.
+   */
+  madeAt?: ISO;
 }
 
 export interface SwitchResult extends SegmentResult {
-  /** The new open segment, absent on a no-op. */
+  /** The new open segment, absent on a no-op or when a later segment closed it (`madeAt`). */
   opened: Segment | null;
 }
 
@@ -290,6 +298,8 @@ export interface SwitchResult extends SegmentResult {
  * - `at` in the past backdates the switch: everything from `at` onwards is
  *   cleared (the open segment is closed at `at`, later segments trimmed or
  *   removed) and the new segment opens at `at`.
+ * - With `madeAt`, segments that started after the switch was made are kept
+ *   and the new segment fills only [at, first such start).
  */
 export function switchCategory(
   segments: readonly Segment[],
@@ -301,6 +311,24 @@ export function switchCategory(
   let atMs = params.at === undefined ? nowMs : parseTime(params.at, 'at');
   assertNotFuture(atMs, nowMs);
   atMs = Math.min(atMs, nowMs);
+
+  if (params.madeAt !== undefined) {
+    const madeAtMs = parseTime(params.madeAt, 'madeAt');
+    const later = w.after(Math.max(atMs, madeAtMs) + 1, '');
+    if (later) {
+      const untilMs = toMs(later.startedAt);
+      w.clearRange(atMs, untilMs);
+      w.create({
+        id: params.newSegmentId ?? ctx.newId(),
+        categoryId: params.categoryId,
+        startedAt: toIso(atMs),
+        endedAt: toIso(untilMs),
+        note: null,
+        source: params.source ?? 'app',
+      });
+      return { ...w.result(), opened: null };
+    }
+  }
 
   const open = w.open();
   if (open && open.categoryId === params.categoryId) {

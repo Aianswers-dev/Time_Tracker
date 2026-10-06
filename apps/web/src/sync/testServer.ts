@@ -19,7 +19,8 @@ import { vi } from 'vitest';
  * Test helper, not imported by the app: a stand-in for the Worker behind a
  * mocked `fetch`. It keeps rows in memory with a `syncedAt` like the real
  * server, applies ops the same way in spirit (a switch runs the shared
- * `switchCategory` with the server's clock, unknown categories are
+ * `switchCategory` with the server's clock and the op's `createdAt` as
+ * `madeAt`, stamping the rows with that time, unknown categories are
  * `validation_failed`, a switch to the category already open under another
  * id is `conflict` and so is an upsert that breaks I1, I2 or I5), answers at
  * most `maxApplied` ops per request and returns the 10 s overlap on `since`
@@ -121,8 +122,13 @@ export function fakeServer(token = 'secret'): FakeServer {
         const live = [...server.segments.values()]
           .map((s) => s.row)
           .filter((s) => s.deletedAt === null);
+        const madeAtMs = Math.min(toMs(op.createdAt), now);
         const open = live.find((s) => s.endedAt === null);
-        if (open && open.categoryId === op.payload.categoryId) {
+        if (
+          open &&
+          open.categoryId === op.payload.categoryId &&
+          toMs(open.startedAt) <= Math.max(toMs(op.payload.at), madeAtMs)
+        ) {
           return { code: 'conflict', message: 'Already on that category under another segment' };
         }
         const result = switchCategory(
@@ -132,10 +138,11 @@ export function fakeServer(token = 'secret'): FakeServer {
             at: op.payload.at,
             newSegmentId: op.payload.newSegmentId,
             source: op.payload.source,
+            madeAt: toIso(madeAtMs),
           },
           { now: toIso(now), newId: () => uuidv7() },
         );
-        server.put({ segments: result.rows });
+        server.put({ segments: result.rows.map((r) => ({ ...r, updatedAt: toIso(madeAtMs) })) });
         return undefined;
       }
       case 'segments.upsert': {

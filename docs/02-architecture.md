@@ -174,7 +174,11 @@ actual refresh cadence.
   `updatedAt` is at least the stored one, otherwise acknowledges and ignores it.
 - A `switch` op carries the new segment's id, so a replay after a timeout is
   a no-op. The server runs the shared `switchCategory` against its own state,
-  so an offline switch still lands correctly after a Shortcut switch.
+  with the op's `createdAt` as `madeAt`: a switch that waited offline still
+  lands, and a Shortcut switch made in the meantime stays (the offline
+  segment ends where it starts). Its rows carry the op's `createdAt` (capped
+  at the server's time) as `updatedAt`, so an edit or Undo queued after the
+  switch wins last-write-wins against them.
 - Failed ops (any `ok: false` result) are dropped from the outbox, a toast
   names the change that did not sync, and the client does a full resync:
   it replaces its local synced tables with a full snapshot. The server is the

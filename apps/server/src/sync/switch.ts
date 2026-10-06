@@ -16,6 +16,8 @@ export interface SwitchInput {
   /** Id for the new segment. Generated when absent. */
   newSegmentId?: string;
   source: SegmentSource;
+  /** When the switch was made, for an op applied later. See shared `switchCategory`. */
+  madeAt?: string;
 }
 
 /**
@@ -46,6 +48,7 @@ export function computeSwitch(
       at: input.at,
       newSegmentId: input.newSegmentId,
       source: input.source,
+      madeAt: input.madeAt,
     },
     { now, newId: () => uuidv7() },
   );

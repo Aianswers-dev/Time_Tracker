@@ -297,6 +297,68 @@ describe('pull', () => {
     ]);
   });
 
+  it('an Undo made before the switch was flushed survives the flush', async () => {
+    const server = await connected();
+    await requestSync();
+    tick();
+    const first = await switchTo(CAT.sleep);
+    await requestSync();
+    tick();
+    const second = await switchTo(CAT.housework);
+    tick(500);
+    if (!second.undo) throw new Error('no undo token');
+    await undoAction(second.undo);
+    // Both ops reach the server later, in one request.
+    tick(60_000);
+    await requestSync();
+
+    const open = (s: { deletedAt: string | null; endedAt: string | null }) =>
+      s.deletedAt === null && s.endedAt === null;
+    expect((await liveSegments()).filter(open).map((s) => s.id)).toEqual([first.opened?.id]);
+    const serverOpen = [...server.segments.values()].map((s) => s.row).filter(open);
+    expect(serverOpen.map((s) => s.id)).toEqual([first.opened?.id]);
+  });
+
+  it('a switch that waited offline keeps a later Shortcut switch, on both sides', async () => {
+    const server = await connected();
+    tick();
+    await switchTo(CAT.sleep);
+    await requestSync();
+    // Offline: switch to Housework. The op waits in the outbox.
+    tick();
+    const offline = await switchTo(CAT.housework);
+    // 30 minutes later a Shortcut switches the server to Relaxing.
+    tick(30 * 60_000);
+    const live = [...server.segments.values()].map((s) => s.row).filter((s) => !s.deletedAt);
+    const shortcut = switchCategory(
+      live,
+      { categoryId: CAT.relaxing, source: 'shortcut' },
+      { now: toIso(Date.now()), newId: () => uuidv7() },
+    );
+    server.put({ segments: shortcut.rows });
+    // Back online.
+    tick();
+    expect(await requestSync()).toEqual({ status: 'ok', again: false });
+
+    const local = await liveSegments();
+    expect(checkInvariants(local)).toEqual([]);
+    const byCategory = (rows: typeof local) =>
+      rows
+        .slice()
+        .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
+        .map((s) => [s.categoryId, s.endedAt === null ? 'open' : 'closed']);
+    expect(byCategory(local)).toEqual([
+      [CAT.sleep, 'closed'],
+      [CAT.housework, 'closed'],
+      [CAT.relaxing, 'open'],
+    ]);
+    expect(local.find((s) => s.id === offline.opened?.id)?.endedAt).toBe(
+      shortcut.opened?.startedAt,
+    );
+    const serverLive = [...server.segments.values()].map((s) => s.row).filter((s) => !s.deletedAt);
+    expect(byCategory(serverLive)).toEqual(byCategory(local));
+  });
+
   it('keeps a pending settings change over the server copy', async () => {
     const server = await connected();
     await requestSync();
