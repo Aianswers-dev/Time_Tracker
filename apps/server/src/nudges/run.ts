@@ -75,7 +75,11 @@ export function possibleDayKeys(nowMs: number): string[] {
 }
 
 export type NudgeOutcome =
-  'no_open_segment' | 'no_subscriptions' | 'nothing_due' | 'no_vapid_subject' | 'sent';
+  | 'no_open_segment'
+  | 'no_subscriptions'
+  | 'nothing_due'
+  | 'no_vapid_subject'
+  | 'sent';
 
 /** The structured line each run logs. No tokens, keys or endpoints. */
 export interface NudgeRunReport {

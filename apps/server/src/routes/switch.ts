@@ -7,7 +7,7 @@ import {
 import { Hono } from 'hono';
 import { createDb } from '../db/client';
 import { categoryFromRow, segmentFromRow } from '../db/mapping';
-import { select } from '../db/queries';
+import { keepOverlapping, select } from '../db/queries';
 import type { AppEnv } from '../env';
 import { ApiException, readJson } from '../http';
 import { toOpFailure } from '../sync/errors';
@@ -50,13 +50,15 @@ switchRoutes.post('/switch', async (c) => {
   const db = createDb(c.env.DB);
   const now = new Date().toISOString();
 
-  const [candidateRows, existing, currentRows] = await db.batch([
+  const windowStart = switchWindowStart(req.at, now);
+  const [candidateRows, existing, overlappingRows] = await db.batch([
     req.categoryId !== undefined
       ? select.categoriesByIds(db, [req.categoryId])
       : select.activeCategories(db),
     select.segmentsByIds(db, req.id === undefined ? [] : [req.id]),
-    select.segmentsOverlapping(db, switchWindowStart(req.at, now), Number.POSITIVE_INFINITY),
+    select.segmentsOverlapping(db, windowStart, Number.POSITIVE_INFINITY),
   ]);
+  const currentRows = keepOverlapping(overlappingRows, windowStart, Number.POSITIVE_INFINITY);
 
   const category = resolveCategory(candidateRows.map(categoryFromRow), req);
   if (!category) {

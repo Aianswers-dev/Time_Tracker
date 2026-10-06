@@ -16,6 +16,7 @@ import {
   categoriesByIds,
   firstSegment,
   firstSettings,
+  keepOverlapping,
   orDefaultSettings,
   select,
 } from '../db/queries';
@@ -41,7 +42,11 @@ stateRoutes.get('/state', async (c) => {
   const day = dayRange(dayKey, settings);
 
   // Today's segments include the open one: it never ends, so it overlaps today.
-  const today = (await select.segmentsOverlapping(db, day.start, day.end)).map(segmentFromRow);
+  const today = keepOverlapping(
+    await select.segmentsOverlapping(db, day.start, day.end),
+    day.start,
+    day.end,
+  ).map(segmentFromRow);
   const open = findOpen(today);
   // The earliest segment tells the shared totals when tracking began, so time
   // before the first switch is not counted as untracked. It adds nothing else.
