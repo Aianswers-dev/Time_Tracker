@@ -14,6 +14,8 @@ export default defineConfig([
     '**/coverage',
     '**/.wrangler',
     '.claude/worktrees',
+    // Run with tsx or esbuild against the shared sources; not part of any tsconfig.
+    'tools/e2e/**/*.ts',
     'apps/server/public',
     'apps/server/drizzle',
   ]),
@@ -44,6 +46,11 @@ export default defineConfig([
     files: ['**/*.{js,mjs,cjs}'],
     extends: [tseslint.configs.disableTypeChecked],
     languageOptions: { globals: globals.node },
+  },
+  {
+    // Playwright scripts: part of each runs in the page through page.evaluate.
+    files: ['tools/e2e/**/*.mjs'],
+    languageOptions: { globals: { ...globals.node, ...globals.browser } },
   },
   {
     // Scriptable (iOS) widget scripts run in Scriptable's own runtime.

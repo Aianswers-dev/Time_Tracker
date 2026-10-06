@@ -16,3 +16,7 @@ dev-dist/
 apps/server/public/
 # Agent worktrees created during development
 .claude/worktrees/
+
+# End-to-end screenshots and downloads
+tools/e2e/**/shots/
+tools/e2e/**/downloads/
