@@ -18,7 +18,10 @@ of where your day went.
 
 M1 (core tracking, local only) and M2 (server, sync and auth) are in place:
 the Now, Today and Settings screens work offline from IndexedDB, and once a
-token is saved every change syncs to the Worker and back. See
+token is saved every change syncs to the Worker and back. M3 (nudges) has its
+server half: the once-a-minute cron evaluates the rules and sends Web Push,
+and the `/api/push/*` endpoints are ready for the app. Push needs no setup:
+the Worker generates its own VAPID keys. See
 [docs/07-roadmap.md](docs/07-roadmap.md).
 
 ## Documentation

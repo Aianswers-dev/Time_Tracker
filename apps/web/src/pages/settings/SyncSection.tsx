@@ -1,4 +1,4 @@
-import { Eye, EyeOff, RefreshCw, TriangleAlert } from 'lucide-react';
+import { CloudUpload, Eye, EyeOff, RefreshCw, TriangleAlert } from 'lucide-react';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useLocation } from 'react-router';
 import { Sheet } from '../../components/Sheet';
@@ -12,6 +12,7 @@ import {
   resetLocalData,
   syncNow,
   tokenErrorMessage,
+  uploadThisPhone,
 } from '../../sync/actions';
 import type { RoundOutcome } from '../../sync/engine';
 import { changesLabel, formatAgo } from '../../sync/format';
@@ -178,10 +179,25 @@ function Connected({ status }: { status: SyncStatus }) {
   const toast = useToast();
   const now = useNow(retryTick(status.retryAt), `${status.lastSyncedAt}|${status.retryAt}`);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [uploading, setUploading] = useState(false);
 
   async function sync() {
     const { message, error } = outcomeMessage(await syncNow(), 'Synced');
     toast.show({ message, tone: error ? 'error' : 'default' });
+  }
+
+  async function upload() {
+    setUploading(true);
+    try {
+      const { queued, outcome } = await uploadThisPhone();
+      const { message, error } = outcomeMessage(
+        outcome,
+        `Uploaded this phone's data (${changesLabel(queued)})`,
+      );
+      toast.show({ message, tone: error ? 'error' : 'default' });
+    } finally {
+      setUploading(false);
+    }
   }
 
   async function disconnectNow() {
@@ -236,8 +252,28 @@ function Connected({ status }: { status: SyncStatus }) {
           )}
         </div>
       )}
+      {status.serverEmpty && (
+        <div
+          className="flex flex-col gap-3 rounded-2xl bg-surface-2 p-3"
+          data-testid="server-empty"
+        >
+          <p className="text-sm">
+            Your server has no data, but this phone still has all of it. Upload it to restore your
+            server. Nothing on this phone changes.
+          </p>
+          <Button
+            variant="primary"
+            className="w-full"
+            disabled={uploading || status.syncing}
+            onClick={() => void upload()}
+          >
+            <CloudUpload size={20} aria-hidden />
+            {uploading ? 'Uploading…' : 'Upload this phone’s data'}
+          </Button>
+        </div>
+      )}
       <Button
-        variant="primary"
+        variant={status.serverEmpty ? 'secondary' : 'primary'}
         className="w-full"
         disabled={status.syncing}
         onClick={() => void sync()}

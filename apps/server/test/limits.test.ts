@@ -7,6 +7,7 @@ import {
   MIN,
   ago,
   allSegments,
+  countingD1,
   insertCategories,
   insertSegments,
   iso,
@@ -19,39 +20,6 @@ import {
 } from './harness';
 
 const server = useTestServer();
-
-/**
- * Wrap a D1 binding to count calls that reach D1: each executed statement and
- * each batch. This is what the Workers Free limit of 50 D1 queries per
- * request counts.
- */
-function countingD1(inner: D1Database): { d1: D1Database; calls: () => number } {
-  let calls = 0;
-  const real = new WeakMap<object, D1PreparedStatement>();
-  const wrap = (stmt: D1PreparedStatement): D1PreparedStatement => {
-    const wrapper = {
-      bind: (...values: unknown[]) => wrap(stmt.bind(...values)),
-      all: () => (calls++, stmt.all()),
-      run: () => (calls++, stmt.run()),
-      first: (column?: string) => (
-        calls++,
-        column === undefined ? stmt.first() : stmt.first(column)
-      ),
-      raw: (options?: { columnNames?: boolean }) => (calls++, stmt.raw(options as never)),
-    };
-    real.set(wrapper, stmt);
-    return wrapper as unknown as D1PreparedStatement;
-  };
-  const d1 = {
-    prepare: (query: string) => wrap(inner.prepare(query)),
-    batch: (statements: D1PreparedStatement[]) => {
-      calls++;
-      return inner.batch(statements.map((s) => real.get(s) ?? s));
-    },
-    exec: (query: string) => (calls++, inner.exec(query)),
-  } as unknown as D1Database;
-  return { d1, calls: () => calls };
-}
 
 async function callsFor(o: Op): Promise<number> {
   const { d1, calls } = countingD1(server.rawDb());

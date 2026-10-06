@@ -6,6 +6,7 @@ import { requireAuth } from './auth';
 import type { AppEnv } from './env';
 import { ApiException, errorResponse } from './http';
 import { exportRoutes } from './routes/export';
+import { pushRoutes } from './routes/push';
 import { readRoutes } from './routes/reads';
 import { stateRoutes } from './routes/state';
 import { switchRoutes } from './routes/switch';
@@ -38,6 +39,7 @@ app.route('/api', switchRoutes);
 app.route('/api', syncRoutes);
 app.route('/api', readRoutes);
 app.route('/api', exportRoutes);
+app.route('/api', pushRoutes);
 
 app.all('/api/*', (c) => errorResponse(c, 404, 'not_found', 'Route not found'));
 

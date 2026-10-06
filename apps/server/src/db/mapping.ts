@@ -1,6 +1,6 @@
-import type { Category, Rule, Segment, Settings } from '@time-tracker/shared';
+import type { Category, NotificationLogEntry, Rule, Segment, Settings } from '@time-tracker/shared';
 import { SETTINGS_ID } from '@time-tracker/shared';
-import type { CategoryRow, RuleRow, SegmentRow, SettingsRow } from './schema';
+import type { CategoryRow, NotificationLogRow, RuleRow, SegmentRow, SettingsRow } from './schema';
 
 /**
  * DB rows <-> shared entities. Drizzle already maps snake_case columns to
@@ -133,5 +133,18 @@ export function settingsToRow(s: Settings, syncedAt: string): SettingsRow {
     staleQuietEnd: s.staleQuietEnd,
     updatedAt: s.updatedAt,
     syncedAt,
+  };
+}
+
+export function notificationLogFromRow(r: NotificationLogRow): NotificationLogEntry {
+  return {
+    id: r.id,
+    kind: r.kind,
+    ruleId: r.ruleId,
+    segmentId: r.segmentId,
+    dayKey: r.dayKey,
+    sentAt: r.sentAt,
+    title: r.title,
+    body: r.body,
   };
 }

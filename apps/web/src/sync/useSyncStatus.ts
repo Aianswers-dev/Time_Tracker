@@ -17,17 +17,20 @@ export interface SyncStatus extends SyncRuntime {
   oldestPendingAt: string | null;
   error: SyncErrorInfo | null;
   bannerDismissed: boolean;
+  /** The server came back empty while this phone has data; offer to upload it. */
+  serverEmpty: boolean;
 }
 
 /** Everything the UI shows about sync. Undefined until the first read resolves. */
 export function useSyncStatus(): SyncStatus | undefined {
   const stored = useLiveQuery(async () => {
-    const [token, rejected, lastSyncedAt, error, dismissed] = await db.meta.bulkGet([
+    const [token, rejected, lastSyncedAt, error, dismissed, serverEmpty] = await db.meta.bulkGet([
       TOKEN_KEY,
       SYNC_META.tokenRejected,
       SYNC_META.lastSyncedAt,
       SYNC_META.syncError,
       SYNC_META.bannerDismissed,
+      SYNC_META.serverEmpty,
     ]);
     const pending = await db.outbox.count();
     const oldest = pending > 0 ? await db.outbox.orderBy('seq').first() : undefined;
@@ -40,6 +43,7 @@ export function useSyncStatus(): SyncStatus | undefined {
       oldestPendingAt: oldest?.op.createdAt ?? null,
       error: parseSyncError(error?.value),
       bannerDismissed: dismissed !== undefined,
+      serverEmpty: serverEmpty !== undefined,
     };
   }, []);
   const runtime = useSyncRuntime();

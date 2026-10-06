@@ -4,11 +4,12 @@
 # every /api route except /api/health answers 401. Generate: openssl rand -base64 32
 AUTH_TOKEN=
 
-# Web Push public key. Needed from M3. Generate the pair: npx web-push generate-vapid-keys
+# Web Push (VAPID) settings are all optional. Without them the Worker generates a key pair on
+# first use, stores it in D1 (server_config) and uses https://<the app's host> as the subject.
+# Set both keys only to use a pair of your own (npx web-push generate-vapid-keys). Changing the
+# keys later invalidates existing subscriptions; the app re-subscribes on its next launch.
 VAPID_PUBLIC_KEY=
-
-# Web Push private key from the same pair. Needed from M3.
 VAPID_PRIVATE_KEY=
 
-# Contact for push services, a mailto: URL, e.g. mailto:you@example.com. Needed from M3.
+# Optional contact for push services, a mailto: or https: URL, e.g. mailto:you@example.com.
 VAPID_SUBJECT=
