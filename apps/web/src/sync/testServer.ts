@@ -21,8 +21,9 @@ import { vi } from 'vitest';
  * server, applies ops the same way in spirit (a switch runs the shared
  * `switchCategory` with the server's clock, unknown categories are
  * `validation_failed`, a switch to the category already open under another
- * id is `conflict` and so is an upsert that breaks I1, I2 or I5), answers at most `maxApplied` ops per request
- * and returns the 10 s overlap on `since` pulls.
+ * id is `conflict` and so is an upsert that breaks I1, I2 or I5), answers at
+ * most `maxApplied` ops per request and returns the 10 s overlap on `since`
+ * pulls.
  */
 
 export interface Call {
