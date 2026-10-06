@@ -110,20 +110,34 @@ actual refresh cadence.
 ## Sync details
 
 - Every synced row carries `id` (client UUID v7), `createdAt`, `updatedAt`,
-  and nullable `deletedAt`. The server stamps `updatedAt` on write.
-- The outbox holds ordered ops: `{ opId, type, payload, createdAt }`. Ops are
-  sent in batches, applied in order. `4xx` responses mark the op failed and
-  surface a toast; `5xx` and network errors retry with exponential backoff
-  (2s, 4s, 8s, capped at 60s).
-- Ops are idempotent. Upserts carry full rows. A `switch` op carries the new
-  segment's id, so replaying it after a timeout is a no-op on the server.
-- `GET /api/snapshot?since=` returns every row with `updatedAt > since`,
-  including soft-deleted rows, plus `serverTime`. Without `since` it returns
-  everything. A year of use is roughly 5 to 10 thousand segments, which
-  IndexedDB handles comfortably, so the client keeps the full history locally.
-- The server is authoritative for the one-open-segment invariant. The `switch`
-  op and `POST /api/switch` are the only ways to open a segment, and they run
-  as a single D1 batch.
+  and nullable `deletedAt`. `updatedAt` is set by whoever made the change (the
+  phone for app edits, the server for Shortcut switches) and is never
+  restamped. Deletes are soft: an upsert with `deletedAt` set.
+- The server adds a `synced_at` column to every synced table: server time of
+  the last write. It is the snapshot cursor, so phone clock drift cannot make
+  a change invisible to the next pull.
+- One user action produces one op. The outbox holds ordered ops
+  `{ opId, type, payload, createdAt }`, sent in batches of up to 200 and
+  applied in order, each atomically.
+- Upserts are last-write-wins: the server applies an incoming row when its
+  `updatedAt` is at least the stored one, otherwise acknowledges and ignores it.
+- A `switch` op carries the new segment's id, so a replay after a timeout is
+  a no-op. The server runs the shared `switchCategory` against its own state,
+  so an offline switch still lands correctly after a Shortcut switch.
+- Failed ops (any `ok: false` result) are dropped from the outbox, a toast
+  names the change that did not sync, and the client does a full resync:
+  it replaces its local synced tables with a full snapshot. The server is the
+  durable truth, so this always converges. `5xx` and network errors keep the
+  op and retry with exponential backoff (2s, 4s, 8s, capped at 60s).
+- After a successful flush the client pulls `GET /api/snapshot?since=` and
+  overwrites local rows with the server's copies, except rows touched by an op
+  still waiting in the outbox. The outbox is flushed first, so the server copy
+  already includes every local change.
+- A year of use is roughly 5 to 10 thousand segments, which IndexedDB handles
+  comfortably, so the client keeps the full history locally and the snapshot
+  is not paged.
+- The server is authoritative for the invariants. It checks I1 and I2 after
+  applying each op and rejects the whole op with `conflict` if they fail.
 
 ## Time handling
 

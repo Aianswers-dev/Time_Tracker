@@ -69,8 +69,13 @@ Same category as the open segment → `200 { "noop": true, ... }`.
 Response:
 
 ```json
-{ "noop": false, "closed": { ...segment } | null, "opened": { ...segment } }
+{ "noop": false, "message": "Switched to Relaxing", "category": { ...category },
+  "closed": { ...segment } | null, "opened": { ...segment } | null }
 ```
+
+`message` is "Switched to {name}" or "Already on {name}", ready for a
+Shortcut's Show Result or Speak Text action. Only active categories match:
+archived or deleted ones answer `404 not_found`.
 
 ### Ops (the client outbox)
 
@@ -89,26 +94,21 @@ blocked.
   "serverTime": "<ISO>" }
 ```
 
-Op types and payloads (zod schemas live in `packages/shared/src/ops.ts`):
+Op types and payloads (zod schemas live in `packages/shared/src/ops.ts`). One
+user action is one op, applied atomically.
 
 | type | payload | server behaviour |
 | --- | --- | --- |
-| `switch` | `{ categoryId, at, newSegmentId, source }` | Close open, open new with the given id. If `newSegmentId` already exists → ok, noop. |
-| `segment.upsert` | full `Segment` | Upsert; validate I2 against neighbours; reject with `conflict` if it overlaps. Used by every edit operation; a client edit that touches three segments sends three upserts in one batch. |
-| `segment.delete` | `{ id }` | Set `deletedAt`. |
-| `category.upsert` | full `Category` | Upsert. |
-| `category.delete` | `{ id }` | Set `deletedAt` only if no segments reference it, else `conflict`. UI archives instead. |
-| `rule.upsert` | full `Rule` | Upsert. |
-| `rule.delete` | `{ id }` | Set `deletedAt`. |
-| `settings.upsert` | full `Settings` | Upsert singleton. |
+| `switch` | `{ categoryId, at, newSegmentId, source }` | If `newSegmentId` already exists: ok, no-op (replay). If the server's open segment already has `categoryId` under a different id: `conflict` (state diverged, client resyncs). Else run shared `switchCategory` against server state and write the result. `at` more than 60 s ahead: `switch_in_future`. |
+| `segments.upsert` | `{ rows: Segment[] }` (1 to 100) | Every edit, undo and delete. Apply each row by last-write-wins, then check I1 and I2 across the affected time window. Any violation rejects the whole op with `conflict`. |
+| `category.upsert` | `Category` | Last-write-wins upsert. Setting `deletedAt` while live segments reference the category: `conflict` (the UI archives instead). |
+| `rule.upsert` | `Rule` | Last-write-wins upsert. Unknown `categoryId`: `validation_failed`. |
+| `settings.upsert` | `Settings` | Last-write-wins upsert of the singleton. |
 
-Upserts are last-write-wins on `updatedAt`: an incoming row older than the
-stored one is acknowledged `ok: true` but ignored. The server stamps
-`updatedAt = max(incoming, now)`.
-
-For `segment.upsert` batches the server validates I1 and I2 after applying
-the whole op list for that request, not after each row, so a multi-row edit
-can pass through a transiently invalid state.
+Last-write-wins: an incoming row is applied when its `updatedAt` is greater
+than or equal to the stored row's, otherwise acknowledged `ok: true` and
+ignored. The server keeps the client's `updatedAt` and sets its own
+`synced_at` on every write.
 
 ### Snapshot (the client pull)
 
@@ -124,9 +124,9 @@ can pass through a transiently invalid state.
 }
 ```
 
-Rows with `updatedAt > since`, including soft-deleted rows. Without `since`,
-everything. Segments are capped at 20,000 rows per response; if more exist the
-response includes `"nextSince"` and the client pages.
+Rows with `synced_at > since`, including soft-deleted rows. Without `since`,
+everything. `settings` is null when unchanged since `since` or never set. Not
+paged: a year of use is well under a few MB.
 
 ### Convenience reads (debugging, Shortcuts)
 
