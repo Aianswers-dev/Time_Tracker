@@ -1,0 +1,68 @@
+/*
+ * Chart tokens for the Stats screen, loaded with its lazy chunk. Category
+ * colours come from each category; these are the chart furniture, the
+ * neutral "context" ink and the heatmap's sequential ramp. The ramp is the
+ * dataviz skill's blue, validated with `validate_palette.js --ordinal`
+ * against the card surface in each mode (light end 2.11:1 on #ffffff, dark
+ * low end 2.17:1 on #151922). In dark mode the ramp is re-stepped so more
+ * time is brighter, not inverted.
+ */
+.stats-root {
+  --chart-grid: #e9ebf0;
+  --chart-axis: #c5cad5;
+  --chart-neutral: #8a93a3;
+  --heat-0: #eef0f4;
+  --heat-1: #86b6ef;
+  --heat-2: #5598e7;
+  --heat-3: #2a78d6;
+  --heat-4: #1c5cab;
+  --heat-5: #104281;
+  --tooltip-bg: #ffffff;
+  /* Opacity of a context series (the trend's daily values) behind the main line. */
+  --faded: 0.45;
+}
+
+@media (prefers-color-scheme: dark) {
+  .stats-root {
+    --chart-grid: #222837;
+    --chart-axis: #353c4d;
+    --chart-neutral: #6b7486;
+    --heat-0: #1c2130;
+    --heat-1: #184f95;
+    --heat-2: #256abf;
+    --heat-3: #3987e5;
+    --heat-4: #6da7ec;
+    --heat-5: #9ec5f4;
+    --tooltip-bg: #1e2330;
+    --faded: 0.7;
+  }
+}
+
+/* Chart scrubbing: vertical page scroll stays native, a sideways drag inspects. */
+.chart-scrub {
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.chart-svg text {
+  font-size: 11px;
+  fill: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-svg .chart-label-strong {
+  fill: var(--fg);
+  font-weight: 600;
+}
+
+.stats-stale {
+  opacity: 0.55;
+  transition: opacity 150ms ease-out;
+}
+
+.chart-focus:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

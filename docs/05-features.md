@@ -75,22 +75,63 @@ Milestone tags (M1, M2, ...) map to `07-roadmap.md`.
 
 ## Stats screen `/stats` (M4)
 
-Range tabs: Today, This week, Last 7 days, This month, Custom. Week starts
-Monday.
+Range tabs: Today, This week, Last 7 days, This month, Custom (labelled
+Today, Week, 7 days, Month, Custom to fit one row; the full name and dates
+show under the title). Every range is whole logical days per `dayStartHour`
+and the settings timezone. Week starts Monday and, like This month, covers
+the whole calendar period, so days still to come show as empty slots. Custom
+has two date pickers (either order, end clamped to today, at most 366 days;
+it opens on the last 30 days). The range lives in the URL (`?range=week`,
+`?range=custom&from=&to=`), so Back from a drill-down returns to it. While a
+new range loads, the previous one stays on screen, faded.
 
-- **Totals donut or bar** with minutes and percentage per category for the
-  range.
+- **Headline tiles**: tracked time (with the average per day), the category
+  with the most time, untracked time, and the first enabled daily budget's
+  category against its budget (today's time, or the average per day for a
+  longer range, with a meter). Without a daily rule the fourth tile counts
+  days tracked.
+- **Totals bar list** with time and percentage per category, largest first,
+  untracked last and hatched. Percentages are of the range's elapsed time,
+  untracked included, so they add up to 100. A bar list rather than a donut:
+  ten categories are too many slices.
 - **Stacked daily bars**, one bar per logical day, segments stacked by
-  category. Tapping a bar jumps to that day on the Today screen.
-- **Hour of day heatmap**: 24 columns, one row per category, intensity equals
-  minutes in that local hour across the range. Answers "when do I waste
-  time".
-- **Budget tracker**: for each daily rule, the number of days under and over
-  budget in the range and a streak of days under.
-- **Trend**: for a chosen category, a line of minutes per day over the range
-  with a 7 day moving average.
-- Charts read from Dexie through the shared aggregation functions. Follow the
-  `dataviz` skill guidance for colour and form when building them.
+  category (largest over the range at the base, untracked hatched on top),
+  on a fixed 24 hour axis. Tapping a bar opens that day on the Today screen
+  (`/today?day=`); sliding a finger across, hovering, or the arrow keys show
+  that day's breakdown in a tooltip instead. A one-day range shows a button
+  to the day instead of a one-bar chart.
+- **Hour of day heatmap**: 24 columns starting at `dayStartHour`, one row per
+  category with its name above it, intensity is the average minutes per day
+  that category took in that local hour (five steps of one blue ramp, with a
+  scale). Tapping a square names it; with nothing picked, the readout gives
+  the peak hour of the budgeted category. Answers "when do I waste time".
+- **Budget tracker**: for each enabled daily rule, the days under and over
+  budget in the range, the streak of days under counting back from the last
+  day so far, and a strip of the days with the budget as a line (over days
+  in the danger colour, above the line). For a one-day range it is a meter
+  with the time left or over.
+- **Trend**: for a chosen category (defaults to the budgeted one), its time
+  per day, faded, and a trailing 7 day moving average. The average reaches
+  up to six days before the range so the first day has a full window, but
+  never before tracking began. A daily budget for the category is drawn as a
+  reference line.
+- Days before the first segment are left out of averages, budgets and the
+  heatmap's per-day figures, and the screen says when tracking began.
+  Before any segment exists it shows a "Nothing tracked yet" card.
+- Every chart has a table view behind a Table toggle, and names categories
+  in a legend or label, never by colour alone.
+- Charts read from Dexie through the shared aggregation functions:
+  `totalsForRange`, `sortedTotals`, `hourHeatmap`, `budgetStatus`,
+  `movingAverage`, and per-day totals equal to `dailyTotals` (computed as
+  `totalsForRange` over each day's `dayRange`, which is the same thing and an
+  order of magnitude faster over a year; a test checks they agree). Segments
+  are loaded by the `startedAt` index for the range plus six lookback days,
+  with the segment reaching in from before, the open segment and the
+  earliest segment (for untracked time). Hand-rolled SVG, no chart library,
+  in the lazily loaded Stats chunk, following the `dataviz` skill.
+- Performance (M4, 10,000 synthetic segments over a year, headless Chromium):
+  every preset range renders in under 60 ms after a tab tap, a full-year
+  custom range in about 0.5 s.
 
 ## Settings screen `/settings`
 
@@ -152,8 +193,15 @@ Monday.
   then every 1h"), an enabled switch, and a sheet for threshold, repeat and
   quiet hours. Each save writes one `settings.upsert` op. Seeded defaults
   from `01-decisions.md` on first run.
-- **Export (M4).** Buttons for CSV and JSON for a chosen range, calling the
-  export endpoints and triggering a download. Offline: generate from Dexie.
+- **Export (M4).** CSV and JSON for a chosen range (all time, last 30 days,
+  this month, last month, or two dates; whole logical days). The files are
+  built on the phone from Dexie in exactly the formats of the export
+  endpoints (`04-api.md`), so export works offline and needs no token; the
+  app never calls the endpoints. Where the browser can share files
+  (`navigator.canShare({ files })`, iOS) the share sheet opens, so the owner
+  can Save to Files or AirDrop it; elsewhere it downloads, and a Download
+  link stays on screen. The open segment has an empty `ended_at` and counts
+  its minutes up to now, as the endpoint does.
 - **About (M1).** App version, build hash, link to the repo.
 
 ## Notifications (M3)
