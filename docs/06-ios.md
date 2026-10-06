@@ -28,16 +28,34 @@ notifications section shows the three steps above and the toggle is hidden.
 
 ## Push permission flow (M3)
 
+No owner setup is needed on the server: the Worker generates its VAPID key
+pair the first time the app asks for it (step 3) and uses
+`https://<the app's host>` as the VAPID subject Apple requires.
+
 1. In standalone mode the owner taps "Enable notifications".
-2. `Notification.requestPermission()` is called from that tap handler.
-3. On `granted`, `registration.pushManager.subscribe({ userVisibleOnly: true,
-   applicationServerKey })` with the VAPID public key from the API.
-4. `POST /api/push/subscriptions` with the subscription JSON.
-5. On every app launch, if permission is `granted` and there is no stored
-   subscription id, or `pushManager.getSubscription()` returns a different
-   endpoint, re-subscribe and re-post. iOS drops subscriptions when the app
-   is deleted and reinstalled.
-6. "Send test notification" calls `POST /api/push/test`.
+2. `Notification.requestPermission()` is called from that tap handler, before
+   any `await`, so iOS still counts it as a user gesture.
+3. On `granted`, `GET /api/push/vapid-public-key`, decode the base64url `key`
+   to bytes, and `registration.pushManager.subscribe({ userVisibleOnly: true,
+   applicationServerKey })`.
+4. `POST /api/push/subscriptions` with `subscription.toJSON()` plus
+   `userAgent: navigator.userAgent`. Store the returned `id` in Dexie
+   `meta.pushSubscriptionId`. Posting the same endpoint again is harmless: it
+   returns the same id.
+5. On every app launch, if permission is `granted`: re-subscribe and re-post
+   when there is no stored subscription id, when `pushManager.getSubscription()`
+   is null or has a different endpoint than the one last posted, or when its
+   `options.applicationServerKey` differs from the key the API serves now (the
+   owner set or changed the VAPID secrets). In the last case call
+   `subscription.unsubscribe()` first: a subscription is bound to one key and
+   pushes signed with another are rejected. iOS drops subscriptions when the
+   app is deleted and reinstalled; the new endpoint gets a new row and the old
+   one is deleted the first time Apple answers 410 for it.
+6. "Send test notification" calls `POST /api/push/test` and shows
+   `{ sent, failed }`. `GET /api/push/subscriptions` gives each
+   subscription's `lastSuccessAt` and `failureCount` for the status line.
+7. Turning notifications off calls `subscription.unsubscribe()` and
+   `DELETE /api/push/subscriptions/:id`, then clears the stored id.
 
 Known quirks:
 
@@ -47,7 +65,11 @@ Known quirks:
   must enable it under iOS Settings → Notifications → Time Tracker. The
   Settings screen says so.
 - Delivery is reliable in practice but not instant. Expect nudges within a
-  minute or two of the threshold.
+  minute or two of the threshold. Pushes carry a 15 minute TTL, so a phone
+  that is off for longer skips stale nudges instead of getting a burst.
+- The Worker logs one JSON line per cron run (`"event": "nudges"`) with the
+  outcome and any push service error, e.g. `HTTP 403 {"reason":"BadJwtToken"}`.
+  `wrangler tail` shows them when a nudge does not arrive.
 - Declarative Web Push (Safari 18.4+) could replace the service worker
   `push` handler later. Standard push is fine to start with.
 

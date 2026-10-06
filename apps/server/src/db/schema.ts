@@ -137,8 +137,22 @@ export const notificationLog = sqliteTable(
     index('notif_rule_segment').on(t.ruleId, t.segmentId, t.sentAt),
     index('notif_rule_day').on(t.ruleId, t.dayKey, t.sentAt),
     index('notif_kind_segment').on(t.kind, t.segmentId, t.sentAt),
+    // The cron reads today's daily rows every minute and prunes by age (0001).
+    index('notif_kind_day').on(t.kind, t.dayKey, t.sentAt),
+    index('notif_sent').on(t.sentAt),
   ],
 );
+
+/**
+ * Server only. Key/value settings the Worker manages itself (0001): the
+ * generated VAPID key pair (`vapid_keys`) and the public origin the app was
+ * last served from (`origin`), the default VAPID subject. Never synced.
+ */
+export const serverConfig = sqliteTable('server_config', {
+  key: text('key').primaryKey(),
+  value: text('value').notNull(),
+  updatedAt: text('updated_at').notNull(),
+});
 
 export type CategoryRow = typeof categories.$inferSelect;
 export type SegmentRow = typeof segments.$inferSelect;
@@ -146,3 +160,4 @@ export type RuleRow = typeof rules.$inferSelect;
 export type SettingsRow = typeof settings.$inferSelect;
 export type PushSubscriptionRow = typeof pushSubscriptions.$inferSelect;
 export type NotificationLogRow = typeof notificationLog.$inferSelect;
+export type ServerConfigRow = typeof serverConfig.$inferSelect;

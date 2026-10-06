@@ -105,6 +105,17 @@ Tasks:
 - Settings: notifications section, rules manager, stale check settings.
 - Owner task list below updated with VAPID key generation.
 
+Status: the server half is done. The scheduled handler
+(`apps/server/src/nudges/run.ts`), Web Push sending with
+`@block65/webcrypto-web-push` 2.x (verified by decrypting its output with an
+RFC 8291 decryptor checked against the RFC's test vector), the `/api/push/*`
+endpoints including `GET /api/push/subscriptions`, and VAPID keys the Worker
+generates itself, so the owner setup below has no VAPID step. Server tests
+cover the scheduled job end to end against D1 with a fake sender, the D1 call
+and send budgets, and the real `scheduled` export. The client half (service
+worker handlers, Settings notifications and rules) and the on-device checks
+below remain.
+
 Definition of done:
 
 - With the Relaxing session rule set to 2 minutes for testing, a real iPhone
@@ -169,12 +180,21 @@ Done once, before M2 can be deployed:
    `apps/server/wrangler.toml`.
 3. Generate a token: `openssl rand -base64 32`. Then
    `wrangler secret put AUTH_TOKEN`.
-4. Before M3: generate VAPID keys (`npx web-push generate-vapid-keys`) and set
-   `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` (your
-   `mailto:` address) with `wrangler secret put`.
+4. Nothing to do for push notifications: the Worker generates its VAPID key
+   pair on first use and stores it in D1. Optional, only if you want your own
+   pair or contact address: `wrangler secret put` `VAPID_PUBLIC_KEY` and
+   `VAPID_PRIVATE_KEY` (both, from `npx web-push generate-vapid-keys`) and
+   `VAPID_SUBJECT` (a `mailto:` or `https:` URL). Setting or changing the keys
+   after the app has subscribed makes it re-subscribe on its next launch.
 5. `pnpm run deploy`, then `wrangler d1 migrations apply time-tracker --remote`.
 6. Open the `workers.dev` URL in Safari, Add to Home Screen, paste the token.
 7. Enable notifications from Settings inside the app, send a test.
 8. Set up Shortcuts from `06-ios.md`.
+
+Upgrading a deploy whose release adds a migration (M3 adds
+`0001_server_config`): apply the migrations first with
+`wrangler d1 migrations apply time-tracker --remote`, then `pnpm run deploy`.
+New tables and indexes do not affect the running code, but new code needs
+them: until they exist every cron run fails.
 
 Secrets are never committed. Local development uses `apps/server/.dev.vars`.

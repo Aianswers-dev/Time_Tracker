@@ -10,11 +10,18 @@ export interface Env {
   ASSETS: Fetcher;
   /** Bearer token for every /api route except /api/health. Unset or empty rejects every request. */
   AUTH_TOKEN?: string;
-  /** Web Push VAPID public key, base64url (M3). */
+  /**
+   * Optional Web Push VAPID public key, base64url (raw 65-byte point). Used only
+   * when VAPID_PRIVATE_KEY is set too; otherwise the Worker generates a pair
+   * once and keeps it in `server_config` (src/push/vapid.ts).
+   */
   VAPID_PUBLIC_KEY?: string;
-  /** Web Push VAPID private key, base64url (M3). Never leaves the Worker. */
+  /** Optional VAPID private key, base64url (32-byte scalar). Never leaves the Worker. */
   VAPID_PRIVATE_KEY?: string;
-  /** Contact for push services, a `mailto:` URL (M3). */
+  /**
+   * Optional VAPID subject, a `mailto:` or `https:` URL. Default: `https://` plus
+   * the host the app registered its subscription from.
+   */
   VAPID_SUBJECT?: string;
 }
 

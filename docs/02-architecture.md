@@ -50,9 +50,17 @@ payload, handles `notificationclick` by focusing or opening the app.
 
 - `fetch` handler: `/api/*` routes, everything else falls through to the
   assets binding with SPA fallback to `index.html`.
-- `scheduled` handler: runs the rule engine once a minute.
-- Bindings: `DB` (D1), `ASSETS`. Secrets: `AUTH_TOKEN`, `VAPID_PUBLIC_KEY`,
-  `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` (a `mailto:` URL).
+- `scheduled` handler: runs the rule engine once a minute
+  (`src/nudges/run.ts`).
+- Bindings: `DB` (D1), `ASSETS`. Secret: `AUTH_TOKEN`. Optional secrets:
+  `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` (used only when both are set),
+  `VAPID_SUBJECT` (a `mailto:` or `https:` URL). Without them the Worker
+  generates a VAPID key pair on first use and keeps it in the `server_config`
+  table, and signs with `https://<the host the app registered from>` as the
+  subject, so the owner needs no VAPID setup (`src/push/vapid.ts`).
+- Web Push sending: `@block65/webcrypto-web-push` 2.x (aes128gcm per RFC 8291,
+  `vapid` authorization per RFC 8292, both accepted by Apple), behind a small
+  `PushSender` interface so the scheduled job is testable (`src/push/`).
 - Drizzle schema and generated SQL migrations under `apps/server/drizzle`.
 
 ### `packages/shared`
@@ -90,13 +98,45 @@ reaches the server. This is a known and accepted limitation.
 whichever copy has the later `updatedAt`. Store the returned `serverTime` as
 the new `lastSync`.
 
-**4. Nudge evaluation (cron).** Load the open segment, its category, enabled
-rules for that category, settings, today's minutes for that category, and the
-notification log for the open segment and the current day. Call
-`evaluateRules`. For each resulting notification: insert a log row, then send
-a Web Push to every stored subscription. Delete a subscription on HTTP 404 or
-410 from the push service. The log insert happens before the send so a crash
-mid-send cannot cause a duplicate on the next minute.
+**4. Nudge evaluation (cron).** `runNudges` in `apps/server/src/nudges/run.ts`:
+
+1. One D1 read batch (one call, one consistent view): settings (or
+   `defaultSettings('UTC')`), the open segment, its category, its category's
+   enabled non-deleted rules, the notification log rows for the open segment
+   and for today's day key, the live segments that are open or end in the
+   last 48 hours (for today's total of the category), the push subscriptions
+   and `server_config`. The reads that depend on the open segment use a
+   subquery; the day-key read asks for every key the current instant can have
+   under any timezone and day start (at most four), because the settings are
+   not known yet. Extra rows are harmless to the rule engine.
+2. No open segment, or no subscriptions: stop. That is the whole run.
+3. Call the shared `evaluateRules` with `todayMs` from the shared `todayMsFor`.
+   Nothing due: stop.
+4. Resolve the VAPID keys and subject. Only the very first send without VAPID
+   secrets writes (one call: store a generated pair). If no subject is known
+   yet (nothing has registered from the app), stop without logging, so the
+   notifications fire as soon as one is.
+5. One write batch: a `notification_log` row for each notification, plus a
+   prune of log rows older than 60 days (except the open segment's). The log
+   is written before anything is sent, so a crash mid-send cannot cause a
+   duplicate on the next minute.
+6. Send each notification to each subscription (subscriptions in parallel,
+   notifications to one subscription in order), at most 6 sends per run. When
+   more are due than fit, the extra notifications are neither logged nor sent
+   and go out a minute later. One bad subscription never stops the others.
+7. One batch recording each subscription's outcome: 404 or 410 deletes it;
+   any other failure adds to `failure_count`; a success sets
+   `last_success_at` and resets the count.
+8. Log one JSON line: `{ event: "nudges", outcome, now, openSegmentId, fired,
+   deferred, subscriptions, sent, failed, removed, errors }`, where `outcome`
+   is `no_open_segment`, `no_subscriptions`, `nothing_due`,
+   `no_vapid_subject` or `sent`, `fired` and `deferred` are notification tags
+   (`session:<ruleId>`, `daily:<ruleId>`, `stale`) and `errors` are push
+   service answers such as `HTTP 403 {"reason":"BadJwtToken"}`. Tokens, keys
+   and endpoints are never logged.
+
+So a run makes 1 D1 call when nothing is due and at most 4 when it sends
+(3 once the key pair exists), and at most 6 push subrequests.
 
 **5. Push received.** The service worker shows the notification using
 `title`, `body`, `tag`, and `data.url` from the payload. Tapping focuses an
@@ -173,7 +213,9 @@ actual refresh cadence.
   or empty `AUTH_TOKEN` rejects every request.
 - Reject request bodies over 1 MB. No rate limiting is needed for one user.
 - The VAPID private key never leaves the Worker. The public key is served by
-  `GET /api/push/vapid-public-key`.
+  `GET /api/push/vapid-public-key`. A generated pair is stored in D1
+  (`server_config`), which only the Worker can read. Push endpoints and keys
+  are never logged or returned by the API.
 - The owner generates the token with `openssl rand -base64 32` and sets it via
   `wrangler secret put AUTH_TOKEN`. The client stores it in Dexie `meta`.
 - The service worker and app are same-origin with the API, so no CORS
@@ -203,13 +245,16 @@ actual refresh cadence.
 | Resource | Free limit | Expected use |
 | --- | --- | --- |
 | Worker requests | 100,000 / day | Cron 1,440 + app traffic well under 2,000 |
-| Worker CPU | 10 ms / invocation | Rule evaluation and one push encryption are well under 10 ms |
+| Worker CPU | 10 ms / invocation | Rule evaluation is negligible. Each push send costs an ECDH key pair, ECDH, HKDF, AES-GCM over 4 KB and an ECDSA signature (about 3 ms measured in Node); at most 6 sends per invocation |
+| Subrequests | 50 / invocation | Cron: at most 6 push sends plus at most 4 D1 calls |
 | Cron Triggers | Available on free plan | 1 trigger, every minute |
-| D1 reads | 5,000,000 rows / day | Cron reads under 20 rows per minute |
+| D1 reads | 5,000,000 rows / day | Cron reads the open segment's rows plus the last 48 hours of segments through indexes: tens of rows per minute, under 150,000 a day |
 | D1 writes | 100,000 rows / day | Dozens per day |
-| D1 queries per request | 50 | `/api/ops` applies at most 15 ops of at most 3 calls each; other routes make at most 4 |
+| D1 queries per request | 50 | `/api/ops` applies at most 15 ops of at most 3 calls each; the cron makes 1 to 4; other routes make at most 4 |
 | D1 storage | 5 GB | Under 10 MB after years of use |
 | Static assets | Free | One small SPA |
 
-If Workers CPU limits ever bite during push encryption, the fix is to batch
-fewer subscriptions per invocation, not to move to a paid plan.
+If Workers CPU limits ever bite during push encryption, the fix is to lower
+`MAX_PUSH_SENDS_PER_INVOCATION` in `apps/server/src/push/deliver.ts` (the
+notifications that do not fit wait for the next minute), not to move to a paid
+plan.

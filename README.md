@@ -16,7 +16,10 @@ of where your day went.
 
 ## Status
 
-The M0 scaffold is in place. M1 (core tracking, local only) is next. See
+M0 to M2 are in place: the scaffold, local tracking, and the server with sync
+and auth. M3 (nudges) has its server half: the once-a-minute cron evaluates the
+rules and sends Web Push, and the `/api/push/*` endpoints are ready for the
+app. Push needs no setup: the Worker generates its own VAPID keys. See
 [docs/07-roadmap.md](docs/07-roadmap.md).
 
 ## Documentation

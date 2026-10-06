@@ -238,12 +238,72 @@ because the client overwrites with the server's copy.
 
 ### Push
 
-- `GET /api/push/vapid-public-key` → `{ "key": "<base64url>" }`
-- `POST /api/push/subscriptions` with the browser's `PushSubscription.toJSON()`
-  plus `{ "userAgent": "..." }` → `201 { "id": "..." }`. Upserts on `endpoint`.
-- `DELETE /api/push/subscriptions/:id` → `204`.
-- `POST /api/push/test` → sends `"Test notification"` to every subscription,
-  returns `{ "sent": n, "failed": n }`. Used by the Settings screen.
+All five routes need the token like every other route. The shared zod schemas
+are in `packages/shared/src/api.ts` where named; the list response has no
+shared schema yet, so its shape is given here.
+
+**`GET /api/push/vapid-public-key`** → `200 { "key": "<base64url>" }`
+(`vapidKeyResponseSchema`). The key is the raw uncompressed P-256 point
+(65 bytes, first byte `0x04`), base64url without padding: pass it straight to
+`pushManager.subscribe({ applicationServerKey })` after decoding to bytes.
+It is the `VAPID_PUBLIC_KEY` secret when both key secrets are set, otherwise a
+pair the Worker generated on first use and stored. It never changes on its
+own, but it does change if the owner later sets or changes the secrets, so the
+client compares it with its subscription's `options.applicationServerKey`
+(see `06-ios.md`). Also records `https://<request host>` as the default VAPID
+subject.
+
+**`POST /api/push/subscriptions`** with `PushSubscription.toJSON()` plus an
+optional label (`pushSubscriptionRequestSchema`):
+
+```json
+{ "endpoint": "https://web.push.apple.com/...", "expirationTime": null,
+  "keys": { "p256dh": "<base64url>", "auth": "<base64url>" }, "userAgent": "iPhone Safari" }
+```
+
+→ `201 { "id": "<uuid>" }` (`pushSubscriptionResponseSchema`). Upserts on
+`endpoint`: registering the same endpoint again answers `201` with the same
+`id`, replaces the keys, resets `failureCount` and keeps the stored
+`userAgent` if none is sent. Beyond the shared schema the server requires an
+`https:` endpoint (at most 2048 characters), a `p256dh` that decodes to a
+65-byte point starting `0x04` and an `auth` that decodes to 16 bytes
+(base64url or base64, padding optional); otherwise `400 validation_failed`
+with `details.issues` paths such as `endpoint`, `keys.p256dh`, `keys.auth`.
+Also records the origin.
+
+**`GET /api/push/subscriptions`** → `200`, oldest first, never with endpoints
+or keys:
+
+```json
+{ "subscriptions": [
+  { "id": "<uuid>", "createdAt": "<ISO>", "lastSuccessAt": "<ISO>" | null,
+    "failureCount": 0, "userAgent": "iPhone Safari" | null } ] }
+```
+
+```ts
+const pushSubscriptionsResponseSchema = z.object({
+  subscriptions: z.array(z.object({
+    id: z.string(),
+    createdAt: z.iso.datetime(),
+    lastSuccessAt: z.iso.datetime().nullable(),
+    failureCount: z.number().int().min(0),
+    userAgent: z.string().nullable(),
+  })),
+});
+```
+
+`failureCount` counts failed sends since the last success. The client finds
+its own row by the id it stored in Dexie `meta.pushSubscriptionId`.
+
+**`DELETE /api/push/subscriptions/:id`** → `204` with no body, also when no
+such subscription exists (so a retry is harmless).
+
+**`POST /api/push/test`** (no body needed) → `200 { "sent": n, "failed": n }`
+(`pushTestResponseSchema`). Sends a "Test notification" (tag `test`) to every
+subscription, at most six, through the same path as nudges, and records the
+outcomes (404 and 410 delete the subscription and count as failed). `sent`
+counts messages the push service accepted (2xx); delivery to the device is up
+to the push service. With no subscriptions: `{ "sent": 0, "failed": 0 }`.
 
 ### Export
 
@@ -269,18 +329,33 @@ response has `Content-Disposition: attachment; filename="time-tracker-<date>.<ex
 ### Scheduled handler
 
 Not an HTTP route. `wrangler.toml` declares `crons = ["* * * * *"]`. The
-handler runs the flow described in `02-architecture.md` "Nudge evaluation".
-Locally, `wrangler dev --test-scheduled` exposes
+`scheduled` export in `apps/server/src/index.ts` calls `runNudges`
+(`src/nudges/run.ts`), which runs the flow described in `02-architecture.md`
+"Nudge evaluation" and logs one JSON line per run (`"event": "nudges"`). An
+unexpected error is logged as `{ "event": "nudges", "level": "error", ... }`
+and rethrown, so the invocation shows as failed. Locally,
+`wrangler dev --test-scheduled` exposes
 `GET /cdn-cgi/handler/scheduled?cron=*+*+*+*+*`.
 
 ## Web Push payload
+
+Every push, nudge or test, is this JSON (`pushPayloadSchema`):
 
 ```json
 { "title": "Relaxing for 1h 0m", "body": "You've been on Relaxing for 1h 0m straight. Time to switch it up.",
   "tag": "session:<ruleId>", "data": { "url": "/" } }
 ```
 
-Keep under 4 KB. Encrypt per RFC 8291 (aes128gcm) and sign per RFC 8292
-(VAPID). Candidate Workers-compatible libraries, to be verified in M3:
-`@block65/webcrypto-web-push`, `webpush-webcrypto`. If neither works, the
-protocol is small enough to implement with WebCrypto directly.
+`tag` is `session:<ruleId>`, `daily:<ruleId>`, `stale` or `test`; a repeat
+with the same tag replaces the banner. `data.url` is always `/`.
+
+Sending uses `@block65/webcrypto-web-push` 2.x on WebCrypto: the body is
+encrypted with `aes128gcm` (RFC 8291) and padded to a 4096-byte record, so a
+payload can be at most 3993 bytes (the largest the schemas allow is well under
+2 KB), and the request carries `Authorization: vapid t=<ES256 JWT>, k=<public
+key>` (RFC 8292) with `aud` the endpoint's origin, `sub` the VAPID subject and
+`exp` 12 hours ahead. Apple accepts both. Headers: `TTL: 900` (15 minutes; a
+late nudge is worse than none), `Urgency: high`, `Content-Encoding:
+aes128gcm`. Tests decrypt the library's output with an independent RFC 8291
+decryptor (itself checked against the RFC's Appendix A example) and verify
+the JWT against the public key.
