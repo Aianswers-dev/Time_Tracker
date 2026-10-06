@@ -210,7 +210,10 @@ or throws a typed error. Tests assert the invariants after each operation.
 - `dayKeyOf(t, settings)`: convert `t` to `settings.timezone`, subtract
   `dayStartHour` hours, format as `YYYY-MM-DD`.
 - `dayRange(dayKey, settings)`: `[start, end)` as UTC instants, where `start`
-  is `dayKey` at `dayStartHour` local and `end` is the next day's.
+  is `dayKey` at `dayStartHour` local and `end` is the next day's. When
+  `dayStartHour` happens twice (clocks going back) the day starts at the
+  first; when it is skipped, at the moment the clocks jump. So `t` is in
+  `dayRange(k)` exactly when `dayKeyOf(t) === k`.
 - `splitByDay(segment, now, settings)`: slices one segment (open segments end
   at `now`) into `{ dayKey, startedAt, endedAt, minutes }` pieces at logical
   day boundaries.
@@ -239,7 +242,10 @@ two. Any trimmed closed segment left shorter than one second is deleted (I5).
 - `editSegment({ id, categoryId?, startedAt?, endedAt?, note? })`: boundaries
   behave like dragging. Moving the start later or the end earlier pulls a
   touching neighbour along. Moving the start earlier or the end later clears
-  what was there. The open segment's end cannot be set (switch instead).
+  what was there. A pulled neighbour only takes over time the segment gave
+  up: when an edit moves the segment past its old end (or before its old
+  start), the time in between keeps whatever was there. The open segment's
+  end cannot be set (switch instead).
   The UI previews the returned rows to show what else will change.
 - `splitSegment({ id, at, secondCategoryId })`: end the segment at `at`,
   create a second segment from `at` to the original end. If the original was

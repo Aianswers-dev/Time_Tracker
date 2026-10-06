@@ -68,6 +68,11 @@ function lastSentMs(entries: readonly NotificationLogEntry[]): number | null {
   return last;
 }
 
+/** The rule's custom body, or null when it has none. A blank message counts as none. */
+function customBody(rule: Rule): string | null {
+  return rule.message !== null && rule.message.trim() !== '' ? rule.message : null;
+}
+
 function isDue(
   over: boolean,
   last: number | null,
@@ -115,7 +120,8 @@ export function evaluateRules(input: RuleEngineInput): PendingNotification[] {
       dayKey: null,
       title: `${name} for ${duration}`,
       body:
-        rule.message ?? `You've been on ${name} for ${duration} straight. Time to switch it up.`,
+        customBody(rule) ??
+        `You've been on ${name} for ${duration} straight. Time to switch it up.`,
       tag: `session:${rule.id}`,
     });
   }
@@ -133,7 +139,7 @@ export function evaluateRules(input: RuleEngineInput): PendingNotification[] {
       dayKey: today,
       title: `${formatDuration(input.todayMs)} of ${name} today`,
       body:
-        rule.message ??
+        customBody(rule) ??
         `That's past your ${formatDuration(rule.thresholdMin * MINUTE_MS)} budget for today.`,
       tag: `daily:${rule.id}`,
     });

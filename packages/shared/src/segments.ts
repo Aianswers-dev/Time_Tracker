@@ -80,12 +80,15 @@ class Working {
   private readonly created = new Set<string>();
   private readonly touched = new Set<string>();
   private readonly deleted = new Set<string>();
+  /** Every input id, soft-deleted ones included, so a created row never reuses one. */
+  private readonly inputIds = new Set<string>();
 
   constructor(
     segments: readonly Segment[],
     readonly ctx: OpContext,
   ) {
     for (const s of segments) {
+      this.inputIds.add(s.id);
       if (s.deletedAt !== null) continue;
       this.rows.set(s.id, s);
       this.original.set(s.id, s);
@@ -116,7 +119,7 @@ class Working {
   }
 
   create(seg: Omit<Segment, 'createdAt' | 'updatedAt' | 'deletedAt'>): Segment {
-    if (this.rows.has(seg.id) || this.original.has(seg.id)) {
+    if (this.rows.has(seg.id) || this.inputIds.has(seg.id)) {
       throw new SegmentOpError('invalid_range', `Segment id ${seg.id} already exists`);
     }
     const row: Segment = {
@@ -251,6 +254,14 @@ function sameContent(a: Segment, b: Segment): boolean {
   );
 }
 
+/** Milliseconds for a time parameter, rejecting anything that does not parse. */
+function parseTime(t: ISO, field: string): number {
+  const ms = toMs(t);
+  if (!Number.isFinite(ms))
+    throw new SegmentOpError('invalid_range', `${field} is not a valid time`);
+  return ms;
+}
+
 function assertNotFuture(atMs: number, nowMs: number): void {
   if (atMs > nowMs + FUTURE_TOLERANCE_MS) {
     throw new SegmentOpError('in_future', 'That time is in the future');
@@ -287,7 +298,7 @@ export function switchCategory(
 ): SwitchResult {
   const w = new Working(segments, ctx);
   const nowMs = w.nowMs;
-  let atMs = params.at === undefined ? nowMs : toMs(params.at);
+  let atMs = params.at === undefined ? nowMs : parseTime(params.at, 'at');
   assertNotFuture(atMs, nowMs);
   atMs = Math.min(atMs, nowMs);
 
@@ -322,7 +333,7 @@ export function backdateOpen(
   const open = w.open();
   if (!open) throw new SegmentOpError('no_open_segment', 'Nothing is running');
   const nowMs = w.nowMs;
-  const newStart = toMs(params.startedAt);
+  const newStart = parseTime(params.startedAt, 'startedAt');
   if (newStart > nowMs) throw new SegmentOpError('in_future', 'That time is in the future');
   const oldStart = toMs(open.startedAt);
   if (newStart === oldStart) return { rows: [], noop: true };
@@ -368,8 +379,9 @@ export function editSegment(
 
   const oldStart = toMs(seg.startedAt);
   const oldEnd = endMs(seg);
-  const newStart = params.startedAt === undefined ? oldStart : toMs(params.startedAt);
-  const newEnd = params.endedAt === undefined ? oldEnd : toMs(params.endedAt);
+  const newStart =
+    params.startedAt === undefined ? oldStart : parseTime(params.startedAt, 'startedAt');
+  const newEnd = params.endedAt === undefined ? oldEnd : parseTime(params.endedAt, 'endedAt');
 
   if (isOpen) {
     if (newStart > nowMs) throw new SegmentOpError('in_future', 'Start is in the future');
@@ -380,13 +392,16 @@ export function editSegment(
       throw new SegmentOpError('too_short', 'Entry is too short');
   }
 
+  // A pulled neighbour only takes over time this segment gave up. When the
+  // segment moves past its old end (or before its old start), the time in
+  // between still belongs to whatever was there.
   if (newStart > oldStart) {
     const prev = w.endingAt(oldStart, seg.id);
-    if (prev) w.update(prev.id, { endedAt: toIso(newStart) });
+    if (prev) w.update(prev.id, { endedAt: toIso(Math.min(newStart, oldEnd)) });
   }
   if (!isOpen && newEnd < oldEnd) {
     const next = w.startingAt(oldEnd, seg.id);
-    if (next) w.update(next.id, { startedAt: toIso(newEnd) });
+    if (next) w.update(next.id, { startedAt: toIso(Math.max(newEnd, oldStart)) });
   }
   w.clearRange(newStart, newEnd, new Set([seg.id]));
 
@@ -413,7 +428,7 @@ export function splitSegment(
 ): SegmentResult {
   const w = new Working(segments, ctx);
   const seg = w.get(params.id);
-  const atMs = toMs(params.at);
+  const atMs = parseTime(params.at, 'at');
   const start = toMs(seg.startedAt);
   const isOpen = seg.endedAt === null;
   const end = isOpen ? w.nowMs : toMs(seg.endedAt ?? '');
@@ -445,8 +460,8 @@ export function insertSegment(
   ctx: OpContext,
 ): SegmentResult {
   const w = new Working(segments, ctx);
-  const start = toMs(params.startedAt);
-  const end = toMs(params.endedAt);
+  const start = parseTime(params.startedAt, 'startedAt');
+  const end = parseTime(params.endedAt, 'endedAt');
   if (end > w.nowMs) throw new SegmentOpError('in_future', 'End is in the future');
   if (end <= start) throw new SegmentOpError('invalid_range', 'End must be after start');
   if (end - start < MIN_SEGMENT_MS) throw new SegmentOpError('too_short', 'Entry is too short');

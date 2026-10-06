@@ -149,6 +149,11 @@ actual refresh cadence.
 - Totals split segments at logical day boundaries. The open segment is treated
   as ending at `now` for all computations.
 - Library: `date-fns` with `@date-fns/tz`. Do not hand-roll timezone math.
+  One exception: do not build instants from local wall-clock fields with the
+  `TZDate` constructor or mutate a `TZDate` (`subDays` and friends). For
+  repeated and skipped local times its answer depends on the runtime's own
+  timezone, so the phone and the Worker disagree. `time.ts` converts with
+  `tzOffset` instead; reading fields from `new TZDate(ms, tz)` is fine.
 - Daylight saving transitions are handled by the library; the one test that
   matters is a segment spanning a DST change still summing to the correct
   number of real minutes.
