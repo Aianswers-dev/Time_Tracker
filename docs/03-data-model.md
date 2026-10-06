@@ -91,17 +91,23 @@ interface OutboxEntry {
 }
 
 interface Meta {            // client only, key/value
-  key: 'token' | 'lastSync' | 'installedAt' | 'seededAt' | 'pushSubscriptionId';
+  key: 'token' | 'lastSync' | 'installedAt' | 'seededAt' | 'pushSubscriptionId'
+     // sync state, see 02-architecture.md "The client sync engine"
+     | 'lastSyncedAt' | 'tokenRejected' | 'syncError' | 'needsFullResync'
+     | 'connectBannerDismissed';
   value: string;
 }
 ```
 
 ## SQL schema (D1 / SQLite)
 
-Drizzle is the source of truth; this is the intended shape. Every synced table
-(`categories`, `segments`, `rules`, `settings`) also has
-`synced_at TEXT NOT NULL`, the server time of the last write, indexed. It is
-the `GET /api/snapshot?since=` cursor and is never sent to the client.
+Drizzle (`apps/server/src/db/schema.ts`) is the source of truth and
+`apps/server/drizzle/0000_init.sql` is the generated migration; this is the
+same shape in plain SQL. Every synced table (`categories`, `segments`,
+`rules`, `settings`) also has `synced_at TEXT NOT NULL`, the server time of
+the last write, indexed. It is the `GET /api/snapshot?since=` cursor and is
+never sent to the client. Booleans are `0`/`1` integers; the server maps rows
+to the shared camelCase types in `apps/server/src/db/mapping.ts`.
 
 ```sql
 CREATE TABLE categories (
@@ -114,8 +120,10 @@ CREATE TABLE categories (
   archived_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  deleted_at TEXT
+  deleted_at TEXT,
+  synced_at TEXT NOT NULL
 );
+CREATE INDEX categories_synced ON categories(synced_at);
 
 CREATE TABLE segments (
   id TEXT PRIMARY KEY,
@@ -126,19 +134,25 @@ CREATE TABLE segments (
   source TEXT NOT NULL DEFAULT 'app',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  deleted_at TEXT
+  deleted_at TEXT,
+  synced_at TEXT NOT NULL
 );
 CREATE INDEX segments_started ON segments(started_at);
 CREATE INDEX segments_cat_started ON segments(category_id, started_at);
--- Enforces invariant I1 at the database level.
+-- Overlap queries ("ended_at IS NULL OR ended_at > ?") only read recent rows.
+CREATE INDEX segments_ended ON segments(ended_at);
+-- Enforces invariant I1 at the database level. The indexed expression is 1
+-- for every row the WHERE clause admits, so at most one such row can exist.
+-- Indexing ended_at itself would enforce nothing: every admitted row has
+-- ended_at NULL, and SQLite treats NULLs as distinct in a UNIQUE index.
 CREATE UNIQUE INDEX segments_one_open
-  ON segments(ended_at) WHERE ended_at IS NULL AND deleted_at IS NULL;
+  ON segments((ended_at IS NULL)) WHERE ended_at IS NULL AND deleted_at IS NULL;
 CREATE INDEX segments_synced ON segments(synced_at);
 
 CREATE TABLE rules (
   id TEXT PRIMARY KEY,
   category_id TEXT NOT NULL REFERENCES categories(id),
-  kind TEXT NOT NULL CHECK (kind IN ('session','daily')),
+  kind TEXT NOT NULL,
   threshold_min INTEGER NOT NULL,
   repeat_every_min INTEGER,
   quiet_start TEXT,
@@ -147,11 +161,14 @@ CREATE TABLE rules (
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  deleted_at TEXT
+  deleted_at TEXT,
+  synced_at TEXT NOT NULL,
+  CONSTRAINT rules_kind CHECK (kind IN ('session', 'daily'))
 );
+CREATE INDEX rules_synced ON rules(synced_at);
 
 CREATE TABLE settings (
-  id TEXT PRIMARY KEY CHECK (id = 'singleton'),
+  id TEXT PRIMARY KEY,
   timezone TEXT NOT NULL,
   day_start_hour INTEGER NOT NULL DEFAULT 4,
   stale_enabled INTEGER NOT NULL DEFAULT 1,
@@ -159,8 +176,11 @@ CREATE TABLE settings (
   stale_repeat_min INTEGER DEFAULT 60,
   stale_quiet_start TEXT,
   stale_quiet_end TEXT,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  synced_at TEXT NOT NULL,
+  CONSTRAINT settings_singleton CHECK (id = 'singleton')
 );
+CREATE INDEX settings_synced ON settings(synced_at);
 
 CREATE TABLE push_subscriptions (
   id TEXT PRIMARY KEY,
@@ -187,6 +207,19 @@ CREATE INDEX notif_rule_segment ON notification_log(rule_id, segment_id, sent_at
 CREATE INDEX notif_rule_day ON notification_log(rule_id, day_key, sent_at);
 CREATE INDEX notif_kind_segment ON notification_log(kind, segment_id, sent_at);
 ```
+
+D1 enforces foreign keys, so a segment or rule can only point at a category
+row that exists (soft-deleted or not). The server checks this before writing
+and answers `validation_failed` instead of surfacing a constraint error.
+
+SQLite checks `segments_one_open` after each statement, not at commit. A
+batch that moves "open" from one row to another must write the row that
+closes (or is deleted) before the row that opens; the server orders every
+segment batch that way.
+
+Timestamps are stored exactly as the shared zod schemas normalise them
+(`Date.prototype.toISOString()`), so comparing them as strings in SQL orders
+them correctly.
 
 The Dexie schema on the client mirrors `categories`, `segments`, `rules`,
 `settings` and adds `outbox` and `meta`. Dexie uses camelCase field names;
