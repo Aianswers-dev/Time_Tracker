@@ -29,6 +29,11 @@ def read(name):
         yield from csv.DictReader(f)
 
 
+def secs(hms: str) -> int:
+    h, m, s = (int(v) for v in hms.split(":"))
+    return h * 3600 + m * 60 + s
+
+
 def main():
     if not os.path.exists(os.path.join(GTFS, "shapes.txt")):
         with zipfile.ZipFile(GTFS_ZIP) as z:
@@ -138,7 +143,11 @@ def main():
             if d < last_s - 5:  # loops can revisit, keep monotonic
                 continue
             last_s = max(last_s, d)
-            stops.append([stop_idx(stop_id), q(d)])
+            stops.append([stop_idx(stop_id), q(d), secs(_arr)])
+        if stops:
+            t0 = stops[0][2]
+            for st in stops:
+                st[2] -= t0
         coords = list(line.simplify(0.4).coords)
         flat: list[int] = []
         for x, y in coords:

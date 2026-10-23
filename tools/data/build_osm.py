@@ -201,6 +201,9 @@ class Handler(osmium.SimpleHandler):
                     road["t"] = 1
                 if layer:
                     road["y"] = int(layer)
+                ms = num(tags.get("maxspeed"))
+                if ms and 5 <= ms <= 130:
+                    road["ms"] = int(ms)
                 if hw.endswith("_link"):
                     road["lk"] = 1
                 if hw == "busway" or kind == 7:

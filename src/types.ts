@@ -46,6 +46,8 @@ export interface Road {
   /** Bus-only road (busway / bus-designated service road). */
   bus: boolean;
   name?: string;
+  /** Posted speed limit in km/h when tagged in OSM. */
+  maxspeed?: number;
   /** Polyline, flat [x0, y0, x1, y1, ...] in metres. One-way roads point in the direction of travel. */
   pts: Float32Array;
 }
@@ -114,6 +116,8 @@ export interface RouteStop {
   stop: number;
   /** Distance along the route polyline in metres. */
   s: number;
+  /** Scheduled seconds after the first stop on this map (from the GTFS timetable). */
+  t: number;
 }
 
 export interface Route {

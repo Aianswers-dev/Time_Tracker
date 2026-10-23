@@ -2,12 +2,12 @@ import type { Area, Building, MapData, Rail, Road, Route, Stop } from '../types'
 import { cumulative } from './coords';
 
 /* Raw JSON shapes written by tools/data/*.py. Coordinates are decimetre ints. */
-interface RawRoad { k: number; w: number; l: number; p: number[]; n?: number; o?: 1; b?: 1; t?: 1; y?: number; lk?: 1; bus?: 1 }
+interface RawRoad { ms?: number; k: number; w: number; l: number; p: number[]; n?: number; o?: 1; b?: 1; t?: 1; y?: number; lk?: 1; bus?: 1 }
 interface RawRoads { bounds: [number, number, number, number]; names: string[]; roads: RawRoad[]; rail: { p: number[]; b?: 1; t?: 1 }[]; signals: number[]; crossings: number[] }
 interface RawBuilding { h: number; m?: number; k?: number; pt?: 1; c?: string; r?: string; rc?: string; n?: string; p: number[] }
 interface RawArea { k?: number; p: number[]; h?: number[][] }
 interface RawAreas { water: RawArea[]; areas: RawArea[]; trees: number[] }
-interface RawRoute { id: string; name: string; dir: number; headsign: string; color: string; text: string; op: string; trips: number; len: number; p: number[]; stops: [number, number][] }
+interface RawRoute { id: string; name: string; dir: number; headsign: string; color: string; text: string; op: string; trips: number; len: number; p: number[]; stops: [number, number, number][] }
 interface RawRoutes { stops: { n: string; c: string; x: number; y: number }[]; routes: RawRoute[] }
 
 const dm = (p: number[]): Float32Array => {
@@ -59,6 +59,7 @@ export async function loadMapData(onProgress: (fraction: number, label: string) 
     link: !!x.lk,
     bus: !!x.bus,
     name: x.n !== undefined ? r.names[x.n] : undefined,
+    maxspeed: x.ms,
     pts: dm(x.p),
   }));
   const rail: Rail[] = r.rail.map((x) => ({ bridge: !!x.b, tunnel: !!x.t, pts: dm(x.p) }));
@@ -90,7 +91,7 @@ export async function loadMapData(onProgress: (fraction: number, label: string) 
       pts,
       cum,
       length: cum[cum.length - 1],
-      stops: x.stops.map(([stop, s]) => ({ stop, s: s * 0.1 })),
+      stops: x.stops.map(([stop, s, t]) => ({ stop, s: s * 0.1, t })),
     };
   });
 
