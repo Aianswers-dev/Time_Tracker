@@ -1,0 +1,20 @@
+:root {
+  --tl-blue: #0b1f3a;
+  --tl-teal: #00a5b5;
+  --tl-green: #8dc63f;
+  --ui-bg: rgba(8, 18, 34, 0.82);
+  --ui-fg: #f2f6fb;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1f3a; color: var(--ui-fg); }
+#app { position: fixed; inset: 0; }
+#app canvas { display: block; width: 100%; height: 100%; }
+#loading {
+  position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 18px; background: radial-gradient(circle at 50% 40%, #16365f, #0b1f3a 70%); z-index: 50;
+}
+#loading h1 { margin: 0; font-size: clamp(28px, 5vw, 54px); letter-spacing: 0.02em; }
+#loading .bar { width: min(420px, 80vw); height: 8px; border-radius: 4px; background: rgba(255,255,255,0.15); overflow: hidden; }
+#loading .bar > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--tl-teal), var(--tl-green)); transition: width 0.2s; }
+#loading .label { opacity: 0.8; font-size: 14px; }
