@@ -1378,6 +1378,26 @@ export class Traffic {
     return out;
   }
 
+  /**
+   * The AI buses' bodies (centreline points front first, bending with an articulated bus) and half
+   * widths, for a driver looking along its lane for a bus ahead (the autopilot). Reused objects.
+   */
+  busBodies(): readonly { body: Body; half: number; len: number }[] {
+    const out = this.busBodiesOut;
+    let n = 0;
+    for (const b of this.active) {
+      if (b.dead) continue;
+      const r = (out[n] ??= { body: b.body, half: 0, len: 0 });
+      r.body = b.body;
+      r.half = b.spec.width / 2;
+      r.len = b.len;
+      n++;
+    }
+    out.length = n;
+    return out;
+  }
+  private readonly busBodiesOut: { body: Body; half: number; len: number }[] = [];
+
   /** AI buses and cars within r of (x, y) with their state, and recent valve events (diagnostics). */
   debugNear(x: number, y: number, r = 60): object {
     const buses = this.active

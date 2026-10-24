@@ -6,6 +6,7 @@ import type { BusPose, BusSpec, DriveInput, InputAction } from '../types';
 import type { RouteTrack, TrackSample } from './track';
 import type { GuideState } from './guide';
 import type { Traffic } from './traffic';
+import type { Body } from './bodies';
 import { TRACK_STEP } from './track';
 import { LEVEL_GAP } from './height';
 import { wrapAngle } from '../data/coords';
@@ -113,8 +114,13 @@ export class Autopilot {
   private redT = 0;
   private ignoreSignalUntil = -1;
   private ignoreTrafficUntil = -1;
+  /** Only vehicles squarely on the lane count as a lead until then (after a long queue). */
+  private strictLeadUntil = -1;
+  /** Consecutive 40 s blocked spells without moving on. */
+  private blockedN = 0;
   private levelBadT = 0;
   private lastProblem = new Map<string, number>();
+  private readonly near: { body: Body; half: number; len: number }[] = [];
   private tmp: TrackSample = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
   private readonly out: DriveInput = { throttle: 0, brake: 0, steer: 0, gear: 'D', pressed: new Set(), held: new Set() };
 
@@ -280,7 +286,7 @@ export class Autopilot {
 
     // Vehicles ahead on the lane.
     if (this.traffic && this.time > this.ignoreTrafficUntil) {
-      const lead = this.leadDistance(sFront, z, Math.min(70, 12 + v * v / (2 * DECEL) + v * 2));
+      const lead = this.leadDistance(sFront, z, Math.min(70, 12 + v * v / (2 * DECEL) + v * 2), this.time < this.strictLeadUntil);
       if (lead < Infinity) {
         const vs = Math.sqrt(2 * 1.8 * Math.max(0, lead - 4));
         if (vs < target) {
@@ -386,13 +392,20 @@ export class Autopilot {
       this.redT = 0;
       this.ignoreSignalUntil = this.time + 15;
     }
-    // Queued behind traffic for a long time: something is wedged (log it, then drive through).
+    // Queued behind traffic for a long time: log it, then count only vehicles squarely on the lane
+    // (a bus or car beside it can hold the sensor); only a queue that still hasn't moved after
+    // two minutes is driven through (the traffic's own jam breaker should have cleared it).
     if (why === 'traffic' && av < 0.5) this.queueT += dt;
-    else this.queueT = 0;
+    else {
+      this.queueT = 0;
+      if (av > 3) this.blockedN = 0;
+    }
     if (this.queueT > 40) {
+      this.blockedN++;
       this.problem('blocked', `queued behind traffic for 40 s (lead ${limitDist.toFixed(0)} m ahead, ${this.traffic?.count ?? 0} AI buses)`, at, 1);
       this.queueT = 0;
-      this.ignoreTrafficUntil = this.time + 12;
+      this.strictLeadUntil = this.time + 20;
+      if (this.blockedN >= 3) this.ignoreTrafficUntil = this.time + 12;
     }
     const moving = target > 1.5 && !a.interlock && this.phase !== 'dwell' && this.phase !== 'closing';
     if (moving && av < 0.3) this.stuckT += dt;
@@ -426,35 +439,51 @@ export class Autopilot {
   }
 
   /** Free distance along the lane ahead of the front to the nearest AI vehicle on it (same level), or Infinity. */
-  private leadDistance(sFront: number, z: number, range: number): number {
+  private leadDistance(sFront: number, z: number, range: number, strict = false): number {
     const tr = this.traffic!;
     const T = this.track;
     const grid = tr.cars.grid;
-    const markers = tr.markers();
+    // The AI buses that could be on the stretch ahead, as their real bodies (an articulated or
+    // turning bus bends; a straight segment for it sweeps across lanes it isn't in, or misses it).
+    const near = this.near;
+    near.length = 0;
+    T.sample(sFront + range / 2, this.tmp);
+    const cx = this.tmp.x;
+    const cy = this.tmp.y;
+    const cr = range / 2 + 4;
+    for (const b of tr.busBodies()) {
+      if (Math.abs(b.body.fx - cx) < cr + b.len && Math.abs(b.body.fy - cy) < cr + b.len) near.push(b);
+    }
     for (let d = 2; d <= range; d += 2) {
       T.sample(sFront + d, this.tmp);
       const pz = T.zAt(sFront + d);
       if (Math.abs(pz - z) > LEVEL_GAP + Math.abs(d * 0.08)) continue;
-      if (grid.nearest(this.tmp.x, this.tmp.y, 1.7, undefined, pz) >= 0) return d;
-      for (const m of markers) {
-        const dx = this.tmp.x - m.x;
-        const dy = this.tmp.y - m.y;
-        if (Math.abs(dx) > m.length + 2 || Math.abs(dy) > m.length + 2) continue;
-        // A bus crossing or coming the other way is drawn as a straight segment here, which sweeps
-        // across our lane when it is turning or articulated: only count it when it is really on the lane.
-        const dh = Math.abs(((m.heading - this.tmp.heading + 3 * Math.PI) % (2 * Math.PI)) - Math.PI);
-        const reach = dh > Math.PI / 4 ? 1.0 : 1.8;
-        // Distance from the lane point to the AI bus centreline segment.
-        const mx = Math.sin(m.heading);
-        const my = Math.cos(m.heading);
-        const along = clamp(dx * mx + dy * my, -m.length / 2, m.length / 2);
-        const ex = dx - mx * along;
-        const ey = dy - my * along;
-        if (ex * ex + ey * ey < reach * reach) return d;
+      const px = this.tmp.x;
+      const py = this.tmp.y;
+      if (grid.nearest(px, py, strict ? 1.0 : 1.7, undefined, pz) >= 0) return d;
+      for (const b of near) {
+        const B = b.body;
+        for (let k = 0; k + 1 < B.n; k++) {
+          if (Math.abs(B.z[k] - pz) > LEVEL_GAP && Math.abs(B.z[k + 1] - pz) > LEVEL_GAP) continue;
+          const ax = B.x[k];
+          const ay = B.y[k];
+          const sx = B.x[k + 1] - ax;
+          const sy = B.y[k + 1] - ay;
+          const l2 = sx * sx + sy * sy;
+          const t = l2 > 1e-6 ? clamp(((px - ax) * sx + (py - ay) * sy) / l2, 0, 1) : 0;
+          const ex = px - ax - sx * t;
+          const ey = py - ay - sy * t;
+          // A bus along our lane (ahead or oncoming) counts within ~1.8 m of the lane centre; one
+          // across it only when its body really covers the lane centre (not a car-length off).
+          const along = Math.abs(sx * this.tmp.hx + sy * this.tmp.hy) > 0.7 * Math.sqrt(l2);
+          const reach = along && !strict ? b.half + 0.55 : b.half - 0.2;
+          if (ex * ex + ey * ey < reach * reach) return d;
+        }
       }
     }
     return Infinity;
   }
+
 
   /** Summary for logs. */
   report(): { time: number; rescues: number; phaseTime: Record<string, number>; problems: AutopilotProblem[]; dwells: AutopilotDwell[] } {
