@@ -143,7 +143,7 @@ function place(time: number): void {
     const e = cab.eye.clone();
     if (q.has('ez')) e.set(num('ex', e.x), num('ey', e.y), num('ez', e.z));
     camera.position.copy(e).applyMatrix4(g.matrixWorld);
-    camera.rotation.set((num('cpitch', 0) * Math.PI) / 180, (num('look', 0) * Math.PI) / 180, 0, 'YXZ');
+    camera.rotation.set((num('cpitch', -7) * Math.PI) / 180, (num('look', 0) * Math.PI) / 180, 0, 'YXZ');
     return;
   }
   let ang = (num('angle', 35) * Math.PI) / 180;

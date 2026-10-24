@@ -144,9 +144,79 @@ function roundedSlab(w: number, l: number, h: number, r: number): THREE.BufferGe
   return g;
 }
 
-export function addTrim(gb: GeoBuilder, B: BodyLayout, sec: SectionLayout, lv: Livery, low: boolean): void {
+export interface MirrorHead {
+  /** +1 driver's side (right), -1 kerb side (left). */
+  side: 1 | -1;
+  kind: 'wing' | 'camera';
+  /** Head centre, section-local. */
+  c: THREE.Vector3;
+  /** Glass width/height and housing depth. */
+  w: number;
+  h: number;
+  d: number;
+  /** Turn of the glass normal from straight back (+z) toward +x, and its tilt down. */
+  yaw: number;
+  pitch: number;
+  /** Support arm, body to head. */
+  arm: THREE.Vector3[];
+  armR: number;
+}
+
+/**
+ * Exterior mirrors as on the Brisbane fleet (photos of T2825, V2299, C2046):
+ * the Volgren Optimus has a rams-horn mirror hanging from the kerb-side roof
+ * corner (livery yellow on Transport for Brisbane) and a black mirror on a
+ * short arm beside the driver's window. The Brisbane Metro has no mirrors:
+ * small camera pods at the top front corners feed screens in the cab.
+ * Glass normals bisect "toward the driver's eye" and "straight back".
+ */
+export function mirrorHeads(B: BodyLayout, sec: SectionLayout): MirrorHead[] {
+  if (!sec.isFront) return [];
   const zo = -sec.axleFromFront;
   const hw = B.hw;
+  if (B.type === 'metro') {
+    const zf = frontZ(B, sec, 2.86);
+    return ([1, -1] as const).map((s) => {
+      const c = V(s * (hw + 0.07), 2.8, zf + 0.42 + zo);
+      return { side: s, kind: 'camera', c, w: 0.075, h: 0.09, d: 0.2, yaw: 0, pitch: 0, arm: [V(s * (hw - 0.02), 2.86, zf + 0.6 + zo), V(c.x, c.y + 0.02, c.z + 0.04)], armR: 0.022 };
+    });
+  }
+  const zl = frontZ(B, sec, 2.6);
+  const left: MirrorHead = {
+    side: -1,
+    kind: 'wing',
+    c: V(-(hw + 0.17), 2.22, zl - 0.32 + zo),
+    w: 0.2,
+    h: 0.36,
+    d: 0.085,
+    yaw: 0.46,
+    pitch: 0.065,
+    arm: [V(-(hw - 0.04), 2.96, zl + 0.32 + zo), V(-(hw + 0.08), 2.99, zl + zo), V(-(hw + 0.17), 2.84, zl - 0.26 + zo), V(-(hw + 0.17), 2.42, zl - 0.33 + zo)],
+    armR: 0.022,
+  };
+  const zr = frontZ(B, sec, 1.6);
+  const right: MirrorHead = {
+    side: 1,
+    kind: 'wing',
+    c: V(hw + 0.2, 1.62, zr + 0.14 + zo),
+    w: 0.19,
+    h: 0.31,
+    d: 0.08,
+    yaw: -0.3,
+    pitch: -0.1,
+    arm: [V(hw - 0.01, 1.3, zr + 0.42 + zo), V(hw + 0.13, 1.36, zr + 0.26 + zo), V(hw + 0.2, 1.47, zr + 0.17 + zo)],
+    armR: 0.02,
+  };
+  return [left, right];
+}
+
+/** Head frame: origin at the head centre, +z = glass normal. */
+export function mirrorFrame(m: MirrorHead): THREE.Matrix4 {
+  return mat4(m.c.x, m.c.y, m.c.z, m.pitch, m.yaw, 0);
+}
+
+export function addTrim(gb: GeoBuilder, B: BodyLayout, sec: SectionLayout, lv: Livery, low: boolean): void {
+  const zo = -sec.axleFromFront;
   const metro = B.type === 'metro';
   const black: RGB = rgb('#18191c');
   const white: RGB = rgb('#eceeef');
@@ -180,30 +250,21 @@ export function addTrim(gb: GeoBuilder, B: BodyLayout, sec: SectionLayout, lv: L
     }
   }
   if (!sec.isFront) return;
-  // mirrors (rams-horn on the Optimus, short stalks on the Metro)
-  const housing = lv.mirror;
-  for (const s of [1, -1]) {
-    const zf = frontZ(B, sec, 2.6);
-    if (metro) {
-      const base = V(s * (hw - 0.05), 2.55, zf + 0.45 + zo);
-      const head = V(s * (hw + 0.14), 2.42, zf + 0.12 + zo);
-      gb.rod(base, head, 0.02, black, 6);
-      gb.box(head.x - 0.075, head.y - 0.12, head.z - 0.035, head.x + 0.075, head.y + 0.12, head.z + 0.035, black);
-      if (!low) gb.quad(V(head.x - 0.065, head.y - 0.105, head.z + 0.037), V(head.x + 0.065, head.y - 0.105, head.z + 0.037), V(head.x + 0.065, head.y + 0.105, head.z + 0.037), V(head.x - 0.065, head.y + 0.105, head.z + 0.037), rgb('#556677'));
-    } else {
-      const p0 = V(s * (hw - 0.04), 2.96, zf + 0.32 + zo);
-      const p1 = V(s * (hw + 0.08), 2.99, zf + 0.0 + zo);
-      const p2 = V(s * (hw + 0.17), 2.86, zf - 0.28 + zo);
-      const p3 = V(s * (hw + 0.17), 2.68, zf - 0.36 + zo);
-      gb.rod(p0, p1, 0.022, black, 6);
-      gb.rod(p1, p2, 0.022, black, 6);
-      gb.rod(p2, p3, 0.022, black, 6);
-      const hx = s * (hw + 0.17), hy = 2.44, hz = zf - 0.37 + zo;
-      const g = roundedSlab(0.22, 0.38, 0.09, 0.05);
-      // slab is flat in XZ; stand it up so its large faces look forward/back
-      gb.add(g, new THREE.Matrix4().makeTranslation(hx, hy, hz).multiply(new THREE.Matrix4().makeRotationX(Math.PI / 2)).multiply(new THREE.Matrix4().makeTranslation(0, -0.045, 0)), housing);
-      g.dispose();
-      if (!low) gb.quad(V(hx - 0.09, hy - 0.16, hz + 0.047), V(hx + 0.09, hy - 0.16, hz + 0.047), V(hx + 0.09, hy + 0.16, hz + 0.047), V(hx - 0.09, hy + 0.16, hz + 0.047), rgb('#4f6070'));
+  // Optimus: kerb-side rams-horn mirror in the livery colour, short-arm black
+  // mirror on the driver's side. Metro: camera pods (camera monitor system).
+  for (const m of mirrorHeads(B, sec)) {
+    for (let i = 0; i < m.arm.length - 1; i++) gb.rod(m.arm[i], m.arm[i + 1], m.armR, black, 6);
+    const col = m.kind === 'camera' || m.side > 0 ? black : lv.mirror;
+    const g = roundedSlab(m.w + 0.03, m.h + 0.03, m.d, Math.min(0.05, m.w * 0.3));
+    // slab is flat in XZ; stand it up so its large faces look forward/back
+    gb.add(g, mirrorFrame(m).multiply(new THREE.Matrix4().makeRotationX(Math.PI / 2)).multiply(new THREE.Matrix4().makeTranslation(0, -m.d / 2 - 0.004, 0)), col);
+    g.dispose();
+    if (m.kind === 'camera' && !low) {
+      // lens on the rear face of the pod
+      const f = mirrorFrame(m);
+      const lens = new THREE.CylinderGeometry(0.022, 0.022, 0.01, 10);
+      gb.add(lens, f.multiply(new THREE.Matrix4().makeTranslation(0, -0.01, m.d / 2 + 0.002)).multiply(new THREE.Matrix4().makeRotationX(Math.PI / 2)), rgb('#0a1a2a'));
+      lens.dispose();
     }
   }
   if (low) return;

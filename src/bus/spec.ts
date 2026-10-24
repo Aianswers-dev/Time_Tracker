@@ -254,7 +254,7 @@ function optimusLayout(type: BusType): BodyLayout {
         ],
       },
     ],
-    eye: { x: 0.62, y: 2.2, z: 1.4 },
+    eye: { x: 0.62, y: 1.9, z: 1.4 },
   };
 }
 
@@ -353,7 +353,7 @@ function metroLayout(): BodyLayout {
         roofPods: [{ z0: 0.6, z1: 5.6, w: 2.1, h: 0.28 }],
       },
     ],
-    eye: { x: 0.62, y: 2.2, z: 1.4 },
+    eye: { x: 0.62, y: 1.92, z: 1.4 },
   };
 }
 

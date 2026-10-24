@@ -18,6 +18,7 @@ import { buildSaloon, type Saloon } from './saloon';
 import { playerSign } from './state';
 import { canvasTexture } from './util';
 import { haloGeometry, haloMaterial } from './halo';
+import { mirrorGlassGeometry, mirrorTexture } from './mirror';
 
 type LampGroup = 'drl' | 'night' | 'brake' | 'indL' | 'indR' | 'reverse';
 const LAMP_GROUPS: Record<LampGroup, LampKind[]> = {
@@ -75,6 +76,8 @@ export function createHighBus(spec: BusSpec, route: Route | undefined): BusMesh 
     new THREE.MeshStandardMaterial({ map: doorTexture(spec.type === 'metro'), transparent: true, roughness: 0.15, metalness: 0.0, envMap: env, envMapIntensity: 0.45, side: THREE.DoubleSide }),
   );
   const glowMat = own(new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false }));
+  // wing mirror glass shows the cab's painted reflections (mirror.ts)
+  const mirrorMat = own(new THREE.MeshBasicMaterial({ map: mirrorTexture(), color: 0xe6eaee }));
   const bellowsMat = own(new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, metalness: 0.35, envMap: env, envMapIntensity: 0.7, side: THREE.DoubleSide }));
   const wheelGeo = own(wheelGeometry(B.tyreR, 0.28, 28));
   const leafGeo = own(leafGeometry());
@@ -128,6 +131,12 @@ export function createHighBus(spec: BusSpec, route: Route | undefined): BusMesh 
     const trim = new THREE.Mesh(own(buildTrim(B, L, lv)), trimMat);
     trim.name = 'trim';
     inner.add(trim);
+    const mg = mirrorGlassGeometry(B, L);
+    if (mg) {
+      const glassMesh = new THREE.Mesh(own(mg), mirrorMat);
+      glassMesh.name = 'mirrorGlass';
+      inner.add(glassMesh);
+    }
 
     const slots = wheelSlots(B, L);
     const wheels = new THREE.InstancedMesh(wheelGeo, wheelMat, slots.length);
