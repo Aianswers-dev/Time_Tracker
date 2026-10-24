@@ -1730,9 +1730,11 @@ export class RouteTrack {
         a = b;
       }
       // (Nowhere a bus fits alongside, or all of it: as matched.)
-      if (ba < 0 || (bb - ba) * TRACK_STEP < 12 || (ba === 0 && bb === ok.length - 1)) return;
-      const s0 = Math.max(z.s0, (i0 + ba) * TRACK_STEP - TRACK_STEP / 2);
-      const s1 = Math.min(z.s1, (i0 + bb) * TRACK_STEP + TRACK_STEP / 2);
+      const trim = !(ba < 0 || (bb - ba) * TRACK_STEP < 12 || (ba === 0 && bb === ok.length - 1));
+      // Within the lane too: a terminus platform can reach past the route's end, where there is no lane.
+      const s0 = Math.max(0, trim ? Math.max(z.s0, (i0 + ba) * TRACK_STEP - TRACK_STEP / 2) : z.s0);
+      const s1 = Math.min(this.length - 1, trim ? Math.min(z.s1, (i0 + bb) * TRACK_STEP + TRACK_STEP / 2) : z.s1);
+      if ((s0 === z.s0 && s1 === z.s1) || s1 - s0 < 8) return;
       const e0 = Math.max(0, Math.round((s0 - z.s0) / z.step));
       const e1 = Math.min(z.edge.length, e0 + Math.floor((s1 - s0) / z.step) + 1);
       zones[k] = { ...z, s0, s1, edge: z.edge.slice(e0, e1) };
