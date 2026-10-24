@@ -7,7 +7,7 @@ import { drivable, roadIndexFor, speedLimitOf } from './roadIndex';
 import { isStationStop } from './routeMeta';
 import { matchStopPlatform, type PlatformZone } from './platforms';
 import { LEVEL_GAP, heightsOf } from './height';
-import type { Heights } from '../data/height';
+import { activeCollider } from '../sim/collider';
 
 export const TRACK_STEP = 4;
 
@@ -34,11 +34,14 @@ export interface TrackStop {
 /** Lane centre this far from a platform edge puts the bus side ~0.35 m off it. */
 const PLATFORM_LANE = 1.6;
 /**
- * Where a road has walls (tunnel walls, viaduct parapets, cutting retaining
- * walls; see sim/collider.ts) the lane centre stays this far inside them:
- * half a bus plus a margin for the body swinging out on bends.
+ * The lane centre stays this far from walls (tunnel tubes, viaduct parapets,
+ * cutting retaining walls; sim/collider.ts): half a bus plus a margin for the
+ * body swinging out on bends.
  */
 const WALL_CLEAR = 2.1;
+/** The bus's vertical span above the road (m): walls outside it are not in the way. */
+const BUS_LO = -0.2;
+const BUS_HI = 3.4;
 /** Sideways metres per metre the lane may move away from a walled stretch. */
 const WALL_SLOPE = 0.35;
 /** Samples either side whose wall bounds a lane sample also keeps to. */
@@ -86,46 +89,89 @@ function boxSmooth(src: Float32Array, half: number): Float32Array {
   return out;
 }
 
-const ALONG_0 = [0];
 const ALONG_3 = [-2, 0, 2];
 
-const cuttings = new WeakMap<Road, boolean>();
-/** Does the road dip below the ground beside it anywhere (so it can have retaining walls)? As sim/collider.ts. */
-function inCutting(r: Road, H: Heights): boolean {
-  let cut = cuttings.get(r);
-  if (cut !== undefined) return cut;
-  cut = false;
-  const p = r.pts;
-  const z = r.z;
-  const n = p.length / 2;
-  const off = Math.max(r.width / 2 + 0.6, 2.6) + 2.5;
-  for (let v = 0; v < n && !cut; v++) if (H.ground(p[2 * v], p[2 * v + 1]) - z[v] > 1.2) cut = true;
-  for (let v = 0; v + 1 < n && !cut; v++) {
-    const mx = (p[2 * v] + p[2 * v + 2]) / 2;
-    const my = (p[2 * v + 1] + p[2 * v + 3]) / 2;
-    const dx = p[2 * v + 2] - p[2 * v];
-    const dy = p[2 * v + 3] - p[2 * v + 1];
-    const L = Math.hypot(dx, dy) || 1;
-    const zm = (z[v] + z[v + 1]) / 2;
-    for (const sd of [-1, 1]) if (H.ground(mx + (sd * dy * off) / L, my - (sd * dx * off) / L) - zm > 1.5) cut = true;
-  }
-  cuttings.set(r, cut);
-  return cut;
+/**
+ * The walls the lane keeps clear of, and where a bus may drive: the driving
+ * collider (sim/collider.ts SimCollider) fits.
+ */
+export interface TrackWalls {
+  readonly walls: {
+    readonly ax: Float32Array;
+    readonly ay: Float32Array;
+    readonly bx: Float32Array;
+    readonly by: Float32Array;
+    readonly lo: Float32Array;
+    readonly hi: Float32Array;
+    readonly count: number;
+  };
+  /** (x, y) is inside a carriageway or station bay at about level z. */
+  drivable(x: number, y: number, z: number): boolean;
+  /** The map road with this index (to tell which map the walls belong to). */
+  road?(index: number): Road | undefined;
 }
 
-/** Does road b simply carry on from road a (a way split end to end, not a junction)? */
-function continues(a: Road, b: Road): boolean {
-  const pa = a.pts;
-  const pb = b.pts;
-  const na = pa.length;
-  const nb = pb.length;
-  const ends = [
-    [pa[na - 2], pa[na - 1], pb[0], pb[1]],
-    [pb[nb - 2], pb[nb - 1], pa[0], pa[1]],
-    [pa[0], pa[1], pb[0], pb[1]],
-    [pa[na - 2], pa[na - 1], pb[nb - 2], pb[nb - 1]],
-  ];
-  return ends.some(([x0, y0, x1, y1]) => Math.hypot(x0 - x1, y0 - y1) < 1);
+const registered = new WeakMap<MapData, TrackWalls>();
+
+/**
+ * Use these walls for every track of this map (the player's guide passes the
+ * driving collider). Tracks built before are rebuilt on their next use.
+ */
+export function useTrackWalls(data: MapData, walls: TrackWalls): void {
+  registered.set(data, walls);
+}
+
+/** The walls for this map: registered ones, else the driving collider if it was built for it. */
+function wallsFor(data: MapData): TrackWalls | null {
+  const w = registered.get(data);
+  if (w) return w;
+  const c = activeCollider;
+  return c && c.road(0) === data.roads[0] ? c : null;
+}
+
+/** Uniform grid over wall pieces (CSR), cached per wall set. */
+interface WallGrid {
+  x0: number;
+  y0: number;
+  nx: number;
+  ny: number;
+  start: Int32Array;
+  items: Int32Array;
+}
+const WALL_CELL = 16;
+const wallGrids = new WeakMap<object, WallGrid>();
+function wallGrid(w: TrackWalls['walls']): WallGrid {
+  let g = wallGrids.get(w);
+  if (g) return g;
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  for (let i = 0; i < w.count; i++) {
+    x0 = Math.min(x0, w.ax[i], w.bx[i]);
+    y0 = Math.min(y0, w.ay[i], w.by[i]);
+    x1 = Math.max(x1, w.ax[i], w.bx[i]);
+    y1 = Math.max(y1, w.ay[i], w.by[i]);
+  }
+  if (!w.count) x0 = y0 = x1 = y1 = 0;
+  const nx = Math.max(1, Math.ceil((x1 - x0) / WALL_CELL) + 1);
+  const ny = Math.max(1, Math.ceil((y1 - y0) / WALL_CELL) + 1);
+  const start = new Int32Array(nx * ny + 1);
+  const each = (i: number, fn: (c: number) => void) => {
+    const cx0 = Math.floor((Math.min(w.ax[i], w.bx[i]) - x0) / WALL_CELL);
+    const cx1 = Math.floor((Math.max(w.ax[i], w.bx[i]) - x0) / WALL_CELL);
+    const cy0 = Math.floor((Math.min(w.ay[i], w.by[i]) - y0) / WALL_CELL);
+    const cy1 = Math.floor((Math.max(w.ay[i], w.by[i]) - y0) / WALL_CELL);
+    for (let cy = cy0; cy <= cy1; cy++) for (let cx = cx0; cx <= cx1; cx++) fn(cy * nx + cx);
+  };
+  for (let i = 0; i < w.count; i++) each(i, (c) => start[c + 1]++);
+  for (let c = 0; c < nx * ny; c++) start[c + 1] += start[c];
+  const items = new Int32Array(start[nx * ny]);
+  const fill = start.slice(0, nx * ny);
+  for (let i = 0; i < w.count; i++) each(i, (c) => (items[fill[c]++] = i));
+  g = { x0, y0, nx, ny, start, items };
+  wallGrids.set(w, g);
+  return g;
 }
 
 /** Roads that can have walls along them (tunnels and viaducts). */
@@ -173,6 +219,8 @@ export class RouteTrack {
   /** Lane-offset bounds that keep the bus off walls (-/+Infinity where unwalled); diagnostics. */
   readonly bandLo: Float32Array;
   readonly bandHi: Float32Array;
+  /** The walls this track was fitted to (null: none were available). */
+  readonly walls: TrackWalls | null;
   readonly stops: TrackStop[];
   readonly signals: TrackSignal[];
   /** Every 40 m: [s, x, y] triples, for quick "is this route near me" tests. */
@@ -193,15 +241,18 @@ export class RouteTrack {
     const nx = new Float32Array(n);
     const ny = new Float32Array(n);
     const target = new Float32Array(n);
+    /** Lateral position of the matched road's centreline (along each sample's normal). */
+    const roadC = new Float32Array(n);
     const kerbBase = new Float32Array(n);
     const known = new Uint8Array(n);
-    // Walls beside each sample (lateral positions, + = left), for keeping the lane off them.
+    // Walls beside each sample (lateral positions along its normal, + = left), for keeping the lane off them.
+    const TW = wallsFor(data);
+    this.walls = TW;
+    const W = TW?.walls;
+    const WG = W ? wallGrid(W) : null;
     const wallStart = new Int32Array(n + 1);
     const wallPos: number[] = [];
-    // Where carriageways at this level cross each sample's normal (a lane only runs in a gap with one).
-    const roadStart = new Int32Array(n + 1);
-    const roadPos: number[] = [0];
-    const nearRoads: number[] = [];
+    const wallSeen = W ? new Int32Array(W.count) : new Int32Array(0);
     this.limit = new Uint8Array(n);
     this.road = new Int32Array(n).fill(-1);
     this.z = new Float32Array(n);
@@ -228,82 +279,58 @@ export class RouteTrack {
       const hit = idx.nearest(p.x, p.y, 14, heading, 0.8, drivable, zr) ?? idx.nearest(p.x, p.y, 32, heading, 0.8, walledRoad, zr);
       if (hit) {
         const road = data.roads[hit.road];
-        const dC = (hit.px - p.x) * nx[i] + (hit.py - p.y) * ny[i];
+        // Where our normal crosses the road's centreline (not just the nearest point's sideways part:
+        // the road can run at an angle to the GTFS shape, through a junction hall or a turnaround).
+        const rnx = -hit.dy;
+        const rny = hit.dx;
+        const cosN = rnx * nx[i] + rny * ny[i];
+        const dC = Math.abs(cosN) > 0.5 ? ((hit.px - p.x) * rnx + (hit.py - p.y) * rny) / cosN : (hit.px - p.x) * nx[i] + (hit.py - p.y) * ny[i];
         const w = Math.max(3.2, road.width);
         const fromCentre = road.oneway ? Math.max(0, w / 2 - 1.75) : Math.min(6, Math.max(1.6, w / 2 - 1.75));
         target[i] = dC + fromCentre;
+        roadC[i] = dC;
         kerbBase[i] = dC + (road.oneway ? w / 2 : Math.max(w / 2, 3.2));
         known[i] = 1;
         this.limit[i] = speedLimitOf(road);
         this.road[i] = hit.road;
       }
-      // Walls along the roads here at this level (see sim/collider.ts): just outside each carriageway
-      // (never closer than 2.6 m to its centreline) of tunnels and viaducts, and of cuttings where the
-      // ground beside is well above the road; none where another carriageway continues beyond.
+      // The collider's walls crossing this sample's normal (and halfway to its neighbours, so walls at
+      // an angle cannot slip between samples), where they stand in the bus's way at this height.
       wallStart[i] = wallPos.length;
-      roadStart[i] = roadPos.length;
-      roadPos.push(0); // the GTFS line itself
-      nearRoads.length = 0;
-      const reach = Math.max(18, (hit ? Math.abs((hit.px - p.x) * nx[i] + (hit.py - p.y) * ny[i]) : 0) + 9);
-      idx.forEachNear(p.x, p.y, reach, (ri, ax, ay, sdx, sdy, slen, _d, zz) => {
-        if (!drivable(data.roads[ri]) || Math.abs(zz - zr) > LEVEL_GAP) return;
-        nearRoads.push(ri, ax, ay, sdx, sdy, slen, zz);
-      });
-      // Where each wall line crosses this sample's normal (roads at an angle too; not ones crossing
-      // our path, whose walls the collider opens where routes cross).
-      for (let k = 0; k < nearRoads.length; k += 7) {
-        const r = data.roads[nearRoads[k]];
-        const ax = nearRoads[k + 1];
-        const ay = nearRoads[k + 2];
-        const sdx = nearRoads[k + 3];
-        const sdy = nearRoads[k + 4];
-        const slen = nearRoads[k + 5];
-        const zk = nearRoads[k + 6];
-        // Road's left normal; cos of the angle between it and ours.
-        const rnx = -sdy;
-        const rny = sdx;
-        const cos = rnx * nx[i] + rny * ny[i];
-        if (Math.abs(cos) < 0.4) continue;
-        const baseAt = Math.max(r.width / 2 + 0.6, 2.6);
-        const tc = -((p.x - ax) * rnx + (p.y - ay) * rny) / cos;
-        const cu = (p.x + nx[i] * tc - ax) * sdx + (p.y + ny[i] * tc - ay) * sdy;
-        if (cu >= -1 && cu <= slen + 1) roadPos.push(tc);
-        // On this sample's normal and halfway to its neighbours (walls at an angle can slip between).
-        for (const along of Math.abs(cos) > 0.97 ? ALONG_0 : ALONG_3) for (const side of [1, -1]) {
-          const qx0 = p.x + dx * along;
-          const qy0 = p.y + dy * along;
-          const dist = (qx0 - ax) * rnx + (qy0 - ay) * rny;
-          // The collider moves a wall out to leave a bus on the route line room (route within 12 m,
-          // running along this road), and leaves out walls the route line runs right beside.
-          let wallAt = baseAt;
-          const need = side * dist + 2.3 / Math.abs(cos) + (1 - Math.abs(cos)) * 4;
-          if (Math.abs(dist) < 12 && Math.abs(cos) > 0.3 && need > wallAt) wallAt = Math.min(baseAt + 12, need);
-          const t = (side * wallAt - dist) / cos;
-          if (Math.abs(t) * Math.abs(cos) < (r.bridge && !r.tunnel ? 1.6 : 2.6)) continue;
-          const wx = qx0 + nx[i] * t;
-          const wy = qy0 + ny[i] * t;
-          const u = (wx - ax) * sdx + (wy - ay) * sdy;
-          if (u < -1 || u > slen + 1 || Math.abs(t) > reach) continue;
-          const walled = r.tunnel || r.bridge || (inCutting(r, H) && H.ground(wx + rnx * side * 2.5, wy + rny * side * 2.5) - zk >= 1.5);
-          if (!walled) continue;
-          // An opening where another carriageway at the wall's level continues beyond it.
-          const ox = wx + rnx * side * 0.9;
-          const oy = wy + rny * side * 0.9;
-          let open = false;
-          for (let q = 0; q < nearRoads.length && !open; q += 7) {
-            if (nearRoads[q] === nearRoads[k] || Math.abs(nearRoads[q + 6] - zk) > 1.6) continue;
-            const qx = ox - nearRoads[q + 1];
-            const qy = oy - nearRoads[q + 2];
-            const qu = qx * nearRoads[q + 3] + qy * nearRoads[q + 4];
-            if (qu < -3 || qu > nearRoads[q + 5] + 3) continue;
-            if (Math.abs(qx * -nearRoads[q + 4] + qy * nearRoads[q + 3]) < data.roads[nearRoads[q]].width / 2 - 0.2) open = true;
+      if (W && WG) {
+        const reach = Math.max(20, Math.abs(target[i]) + 10);
+        const cx0 = Math.max(0, Math.floor((p.x - reach - WG.x0) / WALL_CELL));
+        const cx1 = Math.min(WG.nx - 1, Math.floor((p.x + reach - WG.x0) / WALL_CELL));
+        const cy0 = Math.max(0, Math.floor((p.y - reach - WG.y0) / WALL_CELL));
+        const cy1 = Math.min(WG.ny - 1, Math.floor((p.y + reach - WG.y0) / WALL_CELL));
+        for (let cy = cy0; cy <= cy1; cy++) {
+          for (let cx = cx0; cx <= cx1; cx++) {
+            const c = cy * WG.nx + cx;
+            for (let q = WG.start[c]; q < WG.start[c + 1]; q++) {
+              const w = WG.items[q];
+              if (wallSeen[w] === i + 1) continue;
+              wallSeen[w] = i + 1;
+              if (W.hi[w] <= zr + BUS_LO || W.lo[w] >= zr + BUS_HI) continue;
+              const ax = W.ax[w];
+              const ay = W.ay[w];
+              const ex = W.bx[w] - ax;
+              const ey = W.by[w] - ay;
+              const den = ex * ny[i] - ey * nx[i];
+              if (Math.abs(den) < 1e-6) continue;
+              for (const along of ALONG_3) {
+                const qx = p.x + dx * along - ax;
+                const qy = p.y + dy * along - ay;
+                const u = (qx * ny[i] - qy * nx[i]) / den;
+                if (u < 0 || u > 1) continue;
+                const t = (qx * ey - qy * ex) / den;
+                if (Math.abs(t) <= reach) wallPos.push(t);
+              }
+            }
           }
-          if (!open) wallPos.push(t);
         }
       }
     }
     wallStart[n] = wallPos.length;
-    roadStart[n] = roadPos.length;
     // Fill unknown samples by interpolating between known neighbours.
     let lastKnown = -1;
     for (let i = 0; i <= n; i++) {
@@ -344,7 +371,6 @@ export class RouteTrack {
     const home = Float32Array.from(tMed, (v, i) => Math.max(-24, Math.min(24, v, this.offset[i] + 6), this.offset[i] - 6));
     const lo = new Float32Array(n).fill(-Infinity);
     const hi = new Float32Array(n).fill(Infinity);
-    const bayTo = new Float32Array(n).fill(-Infinity);
     // Busway platforms: the lane hugs the platform edge so buses pull right alongside.
     const zones = route.stops.map((_, k) => matchStopPlatform(data, route, k));
     for (const z of zones) {
@@ -366,94 +392,70 @@ export class RouteTrack {
         this.kerb[i] += (Math.max(PLATFORM_LANE, kerbNow - this.offset[i]) - this.kerb[i]) * w;
         if (s >= z.s0 && s <= z.s1) this.kerb[i] = PLATFORM_LANE;
       }
-      // Alongside the platform the space up to its edge is bay, not wall, where the platform
-      // belongs to this level's road (the nearest road to its edge, as sim/collider.ts decides).
-      const under = data.platforms[z.platform]?.underground ?? false;
-      for (let i = Math.max(0, Math.floor((z.s0 - 2) / TRACK_STEP)); i <= Math.min(n - 1, Math.ceil((z.s1 + 2) / TRACK_STEP)); i++) {
-        const e = edgeAt(i * TRACK_STEP);
-        const ex = bx[i] + nx[i] * e;
-        const ey = by[i] + ny[i] * e;
-        const near = idx.nearest(ex, ey, 16, undefined, 0, (r) => drivable(r) && r.tunnel === under) ?? idx.nearest(ex, ey, 16, undefined, 0, drivable);
-        if (near && Math.abs(near.z - this.z[i]) < 1.8) bayTo[i] = e + 0.5;
-      }
     }
-    // The gap between walls the lane runs in: the one around its road lane, or where that is too
-    // narrow for a bus (a wall standing in the carriageway), the nearest one that fits, staying
-    // on the side chosen just before.
+    // The gap between walls the lane runs in: the one around its road lane where a bus fits and can
+    // drive (a carriageway or station bay: platform bays are open in the collider), else the nearest
+    // such gap, staying on the side chosen just before; where none fits (a junction hall, a tight
+    // turnaround), the middle of the gap the carriageway is in.
     const ws: number[] = [];
     let prev = NaN;
     for (let i = 0; i < n; i++) {
       const h = home[i];
       ws.length = 0;
-      for (let k = wallStart[i]; k < wallStart[i + 1]; k++) {
-        const wp = wallPos[k];
-        if (!(wp > h && wp <= bayTo[i])) ws.push(wp);
-      }
-      if (!ws.length) {
+      for (let k = wallStart[i]; k < wallStart[i + 1]; k++) ws.push(wallPos[k]);
+      if (!ws.length || !TW) {
         prev = NaN;
         continue;
       }
       ws.sort((p1, p2) => p1 - p2);
-      let gi = 0;
-      while (gi < ws.length && ws[gi] < h) gi++;
-      // Gap g spans (ws[g - 1], ws[g]) with -/+Infinity at the ends.
+      const z = this.z[i];
+      const at = (t: number) => TW.drivable(bx[i] + nx[i] * t, by[i] + ny[i] * t, z);
       const gapLo = (g: number) => (g > 0 ? ws[g - 1] + WALL_CLEAR : -Infinity);
       const gapHi = (g: number) => (g < ws.length ? ws[g] - WALL_CLEAR : Infinity);
-      // Only gaps with a carriageway in them (not the drop beyond a parapet).
-      const hasRoad = (g: number) => {
-        const a = g > 0 ? ws[g - 1] : -Infinity;
-        const b = g < ws.length ? ws[g] : Infinity;
-        for (let k = roadStart[i]; k < roadStart[i + 1]; k++) if (roadPos[k] > a && roadPos[k] < b) return true;
-        return false;
+      const fits = (g: number, ref: number) => {
+        const a = gapLo(g);
+        const b = gapHi(g);
+        return a <= b && at(Math.max(a, Math.min(b, ref)));
       };
-      let pick = gi;
-      if (gapLo(gi) > gapHi(gi)) {
+      let gi = 0;
+      while (gi < ws.length && ws[gi] < h) gi++;
+      let pick = -1;
+      if (fits(gi, h)) pick = gi;
+      else {
         const ref = Number.isNaN(prev) ? h : prev;
         let best = Infinity;
-        let widest = -Infinity;
-        let wide = gi;
-        pick = -1;
         for (let g = 0; g <= ws.length; g++) {
+          if (g === gi || !fits(g, ref)) continue;
           const a = gapLo(g);
           const b = gapHi(g);
-          if (b - a > widest && (g === gi || hasRoad(g))) {
-            widest = b - a;
-            wide = g;
-          }
-          if (a > b || !hasRoad(g)) continue;
           const d = ref < a ? a - ref : ref > b ? ref - b : 0;
-          if (d < best) {
+          if (d < best && d < 12) {
             best = d;
             pick = g;
           }
         }
-        if (pick < 0) pick = wide;
       }
-      lo[i] = gapLo(pick);
-      hi[i] = gapHi(pick);
-      // Nowhere a bus fits between the walls we know of, with the route line close by (ramps meeting
-      // in a tunnel junction): the route line, along which the collider leaves the way open.
-      if (lo[i] > hi[i] && Math.abs(h) < 4) {
-        lo[i] = -0.4;
-        hi[i] = 0.4;
+      if (pick >= 0) {
+        lo[i] = gapLo(pick);
+        hi[i] = gapHi(pick);
+      } else {
+        // No gap a bus fits with room to spare: the middle of the drivable gap nearest the road lane.
+        let g = gi;
+        for (let d = 0; d <= ws.length; d++) {
+          const cand = [gi - d, gi + d].find((k) => k >= 0 && k <= ws.length && k > 0 && k < ws.length && at((ws[k - 1] + ws[k]) / 2));
+          if (cand !== undefined) {
+            g = cand;
+            break;
+          }
+        }
+        const a = g > 0 ? ws[g - 1] : h - 3;
+        const b = g < ws.length ? ws[g] : h + 3;
+        const m = Number.isFinite(a) && Number.isFinite(b) ? (a + b) / 2 : h;
+        const half = Math.max(0, (b - a) / 2 - WALL_CLEAR);
+        lo[i] = m - half;
+        hi[i] = m + half;
       }
       prev = Math.max(lo[i], Math.min(hi[i], h));
-    }
-    // Where the lane changes from one tunnel or viaduct road to another (ramps meeting underground,
-    // the King George Square loop), keep to the route line if it is close: the collider opens the
-    // walls where routes cross them, along the route line.
-    for (let i = 1; i < n; i++) {
-      const a = this.road[i - 1];
-      const b = this.road[i];
-      if (a < 0 || b < 0 || a === b) continue;
-      const ra = data.roads[a];
-      const rb = data.roads[b];
-      if (!(ra.tunnel || ra.bridge) || !(rb.tunnel || rb.bridge) || continues(ra, rb)) continue;
-      for (let j = Math.max(0, i - 3); j <= Math.min(n - 1, i + 2); j++) {
-        if (Math.abs(home[j]) >= 4 || bayTo[j] > -Infinity) continue;
-        lo[j] = -0.4;
-        hi[j] = 0.4;
-      }
     }
     this.keepInside(lo, hi, home);
     this.bandLo = lo;
@@ -462,6 +464,7 @@ export class RouteTrack {
       this.x[i] = bx[i] + nx[i] * this.offset[i];
       this.y[i] = by[i] + ny[i] * this.offset[i];
     }
+    if (TW && WG) this.fitToRoads(TW, WG, bx, by, nx, ny, roadC);
     // Tangents from the lane itself.
     this.tx = new Float32Array(n);
     this.ty = new Float32Array(n);
@@ -577,7 +580,6 @@ export class RouteTrack {
     return out;
   }
 
-  /** Road height (m AHD) at route distance s. */
   /**
    * Clamp the lane offsets into [lo, hi] (walled stretches), smoothing the
    * steps that creates without leaving the bounds; kerb distances follow.
@@ -616,9 +618,8 @@ export class RouteTrack {
     }
     const clamp = () => {
       for (let i = 0; i < n; i++) {
-        // No room between the walls we know of: the route line if it is close (the collider keeps
-        // the way open along it), else midway.
-        if (lo[i] > hi[i]) off[i] = Math.abs(home[i]) < 4 ? 0 : (lo[i] + hi[i]) / 2;
+        // Bounds that cannot both be met (neighbours' walls, the slope limit): midway.
+        if (lo[i] > hi[i]) off[i] = (lo[i] + hi[i]) / 2;
         else off[i] = Math.max(lo[i], Math.min(hi[i], off[i]));
       }
     };
@@ -637,6 +638,196 @@ export class RouteTrack {
     for (let i = 0; i < n; i++) {
       const d = off[i] - before[i];
       if (d !== 0) this.kerb[i] = Math.max(1.3, Math.min(6, this.kerb[i] - d));
+    }
+  }
+
+  /** Distance from (x, y) to the nearest wall in a bus's way at road height z (Infinity if none within r). */
+  private wallDist(W: TrackWalls['walls'], G: WallGrid, x: number, y: number, z: number, r = 4): number {
+    let best = Infinity;
+    const cx0 = Math.max(0, Math.floor((x - r - G.x0) / WALL_CELL));
+    const cx1 = Math.min(G.nx - 1, Math.floor((x + r - G.x0) / WALL_CELL));
+    const cy0 = Math.max(0, Math.floor((y - r - G.y0) / WALL_CELL));
+    const cy1 = Math.min(G.ny - 1, Math.floor((y + r - G.y0) / WALL_CELL));
+    for (let cy = cy0; cy <= cy1; cy++) {
+      for (let cx = cx0; cx <= cx1; cx++) {
+        const c = cy * G.nx + cx;
+        for (let q = G.start[c]; q < G.start[c + 1]; q++) {
+          const w = G.items[q];
+          if (W.hi[w] <= z + BUS_LO || W.lo[w] >= z + BUS_HI) continue;
+          const ax = W.ax[w];
+          const ay = W.ay[w];
+          const ex = W.bx[w] - ax;
+          const ey = W.by[w] - ay;
+          const l2 = ex * ex + ey * ey || 1e-9;
+          const t = Math.max(0, Math.min(1, ((x - ax) * ex + (y - ay) * ey) / l2));
+          best = Math.min(best, Math.hypot(x - ax - ex * t, y - ay - ey * t));
+        }
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Where the lane still ends up off the carriageway or against a wall (tight
+   * turnarounds and junction halls underground, where offsets from the GTFS
+   * shape cannot describe the road), follow the road itself: map-match that
+   * stretch onto the roads at this level (staying on connected roads) and put
+   * the lane on the matched carriageway.
+   */
+  private fitToRoads(TW: TrackWalls, G: WallGrid, bx: Float32Array, by: Float32Array, nx: Float32Array, ny: Float32Array, roadC: Float32Array): void {
+    const n = this.n;
+    const data = this.data;
+    const W = TW.walls;
+    const idx = roadIndexFor(data);
+    const bad = new Uint8Array(n);
+    let any = false;
+    for (let i = 0; i < n; i++) {
+      const z = this.z[i];
+      if (!TW.drivable(this.x[i], this.y[i], z) || this.wallDist(W, G, this.x[i], this.y[i], z) < WALL_CLEAR - 0.6) {
+        bad[i] = 1;
+        any = true;
+      }
+    }
+    if (!any) return;
+    const M = 3;
+    const runs: [number, number][] = [];
+    for (let i = 0; i < n; i++) {
+      if (!bad[i]) continue;
+      const a = Math.max(0, i - M);
+      let b = i;
+      while (b + 1 < n && (bad[b + 1] || (b + M + 1 < n && bad.subarray(b + 1, b + M + 2).includes(1)))) b++;
+      b = Math.min(n - 1, b + M);
+      const last = runs[runs.length - 1];
+      if (last && a <= last[1] + 1) last[1] = b;
+      else runs.push([a, b]);
+      i = b;
+    }
+    const lane = (r: Road) => {
+      const w = Math.max(3.2, r.width);
+      return r.oneway ? Math.max(0, w / 2 - 1.75) : Math.min(6, Math.max(1.6, w / 2 - 1.75));
+    };
+    // Roads sharing a node (end to end or a junction on a vertex).
+    const linked = new Map<number, boolean>();
+    const connected = (a: number, b: number): boolean => {
+      if (a === b) return true;
+      const key = a < b ? a * 65536 + b : b * 65536 + a;
+      let v = linked.get(key);
+      if (v === undefined) {
+        v = false;
+        const pa = data.roads[a].pts;
+        const pb = data.roads[b].pts;
+        const ends = (p: Float32Array) => [p[0], p[1], p[p.length - 2], p[p.length - 1]];
+        for (const [P, Q] of [
+          [ends(pa), pb],
+          [ends(pb), pa],
+        ] as const) {
+          for (let e = 0; e < 4 && !v; e += 2) for (let k = 0; k < Q.length && !v; k += 2) if (Math.hypot(P[e] - Q[k], P[e + 1] - Q[k + 1]) < 1.5) v = true;
+        }
+        linked.set(key, v);
+      }
+      return v;
+    };
+    interface Cand {
+      road: number;
+      px: number;
+      py: number;
+      dx: number;
+      dy: number;
+      cost: number;
+    }
+    for (const [a, b] of runs) {
+      // Candidates: carriageways at this level near the route (and the lane at the run's ends).
+      const cands: Cand[][] = [];
+      for (let i = a; i <= b; i++) {
+        const z = this.z[i];
+        // The route's general direction here (GTFS shapes wobble round junction halls: a bus carrying
+        // straight on does not tour the turnaround beside it).
+        const sa = pointAlong(this.route.pts, this.route.cum, i * TRACK_STEP - 16);
+        const sb = pointAlong(this.route.pts, this.route.cum, i * TRACK_STEP + 16);
+        const sl = Math.hypot(sb.x - sa.x, sb.y - sa.y) || 1;
+        const tdx = (sb.x - sa.x) / sl;
+        const tdy = (sb.y - sa.y) / sl;
+        const qx = i === a || i === b ? this.x[i] : bx[i];
+        const qy = i === a || i === b ? this.y[i] : by[i];
+        const list: Cand[] = [];
+        idx.forEachNear(qx, qy, 16, (ri, ax, ay, sdx, sdy, slen, d, zz) => {
+          const r = data.roads[ri];
+          if (r.kind === RoadKind.Pedestrian || Math.abs(zz - z) > LEVEL_GAP) return;
+          const dot = sdx * tdx + sdy * tdy;
+          const ldot = sdx * ny[i] - sdy * nx[i];
+          if (r.oneway ? Math.max(dot, ldot) < 0.2 : Math.max(Math.abs(dot), Math.abs(ldot)) < 0.2) return;
+          const t = Math.max(0, Math.min(slen, (qx - ax) * sdx + (qy - ay) * sdy));
+          const sg = (Math.abs(dot) > Math.abs(ldot) ? dot : ldot) < 0 ? -1 : 1;
+          const cost = d * 0.5 + (1 - Math.abs(dot)) * 30;
+          const old = list.find((c) => c.road === ri);
+          if (old && old.cost <= cost) return;
+          const c = { road: ri, px: ax + sdx * t, py: ay + sdy * t, dx: sdx * sg, dy: sdy * sg, cost };
+          if (old) Object.assign(old, c);
+          else list.push(c);
+        });
+        cands.push(list);
+      }
+      // Viterbi over the stretch.
+      const m = b - a + 1;
+      const score: number[][] = [];
+      const back: number[][] = [];
+      for (let k = 0; k < m; k++) {
+        const L = cands[k];
+        score.push(L.map(() => Infinity));
+        back.push(L.map(() => -1));
+        for (let j = 0; j < L.length; j++) {
+          if (k === 0) {
+            score[k][j] = L[j].cost;
+            continue;
+          }
+          const P = cands[k - 1];
+          for (let q = 0; q < P.length; q++) {
+            const tr = P[q].road === L[j].road ? 0 : connected(P[q].road, L[j].road) ? 3 : 40;
+            const v = score[k - 1][q] + tr + L[j].cost;
+            if (v < score[k][j]) {
+              score[k][j] = v;
+              back[k][j] = q;
+            }
+          }
+        }
+      }
+      let j = -1;
+      let best = Infinity;
+      score[m - 1].forEach((v, q) => {
+        if (v < best) {
+          best = v;
+          j = q;
+        }
+      });
+      if (j < 0) continue;
+      const pick: (Cand | null)[] = new Array(m).fill(null);
+      for (let k = m - 1; k >= 0 && j >= 0; k--) {
+        pick[k] = cands[k][j] ?? null;
+        j = back[k][j];
+      }
+      // Lane points on the matched carriageways (keeping a platform shift on the same road), eased in
+      // and out over the run's margins.
+      const px = new Float32Array(m);
+      const py = new Float32Array(m);
+      for (let k = 0; k < m; k++) {
+        const i = a + k;
+        const c = pick[k];
+        if (!c) {
+          px[k] = this.x[i];
+          py[k] = this.y[i];
+          continue;
+        }
+        const r = data.roads[c.road];
+        const lat = c.road === this.road[i] ? Math.max(-r.width / 2, Math.min(r.width / 2, this.offset[i] - roadC[i])) : lane(r);
+        px[k] = c.px - c.dy * lat;
+        py[k] = c.py + c.dx * lat;
+      }
+      for (let k = 0; k < m; k++) {
+        const i = a + k;
+        const w = Math.min(1, (k + 1) / (M + 1), (m - k) / (M + 1));
+        this.x[i] += (px[k] - this.x[i]) * w;
+        this.y[i] += (py[k] - this.y[i]) * w;
+      }
     }
   }
 
@@ -670,7 +861,8 @@ export class RouteTrack {
 const tracks = new WeakMap<Route, RouteTrack>();
 export function trackFor(route: Route, data: MapData): RouteTrack {
   let t = tracks.get(route);
-  if (!t) {
+  // (Rebuilt when walls became available after it was built.)
+  if (!t || t.walls !== wallsFor(data)) {
     t = new RouteTrack(route, data);
     tracks.set(route, t);
   }
