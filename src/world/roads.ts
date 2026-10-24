@@ -321,6 +321,8 @@ export interface RoadsResult {
   index: RoadIndex;
   /** Tunnel-only index. */
   tunnels: RoadIndex;
+  /** Tunnel mouths (map x, y and road height): where an underground camera can see out. */
+  portals: { x: number; y: number; z: number }[];
 }
 
 interface Layer {
@@ -349,6 +351,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   const tunnels = new RoadIndex(roads, data.bounds, (r) => r.tunnel);
   const mask = ctx.mask;
   const underPlatforms = data.platforms.filter((p) => p.underground || p.layer < 0);
+  const portals: { x: number; y: number; z: number }[] = [];
 
   // Node degrees for junction detection and portals.
   interface Node {
@@ -696,7 +699,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     add(l.tube, tubeMat, 'tube', { range: 2500 });
     add(l.track, trackMat, 'track', { range: 5000 });
   }
-  return { infos, index, tunnels };
+  return { infos, index, tunnels, portals };
 
   // =========================================================================
   // helpers (hoisted function declarations close over the locals above)
@@ -942,7 +945,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   }
 
   /**
-   * Ground cap continuing 10 m past the end of a walled cutting (`c` is the end
+   * Ground cap continuing 15 m past the end of a walled cutting (`c` is the end
    * sample, `prev` the one before it), tapering away from the road so it never
    * hangs over the shoulder that takes over there.
    */
@@ -954,9 +957,11 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     ox /= ol;
     oy /= ol;
     const T = 0.45;
+    // carved cells reach up to a cell diagonal (14 m) past the end; taper only
+    // slightly so the cap still meets the shoulder strip that takes over
     const rows: [number, number][] = [
       [0, cut + T],
-      [10, cut + T + 6],
+      [15, cut + T + 2.5],
     ];
     const cols = [0, 6, 16];
     const grid: number[][] = rows.map(([d, inner]) =>
@@ -1212,6 +1217,16 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     if (ss[ss.length - 1] < ri.len - 0.5) ss.push(ri.len);
     const P0 = ss.map((s) => roadAt(ri, s));
     const cov = P0.map((c) => covered(ri, c));
+    const TUBE_EXT = 2.5;
+    const joinStart = (nodes.get(nodeKey(r.pts[0], r.pts[1]))?.tun ?? 0) > 1;
+    const joinEnd = (nodes.get(nodeKey(r.pts[r.pts.length - 2], r.pts[r.pts.length - 1]))?.tun ?? 0) > 1;
+    const unit = (ax: number, ay: number, bx: number, by: number): [number, number] => {
+      const l = Math.hypot(bx - ax, by - ay) || 1;
+      return [(bx - ax) / l, (by - ay) / l];
+    };
+    const nP = P0.length;
+    const dirS = unit(P0[0].x, P0[0].y, P0[Math.min(1, nP - 1)].x, P0[Math.min(1, nP - 1)].y);
+    const dirE = unit(P0[Math.max(0, nP - 2)].x, P0[Math.max(0, nP - 2)].y, P0[nP - 1].x, P0[nP - 1].y);
     const cover = P0.map((c) => field.natAt(c.x, c.y) - (c.z + H));
     // keep the ground (and terrain skirts) above the roof of the covered parts
     for (let k = 0; k + 1 < ss.length; k++) {
@@ -1258,8 +1273,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         return last >= 0 ? Math.max(wallOff, last + 1.2) : wallOff;
       });
       for (let k = 0; k + 1 < ss.length; k++) {
-        const A = P0[k];
-        const B = P0[k + 1];
+        let A = P0[k];
+        let B = P0[k + 1];
         const isOpen = segOpen[k];
         if (k > 0 && segOpen[k - 1] !== isOpen) nose(k);
         if (!cov[k] && !cov[k + 1]) {
@@ -1269,6 +1284,10 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
           if (!isOpen && k + 2 === ss.length) cutEndCap(L, B, A, side, hw + 0.9);
           continue;
         }
+        // where this tube meets another one, run on a little so the two overlap
+        // instead of leaving a wedge open on the outside of the bend
+        if (k === 0 && joinStart) A = { ...A, x: A.x - dirS[0] * TUBE_EXT, y: A.y - dirS[1] * TUBE_EXT };
+        if (k + 2 === ss.length && joinEnd) B = { ...B, x: B.x + dirE[0] * TUBE_EXT, y: B.y + dirE[1] * TUBE_EXT };
         const P = (c: typeof A, off: number, h: number) => [c.x + c.nx * side * off, c.z + h, c.y + c.ny * side * off] as const;
         const fx = side * A.nx;
         const fy = side * A.ny;
@@ -1353,6 +1372,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const p = r.pts;
     const portalAt = (k: number, inward: number) => {
       const c = P0[k];
+      portals.push({ x: c.x, y: c.y, z: c.z });
       const tx = c.ny * inward;
       const ty = -c.nx * inward;
       const ground = Math.max(field.natAt(c.x + tx * 6, c.y + ty * 6), c.z + H + 0.5);

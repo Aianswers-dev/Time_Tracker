@@ -235,6 +235,7 @@ function makeMap(o: {
   water?: number[][];
   ground?: (x: number, y: number) => number;
   bounds?: [number, number, number, number];
+  platforms?: { pts: number[]; underground: boolean }[];
 }): MapData {
   const bounds = o.bounds ?? [-400, -400, 400, 400];
   const cell = 5;
@@ -269,7 +270,7 @@ function makeMap(o: {
     trees: new Float32Array(0),
     stops: [],
     routes: [],
-    platforms: [],
+    platforms: (o.platforms ?? []).map((p) => ({ name: '', ref: '', pts: new Float32Array(p.pts), area: true, covered: true, layer: p.underground ? -1 : 0, underground: p.underground })),
     terrain: { waterLevel: 0.5, attribution: '', grids: [{ name: 'test', x0, y0, cell, nx, ny, h }] },
   } as unknown as MapData;
 }
@@ -401,11 +402,12 @@ function tunnelCurve(spec: BusSpec): void {
 }
 
 function wallSlide(spec: BusSpec, kind: 'parapet' | 'tunnel'): void {
-  // A wide (16 m) viaduct or tunnel running north; its walls stand at x = +-8.6 m.
+  // A wide (16 m) viaduct or tunnel running north; its parapets stand at x = +-8.6 m, its tunnel walls
+  // (as the world draws them) at +-8.9 m.
   const roads = [{ pts: [0, -400, 0, 400], z: [10, 10], width: 16, bridge: kind === 'parapet', tunnel: kind === 'tunnel' }];
   const data = makeMap(kind === 'parapet' ? { roads } : { roads, ground: () => 20 });
   const col = world(data);
-  const WALL = 8.6;
+  const WALL = kind === 'parapet' ? 8.6 : 8.9;
   const ang = (20 * Math.PI) / 180;
   // Placed at 20 degrees with the front right corner 1 m short of the right-hand wall, at 30 km/h.
   const s0 = spec.sections[0];
@@ -452,6 +454,54 @@ function wallSlide(spec: BusSpec, kind: 'parapet' | 'tunnel'): void {
   check(`wall slide (${label}): clear of the wall after steering away`, lastTouch - 4, -4, 2, 's');
   check(`wall slide (${label}): moving 2 s after steering away`, v6, 2, 20, 'm/s');
   check(`wall slide (${label}): never through the wall (max corner x)`, worst, 0, WALL + 0.05, 'm');
+}
+
+/**
+ * Tunnel tubes as the world draws them: a carriageway splitting off another shares one hall with it (no
+ * wall between them while the other's edge is within ~3.6 m of the wall line), a nose wall closes the
+ * wedge where they part, and beside an underground platform the wall stands past its far edge.
+ */
+function tubeRules(): void {
+  const s10 = Math.sin((10 * Math.PI) / 180);
+  const c10 = Math.cos((10 * Math.PI) / 180);
+  const data = makeMap({
+    roads: [
+      { pts: [0, -200, 0, -40, 0, 200], z: [10, 10, 10], width: 7.4, tunnel: true, kind: 7 },
+      { pts: [0, -40, 200 * s10, -40 + 200 * c10], z: [10, 10], width: 7.4, tunnel: true, kind: 7 },
+      { pts: [300, -200, 300, 200], z: [10, 10], width: 7.4, tunnel: true, kind: 7 },
+    ],
+    platforms: [{ pts: [303.9, -30, 309, -30, 309, 30, 303.9, 30], underground: true }],
+    ground: () => 30,
+    bounds: [-400, -400, 400, 400],
+  });
+  const col = world(data);
+  const W = col.walls;
+  // Walls of a road crossing the line x = const between y0 and y1 (or the horizontal line y = const).
+  const wallsAcross = (road: number, x0: number, x1: number, y: number) => {
+    let n = 0;
+    for (let i = 0; i < W.count; i++) {
+      if (W.road[i] !== road) continue;
+      const ya = W.ay[i];
+      const yb = W.by[i];
+      if ((ya - y) * (yb - y) > 0 || ya === yb) continue;
+      const x = W.ax[i] + ((W.bx[i] - W.ax[i]) * (y - ya)) / (yb - ya);
+      if (x > x0 && x < x1) n++;
+    }
+    return n;
+  };
+  const bWest = (y: number) => (y + 40) * (s10 / c10) - 3.7 / c10; // the split road's left edge
+  check('tube: wall along the far side of the through tube', wallsAcross(0, -5, -4, 101), 1, 1, '');
+  check('tube: wall on the near side well past the split', wallsAcross(0, 4, 5, 151), 1, 1, '');
+  let inHall = 0;
+  for (const y of [-30, -10, 0, 10, 20]) inHall += wallsAcross(0, 1, bWest(y) - 0.2, y) + wallsAcross(1, 1, bWest(y) - 0.2, y);
+  check('tube: no wall in the shared hall between the two carriageways', inHall, 0, 0, '');
+  let nose = 0;
+  for (let i = 0; i < W.count; i++) if (W.road[i] === 0 && Math.abs(W.bx[i] - W.ax[i]) > 2 * Math.abs(W.by[i] - W.ay[i]) && W.ax[i] > 3 && W.ay[i] > 0) nose++;
+  check('tube: a nose wall closes the wedge where the carriageways part', nose, 1, 2, '');
+  let px = NaN;
+  for (let i = 0; i < W.count; i++) if (W.road[i] === 2 && W.ax[i] > 300 && Math.abs(W.ay[i]) < 10) px = W.ax[i];
+  check('tube: wall beside an underground platform stands past its far edge', px - 309, 0.4, 1.5, 'm');
+  check('tube: wall away from the platform at the usual line', wallsAcross(2, 304.5, 304.7, 101), 1, 1, '');
 }
 
 function grade(spec: BusSpec): void {
@@ -528,6 +578,7 @@ async function main(): Promise<void> {
   frameRateIndependence(S.rigid);
   colliderBox(S.rigid);
   console.log('--- 3D (rigid) ---');
+  tubeRules();
   viaduct(S.rigid);
   tunnel(S.rigid);
   tunnelCurve(S.rigid);

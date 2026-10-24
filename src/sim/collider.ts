@@ -730,6 +730,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
   const wHi: number[] = [];
   const wKind: number[] = [];
   const wRoad: number[] = [];
+  /** 1 for tunnel tube walls (they stand where the world draws them; routes never open them). */
+  const wTube: number[] = [];
   const PIECE = 4;
   const BUS_HALF_CLEAR = 2.3; // half a bus plus clearance, from a route line to a wall (when parallel)
 
@@ -917,10 +919,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     let kind: WallKind;
     let lo = Math.min(za, zb) - 0.4;
     let hi: number;
-    if (r.tunnel) {
-      kind = WallKind.Tunnel;
-      hi = Math.max(za, zb) + 4.6;
-    } else if (r.bridge) {
+    if (r.bridge) {
       kind = WallKind.Parapet;
       hi = Math.max(za, zb) + 1.1;
     } else {
@@ -940,7 +939,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       return;
     if (lo > hi) lo = hi - 1;
     // A bus route runs (almost) along this wall line at its level: the GTFS shape says buses pass here.
-    // Tunnel and retaining walls give way (rock and ground still stop a bus: see BusPhysics); parapets only
+    // Retaining walls give way (the ground still stops a bus: see BusPhysics); parapets only
     // where the route runs right over them, so nobody can drive off a viaduct.
     if (routeNear(ax, ay, bx, by, lo, hi, kind === WallKind.Parapet ? 1.6 : 2.6)) return;
     // A parapet between two decks at the same level (no drop behind it) also yields to a route beside it.
@@ -955,10 +954,207 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     wHi.push(hi);
     wKind.push(kind);
     wRoad.push(ri);
+    wTube.push(0);
+  };
+
+  // Tunnel tubes, exactly where src/world/roads.ts (buildTube) draws them: walls hw + 0.9 out, between
+  // samples every 4 m; open toward any other carriageway at this level (shared halls with a flush
+  // floor), with a short nose wall where an open side closes again; pushed out past the far edge of
+  // an underground platform beside the road; and where there is no ground over the tube (portal
+  // approaches) an open cutting whose wall stands at the same line, up to just above the ground.
+  // The world's tubes are 5.8 m high inside (6.4 m for motorways); the walls only need to reach above a
+  // bus, and must stay below roads that cross a shallow tube closer than that.
+  const TUBE_WALL_H = 4.6;
+  // The world's road index buckets segments in 32 m cells from bounds - 200 and only sees a segment
+  // from a point in a cell its box (grown by the half-width) touches; mirrored so the openings agree.
+  const wx0 = data.bounds[0] - 200;
+  const wy0 = data.bounds[1] - 200;
+  const wnx = Math.max(1, Math.ceil((data.bounds[2] + 200 - wx0) / 32));
+  const wny = Math.max(1, Math.ceil((data.bounds[3] + 200 - wy0) / 32));
+  const wcx = (x: number) => Math.min(wnx - 1, Math.max(0, Math.floor((x - wx0) / 32)));
+  const wcy = (y: number) => Math.min(wny - 1, Math.max(0, Math.floor((y - wy0) / 32)));
+  /** As the world's tubeNb: largest (half-width - distance) of another road whose surface is within 3 m of z. */
+  const tubeNb = (x: number, y: number, z: number, self: number): number => {
+    let best = -Infinity;
+    const ci = wcx(x);
+    const cj = wcy(y);
+    forEachRoadSegmentNear(x, y, 0, (sg) => {
+      const ri = sLine[sg];
+      if (ri === self) return;
+      const l = lines[ri];
+      const v = sIdx[sg];
+      const p = l.pts;
+      const hw = l.width / 2;
+      const ax = p[2 * v];
+      const ay = p[2 * v + 1];
+      const bx = p[2 * v + 2];
+      const by = p[2 * v + 3];
+      if (ci < wcx(Math.min(ax, bx) - hw) || ci > wcx(Math.max(ax, bx) + hw) || cj < wcy(Math.min(ay, by) - hw) || cj > wcy(Math.max(ay, by) + hw)) return;
+      project(l, v, x, y);
+      const pen = hw - Math.sqrt(PROJ.d2);
+      if (pen <= best || Math.abs(PROJ.z - z) > 3) return;
+      best = pen;
+    });
+    return best;
+  };
+  const tubePlatforms = (data.platforms ?? []).filter((pf) => pf.area && (pf.underground || pf.layer < 0) && pf.pts.length >= 6);
+  const tubePlatBox = tubePlatforms.map((pf) => {
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    for (let i = 0; i < pf.pts.length; i += 2) {
+      x0 = Math.min(x0, pf.pts[i]);
+      y0 = Math.min(y0, pf.pts[i + 1]);
+      x1 = Math.max(x1, pf.pts[i]);
+      y1 = Math.max(y1, pf.pts[i + 1]);
+    }
+    return [x0, y0, x1, y1];
+  });
+  const inTubePlatform = (x: number, y: number): boolean => {
+    for (let i = 0; i < tubePlatforms.length; i++) {
+      const b = tubePlatBox[i];
+      if (x < b[0] || y < b[1] || x > b[2] || y > b[3]) continue;
+      const pts = tubePlatforms[i].pts;
+      if (pip(pts, 0, pts.length, x, y)) return true;
+    }
+    return false;
+  };
+  interface TubeAt {
+    x: number;
+    y: number;
+    z: number;
+    nx: number;
+    ny: number;
+  }
+  const pushTube = (ax: number, ay: number, bx: number, by: number, lo: number, hi: number, kind: WallKind, ri: number) => {
+    wAx.push(ax);
+    wAy.push(ay);
+    wBx.push(bx);
+    wBy.push(by);
+    wLo.push(lo);
+    wHi.push(hi);
+    wKind.push(kind);
+    wRoad.push(ri);
+    wTube.push(1);
+  };
+  // Tunnel vertex counts per node (every road, footways too): a tube whose end meets another tunnel
+  // road runs on 2.5 m past it, so the two overlap on the outside of the bend.
+  const tunNodes = new Map<number, number>();
+  for (const r of data.roads) {
+    if (!r.tunnel) continue;
+    for (let v = 0; v < r.pts.length / 2; v++) {
+      const k = nodeKey(r.pts[2 * v], r.pts[2 * v + 1]);
+      tunNodes.set(k, (tunNodes.get(k) ?? 0) + 1);
+    }
+  }
+  const TUBE_EXT = 2.5;
+  const tubeWalls = (ri: number) => {
+    const r = data.roads[ri];
+    const p = r.pts;
+    const zs = lines[ri].z;
+    const n = p.length / 2;
+    if (n < 2) return;
+    const cum = new Float64Array(n);
+    for (let k = 1; k < n; k++) cum[k] = cum[k - 1] + Math.hypot(p[2 * k] - p[2 * k - 2], p[2 * k + 1] - p[2 * k - 1]);
+    const len = cum[n - 1];
+    if (len < 0.5) return;
+    // Point, height and left normal at distance s (the world's roadAt).
+    const at = (s: number): TubeAt => {
+      let k = 0;
+      let hi = n - 1;
+      if (s >= len) k = n - 2;
+      else if (s > 0) {
+        while (hi - k > 1) {
+          const m = (k + hi) >> 1;
+          if (cum[m] <= s) k = m;
+          else hi = m;
+        }
+      }
+      k = Math.min(n - 2, Math.max(0, k));
+      const segL = cum[k + 1] - cum[k] || 1e-6;
+      const t = Math.min(1, Math.max(0, (s - cum[k]) / segL));
+      const ax = p[2 * k];
+      const ay = p[2 * k + 1];
+      const dx = p[2 * k + 2] - ax;
+      const dy = p[2 * k + 3] - ay;
+      const l = Math.hypot(dx, dy) || 1;
+      return { x: ax + dx * t, y: ay + dy * t, z: zs[k] + (zs[k + 1] - zs[k]) * t, nx: -dy / l, ny: dx / l };
+    };
+    const hw = r.width / 2;
+    const wallOff = hw + 0.9;
+    const TH = r.kind === RoadKind.Motorway ? 6.4 : 5.8;
+    const ss: number[] = [];
+    for (let s = 0; s <= len + 0.01; s += 4) ss.push(Math.min(s, len));
+    if (ss[ss.length - 1] < len - 0.5) ss.push(len);
+    const P0 = ss.map(at);
+    const cov = P0.map((c) => H.ground(c.x, c.y) - (c.z + TH) > -1.2);
+    const nP = P0.length;
+    const joinStart = (tunNodes.get(nodeKey(p[0], p[1])) ?? 0) > 1;
+    const joinEnd = (tunNodes.get(nodeKey(p[2 * n - 2], p[2 * n - 1])) ?? 0) > 1;
+    const unit = (a: TubeAt, b: TubeAt): [number, number] => {
+      const l = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+      return [(b.x - a.x) / l, (b.y - a.y) / l];
+    };
+    const dirS = unit(P0[0], P0[Math.min(1, nP - 1)]);
+    const dirE = unit(P0[Math.max(0, nP - 2)], P0[nP - 1]);
+    for (const side of [1, -1]) {
+      const nbAt = (c: TubeAt) => {
+        const o = (d: number) => tubeNb(c.x + c.nx * side * d, c.y + c.ny * side * d, c.z, ri);
+        return o(wallOff) > -0.5 || o(wallOff + 0.4) > -0.6 || o(wallOff + 3) > -0.6;
+      };
+      const open = P0.map(nbAt);
+      const segOpen = ss.slice(1).map((s1, k) => open[k] || open[k + 1] || nbAt(at((ss[k] + s1) / 2)));
+      const wo = P0.map((c) => {
+        let last = -1;
+        for (let o = hw + 0.3; o < hw + 26; o += 0.5) {
+          if (inTubePlatform(c.x + c.nx * side * o, c.y + c.ny * side * o)) last = o;
+          else if (last >= 0 || o > hw + 8) break;
+        }
+        return last >= 0 ? Math.max(wallOff, last + 1.2) : wallOff;
+      });
+      const P = (c: TubeAt, o: number): [number, number] => [c.x + c.nx * side * o, c.y + c.ny * side * o];
+      for (let k = 0; k + 1 < ss.length; k++) {
+        let A = P0[k];
+        let B = P0[k + 1];
+        const isOpen = segOpen[k];
+        if (k > 0 && segOpen[k - 1] !== isOpen && cov[k]) {
+          // Nose wall sealing the wedge between two tubes where an open side closes.
+          for (let o = wallOff + 0.5; o <= wallOff + 12; o += 0.5) {
+            const [qx, qy] = P(A, o);
+            if (tubeNb(qx, qy, A.z, ri) > -1.0) {
+              const [sx, sy] = P(A, wallOff);
+              pushTube(sx, sy, qx, qy, A.z - 0.4, A.z + TUBE_WALL_H, WallKind.Tunnel, ri);
+              break;
+            }
+          }
+        }
+        if (isOpen) continue;
+        if (!cov[k] && !cov[k + 1]) {
+          // Open cutting: retaining wall at the same line, up to 0.9 m above the ground behind it.
+          const [ax, ay] = P(A, hw + 0.9);
+          const [bx, by] = P(B, hw + 0.9);
+          const [gax, gay] = P(A, hw + 1.4);
+          const [gbx, gby] = P(B, hw + 1.4);
+          const top = Math.max(H.ground(gax, gay) + 0.9, A.z + 1.18, H.ground(gbx, gby) + 0.9, B.z + 1.18);
+          pushTube(ax, ay, bx, by, Math.min(A.z, B.z) - 0.4, top, WallKind.Retaining, ri);
+          continue;
+        }
+        if (k === 0 && joinStart) A = { ...A, x: A.x - dirS[0] * TUBE_EXT, y: A.y - dirS[1] * TUBE_EXT };
+        if (k + 2 === ss.length && joinEnd) B = { ...B, x: B.x + dirE[0] * TUBE_EXT, y: B.y + dirE[1] * TUBE_EXT };
+        const [ax, ay] = P(A, wo[k]);
+        const [bx, by] = P(B, wo[k + 1]);
+        pushTube(ax, ay, bx, by, Math.min(A.z, B.z) - 0.4, Math.max(A.z, B.z) + TUBE_WALL_H, WallKind.Tunnel, ri);
+      }
+    }
   };
 
   for (let ri = 0; ri < data.roads.length; ri++) {
     const r = data.roads[ri];
+    if (r.tunnel) {
+      tubeWalls(ri);
+      continue;
+    }
     if (r.kind === RoadKind.Pedestrian) continue;
     const p = r.pts;
     const zs = lines[ri].z;
@@ -1028,6 +1224,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
   // Bus routes crossing a wall at its level open a gap there (with a few metres either side).
   const crossings: number[] = [];
   for (let w = 0; w < wAx.length; w++) {
+    if (wTube[w]) continue;
     const mx = (wAx[w] + wBx[w]) / 2;
     const my = (wAy[w] + wBy[w]) / 2;
     forEachRouteSegmentNear(mx, my, PIECE, (s) => {
@@ -1068,7 +1265,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     const mx = (wAx[w] + wBx[w]) / 2;
     const my = (wAy[w] + wBy[w]) / 2;
     let open = false;
-    const list = crossGrid.get(ck(mx, my));
+    const list = wTube[w] ? undefined : crossGrid.get(ck(mx, my));
     if (list)
       for (const i of list) {
         const z = crossings[i + 2];

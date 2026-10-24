@@ -262,11 +262,11 @@ void facade(inout vec3 albedo, inout float rough, inout float metal, inout vec3 
   float band = w_hash(vec2(floor(uv.y / (storey * 2.0)), seed * 57.0));
   float farOn = clamp(uLit * (0.35 + 1.1 * band), 0.0, 1.0) * glassMask;
   float on = mix(lit, farOn, farW) * uNight;
-  float hv = w_hash(floor(uv / vec2(1.7, storey)) + seed * 41.0);
-  vec3 tint = hv < 0.42 ? vec3(1.0, 0.78, 0.52) : (hv < 0.78 ? vec3(0.82, 0.9, 1.0) : vec3(0.55, 0.5, 0.42));
-  vec3 wc = mix(litCol, tint, 0.55);
+  float hv = w_hash(floor(uv / vec2(4.5, storey)) + seed * 41.0);
+  vec3 tint = hv < 0.45 ? vec3(1.0, 0.72, 0.42) : (hv < 0.8 ? vec3(0.78, 0.88, 1.0) : vec3(0.5, 0.42, 0.32));
+  vec3 wc = mix(litCol, tint, 0.7);
   float vary = 0.5 + 0.5 * fract(hv * 7.31);
-  emis += wc * on * vary * mix(0.62, 0.38, farW);
+  emis += wc * on * vary * mix(0.6, 0.32, farW);
   albedo = mix(albedo, albedo * 0.4, on);
 }
 `;

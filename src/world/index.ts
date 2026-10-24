@@ -166,13 +166,40 @@ export async function buildWorld(
 
   const camPos = new THREE.Vector3();
   let infoTimer = 0;
+
+  // Underground culling: inside a covered tunnel nothing above ground can be
+  // seen, except near a portal. Above-ground meshes (with world-space bounds)
+  // are hidden there; tunnel roads, tubes and markings stay.
+  const HIDE = ['buildings', 'houses', 'trees', 'terrain', 'water', 'pools', 'story', 'crossings', 'streetlights', 'rail-masts', 'shelters', 'signal', 'strip', 'foot', 'struct', 'track'];
+  const above: { o: THREE.Object3D; c: THREE.Vector3; r: number }[] = [];
+  root.updateMatrixWorld(true);
+  root.traverse((o) => {
+    if (!HIDE.some((h) => o.name.startsWith(h))) return;
+    const m = o as THREE.Mesh;
+    if (!m.isMesh) return;
+    let sph: THREE.Sphere | null;
+    if ((m as THREE.InstancedMesh).isInstancedMesh) {
+      const im = m as THREE.InstancedMesh;
+      if (!im.boundingSphere) im.computeBoundingSphere();
+      sph = im.boundingSphere;
+    } else {
+      if (!m.geometry.boundingSphere) m.geometry.computeBoundingSphere();
+      sph = m.geometry.boundingSphere;
+    }
+    if (!sph || !Number.isFinite(sph.radius)) return;
+    const c = sph.center.clone().applyMatrix4(m.matrixWorld);
+    above.push({ o: m, c, r: sph.radius });
+  });
+  const portals = roads.portals;
+  const hidden: THREE.Object3D[] = [];
+  let underground = false;
   // Signal clock: our own, re-synchronised to the caller's clock whenever signalStateAt is used.
   let sigClock = 0;
   let sigOffset = 0;
   const debug = location.search.includes('world=debug');
   const dbgWin = window as unknown as { __worldCam?: number[]; __worldHours?: number; __worldInfo?: () => string; __worldRoot?: THREE.Group };
   if (debug) dbgWin.__worldRoot = root;
-  if (debug) dbgWin.__worldInfo = () => `calls ${renderer.info.render.calls} tris ${renderer.info.render.triangles} geos ${renderer.info.memory.geometries} tex ${renderer.info.memory.textures}`;
+  if (debug) dbgWin.__worldInfo = () => `calls ${renderer.info.render.calls} tris ${renderer.info.render.triangles} geos ${renderer.info.memory.geometries} tex ${renderer.info.memory.textures}${underground ? ` underground (${hidden.length} hidden)` : ''}`;
   return {
     update(dt: number, camera: THREE.Camera, hours: number) {
       if (debug && dbgWin.__worldCam) {
@@ -200,12 +227,39 @@ export async function buildWorld(
         sky.sun.intensity *= 1 - 0.85 * under;
         sky.hemi.intensity *= 1 - 0.55 * under;
       }
+      // restore what underground culling hid last frame before the systems below decide visibility
+      for (const o of hidden) o.visible = true;
+      hidden.length = 0;
       for (const c of ctx.cull) {
         const dx = c.x - camPos.x;
         const dz = c.z - camPos.z;
         c.obj.visible = dx * dx + dz * dz < c.range * c.range;
       }
       for (const t of ctx.tick) t(dt, camera);
+      // underground culling (last frame's hidden meshes were restored above)
+      underground = !field.isHole(mx, my) && camPos.y < field.floorAt(mx, my) - 0.3 && depth > 0.5;
+      if (underground) {
+        let pd = Infinity;
+        let px = 0;
+        let py = 0;
+        let pz = 0;
+        for (const p of portals) {
+          const d = Math.hypot(p.x - mx, p.y - my, (p.z - camPos.y) * 2);
+          if (d < pd) {
+            pd = d;
+            px = p.x;
+            py = p.z;
+            pz = -p.y;
+          }
+        }
+        const near = pd < 80;
+        for (const a of above) {
+          if (!a.o.visible) continue;
+          if (near && Math.hypot(a.c.x - px, a.c.y - py, a.c.z - pz) - a.r < 60) continue;
+          a.o.visible = false;
+          hidden.push(a.o);
+        }
+      }
       infoTimer += dt;
       if (infoTimer > 5 && location.search.includes('world=debug')) {
         infoTimer = 0;

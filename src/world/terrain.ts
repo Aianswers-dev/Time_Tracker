@@ -173,6 +173,16 @@ export class TerrainField {
     }
   }
 
+  /** Highest buried roof (tunnel) recorded at the four grid vertices around (x, y), or -Infinity. */
+  floorAt(x: number, y: number): number {
+    const fx = (x - this.x0) / this.cell;
+    const fy = (y - this.y0) / this.cell;
+    if (fx < 0 || fy < 0 || fx >= this.nx - 1 || fy >= this.ny - 1) return -Infinity;
+    const k = Math.floor(fy) * this.nx + Math.floor(fx);
+    const f = this.floor;
+    return Math.max(f[k], f[k + 1], f[k + this.nx], f[k + this.nx + 1]);
+  }
+
   /** After all earthworks: lift ground that sags into a shallow tunnel roof (never above a road clamp). */
   settle(): void {
     const { ren, floor, cap } = this;
