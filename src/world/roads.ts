@@ -296,7 +296,23 @@ export function structMaterial(ctx: Ctx, key = 'struct'): THREE.MeshLambertMater
     vertexPars: 'varying vec3 vGPos;',
     vertex: [['#include <begin_vertex>', '#include <begin_vertex>\nvGPos = (modelMatrix * vec4(transformed, 1.0)).xyz;']],
     fragmentPars: 'uniform sampler2D uNoise;\nvarying vec3 vGPos;',
-    fragment: [['#include <color_fragment>', '#include <color_fragment>\ndiffuseColor.rgb *= 0.88 + 0.22 * texture2D(uNoise, (vGPos.xz + vGPos.y) / 6.0).r;']],
+    fragment: [
+      [
+        '#include <color_fragment>',
+        `#include <color_fragment>
+        diffuseColor.rgb *= 0.88 + 0.22 * texture2D(uNoise, (vGPos.xz + vGPos.y) / 6.0).r;
+        // buff block walls: 0.6 x 0.3 m blocks in stretcher bond
+        vec3 bd = abs(vColor.rgb - vec3(200.0, 180.0, 142.0) / 255.0);
+        if (max(bd.r, max(bd.g, bd.b)) < 0.008) {
+          vec3 fn = normalize(cross(dFdx(vGPos), dFdy(vGPos)));
+          vec2 q = vec2((abs(fn.x) > abs(fn.z) ? vGPos.z : vGPos.x) / 0.6, vGPos.y / 0.3);
+          q.x += 0.5 * mod(floor(q.y), 2.0);
+          vec2 f = (0.5 - abs(fract(q) - 0.5)) * vec2(0.6, 0.3);
+          float j = 1.0 - smoothstep(0.006, 0.016 + fwidth(vGPos.y) * 0.5, min(f.x, f.y));
+          diffuseColor.rgb *= (1.0 - 0.3 * j) * (0.95 + 0.1 * texture2D(uNoise, floor(q) / 37.0).r);
+        }`,
+      ],
+    ],
   });
 }
 
@@ -422,7 +438,45 @@ const nodeKey = (x: number, y: number) => (Math.round(x * 10) + 80000) * 160000 
 const CONC = [192, 188, 178];
 const CONC_DARK = [205, 200, 190];
 const WALL = [176, 170, 158];
+/** Station cutting walls (Mater Hill, Buranda): buff block (joints drawn by structMaterial) on a dark base. */
+const BUFF = [200, 180, 142];
+const BASE_DARK = [74, 74, 72];
 const STEEL = [74, 78, 82];
+
+/**
+ * Where the ray from (x, y) along the unit direction (dx, dy) runs inside the polygon `ring` (flat
+ * x, y pairs), up to maxT: [enter, leave] runs, nearest first. Each stretch between two edge crossings
+ * is tested at its middle, so a ray through a vertex or along an edge cannot flip inside and outside.
+ */
+function rayRuns(ring: ArrayLike<number>, x: number, y: number, dx: number, dy: number, maxT: number): [number, number][] {
+  const n = ring.length / 2;
+  const ts: number[] = [0];
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    const ax = ring[2 * j];
+    const ay = ring[2 * j + 1];
+    const ex = ring[2 * i] - ax;
+    const ey = ring[2 * i + 1] - ay;
+    const den = ex * dy - dx * ey;
+    if (Math.abs(den) < 1e-9) continue;
+    const wx = ax - x;
+    const wy = ay - y;
+    const t = (ex * wy - wx * ey) / den;
+    const u = (dx * wy - dy * wx) / den;
+    if (u >= -1e-6 && u <= 1 + 1e-6 && t > 0 && t < maxT) ts.push(t);
+  }
+  ts.push(maxT);
+  ts.sort((a, b) => a - b);
+  const runs: [number, number][] = [];
+  for (let q = 0; q + 1 < ts.length; q++) {
+    if (ts[q + 1] - ts[q] < 1e-4) continue;
+    const m = (ts[q] + ts[q + 1]) / 2;
+    if (!pointInRing(x + dx * m, y + dy * m, ring)) continue;
+    const last = runs[runs.length - 1];
+    if (last && ts[q] - last[1] < 1e-3) last[1] = ts[q + 1];
+    else runs.push([ts[q], ts[q + 1]]);
+  }
+  return runs;
+}
 
 export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.Material, progress: (f: number) => void): Promise<RoadsResult> {
   const { data, R } = ctx;
@@ -432,6 +486,22 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   const tunnels = new RoadIndex(roads, data.bounds, (r) => r.tunnel);
   const mask = ctx.mask;
   const underPlatforms = data.platforms.filter((p) => p.underground || p.layer < 0);
+  // platforms in the open (at grade or in a cutting), with their bounding boxes, for the earthworks beside them
+  const gradePlatforms = data.platforms
+    .filter((p) => !(p.underground || p.layer < 0) && p.pts.length >= 4)
+    .map((p) => {
+      let x0 = Infinity;
+      let y0 = Infinity;
+      let x1 = -Infinity;
+      let y1 = -Infinity;
+      for (let i = 0; i + 1 < p.pts.length; i += 2) {
+        x0 = Math.min(x0, p.pts[i]);
+        x1 = Math.max(x1, p.pts[i]);
+        y0 = Math.min(y0, p.pts[i + 1]);
+        y1 = Math.max(y1, p.pts[i + 1]);
+      }
+      return { p, x0, y0, x1, y1 };
+    });
   const portals: { x: number; y: number; z: number }[] = [];
 
   // Node degrees for junction detection and portals.
@@ -538,6 +608,10 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   // ... and the Green Bridge's cable-stayed span its own pylons
   const green = greenBridgeSpan(ctx);
   const otherAt = (x: number, y: number, z: number, self: number, dz = 2.5) => index.penetrationZ(x, y, z, dz, self);
+  // Mater Hill and Buranda busway stations stand between buff block cutting walls on a dark base
+  const blockSites: [number, number][] = [];
+  for (const pf of ctx.data.platforms) if (/Mater Hill|Buranda/i.test(pf.name) && pf.pts.length >= 2) blockSites.push([pf.pts[0], pf.pts[1]]);
+  const blockWall = (x: number, y: number) => blockSites.some(([px, py]) => Math.hypot(px - x, py - y) < 170);
   /** Ground height for strips and wall tops that meet the terrain: the settled ground, never below the natural one. */
   const groundAt = (x: number, y: number) => Math.max(field.natAt(x, y), field.settledAt(x, y));
   /**
@@ -977,6 +1051,47 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   }
 
   /**
+   * Far side of a station platform beside a busway, along the ray from (x, y) in the unit direction
+   * (dx, dy), for a platform whose kerb lies within 10 m of the carriageway edge `hw`: where the ray
+   * leaves an outline platform, or 3.5 m behind a platform mapped as its edge line (the body
+   * src/game/platforms.ts gives it). -1 if there is none.
+   */
+  function platformFar(x: number, y: number, dx: number, dy: number, hw: number): number {
+    let best = -1;
+    const R = hw + 16;
+    const ts: number[] = [];
+    for (const g of gradePlatforms) {
+      if (x < g.x0 - R || x > g.x1 + R || y < g.y0 - R || y > g.y1 + R) continue;
+      const p = g.p.pts;
+      const n = p.length / 2;
+      if (g.p.area) {
+        const run = rayRuns(p, x, y, dx, dy, R).find(([a, b]) => b > hw - 0.5 && a < hw + 10);
+        // (a ray running along a platform at an angle does not say how deep it is)
+        if (run && run[1] - Math.max(run[0], hw) < 15) best = Math.max(best, run[1]);
+        continue;
+      }
+      ts.length = 0;
+      for (let e = 0; e + 1 < n; e++) {
+        const ax = p[2 * e];
+        const ay = p[2 * e + 1];
+        const ex = p[2 * e + 2] - ax;
+        const ey = p[2 * e + 3] - ay;
+        const den = ex * dy - dx * ey;
+        if (Math.abs(den) < 1e-9) continue;
+        const wx = ax - x;
+        const wy = ay - y;
+        const tt = (ex * wy - wx * ey) / den;
+        const u = (dx * wy - dy * wx) / den;
+        if (u >= 0 && u <= 1 && tt > 0 && tt < R) ts.push(tt);
+      }
+      ts.sort((a, b) => a - b);
+      const t0 = ts.find((v) => v > hw - 0.5 && v < hw + 10);
+      if (t0 !== undefined) best = Math.max(best, t0 + 3.5);
+    }
+    return best;
+  }
+
+  /**
    * Shoulders / retaining walls / cuttings on one side of an at-grade road.
    * Profile types per sample: 0 none (junction), 1 batter, 2 cutting wall, 3 fill wall.
    */
@@ -992,6 +1107,42 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const m1 = endMiter(ri, true);
     if (m0 && ss[0] === 0) P[0] = { ...P[0], nx: m0[0], ny: m0[1] };
     if (m1 && ss[n - 1] === ri.len) P[n - 1] = { ...P[n - 1], nx: m1[0], ny: m1[1] };
+    // A station platform beside a busway: the batter or cutting wall stands behind it, with the stopping
+    // bay and the platform's footprint level with the road in front (from one sample before each
+    // platform end on, so a cutting wall never cuts across the platform's corner).
+    let pfar: Float32Array | null = null;
+    if (r.kind === RoadKind.Busway && gradePlatforms.length) {
+      let rx0 = Infinity;
+      let ry0 = Infinity;
+      let rx1 = -Infinity;
+      let ry1 = -Infinity;
+      for (let i = 0; i + 1 < r.pts.length; i += 2) {
+        rx0 = Math.min(rx0, r.pts[i]);
+        rx1 = Math.max(rx1, r.pts[i]);
+        ry0 = Math.min(ry0, r.pts[i + 1]);
+        ry1 = Math.max(ry1, r.pts[i + 1]);
+      }
+      const R = hw + 16;
+      if (gradePlatforms.some((g) => g.x0 < rx1 + R && g.x1 > rx0 - R && g.y0 < ry1 + R && g.y1 > ry0 - R)) {
+        const at0 = ss.map((s) => {
+          const c = roadAt(ri, s);
+          return platformFar(c.x, c.y, c.nx * side, c.ny * side, hw);
+        });
+        if (at0.some((v) => v > 0)) {
+          pfar = new Float32Array(n).fill(-1);
+          for (let k = 0; k < n; k++) {
+            const sa = ss[Math.max(0, k - 1)];
+            const sb = ss[Math.min(n - 1, k + 1)];
+            if (Math.max(at0[Math.max(0, k - 1)], at0[k], at0[Math.min(n - 1, k + 1)]) <= 0 && sb - sa < 12) continue;
+            const steps = Math.max(1, Math.ceil((sb - sa) / 0.5));
+            for (let q = 0; q <= steps; q++) {
+              const c = roadAt(ri, sa + ((sb - sa) * q) / steps);
+              pfar[k] = Math.max(pfar[k], platformFar(c.x, c.y, c.nx * side, c.ny * side, hw));
+            }
+          }
+        }
+      }
+    }
     // depth of the natural ground beside the road, and the profile per sample with hysteresis (a walled
     // cutting starts deeper than 1.6 m and runs on while deeper than 0.9 m; a fill wall likewise), short
     // runs merged into their neighbours, so walls never break up into a row of short pieces
@@ -1001,6 +1152,10 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       const fw = foot[k];
       e0[k] = hw + (fw > 0 ? fw : 0.15);
       zE[k] = c.z + (fw > 0 ? KERB_H : 0);
+      if (pfar && pfar[k] > 0) {
+        e0[k] = Math.max(e0[k], pfar[k] + 0.3);
+        zE[k] = c.z;
+      }
       depth[k] = field.natAt(c.x + c.nx * side * (e0[k] + 2.5), c.y + c.ny * side * (e0[k] + 2.5)) - zE[k];
     }
     const raw = new Uint8Array(n);
@@ -1083,6 +1238,20 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       const fl = Math.hypot(A.nx, A.ny) || 1; // (a mitred end normal is longer than 1)
       const fx = (side * A.nx) / fl;
       const fy = (side * A.ny) / fl;
+      if (pfar && (t === 1 || t === 3) && (pfar[k] > 0 || pfar[kb] > 0)) {
+        // the stopping bay and the platform's footprint: a floor level with the road out to the batter or
+        // wall (a cutting's floor does this in cutSeg)
+        const [h0x, h0y] = at(A, hw);
+        const [h1x, h1y] = at(B, hw);
+        const [q0x, q0y] = at(A, e0[k]);
+        const [q1x, q1y] = at(B, e0[kb]);
+        const b0 = L.foot.vert(h0x, A.z - 0.02, h0y, 0.5, ss[k], 4);
+        const b1 = L.foot.vert(h1x, B.z - 0.02, h1y, 0.5, ss[kb], 4);
+        const b2 = L.foot.vert(q1x, B.z - 0.02, q1y, 0.5, ss[kb], 4);
+        const b3 = L.foot.vert(q0x, A.z - 0.02, q0y, 0.5, ss[k], 4);
+        L.foot.quad(b0, b1, b2, b3, 0, 1, 0);
+        field.clampQuad([h0x, h0y, A.z, h1x, h1y, B.z, q1x, q1y, B.z, q0x, q0y, A.z], 0.25);
+      }
       if (t === 1) {
         // graded shoulder to the natural ground
         const wa = shoulderW(k);
@@ -1199,11 +1368,25 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const [o1x, o1y] = at(B, cutB + T);
     const topA = Math.max(ga + 0.9, z0 + 1.2);
     const topB = Math.max(gb + 0.9, z1 + 1.2);
-    const v0 = st.vert(w0x, z0 - 0.2, w0y, ...WALL);
-    const v1 = st.vert(w1x, z1 - 0.2, w1y, ...WALL);
-    const v2 = st.vert(w1x, topB, w1y, ...WALL);
-    const v3 = st.vert(w0x, topA, w0y, ...WALL);
-    st.quad(v0, v1, v2, v3, -fx, 0, fy);
+    if (blockWall(A.x, A.y)) {
+      // station cutting: a dark base to 1 m, buff block above
+      const b0 = st.vert(w0x, z0 - 0.2, w0y, ...BASE_DARK);
+      const b1 = st.vert(w1x, z1 - 0.2, w1y, ...BASE_DARK);
+      const b2 = st.vert(w1x, z1 + 1.0, w1y, ...BASE_DARK);
+      const b3 = st.vert(w0x, z0 + 1.0, w0y, ...BASE_DARK);
+      st.quad(b0, b1, b2, b3, -fx, 0, fy);
+      const v0 = st.vert(w0x, z0 + 1.0, w0y, ...BUFF);
+      const v1 = st.vert(w1x, z1 + 1.0, w1y, ...BUFF);
+      const v2 = st.vert(w1x, topB, w1y, ...BUFF);
+      const v3 = st.vert(w0x, topA, w0y, ...BUFF);
+      st.quad(v0, v1, v2, v3, -fx, 0, fy);
+    } else {
+      const v0 = st.vert(w0x, z0 - 0.2, w0y, ...WALL);
+      const v1 = st.vert(w1x, z1 - 0.2, w1y, ...WALL);
+      const v2 = st.vert(w1x, topB, w1y, ...WALL);
+      const v3 = st.vert(w0x, topA, w0y, ...WALL);
+      st.quad(v0, v1, v2, v3, -fx, 0, fy);
+    }
     const u0 = st.vert(o0x, topA, o0y, ...CONC);
     const u1 = st.vert(o1x, topB, o1y, ...CONC);
     const u2 = st.vert(w1x, topB, w1y, ...CONC);
