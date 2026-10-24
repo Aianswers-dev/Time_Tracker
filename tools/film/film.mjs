@@ -114,6 +114,9 @@ while (!st.finished && st.t < maxT) {
     }
     if (Math.floor(st.t / 60) !== lastLog) {
       lastLog = Math.floor(st.t / 60);
+      // Keep a recent report on disk in case the browser dies mid-run.
+      const partial = await page.evaluate(() => window.__film.report());
+      writeFileSync(join(out, 'report.partial.json'), JSON.stringify({ ...partial, final: st }, null, 1));
       console.log(`t=${st.t.toFixed(0)} s=${st.s}/${Math.round(st.length)} ${st.kmh} km/h ${st.phase} served ${st.served}/${st.total} missed ${st.missed} problems ${st.problems}`);
     }
     continue;

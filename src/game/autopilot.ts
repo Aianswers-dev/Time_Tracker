@@ -104,6 +104,8 @@ export class Autopilot {
   private holdT = 0;
   private lastZ = NaN;
   private queueT = 0;
+  private redT = 0;
+  private ignoreSignalUntil = -1;
   private ignoreTrafficUntil = -1;
   private levelBadT = 0;
   private lastProblem = new Map<string, number>();
@@ -241,7 +243,7 @@ export class Autopilot {
     }
 
     // Red/amber signal ahead (stop line).
-    if (g.signal && g.signal.state !== 'green') {
+    if (g.signal && g.signal.state !== 'green' && this.time > this.ignoreSignalUntil) {
       const d = g.signal.distance;
       const need = (v * v) / (2 * 3.0);
       // Amber too close to stop: go through.
@@ -352,6 +354,14 @@ export class Autopilot {
     this.frame.limitWhy = why;
 
     // --- Problem detection ----------------------------------------------------------------
+    // Held at a red for minutes: the light never turns green for this approach (log it, then go).
+    if (why === 'signal' && av < 0.5) this.redT += dt;
+    else if (why !== 'signal') this.redT = 0;
+    if (this.redT > 150) {
+      this.problem('red-forever', `red light ${g.signal ? Math.round(g.signal.distance) : '?'} m ahead for 150 s`, at, 1);
+      this.redT = 0;
+      this.ignoreSignalUntil = this.time + 15;
+    }
     // Queued behind traffic for a long time: something is wedged (log it, then drive through).
     if (why === 'traffic' && av < 0.5) this.queueT += dt;
     else this.queueT = 0;
@@ -413,13 +423,17 @@ export class Autopilot {
         const dx = this.tmp.x - m.x;
         const dy = this.tmp.y - m.y;
         if (Math.abs(dx) > m.length + 2 || Math.abs(dy) > m.length + 2) continue;
+        // A bus crossing or coming the other way is drawn as a straight segment here, which sweeps
+        // across our lane when it is turning or articulated: only count it when it is really on the lane.
+        const dh = Math.abs(((m.heading - this.tmp.heading + 3 * Math.PI) % (2 * Math.PI)) - Math.PI);
+        const reach = dh > Math.PI / 4 ? 1.0 : 1.8;
         // Distance from the lane point to the AI bus centreline segment.
         const mx = Math.sin(m.heading);
         const my = Math.cos(m.heading);
         const along = clamp(dx * mx + dy * my, -m.length / 2, m.length / 2);
         const ex = dx - mx * along;
         const ey = dy - my * along;
-        if (ex * ex + ey * ey < 1.8 * 1.8) return d;
+        if (ex * ex + ey * ey < reach * reach) return d;
       }
     }
     return Infinity;
