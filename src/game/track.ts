@@ -864,23 +864,6 @@ export class RouteTrack {
         this.x[i] += (px[k] - this.x[i]) * w;
         this.y[i] += (py[k] - this.y[i]) * w;
       }
-      // Ease out the steps where the matched road changes (a junction): a light smoothing in place.
-      for (let pass = 0; pass < 2; pass++) {
-        const sx = Float32Array.from(this.x.subarray(a, b + 1));
-        const sy = Float32Array.from(this.y.subarray(a, b + 1));
-        for (let k = 1; k < m - 1; k++) {
-          const k0 = Math.max(0, k - 2);
-          const k1 = Math.min(m - 1, k + 2);
-          let ax = 0;
-          let ay = 0;
-          for (let q = k0; q <= k1; q++) {
-            ax += sx[q];
-            ay += sy[q];
-          }
-          this.x[a + k] = ax / (k1 - k0 + 1);
-          this.y[a + k] = ay / (k1 - k0 + 1);
-        }
-      }
     }
   }
 
