@@ -1,33 +1,180 @@
-// STUB — replaced by the world subsystem. Keep the exported signature.
+/**
+ * The 3D world: ground, river, roads, buildings, vegetation, street furniture,
+ * landmarks, sky and time of day. See the individual modules for details.
+ */
 import * as THREE from 'three';
-import type { MapData, WorldHandle } from '../types';
+import { AreaKind, BuildingKind, type MapData, type WorldHandle } from '../types';
+import { buildBuildings } from './buildings';
+import type { Ctx, Extras } from './ctx';
+import { INNER_PAD, buildGround, buildOuter, makeGroundMaterial } from './ground';
+import { buildRoads } from './roads';
+import { U } from './shaders';
+import { SkySystem } from './sky';
+import { makeAsphaltTexture, makeGlowTexture, makeNoiseTexture, makeTrackTexture, makeWaterNormal } from './textures';
+import { MASK_BUILDING, MASK_GREEN, MASK_PLAZA, MASK_POOL, MASK_RAIL, MASK_SPORT, MASK_WATER, Mask, centroid, signedArea, yieldFrame } from './util';
+import { buildWater } from './water';
+import extrasUrl from './gen/extras.json?url';
+import outerUrl from './gen/outer.png';
+
+async function loadExtras(): Promise<{ extras: Extras | null; outer: THREE.Texture | null }> {
+  try {
+    const [res, tex] = await Promise.all([fetch(extrasUrl), new THREE.TextureLoader().loadAsync(outerUrl)]);
+    const extras = res.ok ? ((await res.json()) as Extras) : null;
+    tex.colorSpace = THREE.NoColorSpace;
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.anisotropy = 4;
+    return { extras, outer: tex };
+  } catch (e) {
+    console.warn('[world] extras unavailable', e);
+    return { extras: null, outer: null };
+  }
+}
+
+function buildMask(data: MapData, R: [number, number, number, number]): Mask {
+  const m = new Mask(R[0], R[1], R[2], R[3], 3);
+  for (const w of data.water) m.fillRings([w.pts, ...w.holes], MASK_WATER);
+  for (const a of data.areas) {
+    const flag =
+      a.kind === AreaKind.Water ? MASK_POOL : a.kind === AreaKind.Sport ? MASK_SPORT : a.kind === AreaKind.Plaza ? MASK_PLAZA : MASK_GREEN;
+    m.fillRings([a.pts, ...a.holes], flag);
+  }
+  for (const b of data.buildings) m.fillRings([b.pts], MASK_BUILDING);
+  for (const r of data.rail) if (!r.tunnel) m.fillLine(r.pts, 3, MASK_RAIL);
+  return m;
+}
+
+function buildDensity(data: MapData, R: [number, number, number, number]): Ctx['density'] {
+  const cell = 16;
+  const nx = Math.ceil((R[2] - R[0]) / cell);
+  const ny = Math.ceil((R[3] - R[1]) / cell);
+  let d = new Float32Array(nx * ny);
+  for (const b of data.buildings) {
+    const area = Math.abs(signedArea(b.pts));
+    const house = b.kind === BuildingKind.House || b.kind === BuildingKind.Shed || (b.kind === BuildingKind.Generic && area < 320 && b.height <= 8);
+    if (house) continue;
+    const [cx, cy] = centroid(b.pts);
+    const i = Math.floor((cx - R[0]) / cell);
+    const j = Math.floor((cy - R[1]) / cell);
+    if (i < 0 || j < 0 || i >= nx || j >= ny) continue;
+    d[j * nx + i] += area / (cell * cell);
+  }
+  // blur (three box passes ~ gaussian)
+  for (let pass = 0; pass < 3; pass++) {
+    const o = new Float32Array(nx * ny);
+    for (let j = 0; j < ny; j++) {
+      for (let i = 0; i < nx; i++) {
+        let s = 0;
+        let c = 0;
+        for (let dj = -1; dj <= 1; dj++) {
+          const jj = j + dj;
+          if (jj < 0 || jj >= ny) continue;
+          for (let di = -1; di <= 1; di++) {
+            const ii = i + di;
+            if (ii < 0 || ii >= nx) continue;
+            s += d[jj * nx + ii];
+            c++;
+          }
+        }
+        o[j * nx + i] = s / c;
+      }
+    }
+    d = o;
+  }
+  const bytes = new Uint8Array(nx * ny * 4);
+  for (let k = 0; k < nx * ny; k++) {
+    d[k] = Math.min(1, d[k]);
+    bytes[4 * k] = d[k] * 255;
+    bytes[4 * k + 3] = 255;
+  }
+  const tex = new THREE.DataTexture(bytes, nx, ny, THREE.RGBAFormat);
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearFilter;
+  tex.needsUpdate = true;
+  return { tex, data: d, x0: R[0], y0: R[1], cell, nx, ny };
+}
 
 export async function buildWorld(
   scene: THREE.Scene,
-  _renderer: THREE.WebGLRenderer,
+  renderer: THREE.WebGLRenderer,
   data: MapData,
   onProgress: (fraction: number, label: string) => void,
 ): Promise<WorldHandle> {
-  onProgress(0, 'Building city…');
-  scene.background = new THREE.Color(0x9ec9ef);
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x445533, 1.2));
-  const sun = new THREE.DirectionalLight(0xffffff, 1.5);
-  sun.position.set(300, 600, 200);
-  scene.add(sun);
-  const [x0, y0, x1, y1] = data.bounds;
-  const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(x1 - x0, y1 - y0).rotateX(-Math.PI / 2),
-    new THREE.MeshLambertMaterial({ color: 0x8a9a70 }),
-  );
-  ground.position.set((x0 + x1) / 2, -0.05, -(y0 + y1) / 2);
-  scene.add(ground);
-  const pos: number[] = [];
-  for (const r of data.roads) {
-    for (let i = 0; i + 3 < r.pts.length; i += 2) pos.push(r.pts[i], 0.05, -r.pts[i + 1], r.pts[i + 2], 0.05, -r.pts[i + 3]);
+  const t0 = performance.now();
+  const step = async (f: number, label: string) => {
+    onProgress(f, label);
+    await yieldFrame();
+  };
+  await step(0, 'Building city…');
+  const extrasP = loadExtras();
+  const [bx0, by0, bx1, by1] = data.bounds;
+  const R: [number, number, number, number] = [bx0 - INNER_PAD - 0.05, by0 - INNER_PAD - 0.05, bx1 + INNER_PAD + 0.05, by1 + INNER_PAD + 0.05];
+  const tex = {
+    noise: makeNoiseTexture(),
+    asphalt: makeAsphaltTexture(),
+    waterNormal: makeWaterNormal(),
+    track: makeTrackTexture(),
+    glow: makeGlowTexture(),
+  };
+  await step(0.04, 'Surveying the river…');
+  const mask = buildMask(data, R);
+  const density = buildDensity(data, R);
+  const { extras: ex, outer } = await extrasP;
+  let extras = ex;
+  if (extras && extras.inner.some((v, i) => Math.abs(v - R[i]) > 1.5)) {
+    console.warn('[world] extras.json was built for different bounds; ignoring it (run src/world/gen/build_extras.py)');
+    extras = null;
   }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  scene.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0x333333 })));
-  onProgress(1, 'City ready');
-  return { update() {} };
+  const root = new THREE.Group();
+  root.name = 'world';
+  scene.add(root);
+  const ctx: Ctx = { scene, renderer, data, extras, outerTex: outer, R, mask, tex, density, root, cull: [], tick: [] };
+
+  const sky = new SkySystem(scene, renderer);
+  await step(0.08, 'Laying the ground…');
+  const groundMat = makeGroundMaterial(ctx);
+  await buildGround(ctx, groundMat);
+  buildOuter(ctx, groundMat);
+  buildWater(ctx);
+
+  await step(0.16, 'Paving roads…');
+  const roads = await buildRoads(ctx, [], (f) => onProgress(0.16 + f * 0.24, 'Paving roads…'));
+
+  await step(0.4, 'Raising buildings…');
+  await buildBuildings(ctx, (f) => onProgress(0.4 + f * 0.35, 'Raising buildings…'));
+
+  await step(1, 'City ready');
+  console.info(`[world] built in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+
+  const camPos = new THREE.Vector3();
+  let infoTimer = 0;
+  const debug = location.search.includes('world=debug');
+  const dbgWin = window as unknown as { __worldCam?: number[]; __worldHours?: number; __worldInfo?: () => string };
+  if (debug) dbgWin.__worldInfo = () => `calls ${renderer.info.render.calls} tris ${renderer.info.render.triangles} geos ${renderer.info.memory.geometries} tex ${renderer.info.memory.textures}`;
+  return {
+    update(dt: number, camera: THREE.Camera, hours: number) {
+      if (debug && dbgWin.__worldCam) {
+        // debug camera: [x, y, h, lookX, lookY, lookH] in map coordinates
+        const c = dbgWin.__worldCam;
+        camera.position.set(c[0], c[2], -c[1]);
+        camera.lookAt(c[3], c[5], -c[4]);
+        camera.updateMatrixWorld();
+      }
+      if (debug && dbgWin.__worldHours !== undefined) hours = dbgWin.__worldHours;
+      U.uTime.value += dt;
+      sky.update(camera, hours);
+      camera.getWorldPosition(camPos);
+      U.uInTunnel.value = camPos.y < 5 && roads.tunnels.penetration(camPos.x, -camPos.z) > -0.4 ? 1 : 0;
+      for (const c of ctx.cull) {
+        const dx = c.x - camPos.x;
+        const dz = c.z - camPos.z;
+        c.obj.visible = dx * dx + dz * dz < c.range * c.range;
+      }
+      for (const t of ctx.tick) t(dt, camera);
+      infoTimer += dt;
+      if (infoTimer > 5 && location.search.includes('world=debug')) {
+        infoTimer = 0;
+        console.info(`[world] calls ${renderer.info.render.calls} tris ${renderer.info.render.triangles}`);
+      }
+    },
+  };
 }
