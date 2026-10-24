@@ -289,6 +289,19 @@ async function main() {
           events: g.events.slice(-3).map((e) => `${e.kind}: ${e.text}`),
         };
       },
+      /** AI vehicles within `r` metres of the bus (for attributing blocked spells). */
+      traffic(r = 60) {
+        const p = physics.pose;
+        const near = (x: number, y: number) => Math.hypot(x - p.x, y - p.y) < r;
+        const buses = traffic
+          .markers()
+          .filter((m) => near(m.x, m.y))
+          .map((m) => ({ x: +m.x.toFixed(1), y: +m.y.toFixed(1), heading: Math.round((m.heading * 180) / Math.PI), length: m.length }));
+        const g = traffic.cars.grid;
+        const cars: { id: number; x: number; y: number; z: number; v: number }[] = [];
+        for (let i = 0; i < g.count; i++) if (near(g.px[i], g.py[i])) cars.push({ id: g.pid[i], x: +g.px[i].toFixed(1), y: +g.py[i].toFixed(1), z: +g.pz[i].toFixed(1), v: +g.pv[i].toFixed(1) });
+        return { buses, cars };
+      },
       report() {
         return { ...auto!.report(), summary: guide.state.summary, served: guide.state.stopsServed, missed: guide.state.stopsMissed, total: guide.state.stopsTotal, events: guide.state.events.map((e) => `${e.kind}: ${e.text}`) };
       },
