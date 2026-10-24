@@ -1,74 +1,43 @@
-# Agent guide for Time Tracker
+# Agent guide for Brisbane Bus Simulator
 
-This repo is a single-user, always-on time tracker: a React PWA on an iPhone
-plus a Hono API on Cloudflare Workers. All milestones (M0 to M5) are built and
-merged. Start with `HANDOFF.md` (current state, decisions, known gaps, lessons
-learned), then read `docs/01` through `docs/08` in order before writing code.
-They are short and they are the spec.
+A browser bus simulator of Brisbane's CBD and inner suburbs: three.js +
+TypeScript strict + Vite, no server. Read `README.md`, then `src/types.ts`
+(the contract between subsystems and the coordinate conventions).
 
 ## Ground rules
 
-- **Decisions in `docs/01-decisions.md` are settled.** Do not add multi-user,
-  accounts, a different framework, a paid service, or a native app. If a
-  decision turns out to be impossible, write the problem and your proposed
-  change under "Open questions" in that file and pick the simplest workaround
-  that keeps the free tier and single-user model.
-- **One milestone or change per PR.** Update the docs when the code diverges
-  from them, in the same PR. New work goes under "Backlog" or "Known
-  limitations" first (`docs/07-roadmap.md`, `HANDOFF.md`).
-- **The timer is derived, never run.** Elapsed time is `now - startedAt` of
-  the open segment. Never store a running counter. `setInterval` is only for
-  re-rendering the clock.
-- **All time math lives in `packages/shared`** as pure functions with Vitest
-  tests: day bucketing, splitting segments across day boundaries, totals,
-  switch and edit operations, the rule engine. Both apps import it.
-- **Times are ISO 8601 UTC strings** everywhere in storage and over the wire.
-  Local day boundaries use the timezone and `dayStartHour` from settings.
-- **Local-first.** The UI reads and writes Dexie (IndexedDB). An outbox replays
-  writes to the server. Never put app data in `localStorage`.
-- **Validate at boundaries with zod**, schemas shared between client and server.
-- **Stay inside the Workers Free plan** (docs/02 "Free tier budget"): 10 ms of
-  CPU and about 50 D1 calls per invocation, 100 bound parameters per statement.
-  Batch reads with `db.batch()`, pass id lists through the `json_each` helper,
-  page anything that grows with history, and do not add per-row Drizzle work
-  to hot paths.
+- **Coordinates**: map data is metres, x east / y north, centred on King George
+  Square. three.js uses x = x, z = -y. Headings are compass radians (0 north,
+  clockwise). Use `src/data/coords.ts`; don't hand-roll conversions.
+- **Australia drives on the left**; buses are right-hand drive.
+- **Accuracy first**: map and routes come from OpenStreetMap and the TransLink
+  GTFS feed via `tools/data/`. Fix data problems in the pipeline and rebuild,
+  not by hand-editing `public/data/`.
+- **Everything is procedural**: no runtime downloads of models, textures or
+  audio. Canvas textures and synthesised audio are fine.
+- **Performance**: 60 fps on a mid-range laptop in the CBD. Merge geometry,
+  instance repeated objects, share materials, keep draw calls in the low
+  hundreds, and keep per-frame CPU work in each subsystem around a millisecond.
+- Subsystems talk through `src/types.ts` and the exports of each directory's
+  `index.ts`. `src/main.ts` is the only orchestrator.
 
-## Conventions
-
-- pnpm workspaces: `apps/web`, `apps/server`, `packages/shared`.
-- TypeScript strict, no `any`, ESLint + Prettier, Vitest.
-- React function components, hooks, Tailwind. Mobile portrait first. Touch
-  targets at least 56px. Must look right in dark mode.
-- Hono for the API. Drizzle ORM for D1. Migrations committed under
-  `apps/server/drizzle`.
-- Never commit secrets. Local secrets go in `apps/server/.dev.vars` (gitignored).
-  Document any new secret in `docs/07-roadmap.md` under owner setup tasks.
-
-## Commands (available after M0)
+## Commands
 
 ```sh
 pnpm install
-pnpm dev          # web on :5173 proxying /api to wrangler dev on :8787
-pnpm test
-pnpm lint && pnpm typecheck
+pnpm dev
+pnpm typecheck
 pnpm build
-pnpm run deploy   # pnpm deploy is a pnpm built-in, so use run
+pnpm data            # rebuild public/data (see tools/data/README.md)
+npx -y tsx src/sim/selftest.ts   # physics sanity checks
 ```
 
-## Testing
+## Checking your work
 
-- Server tests run the real Worker in workerd with an in-memory D1
-  (`apps/server/test/harness.ts`). Web data and sync tests use fake-indexeddb
-  and the fake server in `apps/web/src/sync/testServer.ts`.
-- End-to-end checks of the built app live in `tools/e2e` (see its README).
-  Run `tools/e2e/sync` against the real Worker after any sync change, and look
-  at the screenshots after any UI change.
-- Stop any server you start by port or PID. Never `pkill -f` a pattern that
+- Screenshots: start `npx vite --port 5174 --strictPort` and run
+  `SHOT_URL=http://localhost:5174/ node tools/shot/shot.mjs "route=61&cam=chase" out.png 30000`.
+  Headless Chromium uses SwiftShader, so it is slow; give long waits.
+- `src/bus/preview.html` previews bus models; `?world=debug` and `?simdebug`
+  expose debug hooks on `window`.
+- Stop servers by port (`fuser -k 5174/tcp`). Never `pkill -f` a pattern that
   also matches your own shell's command line.
-
-## Before opening a PR
-
-- `pnpm lint`, `pnpm typecheck`, `pnpm test`, `pnpm build` all pass. Check
-  each command's exit status; piping into `tail` hides failures.
-- The relevant definition of done in `docs/07-roadmap.md` is met.
-- Docs updated where behaviour changed.

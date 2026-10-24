@@ -1,22 +1,5 @@
-node_modules/
-dist/
-build/
-.wrangler/
-.dev.vars
-*.local
-.env
-.env.*
-!.env.example
-coverage/
-.DS_Store
+node_modules
+dist
+tools/data/raw
 *.log
-.turbo/
-.vite/
-dev-dist/
-apps/server/public/
-# Agent worktrees created during development
-.claude/worktrees/
-
-# End-to-end screenshots and downloads
-tools/e2e/**/shots/
-tools/e2e/**/downloads/
+.DS_Store

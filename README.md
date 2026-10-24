@@ -1,126 +1,82 @@
-# Time Tracker
+# Brisbane Bus Simulator
 
-A personal, always-on time tracker for one person on one iPhone.
+Drive real TransLink bus routes through an accurate 3D model of Brisbane's CBD
+and inner suburbs, from the driver's seat of a Transport for Brisbane bus, a
+Blue or Maroon CityGlider, or a 24.7 m bi-articulated Brisbane Metro.
 
-Exactly one category is active at every moment. Switching category closes the
-current time segment and opens a new one. The app nudges you with a push
-notification when you have spent too long on a category, and shows dashboards
-of where your day went.
+It runs in the browser (three.js + TypeScript + Vite). There is no server: the
+map and timetable are pre-built JSON in `public/data/`.
 
-- **Client:** React PWA installed to the iPhone Home Screen. Local-first, works offline.
-- **Server:** tiny Hono API on Cloudflare Workers with a D1 (SQLite) database and a
-  once-a-minute cron that evaluates nudge rules and sends Web Push.
-- **Cost:** $0. Everything stays inside the Cloudflare free tier.
-- **iOS extras:** Siri and Shortcuts automations via the API, a Scriptable home
-  screen widget. No native app.
+```sh
+pnpm install
+pnpm dev        # http://localhost:5173
+pnpm build      # static site in dist/
+```
 
-## Status
+## What's in it
 
-All milestones (M0 to M5) are built. What is left needs the owner's iPhone:
-deploy (docs/08-deploy.md), install, and confirm push delivery, the widget
-and the Siri phrase on the device.
+- **The city** from OpenStreetMap: ~16,500 road segments with real widths,
+  lanes, one-ways and speed limits, ~56,000 buildings with heights, the
+  Brisbane River, parks, rail lines, traffic signals and crossings. Gaps in the
+  OSM house coverage are filled with procedural Queenslanders.
+- **The routes** from the TransLink GTFS feed: every bus route-direction that
+  runs at least 1.2 km inside the map (~386, including M1/M2, CityGlider 60/61,
+  the City and Spring Hill loops, BUZ and NightLink routes), with their real
+  stops and scheduled times.
+- **The buses**: Volgren Optimus in the Transport for Brisbane TransLink
+  livery, Blue and Maroon CityGliders, and the Brisbane Metro, each with a
+  right-hand-drive cab (working speedo, tell-tales, ticketing console) and
+  saloon. LED destination signs show the route you pick.
+- **Driving**: heavy-vehicle physics with an automatic gearbox, rear-axle
+  pivoting and front overhang swing, articulated Metro sections, door
+  interlock, kneel, park brake, collisions with buildings and traffic, and
+  synthesised engine, air-brake and door sounds.
+- **The shift**: pull into each stop and open the doors to serve it, keep to
+  the timetable, follow turn-by-turn hints, and get a summary at the end.
+  ~50 AI buses run their own real routes around you, plus car traffic.
 
-- **Track.** Tap a category on the Now screen; the timer runs from the start
-  time, so it is right even after the app was closed. Undo, backdate, and
-  edit, split, delete or fill gaps on the Today timeline. Works offline.
-- **Sync.** Paste your app password once; every change syncs to your
-  Cloudflare Worker and back. Shortcuts and Siri switch through the API.
-- **Nudges.** Session limits ("1h of Relaxing in a row"), daily budgets
-  ("3h of Relaxing today") and a "Still on it?" check, with quiet hours, sent
-  as push notifications by a once-a-minute cron.
-- **Dashboards.** Totals, each day stacked by category, an hour-of-day
-  heatmap, budget streaks and trends, plus CSV and JSON export.
-- **Widget.** A Scriptable script for Home Screen and Lock Screen widgets.
+## Controls
 
-See [docs/07-roadmap.md](docs/07-roadmap.md) for details per milestone.
+| Action | Keyboard | Gamepad |
+| --- | --- | --- |
+| Throttle / brake | W / S or ↑ / ↓ (Shift+S emergency stop) | RT / LT |
+| Steer | A / D or ← / → | Left stick |
+| Gears | R reverse (when stopped), N neutral, G drive | D-pad up / down |
+| Doors | O or Space | A |
+| Indicators | Q / E (self-cancel) | LB / RB |
+| Hazards / headlights | Z / L | R3 / D-pad left |
+| Horn | H (hold) | X |
+| Kneel / park brake | K / F | L3 / B |
+| Camera (cab, chase, top, cinematic) | C | Y |
+| Look at mirrors / back | hold , . / or drag the mouse | Right stick |
+| Map / time of day / pause | M / T / P or Esc | Back / – / Start |
+| Guidance chevrons | V | |
+| Reset onto the road | Backspace | D-pad right |
 
-## Get it on your iPhone
+Phones and tablets get on-screen pedals, a steering wheel and buttons (force
+them with `?touch=1`).
 
-Follow [docs/08-deploy.md](docs/08-deploy.md): create a free Cloudflare
-account, add three secrets to this repository, run the **Deploy** workflow,
-then add the app to your Home Screen from Safari. About 15 minutes, all from
-a phone.
+## Dev shortcuts
 
-## Documentation
+`?route=61&dir=0&hours=10&cam=chase&s=800` skips the menu and starts route 61
+(direction 0) at 10:00, 800 m along, in the chase camera. `cam=top` is the
+overhead view. `node tools/shot/shot.mjs "<query>" out.png <waitMs> "<keys>"`
+takes a headless screenshot of a running dev server.
 
-Read in order.
+## Layout
 
-| Doc | What it covers |
+| Path | What |
 | --- | --- |
-| [01-decisions.md](docs/01-decisions.md) | Settled product and technical decisions, starting categories, out of scope |
-| [02-architecture.md](docs/02-architecture.md) | Components, key flows, sync, time handling, hosting, free tier budget |
-| [03-data-model.md](docs/03-data-model.md) | Types, SQL schema, invariants, segment math, rule engine semantics |
-| [04-api.md](docs/04-api.md) | HTTP API, auth, sync ops, push endpoints |
-| [05-features.md](docs/05-features.md) | Screen by screen feature spec with acceptance criteria |
-| [06-ios.md](docs/06-ios.md) | iOS constraints, install and push flow, Shortcuts recipes, Scriptable widget |
-| [07-roadmap.md](docs/07-roadmap.md) | Milestones, task breakdown, definition of done, owner setup tasks |
-| [08-deploy.md](docs/08-deploy.md) | Deploy from GitHub and install on the iPhone, no computer needed |
-| [HANDOFF.md](HANDOFF.md) | Current state, decisions made during the build, known gaps, how to continue |
+| `src/types.ts` | The shared contract between subsystems (data, buses, driving, world) |
+| `src/data/` | JSON loading and coordinate helpers |
+| `src/world/` | Ground, river, roads, buildings, vegetation, street furniture, landmarks, sky |
+| `src/bus/` | Bus models, liveries, destination signs, cab and saloon |
+| `src/sim/` | Input, physics, collisions, cameras, audio |
+| `src/game/` | Menu, route guidance and stops, HUD and maps, AI traffic |
+| `tools/data/` | Python pipeline that builds `public/data/` from OSM and GTFS |
 
-Agents working in this repo should also read [CLAUDE.md](CLAUDE.md).
+## Data and credits
 
-## Quick start
-
-### Prerequisites
-
-- Node 22 (check [.nvmrc](.nvmrc))
-- pnpm 10: run `corepack enable` to use the version pinned in `package.json`
-
-### Commands
-
-```sh
-pnpm install              # Install dependencies
-pnpm dev                  # Vite on :5173 proxying /api to wrangler dev on :8787 with local D1
-pnpm test                 # Vitest across packages
-pnpm lint                 # ESLint and Prettier
-pnpm typecheck            # TypeScript checks
-pnpm build                # builds the PWA into the Worker's static assets
-pnpm run deploy           # pnpm deploy is a pnpm built-in, so use run
-```
-
-### Local development
-
-`pnpm dev` applies the local D1 migrations, then starts `wrangler dev` on :8787
-and Vite on :5173. Open `http://localhost:5173`. Vite proxies `/api` to the
-Worker, so `curl localhost:5173/api/health` returns `{ "ok": true, ... }`.
-
-The API needs a token from M2 on: every `/api` route except `/api/health`
-answers `401` until `AUTH_TOKEN` is set. Copy the example file and fill it in:
-
-```sh
-cp apps/server/.dev.vars.example apps/server/.dev.vars
-openssl rand -base64 32   # paste as AUTH_TOKEN
-```
-
-The app works without it; sync is off until you connect. Open Settings →
-Sync (or tap the banner on the Now screen), paste the same token and tap
-Connect. The phone's changes go up first, then the server's copy replaces
-the local data. "Sync now", "Disconnect" and "Reset local data and
-re-download" live in the same section.
-
-### Server tests
-
-`pnpm test` includes them; to run only the server's:
-
-```sh
-pnpm --filter @time-tracker/server test
-```
-
-They start the real Worker in workerd with wrangler's `createTestHarness`,
-backed by an in-memory local D1 with the migrations in `apps/server/drizzle`
-applied, and call it over HTTP. No Cloudflare account, network or
-`.dev.vars` is needed (the tests set their own `AUTH_TOKEN`), and your
-`wrangler dev` database is not touched. Each test file starts its own Worker
-and every table is emptied before each test.
-
-While `pnpm dev` runs, trigger the cron handler by hand:
-
-```sh
-curl "http://localhost:8787/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"
-```
-
-### Repo layout
-
-- `apps/web`: React PWA, Tailwind, service worker
-- `apps/server`: Hono on Workers, D1 database, cron handler
-- `packages/shared`: types, zod schemas and all time math, with Vitest tests
+Map data © OpenStreetMap contributors, ODbL. Timetable data © State of
+Queensland (Department of Transport and Main Roads), CC BY 4.0. See
+`tools/data/README.md` to rebuild the data.
