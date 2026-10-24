@@ -541,12 +541,24 @@ export async function buildTerrain(ctx: Ctx, f: TerrainField, mat: THREE.Materia
     for (let ci = 0; ci < f.onx - 1; ci += OC) {
       const ci1 = Math.min(f.onx - 1, ci + OC);
       const cj1 = Math.min(f.ony - 1, cj + OC);
-      const w = ci1 - ci + 1;
+      // chunks well away from the inner grid use every other sample
+      const bx = Math.max(ex0 - (f.ox0 + ci1 * f.ocell), 0, f.ox0 + ci * f.ocell - ex1);
+      const by = Math.max(ey0 - (f.oy0 + cj1 * f.ocell), 0, f.oy0 + cj * f.ocell - ey1);
+      const st = Math.hypot(bx, by) > 2500 ? 2 : 1;
+      const range = (a0: number, a1: number) => {
+        const out: number[] = [];
+        for (let a = a0; a < a1; a += st) out.push(a);
+        out.push(a1);
+        return out;
+      };
+      const is = range(ci, ci1);
+      const js = range(cj, cj1);
+      const w = is.length;
       const pos: number[] = [];
       const nrm: number[] = [];
       const idx: number[] = [];
-      for (let j = cj; j <= cj1; j++) {
-        for (let i = ci; i <= ci1; i++) {
+      for (const j of js) {
+        for (const i of is) {
           const x = f.ox0 + i * f.ocell;
           const y = f.oy0 + j * f.ocell;
           let z = f.oh[j * f.onx + i];
@@ -563,13 +575,15 @@ export async function buildTerrain(ctx: Ctx, f: TerrainField, mat: THREE.Materia
           nrm.push(-gx / l, 1 / l, gy / l);
         }
       }
-      for (let j = cj; j < cj1; j++) {
-        for (let i = ci; i < ci1; i++) {
-          const x0 = f.ox0 + i * f.ocell;
-          const y0 = f.oy0 + j * f.ocell;
+      for (let jj = 0; jj + 1 < js.length; jj++) {
+        for (let ii = 0; ii + 1 < is.length; ii++) {
+          const x0 = f.ox0 + is[ii] * f.ocell;
+          const y0 = f.oy0 + js[jj] * f.ocell;
+          const x1 = f.ox0 + is[ii + 1] * f.ocell;
+          const y1 = f.oy0 + js[jj + 1] * f.ocell;
           // skip cells fully inside the inner grid
-          if (x0 > ex0 + f.ocell && x0 + f.ocell < ex1 - f.ocell && y0 > ey0 + f.ocell && y0 + f.ocell < ey1 - f.ocell) continue;
-          const a = (j - cj) * w + (i - ci);
+          if (x0 > ex0 + f.ocell && x1 < ex1 - f.ocell && y0 > ey0 + f.ocell && y1 < ey1 - f.ocell) continue;
+          const a = jj * w + ii;
           idx.push(a, a + 1, a + w + 1, a, a + w + 1, a + w);
         }
       }

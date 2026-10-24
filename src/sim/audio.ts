@@ -53,7 +53,7 @@ function tunnelIR(ctx: Ctx): AudioBuffer {
     for (let i = 0; i < len; i++) {
       const t = i / sr;
       // Diffuse tail, darker as it decays (one-pole smoothing grows with time).
-      d[i] = rnd() * Math.exp(-t / 0.42) * 0.35;
+      d[i] = rnd() * Math.exp(-t / 0.45) * 0.6;
     }
     let y = 0;
     for (let i = 0; i < len; i++) {
@@ -553,7 +553,7 @@ export class BusAudio {
     // Rear engine: from the cab it is ten metres behind a bulkhead.
     this.engineBus?.frequency.setTargetAtTime(cab ? 1400 : 5200, now, 0.2);
     // In a tunnel the engine and tyres bounce back off the walls.
-    this.reverbSend?.gain.setTargetAtTime(t.inTunnel ? 0.55 : 0, now, t.inTunnel ? 0.35 : 0.6);
+    this.reverbSend?.gain.setTargetAtTime(t.inTunnel ? 0.9 : 0, now, t.inTunnel ? 0.35 : 0.6);
 
     // Road.
     const vn = v / 22;

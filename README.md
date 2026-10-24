@@ -27,13 +27,20 @@ pnpm build      # static site in dist/
   livery, Blue and Maroon CityGliders, and the Brisbane Metro, each with a
   right-hand-drive cab (working speedo, tell-tales, ticketing console) and
   saloon. LED destination signs show the route you pick.
+- **Real elevation**: terrain from the AWS/Mapzen terrain tiles, every road,
+  bridge and tunnel at its solved height. Busway viaducts pass over the
+  streets, the King George Square and Queen Street busway stations are
+  underground, and the Story Bridge deck is 30 m above the river.
 - **Driving**: heavy-vehicle physics with an automatic gearbox, rear-axle
   pivoting and front overhang swing, articulated Metro sections, door
-  interlock, kneel, park brake, collisions with buildings and traffic, and
-  synthesised engine, air-brake and door sounds.
-- **The shift**: pull into each stop and open the doors to serve it, keep to
-  the timetable, follow turn-by-turn hints, and get a summary at the end.
-  ~50 AI buses run their own real routes around you, plus car traffic.
+  interlock, kneel, park brake, hills (with hill-start assist), staying on
+  your level in tunnels and on viaducts, tunnel walls and parapets,
+  collisions with buildings and traffic, and synthesised engine, air-brake,
+  door and tunnel-echo sounds.
+- **The shift**: pull into each stop (any lettered bay at a busway platform)
+  and open the doors to serve it, keep to the timetable, follow turn-by-turn
+  hints, and get a summary at the end. AI buses run their own real routes
+  around you, plus car traffic (Off / Light / Normal in the menu).
 
 ## Controls
 
@@ -78,5 +85,8 @@ takes a headless screenshot of a running dev server.
 ## Data and credits
 
 Map data © OpenStreetMap contributors, ODbL. Timetable data © State of
-Queensland (Department of Transport and Main Roads), CC BY 4.0. See
+Queensland (Department of Transport and Main Roads), CC BY 4.0. Terrain:
+Mapzen Terrain Tiles (AWS Open Data); Australia terrain data © Commonwealth
+of Australia (Geoscience Australia) 2017; SRTM and GMTED2010 courtesy of the
+U.S. Geological Survey; ETOPO1 courtesy of NOAA. See
 `tools/data/README.md` to rebuild the data.

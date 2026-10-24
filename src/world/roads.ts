@@ -781,26 +781,49 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     }
     const g = L.strip;
     const st = L.struct;
+    const at = (c: (typeof P)[number], off: number) => [c.x + c.nx * side * off, c.y + c.ny * side * off] as const;
+    const shoulderW = (k: number) => clamp(2.5 + 1.6 * Math.abs(field.natAt(...at(P[k], e0[k] + 3)) - zE[k]), 3, 9);
     for (let k = 0; k + 1 < n; k++) {
       const t = type[k];
       if (t === 0) continue;
       const A = P[k];
-      const B = P[k + 1];
-      const at = (c: typeof A, off: number) => [c.x + c.nx * side * off, c.y + c.ny * side * off] as const;
+      let kb = k + 1;
+      if (t === 1) {
+        // merge up to three straight, evenly graded samples into one shoulder quad
+        const wa = shoulderW(k);
+        while (kb - k < 3 && kb + 1 < n && type[kb] === 1 && e0[kb + 1] === e0[k]) {
+          const C = P[kb + 1];
+          if (A.nx * C.nx + A.ny * C.ny < 0.998) break;
+          const wc = shoulderW(kb + 1);
+          let ok = true;
+          for (let q = k + 1; q <= kb; q++) {
+            const f = (ss[q] - ss[k]) / (ss[kb + 1] - ss[k]);
+            if (Math.abs(zE[q] - (zE[k] + (zE[kb + 1] - zE[k]) * f)) > 0.06) ok = false;
+            const [px, py] = at(P[q], e0[q] + wa + (wc - wa) * f);
+            const [ax, ay] = at(A, e0[k] + wa);
+            const [cx, cy] = at(C, e0[kb + 1] + wc);
+            const lin = field.natAt(ax, ay) + (field.natAt(cx, cy) - field.natAt(ax, ay)) * f;
+            if (Math.abs(field.natAt(px, py) - lin) > 0.12) ok = false;
+          }
+          if (!ok) break;
+          kb++;
+        }
+      }
+      const B = P[kb];
       const fx = side * A.nx;
       const fy = side * A.ny;
       if (t === 1) {
         // graded shoulder to the natural ground
-        const wa = clamp(2.5 + 1.6 * Math.abs(field.natAt(...at(A, e0[k] + 3)) - zE[k]), 3, 9);
-        const wb = clamp(2.5 + 1.6 * Math.abs(field.natAt(...at(B, e0[k + 1] + 3)) - zE[k + 1]), 3, 9);
+        const wa = shoulderW(k);
+        const wb = shoulderW(kb);
         const [a0x, a0y] = at(A, e0[k]);
-        const [b0x, b0y] = at(B, e0[k + 1]);
+        const [b0x, b0y] = at(B, e0[kb]);
         const [a1x, a1y] = at(A, e0[k] + wa);
-        const [b1x, b1y] = at(B, e0[k + 1] + wb);
+        const [b1x, b1y] = at(B, e0[kb] + wb);
         const a1z = field.natAt(a1x, a1y);
         const b1z = field.natAt(b1x, b1y);
         const i0 = g.vert(a0x, zE[k], a0y);
-        const i1 = g.vert(b0x, zE[k + 1], b0y);
+        const i1 = g.vert(b0x, zE[kb], b0y);
         const i2 = g.vert(b1x, b1z, b1y);
         const i3 = g.vert(a1x, a1z, a1y);
         g.quad(i0, i1, i2, i3, 0, 1, 0);
@@ -808,7 +831,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const s2 = g.vert(b1x, b1z - 0.4, b1y);
         const s3 = g.vert(a1x, a1z - 0.4, a1y);
         g.quad(i3, i2, s2, s3, fx, 0, -fy);
-        field.clampQuad([a0x, a0y, zE[k], b0x, b0y, zE[k + 1], b1x, b1y, b1z, a1x, a1y, a1z], 0.25);
+        field.clampQuad([a0x, a0y, zE[k], b0x, b0y, zE[kb], b1x, b1y, b1z, a1x, a1y, a1z], 0.25);
+        k = kb - 1;
       } else if (t === 2 || t === 4) {
         cutSeg(L, A, B, side, ss[k], ss[k + 1], foot[k], foot[k + 1], e0[k], e0[k + 1], hw, t === 2);
       } else if (t === 3) {
@@ -1150,14 +1174,22 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const cov = P0.map((c) => covered(ri, c));
     const cover = P0.map((c) => field.natAt(c.x, c.y) - (c.z + H));
     for (const side of [1, -1]) {
-      const open = ss.map((s, k) => {
-        const c = P0[k];
+      // open toward a neighbouring tunnel carriageway (its tube closes the far side)
+      const open = P0.map((c) => {
         const qx = c.x + c.nx * side * (wallOff + 0.4);
         const qy = c.y + c.ny * side * (wallOff + 0.4);
         const q2x = c.x + c.nx * side * (wallOff + 3);
         const q2y = c.y + c.ny * side * (wallOff + 3);
-        void s;
-        return otherAt(qx, qy, c.z, ri.i, 3) > -0.6 || otherAt(q2x, q2y, c.z, ri.i, 3) > -0.6 || inPlatform(qx, qy) || inPlatform(q2x, q2y);
+        return otherAt(qx, qy, c.z, ri.i, 3) > -0.6 || otherAt(q2x, q2y, c.z, ri.i, 3) > -0.6;
+      });
+      // underground platform beside the road: push the wall out past its far edge
+      const wo = P0.map((c) => {
+        let last = -1;
+        for (let o = hw + 0.3; o < hw + 26; o += 0.5) {
+          if (inPlatform(c.x + c.nx * side * o, c.y + c.ny * side * o)) last = o;
+          else if (last >= 0 || o > hw + 8) break;
+        }
+        return last >= 0 ? Math.max(wallOff, last + 1.2) : wallOff;
       });
       for (let k = 0; k + 1 < ss.length; k++) {
         const A = P0[k];
@@ -1171,30 +1203,33 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const P = (c: typeof A, off: number, h: number) => [c.x + c.nx * side * off, c.z + h, c.y + c.ny * side * off] as const;
         const fx = side * A.nx;
         const fy = side * A.ny;
-        const ceilW = isOpen ? wallOff + 6 : wallOff;
+        const woA = isOpen ? wallOff : wo[k];
+        const woB = isOpen ? wallOff : wo[k + 1];
+        const ceilA = isOpen ? wallOff + 6 : woA;
+        const ceilB = isOpen ? wallOff + 6 : woB;
         const w0 = t.vert(...P(A, hw, 0.25), ...walkC);
         const w1 = t.vert(...P(B, hw, 0.25), ...walkC);
-        const w2 = t.vert(...P(B, isOpen ? wallOff + 0.6 : wallOff, 0.25), ...walkC);
-        const w3 = t.vert(...P(A, isOpen ? wallOff + 0.6 : wallOff, 0.25), ...walkC);
+        const w2 = t.vert(...P(B, isOpen ? wallOff + 0.6 : woB, 0.25), ...walkC);
+        const w3 = t.vert(...P(A, isOpen ? wallOff + 0.6 : woA, 0.25), ...walkC);
         t.quad(w0, w1, w2, w3, 0, 1, 0);
         const k0 = t.vert(...P(A, hw, 0), ...walkC);
         const k1 = t.vert(...P(B, hw, 0), ...walkC);
         t.quad(k0, k1, w1, w0, -fx, 0, fy);
         const c0 = t.vert(...P(A, 0, H), ...ceilC);
         const c1 = t.vert(...P(B, 0, H), ...ceilC);
-        const c2 = t.vert(...P(B, ceilW, H), ...ceilC);
-        const c3 = t.vert(...P(A, ceilW, H), ...ceilC);
+        const c2 = t.vert(...P(B, ceilB, H), ...ceilC);
+        const c3 = t.vert(...P(A, ceilA, H), ...ceilC);
         t.quad(c0, c1, c2, c3, 0, -1, 0);
         if (!isOpen) {
-          const a0 = t.vert(...P(A, wallOff, 0), ...wallC);
-          const a1 = t.vert(...P(B, wallOff, 0), ...wallC);
-          const a2 = t.vert(...P(B, wallOff, H), ...wallC);
-          const a3 = t.vert(...P(A, wallOff, H), ...wallC);
+          const a0 = t.vert(...P(A, woA, 0), ...wallC);
+          const a1 = t.vert(...P(B, woB, 0), ...wallC);
+          const a2 = t.vert(...P(B, woB, H), ...wallC);
+          const a3 = t.vert(...P(A, woA, H), ...wallC);
           t.quad(a0, a1, a2, a3, -fx, 0, fy);
-          const d0 = t.vert(...P(A, wallOff - 0.01, 0), 70, 72, 74);
-          const d1 = t.vert(...P(B, wallOff - 0.01, 0), 70, 72, 74);
-          const d2 = t.vert(...P(B, wallOff - 0.01, 1.1), 70, 72, 74);
-          const d3 = t.vert(...P(A, wallOff - 0.01, 1.1), 70, 72, 74);
+          const d0 = t.vert(...P(A, woA - 0.01, 0), 70, 72, 74);
+          const d1 = t.vert(...P(B, woB - 0.01, 0), 70, 72, 74);
+          const d2 = t.vert(...P(B, woB - 0.01, 1.1), 70, 72, 74);
+          const d3 = t.vert(...P(A, woA - 0.01, 1.1), 70, 72, 74);
           t.quad(d0, d1, d2, d3, -fx, 0, fy);
         }
         // shallow cover: a grassed mound over the box so its roof never shows
