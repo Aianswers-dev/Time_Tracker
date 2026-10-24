@@ -1191,6 +1191,9 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         }
         return last >= 0 ? Math.max(wallOff, last + 1.2) : wallOff;
       });
+      // DEBUGTUBE
+      (globalThis as unknown as { __tubes: unknown[] }).__tubes ??= [];
+      (globalThis as unknown as { __tubes: unknown[] }).__tubes.push({ i: ri.i, n: r.name, side, pts: P0.map((c, k) => [Math.round(c.x), Math.round(c.y), Math.round(c.z * 10) / 10, cov[k] ? 1 : 0, open[k] ? 1 : 0, Math.round(wo[k] * 10) / 10]) });
       for (let k = 0; k + 1 < ss.length; k++) {
         const A = P0[k];
         const B = P0[k + 1];
