@@ -14,12 +14,18 @@
  * axle follows a no-slip tractrix, so trailers off-track into corners and can
  * jackknife when reversing. Joints are limited to +-50 degrees.
  *
- * Vertical: each section samples the road surface under its rear axle and
- * its front axle (or hitch) at the level it is already on, so the bus stays
- * in a tunnel under the street or up on a viaduct over it. Heights follow the
- * surface with a feed-forward spring (no jitter at segment joins); running off
- * an edge drops the bus under gravity. The grade pulls the bus back uphill
- * and pushes it downhill (m g sin(theta)); the brakes and park brake hold it.
+ * Vertical: the front section samples the road surface under its rear and
+ * front axles at the level it is already on, so the bus stays in a tunnel
+ * under the street or up on a viaduct over it. A trailer's front rests on the
+ * hitch of the section ahead, and its axle looks for the road at the level
+ * that hitch is on, so the whole bus is always on one level (also right after
+ * a reset). Heights follow the surface with a feed-forward spring (no jitter
+ * at segment joins); steps of up to ~1.2 m are followed without an impact.
+ * The bus changes level only where roads connect (ramps): the front section
+ * stops at an edge with nothing at its level beyond (a deck side, a drop off
+ * an embankment), like at a rock face, and a trailer whose wheels are over a
+ * drop keeps the level. The grade pulls the bus back uphill and pushes it
+ * downhill (m g sin(theta)); the brakes and park brake hold it.
  *
  * Integration runs in fixed-size substeps of at most 1/120 s so behaviour does
  * not depend on the frame rate.
@@ -30,12 +36,24 @@ import type { BusControls } from './controls';
 import { DieselPowertrain, ElectricPowertrain, type Powertrain } from './powertrain';
 import { emitSim, isSimInput, player, telemetry } from './hub';
 import { isSimCollider, type SimCollider } from './collider';
+import type { Surface } from '../data/height';
 
 const G = 9.81;
 const RHO = 1.2;
 const SUBSTEP = 1 / 120;
 const JOINT_LIMIT = (50 * Math.PI) / 180;
 const WHEEL_RADIUS = 0.48;
+/**
+ * Off every road at the bus's level, ground further below than this is a drop (a viaduct's side, the top
+ * of an embankment or a retaining wall), not a surface to drive down onto.
+ */
+const EDGE_DROP = 1.2;
+/** How far past a bridge deck's carriageway edge an axle can be before it is off the deck (deck edge + a little). */
+const DECK_EDGE = 0.6;
+/** Steepest grade between a trailer's hitch and its axle (rise over run). */
+const TRAILER_GRADE = 0.2;
+/** Fastest the wheels follow a step down in the road (m/s, plus the surface's own rate). */
+const STEP_DOWN_RATE = 3;
 
 const clamp = (v: number, a: number, b: number) => (v < a ? a : v > b ? b : v);
 const smooth = (cur: number, target: number, h: number, tau: number) => cur + (target - cur) * (1 - Math.exp(-h / Math.max(1e-4, tau)));
@@ -144,6 +162,9 @@ export class BusPhysics {
   private tF: Float64Array;
   private airR: Uint8Array;
   private airF: Uint8Array;
+  /** Section 0's front / rear axle is over a drop with nothing at its level (only after a reset onto an edge). */
+  private hangF = false;
+  private hangR = false;
   private settleZ = true;
   /** False when placed without a height before the map was known: settle on the road nearest the ground. */
   private zKnown = false;
@@ -250,6 +271,7 @@ export class BusPhysics {
     this.vzF.fill(0);
     this.airR.fill(0);
     this.airF.fill(0);
+    this.hangF = this.hangR = false;
     this.settleZ = true;
     this.grade = 0;
     this.gradeSin = 0;
@@ -477,17 +499,14 @@ export class BusPhysics {
     const secs = p.sections;
     const settle = this.settleZ || h <= 0;
     const sinking = this.sinkT > 0;
-    // Off the road the surface is the terrain: a sudden rise there is a face the bus can't climb.
+    // The front section's axles must stay on something at their level: off the road a sudden rise is a
+    // face the bus can't climb, and a drop is an edge it can't drive off (levels change on ramps only).
     if (c && !settle && !sinking) {
       const s0 = secs[0];
       const fx = s0.x + Math.sin(s0.heading) * spec.wheelbase;
       const fy = s0.y + Math.cos(s0.heading) * spec.wheelbase;
-      const lim = 0.6;
-      const sF = c.surface(fx, fy, this.zF[0], 2.2);
-      // (Station bays beside the through-lanes are not in the road data but are drivable.)
-      if (sF.road < 0 && sF.z - this.zF[0] > lim && !c.drivable(fx, fy, this.zF[0])) return true;
-      const sR = c.surface(s0.x, s0.y, this.zR[0], 2.2);
-      if (sR.road < 0 && sR.z - this.zR[0] > lim && !c.drivable(s0.x, s0.y, this.zR[0])) return true;
+      if (this.blocked(c, fx, fy, this.zF[0], s0.heading, this.hangF)) return true;
+      if (this.blocked(c, s0.x, s0.y, this.zR[0], s0.heading, this.hangR)) return true;
     }
     let wSum = 0;
     let gSum = 0;
@@ -502,30 +521,54 @@ export class BusPhysics {
         const floor = (c?.waterLevel ?? 0) - 2.8;
         this.zR[i] = Math.max(floor, this.zR[i] - 0.9 * h);
         this.zF[i] = Math.max(floor - 0.8, this.zF[i] - 1.4 * h);
-      } else if (c) {
-        const hint = settle && !this.zKnown ? undefined : this.zR[i];
-        const sR = c.surface(sp.x, sp.y, hint, 2.2);
-        const sF = c.surface(fx, fy, hint === undefined ? undefined : this.zF[i], 2.2);
-        if (i === 0) {
-          this.roadIndex = sR.road;
-          this.inTunnel = sR.road >= 0 && !!c.road(sR.road)?.tunnel;
+      } else if (c && i === 0) {
+        // Front section: both axles at the level they are on (placed without a height: the road nearest
+        // the ground under the rear axle, and the front axle on that level).
+        const unknown = settle && !this.zKnown;
+        const sR = c.surface(sp.x, sp.y, unknown ? undefined : this.zR[0], 2.2, sp.heading);
+        const hintR = unknown ? sR.z : this.zR[0];
+        const hintF = unknown ? sR.z : this.zF[0];
+        const sF = c.surface(fx, fy, hintF, 2.2, sp.heading);
+        this.roadIndex = sR.road;
+        this.inTunnel = sR.road >= 0 && !!c.road(sR.road)?.tunnel;
+        this.hangR = this.hanging(c, sp.x, sp.y, sR, hintR);
+        this.hangF = this.hanging(c, fx, fy, sF, hintF);
+        // With something under one axle the section keeps its level over the gap under the other;
+        // with nothing under either (placed in mid-air) it falls.
+        const fall = this.hangR && this.hangF;
+        const tRz = fall ? (sR.road >= 0 ? c.ground(sp.x, sp.y) : sR.z) : this.levelTarget(sR, hintR);
+        const tFz = fall ? (sF.road >= 0 ? c.ground(fx, fy) : sF.z) : this.levelTarget(sF, hintF);
+        if (settle) {
+          this.zR[0] = this.tR[0] = tRz;
+          this.zF[0] = this.tF[0] = tFz;
+          this.vzR[0] = this.vzF[0] = 0;
+          this.airR[0] = this.airF[0] = 0;
+        } else {
+          this.followZ(this.zR, this.vzR, this.tR, this.airR, 0, tRz, h, v);
+          this.followZ(this.zF, this.vzF, this.tF, this.airF, 0, tFz, h, v);
         }
-        // No road at this level and the ground is far above: that's rock over a tunnel (or a cliff
-        // face), not a surface to stand on - keep the level (walls and the step check stop the bus).
-        let tRz = sR.z;
-        let tFz = sF.z;
-        const ref = hint ?? sR.z;
-        if (sR.road < 0 && tRz - (hint === undefined ? ref : this.zR[i]) > 2.2) tRz = hint === undefined ? ref : this.zR[i];
-        if (sF.road < 0 && tFz - (hint === undefined ? ref : this.zF[i]) > 2.2) tFz = hint === undefined ? tRz : this.zF[i];
+      } else if (c) {
+        // Trailer: its front rests on the hitch of the section ahead (on the line through that section's
+        // axles), and its axle is on the road at the hitch's level, never steeper than TRAILER_GRADE from it.
+        const ps = spec.sections[i - 1];
+        const dP = i === 1 ? spec.wheelbase : Math.max(0.5, ps.axleFromFront - ps.hitchFromFront);
+        const back = ps.rearHitchFromFront - ps.axleFromFront;
+        const slopeP = (this.zR[i - 1] - this.zF[i - 1]) / dP;
+        const hz = this.zR[i - 1] + slopeP * back;
+        const lim = TRAILER_GRADE * dF;
+        // Where the axle should be: on the leading section's grade after a reset, else this section's own.
+        const pred = hz + clamp(settle ? slopeP * dF : this.zR[i] - this.zF[i], -lim, lim);
+        const sR = c.surface(sp.x, sp.y, pred, 2.2, sp.heading);
+        const tRz = clamp(this.levelTarget(sR, pred), hz - lim, hz + lim);
+        this.zF[i] = this.tF[i] = hz;
+        this.vzF[i] = 0;
+        this.airF[i] = 0;
         if (settle) {
           this.zR[i] = this.tR[i] = tRz;
-          this.zF[i] = this.tF[i] = tFz;
-          this.vzR[i] = this.vzF[i] = 0;
-          this.airR[i] = this.airF[i] = 0;
-        } else {
-          this.followZ(this.zR, this.vzR, this.tR, this.airR, i, tRz, h, v);
-          this.followZ(this.zF, this.vzF, this.tF, this.airF, i, tFz, h, v);
-        }
+          this.vzR[i] = 0;
+          this.airR[i] = 0;
+        } else this.followZ(this.zR, this.vzR, this.tR, this.airR, i, tRz, h, v);
+        this.zR[i] = clamp(this.zR[i], hz - lim, hz + lim);
       }
       const pitch = Math.atan2(this.zF[i] - this.zR[i], dF);
       sp.z = this.zR[i];
@@ -542,9 +585,43 @@ export class BusPhysics {
     return false;
   }
 
+  /**
+   * Nothing to stand on at level z under (x, y) (surface sample `s` taken there at that level): no road
+   * or station bay, and the ground more than EDGE_DROP below; or past the side of a bridge deck (beyond
+   * its edge, no other carriageway there) with the ground that far below.
+   */
+  private hanging(c: SimCollider, x: number, y: number, s: Surface, z: number): boolean {
+    if (s.road >= 0) {
+      if (s.edge <= DECK_EDGE || !c.road(s.road)?.bridge) return false;
+      return z - c.ground(x, y) > EDGE_DROP && !c.drivable(x, y, z);
+    }
+    return z - s.z > EDGE_DROP && !c.drivable(x, y, z);
+  }
+
+  /** Height the wheels at surface sample `s` follow: the road, else the ground unless it is a face or a drop (keep level z). */
+  private levelTarget(s: Surface, z: number): number {
+    if (s.road >= 0) return s.z;
+    // No road at this level and the ground far above: rock over a tunnel (or a cliff face), not a surface
+    // to stand on. Far below: the drop beside a deck. Either way keep the level (walls and the face and
+    // edge checks stop the front section; a trailer's wheels just hang there).
+    if (s.z - z > 2.2 || z - s.z > EDGE_DROP) return z;
+    return s.z;
+  }
+
+  /**
+   * Moving an axle of the front section to (x, y) at level z runs into a rock face (off the road, the
+   * ground well above), or over an edge (see `hanging`). An axle already over a drop (placed there) may
+   * move on, so the bus can drive back onto the road.
+   */
+  private blocked(c: SimCollider, x: number, y: number, z: number, heading: number, wasHanging: boolean): boolean {
+    const s = c.surface(x, y, z, 2.2, heading);
+    if (s.road < 0 && s.z - z > 0.6 && !c.drivable(x, y, z)) return true;
+    return !wasHanging && this.hanging(c, x, y, s, z);
+  }
+
   private followZ(z: Float64Array, vz: Float64Array, tPrev: Float64Array, air: Uint8Array, i: number, target: number, h: number, v: number): void {
-    if (air[i] || z[i] - target > 0.6) {
-      // Off an edge: free fall until the wheels meet the surface again.
+    if (air[i] || z[i] - target > EDGE_DROP) {
+      // A road far below the wheels (they don't drive off edges, see levelTarget): free fall onto it.
       vz[i] -= G * h;
       z[i] += vz[i] * h;
       if (z[i] <= target) {
@@ -554,11 +631,12 @@ export class BusPhysics {
         air[i] = 0;
       } else air[i] = 1;
     } else {
-      // Feed the surface's own rate forward (lag-free on grades), then a short spring for steps and joins.
+      // Feed the surface's own rate forward (lag-free on grades), then a short spring for steps and joins:
+      // up at once (the wheels can't sink into the road), down a step at a few m/s (no free fall, no thump).
       const lim = Math.abs(v) * 0.25 + 0.5;
       const rate = clamp((target - tPrev[i]) / h, -lim, lim);
       z[i] += rate * h;
-      z[i] += (target - z[i]) * (1 - Math.exp(-h / 0.07));
+      z[i] += Math.max(-STEP_DOWN_RATE * h, (target - z[i]) * (1 - Math.exp(-h / 0.07)));
       if (z[i] < target - 0.25) z[i] = target - 0.25;
       vz[i] = rate;
     }

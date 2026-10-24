@@ -71,8 +71,12 @@ export interface SimCollider extends Collider {
   resolve(pose: BusPose, spec: BusSpec): ResolveResult;
   /** Seconds covered by the next resolve() (the physics frame), for frame-rate independent contact response. */
   setStepTime(dt: number): void;
-  /** Road surface under (x, y) at the level closest to `hintZ` (see Heights.surfaceAt). */
-  surface(x: number, y: number, hintZ?: number, maxStep?: number): Surface;
+  /**
+   * Road surface under (x, y) at the level closest to `hintZ` (see Heights.surfaceAt; `heading` prefers
+   * the road running that way). Station bays beside the through-lanes are surfaces too (at the busway's
+   * height beside them, `road` = that busway), so wherever `drivable` is true there is a surface.
+   */
+  surface(x: number, y: number, hintZ?: number, maxStep?: number, heading?: number): Surface;
   ground(x: number, y: number): number;
   road(index: number): Road | undefined;
   /** True if (x, y) is inside a solid building footprint (at height z when given). */
@@ -273,6 +277,8 @@ interface Line {
   route: boolean;
   /** A station bay strip from a platform edge to its road (drivable, never snapped to). */
   bay?: boolean;
+  /** For a bay strip: the road it leads to. */
+  road?: number;
 }
 
 /** Projection scratch. */
@@ -475,6 +481,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     let qx = 0;
     let qy = 0;
     let qz = 0;
+    let qr = -1;
+    let qhw = 0;
     forEachRoadSegmentNear(px, py, 16, (sg) => {
       const l = lines[sLine[sg]];
       if (l.kind === RoadKind.Pedestrian) return;
@@ -493,10 +501,14 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
         qx = l.pts[2 * v] + (l.pts[2 * v + 2] - l.pts[2 * v]) * PROJ.t;
         qy = l.pts[2 * v + 1] + (l.pts[2 * v + 3] - l.pts[2 * v + 1]) * PROJ.t;
         qz = PROJ.z;
+        qr = sLine[sg];
+        qhw = l.width / 2;
       }
     });
     const d = Math.sqrt(bestD);
-    if (d >= 16 || d < 0.5) return;
+    // Nothing to fill where the carriageway already reaches the platform edge (wide busways, and the
+    // station bay carriageways the map data may carry as roads of their own).
+    if (d >= 16 || d < Math.max(0.5, qhw - 0.2)) return;
     // Only edges facing the road: the strip must not run across the platform itself.
     if (poly && pip(poly, 0, poly.length, px + ((qx - px) / d) * 0.6, py + ((qy - py) / d) * 0.6)) return;
     bayLines.push({
@@ -510,6 +522,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       link: false,
       route: false,
       bay: true,
+      road: qr,
     });
   };
   /**
@@ -634,6 +647,35 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
         }
       });
     return found;
+  };
+
+  /**
+   * Station bay surface under (x, y) within `maxStep` of level z: the strips' busway heights, blended by
+   * how far inside each strip the point is (smooth along the platform, where the strips overlap).
+   */
+  const bayAt = (x: number, y: number, z: number, maxStep: number): Surface | null => {
+    let wSum = 0;
+    let zSum = 0;
+    let edge = Infinity;
+    let road = -1;
+    let bestW = 0;
+    forEachBayNear(x, y, 3, (li) => {
+      const l = lines[li];
+      project(l, 0, x, y);
+      const hw = l.width / 2;
+      if (PROJ.d2 >= hw * hw || Math.abs(PROJ.z - z) > maxStep) return;
+      const d = Math.sqrt(PROJ.d2);
+      const w = hw - d;
+      wSum += w;
+      zSum += w * PROJ.z;
+      edge = Math.min(edge, -w);
+      if (w > bestW) {
+        bestW = w;
+        road = l.road ?? -1;
+      }
+    });
+    if (wSum <= 0 || road < 0) return null;
+    return { z: zSum / wSum, road, edge };
   };
 
   lap('roads+bays');
@@ -1921,7 +1963,12 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     setStepTime: (dt) => {
       stepTime = Math.max(1e-3, Math.min(0.1, dt));
     },
-    surface: (x, y, hintZ, maxStep) => H.surfaceAt(x, y, hintZ, maxStep),
+    surface: (x, y, hintZ, maxStep, heading) => {
+      const s = H.surfaceAt(x, y, hintZ, maxStep, heading);
+      // Inside a carriageway at this level: that's it. On a verge or off every road: a station bay?
+      if (hintZ === undefined || bayLines.length === 0 || (s.road >= 0 && s.edge <= 0)) return s;
+      return bayAt(x, y, hintZ, maxStep ?? 2.5) ?? s;
+    },
     ground: (x, y) => H.ground(x, y),
     road: (i) => data.roads[i],
     pointInBuilding,

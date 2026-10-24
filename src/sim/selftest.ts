@@ -236,6 +236,8 @@ function makeMap(o: {
   ground?: (x: number, y: number) => number;
   bounds?: [number, number, number, number];
   platforms?: { pts: number[]; underground: boolean }[];
+  /** Bus route polylines (x, y pairs) with their heights. */
+  routes?: { pts: number[]; z: number[] }[];
 }): MapData {
   const bounds = o.bounds ?? [-400, -400, 400, 400];
   const cell = 5;
@@ -269,7 +271,7 @@ function makeMap(o: {
     water: (o.water ?? []).map((pts) => ({ kind: 0, pts: new Float32Array(pts), holes: [] })),
     trees: new Float32Array(0),
     stops: [],
-    routes: [],
+    routes: (o.routes ?? []).map((r) => ({ id: 't', name: '', dir: 0, headsign: '', color: '#000000', textColor: '#ffffff', operator: 'BT', trips: 1, pts: new Float32Array(r.pts), cum: new Float32Array(r.pts.length / 2), z: new Float32Array(r.z), length: 0, stops: [] })),
     platforms: (o.platforms ?? []).map((p) => ({ name: '', ref: '', pts: new Float32Array(p.pts), area: true, covered: true, layer: p.underground ? -1 : 0, underground: p.underground })),
     terrain: { waterLevel: 0.5, attribution: '', grids: [{ name: 'test', x0, y0, cell, nx, ny, h }] },
   } as unknown as MapData;
@@ -572,6 +574,156 @@ function river(spec: BusSpec): void {
   check('river: recovered at road level (z)', r.p.pose.z ?? 0, 2.9, 3.1, 'm');
 }
 
+/** Every section's road height over a run (rear axles). */
+function sectionZs(p: BusPhysics): number[] {
+  return p.pose.sections.map((sp) => sp.z ?? 0);
+}
+
+function levelsAfterReset(spec: BusSpec): void {
+  // A viaduct deck at 10 m that starts at y = 0 (no ramp in the data), over a street at ground level
+  // (y = -8, under where the trailers are). A bus placed with its front section on the deck and the
+  // rest over the street: every section is on the deck's level, and stays there driving on.
+  const data = makeMap({
+    roads: [
+      { pts: [0, 0, 0, 300], z: [10, 10], bridge: true, width: 7.4 },
+      { pts: [-300, -8, 300, -8], z: [0, 0], width: 7 },
+    ],
+  });
+  const col = world(data);
+  let minZ = Infinity;
+  let maxZ = -Infinity;
+  let first: number[] = [];
+  const r = drive(spec, col, [0, 3, 0, 10], 10, (t, p) => {
+    const zs = sectionZs(p);
+    if (t === 0) first = zs;
+    else {
+      minZ = Math.min(minZ, ...zs);
+      maxZ = Math.max(maxZ, ...zs);
+    }
+    return { throttle: 0.4 };
+  });
+  check(`reset onto a deck edge: sections on the deck's level (min z, ${spec.sections.length} sections)`, minOf(first.length ? first : [NaN]), 9.4, 10.1, 'm');
+  check('reset onto a deck edge: no section drops driving on (min z)', minZ, 9.4, 10.1, 'm');
+  check('reset onto a deck edge: no section climbs (max z)', maxZ, 9.9, 10.6, 'm');
+  check('reset onto a deck edge: drove onto the deck', r.p.pose.y, 20, 300, 'm');
+  // Backspace (reset in place) at the same spot: back on the deck, every section on its level.
+  const p = new BusPhysics(spec);
+  const c = new BusControls();
+  p.reset(0.5, 3, 0.05, 10);
+  p.update(DT, input(), c, col);
+  p.reset(p.pose.x, p.pose.y, p.pose.heading);
+  p.update(DT, input(), c, col);
+  check('Backspace on a deck edge: every section on the deck (min z)', minOf(sectionZs(p)), 9.4, 10.1, 'm');
+}
+
+function noDriveOffEdge(spec: BusSpec): void {
+  // A viaduct deck at 10 m with a gap in its east parapet (a bus route's GTFS line runs off the deck
+  // there, which opens the wall): driving through the gap, the bus stops at the deck's edge instead of
+  // dropping 10 m, and can back away again.
+  const ang = Math.atan2(12, 140);
+  const data = makeMap({
+    roads: [{ pts: [0, -300, 0, 300], z: [10, 10], bridge: true, width: 7.4 }],
+    routes: [{ pts: [0, -200, 12, -60], z: [10, 10] }],
+  });
+  const col = world(data);
+  let maxFX = -Infinity;
+  const r = drive(spec, col, [-15 * Math.tan(ang), -215, ang, 10], 22, (_t, p) => {
+    const fx = p.pose.x + Math.sin(p.pose.heading) * spec.wheelbase;
+    maxFX = Math.max(maxFX, fx);
+    return { throttle: 0.45 };
+  });
+  check("deck edge with no parapet: doesn't drop off (min z, all sections)", minOf(r.out.map((s) => s.z).concat(sectionZs(r.p))), 9.9, 10.1, 'm');
+  check('deck edge with no parapet: front axle stops at the edge (max x)', maxFX, 3.0, 3.7 + 0.6 + 0.2, 'm');
+  const late = r.out.filter((s) => s.t > 18);
+  check('deck edge with no parapet: held there (progress in the last 4 s)', Math.hypot(late[late.length - 1].x - late[0].x, late[late.length - 1].y - late[0].y), 0, 4, 'm');
+  const y0 = r.p.pose.y;
+  for (let t = 0; t < 4; t += DT) {
+    const i = input({ gear: 'R', throttle: 0.5 });
+    r.c.update(DT, i, r.p.pose);
+    r.p.update(DT, i, r.c, col);
+  }
+  check('deck edge with no parapet: can back away from the edge', y0 - r.p.pose.y, 1, 40, 'm');
+  // Placed in mid-air beside the deck (nothing under either axle of the front section): it falls.
+  const f = drive(spec, col, [-12, -150, 0, 10], 4, () => ({}));
+  check('placed in mid-air beside the deck: falls to the ground (z)', f.p.pose.z ?? 0, -0.1, 0.1, 'm');
+}
+
+function stationBays(spec: BusSpec): void {
+  // A busway (7.4 m, at 10 m) with a platform whose kerb is 8.2 m from the centreline (PA Hospital on a
+  // viaduct, Mater Hill in a cutting): along the bay, 1.6 m off the kerb (beyond the busway's own
+  // surface), the bus stays at the busway's level.
+  for (const kind of ['viaduct', 'cutting'] as const) {
+    const data = makeMap({
+      roads: [{ pts: [0, -300, 0, 300], z: [10, 10], bridge: kind === 'viaduct', width: 7.4, kind: 7 }],
+      platforms: [{ pts: [8.2, -40, 12, -40, 12, 40, 8.2, 40], underground: false }],
+      ground: kind === 'viaduct' ? () => 3 : (x) => 10 + Math.min(6, Math.max(0, Math.abs(x) - 4.2) * 0.5),
+    });
+    const col = world(data);
+    const r = drive(spec, col, [6.6, -55, 0, 10], 8, () => ({ throttle: 0.3 }));
+    const zs = r.out.map((s) => s.z).concat(sectionZs(r.p));
+    check(`station bay (${kind}): stays at the busway's level (min z)`, minOf(zs), 9.9, 10.1, 'm');
+    check(`station bay (${kind}): stays at the busway's level (max z)`, maxOf(zs), 9.9, 10.1, 'm');
+    check(`station bay (${kind}): drove along the bay`, r.p.pose.y + 55, 8, 100, 'm');
+    check(`station bay (${kind}): the bay is drivable and has a surface`, col.surface(6.6, 0, 10, 2.2).z, 9.95, 10.05, 'm');
+  }
+}
+
+function stepsAndGrades(spec: BusSpec): void {
+  // A 0.8 m step down where two ways meet at different heights (a data join): followed, not a thump.
+  {
+    const data = makeMap({
+      roads: [
+        { pts: [0, -300, 0, 0], z: [1, 1], width: 7 },
+        { pts: [0, 0, 0, 300], z: [0.2, 0.2], width: 7 },
+      ],
+    });
+    const col = world(data);
+    let maxImpact = 0;
+    const r = drive(spec, col, [-1.75, -60, 0, 1], 8, (t, p) => {
+      if (t === 0) p.pose.speed = 11;
+      return { throttle: 0.4 };
+    });
+    for (const s of r.out) maxImpact = Math.max(maxImpact, s.hit ? 99 : 0);
+    const p = new BusPhysics(spec);
+    const c = new BusControls();
+    p.reset(-1.75, -60, 0, 1);
+    p.pose.speed = 11;
+    for (let t = 0; t < 8; t += DT) {
+      const i = input({ throttle: 0.4 });
+      c.update(DT, i, p.pose);
+      maxImpact = Math.max(maxImpact, p.update(DT, i, c, col).impact);
+    }
+    check('0.8 m step down at 40 km/h: no impact', maxImpact, 0, 0.5, 'm/s');
+    check('0.8 m step down: on the lower road after it', p.pose.z ?? 0, 0.15, 0.25, 'm');
+  }
+  // An 8 % climb mapped with a vertex every 6 m: the height follows the grade (no steps a few metres
+  // past each vertex), and so it does past a flat side street crossing it.
+  const pts: number[] = [];
+  const zs: number[] = [];
+  for (let y = -300; y <= 300; y += 6) {
+    pts.push(0, y);
+    zs.push(30 + y * 0.08);
+  }
+  const data = makeMap({
+    roads: [
+      { pts, z: zs, width: 14 },
+      { pts: [-150, 0.3, 150, 0.3], z: [30.02, 30.02], width: 7.4 },
+    ],
+  });
+  const col = world(data);
+  let worst = 0;
+  for (const lat of [-1.75, -5.35]) {
+    for (const v0 of [4, 11]) {
+      drive(spec, col, [lat, -60, 0, 30 - 60 * 0.08], 120 / v0 / 1.0 > 20 ? 20 : 120 / v0, (t, p) => {
+        if (t === 0) p.pose.speed = v0;
+        if (t > 0.5) worst = Math.max(worst, Math.abs((p.pose.z ?? 0) - (30 + p.pose.y * 0.08)));
+        return { throttle: p.pose.speed < v0 ? 0.5 : 0 };
+      });
+    }
+  }
+  check('8 % grade with vertices and a side street: height error', worst, 0, 0.08, 'm');
+}
+
 async function main(): Promise<void> {
   const S = await specs();
   console.log('--- rigid ---');
@@ -594,6 +746,10 @@ async function main(): Promise<void> {
   wallSlide(S.rigid, 'tunnel');
   grade(S.rigid);
   river(S.rigid);
+  levelsAfterReset(S.rigid);
+  noDriveOffEdge(S.rigid);
+  stationBays(S.rigid);
+  stepsAndGrades(S.rigid);
   console.log('--- glider ---');
   check('0-50 km/h', zeroTo50(S.glider), 10, 16, 's');
   console.log('--- metro ---');
@@ -612,6 +768,10 @@ async function main(): Promise<void> {
   wallSlide(S.metro, 'parapet');
   wallSlide(S.metro, 'tunnel');
   grade(S.metro);
+  levelsAfterReset(S.metro);
+  noDriveOffEdge(S.metro);
+  stationBays(S.metro);
+  stepsAndGrades(S.metro);
   console.log(failures ? `\n${failures} check(s) FAILED` : '\nall checks passed');
 }
 
