@@ -80,17 +80,26 @@ export function buildDark(B: BodyLayout, sec: SectionLayout, opts: { underbody?:
     gb.box(-hw + 0.5, B.tyreR - 0.06, ax.z - 0.07 + zo, hw - 0.5, B.tyreR + 0.06, ax.z + 0.07 + zo, dark);
   }
   if (opts.jointCaps) {
-    // close the open ends of articulated bodies (seen only from outside)
+    // Close the open ends of articulated bodies with a lit end wall: grey
+    // panel, light gangway portal frame and the darker gangway itself, so a
+    // joint seen without its bellows reads as a bus end, not a black void.
     const ends: number[] = [];
     if (!sec.isFront) ends.push(sec.bodyFront + 0.004);
     if (!sec.isRear) ends.push(sec.bodyRear - 0.004);
+    const wall: RGB = rgb('#7a8088'), frame: RGB = rgb('#b4b9bf'), gang: RGB = rgb('#3c4047');
     for (const ze of ends) {
-      const z = ze + zo;
-      const x = hw - 0.03;
       const facingFwd = ze < (sec.bodyFront + sec.bodyRear) / 2;
-      const a = V(-x, 0.33, z), b = V(x, 0.33, z), c = V(x, B.yTop - 0.06, z), d = V(-x, B.yTop - 0.06, z);
-      if (facingFwd) gb.quad(b, a, d, c, rgb('#16171a'));
-      else gb.quad(a, b, c, d, rgb('#16171a'));
+      const rect = (x0: number, x1: number, y0: number, y1: number, dz: number, c: RGB) => {
+        const z = ze + zo + (facingFwd ? -dz : dz);
+        const a = V(x0, y0, z), b = V(x1, y0, z), cc = V(x1, y1, z), d = V(x0, y1, z);
+        if (facingFwd) gb.quad(b, a, d, cc, c);
+        else gb.quad(a, b, cc, d, c);
+      };
+      const x = hw - 0.03, yt = B.yTop - 0.06;
+      rect(-x, x, 0.33, yt, 0, wall);
+      const gx = Math.min(0.78, hw - 0.3), gy = Math.min(B.doorTop, yt - 0.25);
+      rect(-gx - 0.07, gx + 0.07, 0.34, gy + 0.07, 0.003, frame);
+      rect(-gx, gx, 0.36, gy, 0.006, gang);
     }
   }
   if (opts.doorWells) {
@@ -438,6 +447,19 @@ function bellowsProfile(B: BodyLayout, low: boolean): [number, number, number, n
   return out.slice(0, PROFILE_N);
 }
 
+const _jm = new THREE.Matrix4();
+
+/**
+ * Centre of the rear face of section `prev` (at z = zRear in its own frame),
+ * expressed in the frame of section `cur`. Both roots must share a parent.
+ */
+export function jointInFrame(prev: THREE.Object3D, cur: THREE.Object3D, zRear: number, out: THREE.Vector3): THREE.Vector3 {
+  prev.updateMatrix();
+  cur.updateMatrix();
+  out.set(0, 0, zRear).applyMatrix4(prev.matrix);
+  return out.applyMatrix4(_jm.copy(cur.matrix).invert());
+}
+
 export class Bellows {
   readonly geometry: THREE.BufferGeometry;
   private readonly prof: [number, number, number, number][];
@@ -483,11 +505,13 @@ export class Bellows {
   /**
    * Fill the tube between the rear face of the section in front (centre `a`,
    * facing heading offset `angle` relative to this section, local frame) and
-   * this section's front face centre `b` (facing straight ahead).
+   * this section's front face centre `b` (facing straight ahead). `a.y` is
+   * the height of the other face relative to this section, so the tube stays
+   * closed when the sections sit at different levels or grades.
    */
   update(a: THREE.Vector3, angle: number, b: THREE.Vector3): void {
     // skip the rebuild when nothing moved (most AI buses most of the time)
-    const key = a.x * 1e3 + a.z * 7.1 + angle * 1e5 + b.z;
+    const key = a.x * 1e3 + a.z * 7.1 + a.y * 313.7 + angle * 1e5 + b.z;
     if (Math.abs(key - this.key) < 1e-3) return;
     this.key = key;
     const RINGS = this.rings;
@@ -500,6 +524,7 @@ export class Bellows {
       const dax = Math.sin(angle), daz = -Math.cos(angle);
       const cx = h00 * b.x + h10 * len * 0 + h01 * a.x + h11 * len * dax;
       const cz = h00 * b.z + h10 * len * -1 + h01 * a.z + h11 * len * daz;
+      const cy = b.y + (a.y - b.y) * (3 * t * t - 2 * t * t * t);
       const phi = angle * t;
       const rx = Math.cos(phi), rz = Math.sin(phi);
       const shrink = k % 2 ? 0.955 : 1;
@@ -510,7 +535,7 @@ export class Bellows {
         const sy = floor ? py : 0.34 + (py - 0.34) * (shrink === 1 ? 1 : 0.985);
         const j = (k * n + i) * 3;
         this.pos[j] = cx + rx * sx;
-        this.pos[j + 1] = sy;
+        this.pos[j + 1] = sy + cy;
         this.pos[j + 2] = cz + rz * sx;
         this.nor[j] = rx * nx;
         this.nor[j + 1] = ny;

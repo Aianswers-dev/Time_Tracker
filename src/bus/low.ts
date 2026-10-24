@@ -12,7 +12,7 @@ import { atlasLayout, buildShell } from './shell';
 import { paintSection } from './paint';
 import { liveryFor, makeLivery, type Livery, type LiveryId } from './livery';
 import { lampGeometry } from './lamps';
-import { Bellows, buildDark, buildSignGeometry } from './parts';
+import { Bellows, jointInFrame, buildDark, buildSignGeometry } from './parts';
 import { envMap } from './materials';
 import { blankSignMaterial, signMaterial } from './sign';
 import { canvasTexture } from './util';
@@ -150,15 +150,11 @@ export function createLowBus(spec: BusSpec, route: Route | undefined): BusMesh {
         if (!s.bellows || !pp || !pc) continue;
         const prevL = parts[i - 1].a.L;
         const zRear = prevL.bodyRear - prevL.axleFromFront;
-        const fx = Math.sin(pp.heading), fy = Math.cos(pp.heading);
-        const dx = pp.x - fx * zRear - pc.x, dy = pp.y - fy * zRear - pc.y;
-        const cf = Math.sin(pc.heading), cy = Math.cos(pc.heading);
-        const ax = dx * cy - dy * cf;
-        const az = -(dx * cf + dy * cy);
+        // the previous section's rear face in this section's frame (x, height, z)
+        jointInFrame(parts[i - 1].root, s.root, zRear, _a);
         const bz = s.a.L.bodyFront - s.a.L.axleFromFront;
         let ang = pp.heading - pc.heading;
         ang = Math.atan2(Math.sin(ang), Math.cos(ang));
-        _a.set(ax, 0, az);
         _b.set(0, 0, bz);
         s.bellows.update(_a, ang, _b);
       }

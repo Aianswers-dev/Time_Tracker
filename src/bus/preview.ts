@@ -62,18 +62,20 @@ function fakeRoute(id: string): Route {
 
 function poseFor(bus: BusMesh, x: number, y: number, heading: number, bendDeg: number, steer: number): BusPose {
   const spec = bus.spec;
-  const sections: { x: number; y: number; heading: number }[] = [{ x, y, heading }];
+  // lift / gap: pull the sections apart (height, chain gap) to check the joints stay closed
+  const lift = num('lift', 0), gap = num('gap', 0);
+  const sections: { x: number; y: number; z?: number; heading: number }[] = [{ x, y, heading }];
   for (let i = 1; i < spec.sections.length; i++) {
     const prev = sections[i - 1];
     const sp = spec.sections[i - 1];
     const sc = spec.sections[i];
     const [fx, fy] = headingDir(prev.heading);
     const back = sp.rearHitchFromFront - sp.axleFromFront;
-    const px = prev.x - fx * back, py = prev.y - fy * back;
+    const px = prev.x - fx * (back + gap), py = prev.y - fy * (back + gap);
     const h = prev.heading - (bendDeg * Math.PI) / 180;
     const [gx, gy] = headingDir(h);
     const d = sc.axleFromFront - sc.hitchFromFront;
-    sections.push({ x: px - gx * d, y: py - gy * d, heading: h });
+    sections.push({ x: px - gx * d, y: py - gy * d, z: -lift * i, heading: h });
   }
   return { x, y, heading, speed: 0, steer, wheelSpin: num('spinAngle', 0.4), sections, roll: num('roll', 0), pitch: num('pitch', 0) };
 }
