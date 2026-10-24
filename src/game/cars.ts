@@ -105,6 +105,18 @@ interface Node {
   /** Junction box radius from the node, metres. */
   boxR: number;
   occ: Occupant[];
+  /** The player's bus approaching (claimApproach), until `until`; null when none. */
+  pc: PlayerApproach | null;
+}
+
+/** The player's bus heading into a junction: a point on its lane, its direction in, and its movement. */
+interface PlayerApproach {
+  until: number;
+  x: number;
+  y: number;
+  inX: number;
+  inY: number;
+  cls: Turn;
 }
 
 interface Hold {
@@ -473,7 +485,7 @@ export class CarTraffic {
       const hit = l.find((n) => Math.abs(this.nodes[n].z - z) < LEVEL_GAP);
       if (hit !== undefined) return hit;
       const n = this.nodes.length;
-      this.nodes.push({ x, y, z, out: [], edges: [], deg: 0, until: -1, holder: -1, rank: 0, sig: false, boxR: 4, occ: [] });
+      this.nodes.push({ x, y, z, out: [], edges: [], deg: 0, until: -1, holder: -1, rank: 0, sig: false, boxR: 4, occ: [], pc: null });
       l.push(n);
       return n;
     };
@@ -1074,6 +1086,16 @@ export class CarTraffic {
     return !nd.sig && minor && nd.until > time;
   }
 
+  /**
+   * The player's bus is heading into `node` (lane point (x, y), direction (inX, inY), movement cls),
+   * until `until`: cars on the same approach do not turn across its lane in front of it.
+   */
+  claimApproach(node: number, x: number, y: number, inX: number, inY: number, cls: Turn, until: number): void {
+    const nd = this.nodes[node];
+    if (nd.pc) Object.assign(nd.pc, { until, x, y, inX, inY, cls });
+    else nd.pc = { until, x, y, inX, inY, cls };
+  }
+
   /** Main-road vehicle approaching an unsignalised junction: mark it busy. */
   markMajor(node: number, time: number, holder: number): void {
     const nd = this.nodes[node];
@@ -1390,6 +1412,13 @@ export class CarTraffic {
       if (e0.rank + 0.01 < nd.rank && nd.until > time && nd.holder !== lane) return nd.holder === PLAYER_HOLD ? Wait.Player : Wait.Junction;
     }
     const cls = classify(wrapAngle(Math.atan2(outX, outY) - Math.atan2(inX, inY)));
+    // The player's bus coming up on the same approach in the next lane: a car that would turn across
+    // its lane in front of it (left from the lane on its right, right from the lane on its left) waits.
+    const pc = nd.pc;
+    if (pc && pc.until > time && inX * pc.inX + inY * pc.inY > 0.8) {
+      const side = (c.x - pc.x) * pc.inY - (c.y - pc.y) * pc.inX;
+      if ((side > 1.8 && cls === Turn.Left && pc.cls !== Turn.Left) || (side < -1.8 && cls === Turn.Right && pc.cls !== Turn.Right)) return Wait.Player;
+    }
     // The player's bus in (or about to enter) the box: waiting for it is legitimate.
     if (!this.boxClear(N, c.id, inX, inY, outX, outY, cls, time)) return this.boxBy === PLAYER_HOLD ? Wait.Player : Wait.Junction;
     // The exit must have room for the whole car, so it never stops in the box.
