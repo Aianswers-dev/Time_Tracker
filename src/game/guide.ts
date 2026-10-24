@@ -5,7 +5,7 @@ import * as THREE from 'three';
 import type { MapData, Road, Route } from '../types';
 import { pointAlong, projectOnto } from '../data/coords';
 import { drivable, roadIndexFor, speedLimitOf } from './roadIndex';
-import { trackFor, type RouteTrack, type TrackSample } from './track';
+import { trackFor, useTrackWalls, type RouteTrack, type TrackSample, type TrackWalls } from './track';
 import { computeTurns, shortStreet, type TurnHint } from './turns';
 import { isStationStop, stopDisplayName, stopNumber } from './routeMeta';
 import { flagAtlas, partsGroup, plateGeometry, poleParts, signMaterial, SIGN_H, SIGN_W } from './stops3d';
@@ -120,6 +120,12 @@ export interface GuideState {
 export interface RouteGuideOptions {
   /** Overall length of the player's bus (front to rear), metres. */
   busLength?: number;
+  /**
+   * The driving collider's walls (tunnel tubes, parapets) to bound the guide
+   * lane with. Without it the lane uses the most recently built collider for
+   * this map, if any.
+   */
+  walls?: TrackWalls;
 }
 
 interface StopPlace {
@@ -183,6 +189,7 @@ export class RouteGuide {
   ) {
     this.busLength = opts.busLength ?? 13;
     this.heights = heightsOf(data);
+    if (opts.walls) useTrackWalls(data, opts.walls);
     this.track = trackFor(route, data);
     this.turns = computeTurns(data, route);
     this.color = brighten(route.color, 0.32);

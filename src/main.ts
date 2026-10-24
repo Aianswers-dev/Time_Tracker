@@ -89,7 +89,7 @@ async function main() {
   const audio = new BusAudio();
   audio.setType(choice.type);
   audio.start();
-  const guide = new RouteGuide(scene, data, route, { busLength: bus.spec.sections.reduce((a, s) => a + s.length, 0) });
+  const guide = new RouteGuide(scene, data, route, { busLength: bus.spec.sections.reduce((a, s) => a + s.length, 0), walls: collider });
   const hud = new Hud(document.body, data, { traffic, guide });
   // Player collides with buildings and with the AI buses and cars.
   const playerCollider = traffic.wrapCollider(collider);
