@@ -5,6 +5,7 @@
 import * as THREE from 'three';
 import { AreaKind, BuildingKind, type MapData, type WorldHandle } from '../types';
 import { buildBuildings } from './buildings';
+import { buildFurniture } from './furniture';
 import { buildHouses } from './houses';
 import { buildTrees } from './trees';
 import type { Ctx, Extras } from './ctx';
@@ -148,12 +149,17 @@ export async function buildWorld(
   await step(0.8, 'Planting jacarandas…');
   const nTrees = await buildTrees(ctx, roads, houses.yards, (f) => onProgress(0.8 + f * 0.1, 'Planting jacarandas…'));
   console.info(`[world] ${houses.count} generated houses, ${nTrees} trees`);
+  await step(0.9, 'Installing traffic lights…');
+  const signals = await buildFurniture(ctx, roads, (f) => onProgress(0.9 + f * 0.08, 'Installing traffic lights…'));
 
   await step(1, 'City ready');
   console.info(`[world] built in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
 
   const camPos = new THREE.Vector3();
   let infoTimer = 0;
+  // Signal clock: our own, re-synchronised to the caller's clock whenever signalStateAt is used.
+  let sigClock = 0;
+  let sigOffset = 0;
   const debug = location.search.includes('world=debug');
   const dbgWin = window as unknown as { __worldCam?: number[]; __worldHours?: number; __worldInfo?: () => string; __worldRoot?: THREE.Group };
   if (debug) dbgWin.__worldRoot = root;
@@ -169,6 +175,8 @@ export async function buildWorld(
       }
       if (debug && dbgWin.__worldHours !== undefined) hours = dbgWin.__worldHours;
       U.uTime.value += dt;
+      sigClock += dt;
+      U.uSignalTime.value = sigClock + sigOffset;
       sky.update(camera, hours);
       camera.getWorldPosition(camPos);
       U.uInTunnel.value = camPos.y < 5 && roads.tunnels.penetration(camPos.x, -camPos.z) > -0.4 ? 1 : 0;
@@ -183,6 +191,10 @@ export async function buildWorld(
         infoTimer = 0;
         console.info(`[world] calls ${renderer.info.render.calls} tris ${renderer.info.render.triangles}`);
       }
+    },
+    signalStateAt(x: number, y: number, timeSeconds: number) {
+      sigOffset = timeSeconds - sigClock;
+      return signals.stateAt(x, y, timeSeconds);
     },
   };
 }

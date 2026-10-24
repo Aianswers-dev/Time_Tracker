@@ -811,7 +811,7 @@ function metroFront(p: RP, B: BodyLayout, lv: Livery, lamps: LampDef[]): void {
   p.ctx.globalAlpha = 0.5;
   p.rrect(0.24, W - 0.24, 0.96, 1.35, 0.05, '#030405');
   p.ctx.restore();
-  p.rrect(0.32, W - 0.32, 2.38, 2.74, 0.03, '#030405'); // sign box
+  p.rrect(0.32, W - 0.32, 2.57, 2.9, 0.03, '#030405'); // sign box
   // white lower nose and blue centre panel
   p.ctx.beginPath();
   p.spline([[0, 0.98], [0.5, 0.9], [W / 2, 0.88], [W - 0.5, 0.9], [W, 0.98]]);

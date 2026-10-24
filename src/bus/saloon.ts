@@ -214,7 +214,7 @@ export function buildSaloon(B: BodyLayout, sec: SectionLayout, driver: boolean):
   if (sec.isFront) {
     const fz = (y: number) => Z(frontZ(B, sec, y) + 0.07);
     const metro = B.type === 'metro';
-    const g0 = metro ? 0.98 : 1.12, g1 = metro ? 2.36 : 2.72;
+    const g0 = metro ? 0.98 : 1.12, g1 = metro ? 2.58 : 2.72;
     const xg = B.hw - (metro ? 0.22 : 0.15);
     const ys = [0.34, g0, (g0 + g1) / 2, g1, B.ceiling];
     for (let i = 0; i < ys.length - 1; i++) {

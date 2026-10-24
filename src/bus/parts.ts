@@ -237,7 +237,7 @@ export function buildSignGeometry(B: BodyLayout, sec: SectionLayout, parts: ('fr
   const metro = B.type === 'metro';
   const white: RGB = [1, 1, 1];
   if (parts.includes('front') && sec.isFront) {
-    const [h0, h1] = metro ? [2.45, 2.67] : [2.755, 2.965];
+    const [h0, h1] = metro ? [2.62, 2.84] : [2.755, 2.965];
     const half = metro ? W / 2 - 0.36 : W / 2 - 0.3;
     // follow the curved front in strips so the shell never pokes through
     const [u0, v0, u1, v1] = SIGN_UV.front;

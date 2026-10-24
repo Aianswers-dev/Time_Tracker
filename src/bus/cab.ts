@@ -409,13 +409,13 @@ function buildFurniture(B: BodyLayout, sec: SectionLayout, dz: number): { geo: T
   stripe.dispose();
   // destination sign cabinet behind the front display
   const metro = B.type === 'metro';
-  const [hb0, hb1] = metro ? [2.43, 2.69] : [2.73, 2.99];
-  const zh = fz(metro ? 2.56 : 2.86) - 0.02;
+  const [hb0, hb1] = metro ? [2.6, 2.86] : [2.73, 2.99];
+  const zh = fz(metro ? 2.73 : 2.86) - 0.02;
   const depth = metro ? 0.1 : 0.22;
   gb.box(-B.hw + (metro ? 0.36 : 0.12), hb0, Z(zh), B.hw - (metro ? 0.36 : 0.12), hb1, Z(zh + depth), rgb(metro ? '#1c1e22' : '#464a51'), 2 | 1 | 8 | 16);
   if (!metro) for (const x of [-0.7, 0.0, 0.7]) gb.box(x - 0.03, hb0 + 0.08, Z(zh + depth), x + 0.03, hb0 + 0.14, Z(zh + depth + 0.02), rgb('#9aa0a7'));
   // black rubber seal around the inside of the windscreen
-  const g0 = metro ? 0.98 : 1.12, g1 = metro ? 2.4 : 2.72, xg = B.hw - (metro ? 0.22 : 0.15);
+  const g0 = metro ? 0.98 : 1.12, g1 = metro ? 2.6 : 2.72, xg = B.hw - (metro ? 0.22 : 0.15);
   const seal = rgb('#08090a');
   gb.quad(V(xg, g1 - 0.03, Z(fz(g1) - 0.015)), V(-xg, g1 - 0.03, Z(fz(g1) - 0.015)), V(-xg, g1, Z(fz(g1) - 0.015)), V(xg, g1, Z(fz(g1) - 0.015)), seal);
   for (const sx of [1, -1]) {
@@ -549,7 +549,7 @@ export function createCab(type: BusType): Cab {
   const vg = new GeoBuilder();
   vg.alpha = [];
   const zv = frontZ(B, sec, 2.62) + 0.1;
-  const vy0 = metro ? 2.22 : 2.56, vy1 = metro ? 2.39 : 2.715;
+  const vy0 = metro ? 2.4 : 2.56, vy1 = metro ? 2.58 : 2.715;
   // roller blind: darker toward the top edge
   const c0 = vg.vertex(1.1, vy0, Z(zv), 0, 0, 1, 0, 0, [0.02, 0.02, 0.03], 0.35);
   const c1 = vg.vertex(0.16, vy0, Z(zv), 0, 0, 1, 0, 0, [0.02, 0.02, 0.03], 0.35);
