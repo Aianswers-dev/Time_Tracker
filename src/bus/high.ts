@@ -246,8 +246,9 @@ export function createHighBus(spec: BusSpec, route: Route | undefined): BusMesh 
       pose.sections.forEach((p, i) => {
         const s = secs[i];
         if (!s) return;
-        toWorld(p.x, p.y, 0, s.root.position);
-        s.root.rotation.y = headingToRotY(p.heading);
+        // Section root sits on the road at its rear axle, yawed then pitched to the grade.
+        toWorld(p.x, p.y, p.z ?? pose.z ?? 0, s.root.position);
+        s.root.rotation.set(p.pitch ?? 0, headingToRotY(p.heading), 0, 'YXZ');
         s.pivot.rotation.set(pose.pitch * (i === 0 ? 1 : 0.6), 0, -pose.roll);
       });
       setWheels(pose);

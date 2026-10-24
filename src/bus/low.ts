@@ -139,8 +139,9 @@ export function createLowBus(spec: BusSpec, route: Route | undefined): BusMesh {
       pose.sections.forEach((p, i) => {
         const s = parts[i];
         if (!s) return;
-        toWorld(p.x, p.y, 0, s.root.position);
-        s.root.rotation.y = headingToRotY(p.heading);
+        // Section root sits on the road at its rear axle, yawed then pitched to the grade.
+        toWorld(p.x, p.y, p.z ?? pose.z ?? 0, s.root.position);
+        s.root.rotation.set(p.pitch ?? 0, headingToRotY(p.heading), 0, 'YXZ');
       });
       for (let i = 1; i < parts.length; i++) {
         const s = parts[i];

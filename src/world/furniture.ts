@@ -689,7 +689,18 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
   {
     const tpl = shelterTemplate();
     const items: { x: number; y: number; ang: number }[] = [];
+    // Busway platforms draw their own canopies (src/game/platforms.ts).
+    const platformBoxes = data.platforms.map((pf) => {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (let i = 0; i < pf.pts.length; i += 2) {
+        x0 = Math.min(x0, pf.pts[i]); x1 = Math.max(x1, pf.pts[i]);
+        y0 = Math.min(y0, pf.pts[i + 1]); y1 = Math.max(y1, pf.pts[i + 1]);
+      }
+      return [x0 - 12, y0 - 12, x1 + 12, y1 + 12];
+    });
+    const nearPlatform = (x: number, y: number) => platformBoxes.some((bb) => x >= bb[0] && x <= bb[2] && y >= bb[1] && y <= bb[3]);
     for (const st of data.stops) {
+      if (nearPlatform(st.x, st.y)) continue;
       const nr = index.nearest(st.x, st.y, 25, (ri) => !infos[ri].r.tunnel && infos[ri].r.kind !== RoadKind.Motorway);
       if (!nr) continue;
       const ri = infos[nr.road];
