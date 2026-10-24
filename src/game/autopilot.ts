@@ -403,7 +403,8 @@ export class Autopilot {
       this.sRear = s;
     }
     if (Number.isFinite(this.lastZ) && Math.abs(z - this.lastZ) > Math.max(0.25, av * dt * 0.25)) this.problem('z-jump', `road height jumped ${(z - this.lastZ).toFixed(2)} m in one frame at ${(v * 3.6).toFixed(0)} km/h`, at, 2);
-    this.lastZ = z;
+    // A rescue teleports the bus before the next frame: don't count that as a jump.
+    this.lastZ = this.rescue ? NaN : z;
     if (Math.abs(pose.roll) > 0.12) this.problem('roll', `body roll ${(pose.roll * 57.3).toFixed(1)}°`, at, 5);
     return out;
   }
