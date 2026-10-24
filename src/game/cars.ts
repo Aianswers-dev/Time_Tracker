@@ -21,6 +21,11 @@ import { rng } from './util';
 import { signalsFor } from '../data/signals';
 
 const VIEW = 600;
+/** Reservation id the player's bus holds junction boxes with (AI buses use -id, cars +id). */
+export const PLAYER_HOLD = -1e9;
+/** Jam breaker: seconds without progress (whatever the reason) before a vehicle is removed, out of view / in view. */
+export const STALL_HIDDEN = 75;
+export const STALL_VISIBLE = 180;
 /** Instance capacity per model (the Normal level keeps ~95 cars). */
 const CAPACITY = 110;
 
@@ -143,6 +148,10 @@ interface Car {
   busWait: number;
   /** Seconds stationary while not legitimately waiting. */
   idle: number;
+  /** Distance driven, the odometer reading at the last progress mark, and seconds since it (jam breaker). */
+  odo: number;
+  mark: number;
+  stall: number;
   /** Legitimately waiting (red light, the player, or a queue behind those). */
   exempt: boolean;
   visible: boolean;
@@ -171,6 +180,8 @@ export interface BusJunction {
 export interface CarStats {
   overlapDespawns: number;
   stuckDespawns: number;
+  /** Removed by the jam breaker (no progress for minutes, whatever the reason). */
+  stallDespawns: number;
   waitingRed: number;
   waitingJunction: number;
   stationary: number;
@@ -356,7 +367,11 @@ export class CarTraffic {
   /** The car whose queue fills a junction exit (set by canGo when it returns Junction for that reason). */
   private blockRef = 0;
   private pt2: LanePt = { x: 0, y: 0, hx: 0, hy: 0, z: 0, g: 0 };
-  readonly stats: CarStats = { overlapDespawns: 0, stuckDespawns: 0, waitingRed: 0, waitingJunction: 0, stationary: 0 };
+  readonly stats: CarStats = { overlapDespawns: 0, stuckDespawns: 0, stallDespawns: 0, waitingRed: 0, waitingJunction: 0, stationary: 0 };
+  /** Id of the holder that made the last boxClear() fail. */
+  private boxBy = 0;
+  /** Film/test runs: fixed caps (no adaptation to CPU time), so runs are reproducible. */
+  fixedCaps = false;
   /** Recent safety-valve events (diagnostics). */
   readonly events: string[] = [];
   enabled = true;
@@ -994,8 +1009,18 @@ export class CarTraffic {
       if (o.until >= time) nd.occ[w++] = o;
     }
     nd.occ.length = w;
-    for (const o of nd.occ) if (o.id !== id && movementsConflict(inX, inY, outX, outY, cls, o)) return false;
+    for (const o of nd.occ) {
+      if (o.id !== id && movementsConflict(inX, inY, outX, outY, cls, o)) {
+        this.boxBy = o.id;
+        return false;
+      }
+    }
     return true;
+  }
+
+  /** The holder that made the last boxClear() fail (PLAYER_HOLD for the player's bus). */
+  get boxBlocker(): number {
+    return this.boxBy;
   }
 
   /** Reserve the box for a movement until `until` (refreshes an existing hold). */
@@ -1205,6 +1230,9 @@ export class CarTraffic {
       holds: [],
       busWait: 0,
       idle: 0,
+      odo: 0,
+      mark: 0,
+      stall: 0,
       exempt: false,
       visible: false,
       dead: false,
@@ -1254,6 +1282,28 @@ export class CarTraffic {
     return i < 0 ? -1 : this.grid.pv[i];
   }
 
+  /**
+   * Footprint of car `id` as a capsule: end points (a = front), radius (half
+   * width), speed, heading and height. False if there is no such car.
+   */
+  capsule(id: number, out: { ax: number; ay: number; bx: number; by: number; r: number; v: number; heading: number; z: number }): boolean {
+    const c = this.byId.get(id);
+    if (!c || c.dead) return false;
+    const r = this.models[c.model].width / 2;
+    const h = Math.max(0, c.len / 2 - r);
+    const hx = Math.sin(c.heading);
+    const hy = Math.cos(c.heading);
+    out.ax = c.x + hx * h;
+    out.ay = c.y + hy * h;
+    out.bx = c.x - hx * h;
+    out.by = c.y - hy * h;
+    out.r = r;
+    out.v = c.v;
+    out.heading = c.heading;
+    out.z = c.z;
+    return true;
+  }
+
   /** Is the car with this id waiting legitimately (red light, player, or a queue behind those)? */
   isExempt(id: number): boolean {
     return this.byId.get(id)?.exempt ?? false;
@@ -1277,10 +1327,11 @@ export class CarTraffic {
       if (st === 'amber' && stopAt > (c.v * c.v) / (2 * 3.5)) return Wait.Red;
     } else {
       const e = this.edges[lane >> 1];
-      if (e.rank + 0.01 < nd.rank && nd.until > time && nd.holder !== lane) return Wait.Junction;
+      if (e.rank + 0.01 < nd.rank && nd.until > time && nd.holder !== lane) return nd.holder === PLAYER_HOLD ? Wait.Player : Wait.Junction;
     }
     const cls = classify(wrapAngle(Math.atan2(outX, outY) - Math.atan2(inX, inY)));
-    if (!this.boxClear(N, c.id, inX, inY, outX, outY, cls, time)) return Wait.Junction;
+    // The player's bus in (or about to enter) the box: waiting for it is legitimate.
+    if (!this.boxClear(N, c.id, inX, inY, outX, outY, cls, time)) return this.boxBy === PLAYER_HOLD ? Wait.Player : Wait.Junction;
     // The exit must have room for the whole car, so it never stops in the box.
     const idx = Math.min(c.laneIdx, this.lanesIn(next) - 1);
     const room = nd.boxR + c.len + 1.5;
@@ -1358,10 +1409,16 @@ export class CarTraffic {
     const py = player.y;
     const bg = this.busGrid;
     bg.clear();
-    for (let k = 0; k < playerBody.n; k++) bg.add(playerBody.x[k], playerBody.y[k], Math.max(0, Math.abs(playerBody.speed)), -1, playerBody.z[k]);
-    busBodies.forEach((b, i) => {
-      for (let k = 0; k < b.n; k++) bg.add(b.x[k], b.y[k], b.speed, i, b.z[k]);
-    });
+    // Body points and the midpoints between them (<= ~1.8 m apart), so a probe
+    // with the contact radius cannot slip between two points.
+    const addBody = (b: Body, v: number, id: number) => {
+      for (let k = 0; k < b.n; k++) {
+        bg.add(b.x[k], b.y[k], v, id, b.z[k]);
+        if (k + 1 < b.n) bg.add((b.x[k] + b.x[k + 1]) / 2, (b.y[k] + b.y[k + 1]) / 2, v, id, (b.z[k] + b.z[k + 1]) / 2);
+      }
+    };
+    addBody(playerBody, Math.max(0, Math.abs(playerBody.speed)), -1);
+    busBodies.forEach((b, i) => addBody(b, b.speed, i));
 
     this.candTimer -= dt;
     if (this.candTimer <= 0) {
@@ -1474,7 +1531,8 @@ export class CarTraffic {
           lim(idm(d - c.len / 2 - 0.5, this.grid.pv[hc] * 0.6, 1.6), Wait.Car, this.grid.pid[hc]);
           break;
         }
-        const hb = bg.nearest(pt.x, pt.y, 2.1, undefined, pt.z);
+        // A bus (1.25 m half width) touches a car (0.92) 2.2 m from its centreline: look wider than that.
+        const hb = bg.nearest(pt.x, pt.y, 2.5, undefined, pt.z);
         if (hb >= 0) {
           lim(idm(d - c.len / 2 - 0.6, bg.pv[hb] * 0.8, 1.5), bg.pid[hb] === -1 ? Wait.Player : Wait.Bus, bg.pid[hb]);
           busBlock = bg.pv[hb] < 1;
@@ -1541,6 +1599,7 @@ export class CarTraffic {
       c.braking = acc < -0.6 || c.v < 0.2;
       c.v = Math.max(0, c.v + acc * dt);
       c.u += c.v * dt;
+      c.odo += c.v * dt;
       // Release junctions we have cleared; keep the others reserved while we are on our way through.
       for (let k = c.holds.length - 1; k >= 0; k--) {
         const h = c.holds[k];
@@ -1602,6 +1661,17 @@ export class CarTraffic {
         this.kill(c);
         st.stuckDespawns++;
       }
+      // Jam breaker: no progress for minutes whatever the reason (a queue that
+      // never clears, a wait on the player that never ends) and it goes.
+      if (c.odo - c.mark > 3) {
+        c.mark = c.odo;
+        c.stall = 0;
+      } else c.stall += dt;
+      if (!c.dead && c.stall > (c.visible ? STALL_VISIBLE : STALL_HIDDEN)) {
+        this.note(`stall lane ${c.lane} u ${c.u.toFixed(1)} why ${wt.why} ref ${wt.ref} end ${N} sig ${nd.sig}`);
+        this.kill(c);
+        st.stallDespawns++;
+      }
     }
 
     // Car grid (for buses, the probes above and overlap checks).
@@ -1635,11 +1705,22 @@ export class CarTraffic {
           }
         }
         const ob = bg.nearest(qx, qy, 1.6, undefined, c.z);
-        if (ob >= 0 && bg.pid[ob] >= 0) {
+        // Inside an AI bus, or deep inside the player's bus (the player is never moved for it).
+        if (ob >= 0 && (bg.pid[ob] >= 0 || (bg.px[ob] - qx) ** 2 + (bg.py[ob] - qy) ** 2 < 1.0)) {
           this.note(`car-bus lane ${c.lane} u ${c.u.toFixed(1)} v ${c.v.toFixed(1)} bus v ${bg.pv[ob].toFixed(1)} holds ${c.holds.map((h) => h.node)} end ${this.endNode(c.lane)}`);
           this.kill(c);
           st.overlapDespawns++;
           break;
+        }
+        // Touching the player's bus ahead: stop dead (it is never shoved out of the way).
+        if (f > 0 && !c.dead) {
+          let touch = false;
+          bg.query(qx, qy, 2.3, (i) => {
+            if (bg.pid[i] !== -1 || Math.abs(bg.pz[i] - c.z) > LEVEL_GAP) return false;
+            touch = (bg.px[i] - c.x) * hx + (bg.py[i] - c.y) * hy > 0;
+            return touch;
+          });
+          if (touch) c.v = 0;
         }
       }
     }
@@ -1647,7 +1728,8 @@ export class CarTraffic {
     const cost = performance.now() - t0;
     this.costEma += (cost - this.costEma) * 0.05;
     this.costTimer -= dt;
-    if (this.costTimer <= 0) {
+    if (this.fixedCaps) this.maxCars = this.capCars;
+    else if (this.costTimer <= 0) {
       this.costTimer = 1;
       if (this.costEma > 0.6 && this.maxCars > 20) this.maxCars -= 4;
       else if (this.costEma < 0.35 && this.maxCars < this.capCars) this.maxCars += 2;
