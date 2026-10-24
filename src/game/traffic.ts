@@ -140,6 +140,8 @@ export class Traffic {
   private touching = new Map<number, number>();
   private cap = { ax: 0, ay: 0, bx: 0, by: 0, r: 0, v: 0, heading: 0, z: 0 };
   private aheadHX = new Float32Array(LOOK_MAX);
+  /** The vehicle that made the last junctionOk() fail on its exit (bus id or car id), else 0. */
+  private jRef = 0;
   private aheadHY = new Float32Array(LOOK_MAX);
   private lastPlayerZ: number | undefined;
   private aheadX = new Float32Array(LOOK_MAX);
@@ -622,7 +624,9 @@ export class Traffic {
     for (let i = this.active.length - 1; i >= 0; i--) {
       const b = this.active[i];
       const d = Math.hypot(b.body.fx - px, b.body.fy - py);
-      const done = b.state === State.Terminus && b.dwell <= 0 && (!b.visible || b.dwell < -20);
+      // End of the trip: gone once out of view, or a few seconds after its last
+      // dwell (it never holds a terminal's front bay for long).
+      const done = b.state === State.Terminus && b.dwell <= 0 && (!b.visible || b.dwell < -6);
       const stuck = b.idle > (b.visible ? 45 : 25);
       // Jam breaker: no progress for minutes whatever the reason (exempt waits included).
       const stalled = !stuck && b.stall > (b.visible ? STALL_VISIBLE : STALL_HIDDEN);
@@ -874,7 +878,8 @@ export class Traffic {
     }
     if (b.s >= L - 3 && b.v < 0.6) {
       b.state = State.Terminus;
-      b.dwellTotal = b.dwell = 8;
+      // Passengers already got off at the last stop's dwell.
+      b.dwellTotal = b.dwell = time - b.departT < 30 ? 2 : 8;
       b.v = 0;
       return;
     }
@@ -900,7 +905,7 @@ export class Traffic {
           res = this.junctionOk(b, k, stopAt + (jl[k].stopS - j.stopS), time);
           k++;
         }
-        if (res !== Wait.None) lim(idm(b.v, v0, Math.max(0.05, stopAt), 0, 0.8), res);
+        if (res !== Wait.None) lim(idm(b.v, v0, Math.max(0.05, stopAt), 0, 0.8), res, this.jRef);
         else if (stopAt <= commitDist) {
           for (let q = b.jNext; q < k; q++) {
             const jq = jl[q];
@@ -964,9 +969,8 @@ export class Traffic {
     const consider = (o: Body, id: number, other: AiBus | null) => {
       if (Math.abs(o.fx - bodyF.fx) > reach || Math.abs(o.fy - bodyF.fy) > reach) return;
       const rel = wrapAngle(o.heading - bodyF.heading);
-      const crossing = Math.abs(rel) > 0.9 && Math.abs(rel) < 2.4;
-      // Two buses waiting on each other across a junction: the older id goes first.
-      if (other && crossing && other.obstacle === b.id && other.id < b.id) return;
+      // Two buses waiting on each other (across a junction, at a merge): one of them goes.
+      if (other && other.obstacle === b.id && other.id < b.id) return;
       // Two 2.5 m wide bodies touch with their centrelines 2.5 m apart: look
       // wider than that, except at oncoming traffic in the next lane.
       const r2 = Math.abs(rel) > 2.4 ? 3.4 : 2.8 * 2.8;
@@ -1073,6 +1077,7 @@ export class Traffic {
   /** May this bus go through junction `j` (stop line `stopAt` ahead) now? */
   private junctionOk(b: AiBus, k: number, stopAt: number, time: number): Wait {
     const j = b.jl[k];
+    this.jRef = 0;
     if (j.sig) {
       const a = b.jAsk[k];
       const st = a ? (this.world.signalStateAt?.(a.x, a.y, time, a.dx, a.dy, a.z) ?? null) : this.cars.signalFor(j.node, j.inX, j.inY, time);
@@ -1080,16 +1085,35 @@ export class Traffic {
       if (st === 'amber' && stopAt > (b.v * b.v) / (2 * 3)) return Wait.Red;
     } else if (this.cars.giveWayBusy(j.node, j.minor, time)) return Wait.Junction;
     if (!this.cars.boxClear(j.node, -b.id, j.inX, j.inY, j.outX, j.outY, j.cls, time)) return this.cars.boxBlocker === PLAYER_HOLD ? Wait.Player : Wait.Junction;
-    // Room on the far side for the bus to get out of the box.
-    b.track.sample(j.s + j.boxR + 4, this.tmp2, 0);
-    const x = this.tmp2.x;
-    const y = this.tmp2.y;
-    const z = b.track.zAt(j.s + j.boxR + 4);
-    if (this.cars.slowCarNear(x, y, 1.8, z)) return Wait.Junction;
-    for (const o of this.active) {
-      if (o === b || o.dead || o.v > 2) continue;
-      const body = o.body;
-      for (let q = 0; q < body.n; q++) if (Math.hypot(body.x[q] - x, body.y[q] - y) < 2.2 && Math.abs(body.z[q] - z) <= LEVEL_GAP) return Wait.Junction;
+    // Room on the far side for the whole bus to get out of the box (it never
+    // stops with its tail across the junction). Waiting for a queue that is
+    // itself waiting legitimately is legitimate (jRef names the blocker).
+    const pb = this.playerBody;
+    const G = this.cars.grid;
+    for (let q = j.s + j.boxR + 2; q <= j.s + j.boxR + b.len + 1; q += 3) {
+      b.track.sample(q, this.tmp2, 0);
+      const x = this.tmp2.x;
+      const y = this.tmp2.y;
+      const z = b.track.zAt(q);
+      const gi = G.nearest(x, y, 1.8, undefined, z);
+      if (gi >= 0 && G.pv[gi] < 2) {
+        this.jRef = G.pid[gi];
+        return Wait.Car;
+      }
+      for (const o of this.active) {
+        if (o === b || o.dead || o.v > 2) continue;
+        const body = o.body;
+        if (Math.abs(body.fx - x) > o.len + 3 || Math.abs(body.fy - y) > o.len + 3) continue;
+        for (let k = 0; k < body.n; k++) {
+          if (Math.hypot(body.x[k] - x, body.y[k] - y) < 2.2 && Math.abs(body.z[k] - z) <= LEVEL_GAP) {
+            this.jRef = o.id;
+            return Wait.Bus;
+          }
+        }
+      }
+      if (Math.abs(pb.speed) < 2) {
+        for (let k = 0; k < pb.n; k++) if (Math.hypot(pb.x[k] - x, pb.y[k] - y) < 2.2 && Math.abs(pb.z[k] - z) <= LEVEL_GAP) return Wait.Player;
+      }
     }
     return Wait.None;
   }
@@ -1283,11 +1307,12 @@ export class Traffic {
       }
       const sh = (pose.sections[bsec] ?? pose).heading;
       const fn = Math.sin(sh) * bnx + Math.cos(sh) * bny;
-      // Relative normal velocity (the other vehicle's motion counts too).
+      // Relative normal velocity (the other vehicle's motion counts too)...
       const vOther = ovx * bnx + ovy * bny;
       const vn = pose.speed * fn - vOther;
       if (vn < 0) {
-        out.impact = Math.max(out.impact, -vn);
+        // ...but the impact reported (and scored by the guide) is the player's own speed into the contact.
+        out.impact = Math.max(out.impact, Math.max(0, -pose.speed * fn));
         // Our motion into the contact is taken away; the contact never adds speed
         // (a stopped bus is not launched by the vehicle that touched it).
         const ns = pose.speed - vn * fn * 1.05;

@@ -1347,9 +1347,16 @@ export class CarTraffic {
       }
     }
     const ne = this.edges[next >> 1];
-    this.at(next, Math.min(ne.len, nd.boxR + 3), this.laneOffset(next, idx), this.pt2);
-    const hb = this.busGrid.nearest(this.pt2.x, this.pt2.y, 2.6, undefined, this.pt2.z);
-    if (hb >= 0 && this.busGrid.pv[hb] < 2) return Wait.Junction;
+    // ...and of buses (and the player's bus) standing there.
+    for (let q = 0; q < 2; q++) {
+      this.at(next, Math.min(ne.len, nd.boxR + 2 + q * c.len), this.laneOffset(next, idx), this.pt2);
+      const hb = this.busGrid.nearest(this.pt2.x, this.pt2.y, 2.6, undefined, this.pt2.z);
+      if (hb >= 0 && this.busGrid.pv[hb] < 2) {
+        if (this.busGrid.pid[hb] === -1) return Wait.Player;
+        this.blockRef = this.busGrid.pid[hb];
+        return Wait.Bus;
+      }
+    }
     // A link too short to stop on: the junction after it must be enterable too.
     if (depth === 0 && this.shortLink(next, nd.boxR, c.len)) {
       if (c.next2 < 0) c.next2 = this.chooseNext(next);

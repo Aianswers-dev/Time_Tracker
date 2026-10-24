@@ -115,6 +115,16 @@ if (args.includes('--routes')) {
   let agreeSum = 0;
   const bad: string[] = [];
   const t1 = performance.now();
+  // Car lanes (not bus-only edges) by end node.
+  const lanesInto = new Map<number, number[]>();
+  for (let lane = 0; lane < C.edges.length * 2; lane++) {
+    const e = C.edges[lane >> 1];
+    if (e.bus || (e.oneway && lane & 1)) continue;
+    const n = C.endNode(lane);
+    let l = lanesInto.get(n);
+    if (!l) lanesInto.set(n, (l = []));
+    l.push(lane);
+  }
   for (const r of data.routes) {
     const tr = trackFor(r, data);
     const tmp = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
@@ -145,7 +155,20 @@ if (args.includes('--routes')) {
         return model.junctionAt(nd.x - j.inX * 10, nd.y - j.inY * 10, j.inX, j.inY, nd.z) === gj;
       });
       if (!bj) continue;
-      const ai = (t: number) => cars.signalFor(bj.node, bj.inX, bj.inY, t);
+      // The car lane into that node that arrives the way the route does, asked as canGo asks.
+      let lane = -1;
+      let bd = 0.7;
+      for (const l of lanesInto.get(bj.node) ?? []) {
+        const [lx, ly] = C.laneEndDir(l);
+        const d = lx * bj.inX + ly * bj.inY;
+        if (d > bd) {
+          bd = d;
+          lane = l;
+        }
+      }
+      if (lane < 0) continue;
+      const [ldx, ldy] = C.laneEndDir(lane);
+      const ai = (t: number) => cars.signalFor(bj.node, ldx, ldy, t);
       const guide = (t: number) => model.stateAt(qx, qy, t, hx, hy, zq);
       if (ai(0) === null || guide(0) === null) continue;
       let same = 0;
