@@ -108,6 +108,26 @@ export class MeshGeo {
     this.quad(hi[0], hi[1], hi[2], hi[3], 0, 1, 0);
     this.quad(lo[0], lo[1], lo[2], lo[3], 0, -1, 0);
   }
+  /** As box(), but each face has its own vertices, so the sides shade with their own normals. */
+  boxF(x: number, y: number, h0: number, h1: number, ux: number, uy: number, hl: number, hw: number, ...a: number[]): void {
+    const vx = -uy;
+    const vy = ux;
+    const cs: [number, number][] = [
+      [-hl, -hw],
+      [hl, -hw],
+      [hl, hw],
+      [-hl, hw],
+    ];
+    const P = (i: number, h: number) => this.vert(x + ux * cs[i][0] + vx * cs[i][1], h, y + uy * cs[i][0] + vy * cs[i][1], ...a);
+    for (let i = 0; i < 4; i++) {
+      const j = (i + 1) % 4;
+      const mx = ux * (cs[i][0] + cs[j][0]) * 0.5 + vx * (cs[i][1] + cs[j][1]) * 0.5;
+      const my = uy * (cs[i][0] + cs[j][0]) * 0.5 + vy * (cs[i][1] + cs[j][1]) * 0.5;
+      this.quad(P(i, h0), P(j, h0), P(j, h1), P(i, h1), mx, 0, -my);
+    }
+    this.quad(P(0, h1), P(1, h1), P(2, h1), P(3, h1), 0, 1, 0);
+    this.quad(P(0, h0), P(1, h0), P(2, h0), P(3, h0), 0, -1, 0);
+  }
   /** Box between two points (a beam), square section of half-size r. */
   beam(ax: number, ah: number, ay: number, bx: number, bh: number, by: number, r: number, ...a: number[]): void {
     // three.js space vectors

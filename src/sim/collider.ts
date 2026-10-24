@@ -1098,9 +1098,14 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
   const wny = Math.max(1, Math.ceil((data.bounds[3] + 200 - wy0) / 32));
   const wcx = (x: number) => Math.min(wnx - 1, Math.max(0, Math.floor((x - wx0) / 32)));
   const wcy = (y: number) => Math.min(wny - 1, Math.max(0, Math.floor((y - wy0) / 32)));
-  /** As the world's tubeNb: largest (half-width - distance) of another road whose surface is within 3 m of z. */
+  /**
+   * As the world's tubeNb: largest (half-width - distance) of another road at this level: a tunnel
+   * whose surface is within 3 m of z, or another road from 3 m below to 0.5 m above z (not a street
+   * crossing over a shallow tube) where the ground is not far below the tube's top.
+   */
   const tubeNb = (x: number, y: number, z: number, self: number): number => {
     let best = -Infinity;
+    const level = H.ground(x, y) - (z + (data.roads[self].kind === RoadKind.Motorway ? 6.4 : 5.8)) > -1.8;
     const ci = wcx(x);
     const cj = wcy(y);
     forEachRoadSegmentNear(x, y, 0, (sg) => {
@@ -1117,7 +1122,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       if (ci < wcx(Math.min(ax, bx) - hw) || ci > wcx(Math.max(ax, bx) + hw) || cj < wcy(Math.min(ay, by) - hw) || cj > wcy(Math.max(ay, by) + hw)) return;
       project(l, v, x, y);
       const pen = hw - Math.sqrt(PROJ.d2);
-      if (pen <= best || Math.abs(PROJ.z - z) > 3) return;
+      const dz = PROJ.z - z;
+      if (pen <= best || (l.tunnel ? Math.abs(dz) > 3 : !level || dz > 0.5 || dz < -3)) return;
       best = pen;
     });
     return best;

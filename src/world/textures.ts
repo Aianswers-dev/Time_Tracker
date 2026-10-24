@@ -205,6 +205,37 @@ export function makeRoadTextTexture(words: string[]): { tex: THREE.CanvasTexture
   return { tex, rows: words.length };
 }
 
+/**
+ * White sign lettering on transparent, one line per 64 px row of a 1024 px
+ * atlas. `widths[i]` is line i's drawn width as a fraction of the row width.
+ */
+export function makeSignTextTexture(lines: string[]): { tex: THREE.CanvasTexture; rows: number; widths: number[] } {
+  const rows = Math.max(1, lines.length);
+  const c = document.createElement('canvas');
+  c.width = 1024;
+  c.height = 64 * rows;
+  const g = c.getContext('2d')!;
+  g.clearRect(0, 0, c.width, c.height);
+  g.fillStyle = '#fff';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.font = 'bold 44px Arial, Helvetica, sans-serif';
+  const widths = lines.map((ln, i) => {
+    const w = Math.max(1, g.measureText(ln).width);
+    const sx = Math.min(1, 1000 / w);
+    g.save();
+    g.translate(512, i * 64 + 34);
+    g.scale(sx, 1);
+    g.fillText(ln, 0, 0);
+    g.restore();
+    return Math.min(1000, w * sx + 24) / 1024;
+  });
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 8;
+  return { tex, rows, widths };
+}
+
 /** Radial soft spot for light pools and glows. */
 export function makeGlowTexture(size = 128): THREE.DataTexture {
   const d = new Uint8Array(size * size * 4);
