@@ -27,6 +27,9 @@ export interface Saloon {
   dispose(): void;
 }
 
+/** Height of the driver's raised platform (seat base, pedals). */
+export const DRIVER_PLATFORM = 0.62;
+
 const COL = {
   floor: rgb('#33363b'),
   riser: rgb('#25272b'),
@@ -186,10 +189,11 @@ export function buildSaloon(B: BodyLayout, sec: SectionLayout, driver: boolean):
       else st.quad(V(x, ya, Z(zb)), V(x, ya, Z(za)), V(x, yb, Z(za)), V(x, yb, Z(zb)), c);
     };
     let z = zStart;
-    for (const o of ops) {
+    for (const [k, o] of ops.entries()) {
       if (o.z0 > z) {
         panel(z, o.z0, 0.34, B.sill, COL.lower);
-        panel(z, o.z0, B.sill, wallTop, COL.pillar);
+        // ahead of the first opening the windscreen wraps round the corner; the cab builds that A-pillar
+        if (!(driver && sec.isFront && k === 0)) panel(z, o.z0, B.sill, wallTop, COL.pillar);
       }
       panel(o.z0, o.z1, 0.34, o.y0, COL.lower);
       panel(o.z0, o.z1, o.y1, wallTop, COL.pillar);
@@ -210,24 +214,11 @@ export function buildSaloon(B: BodyLayout, sec: SectionLayout, driver: boolean):
     st.box(-0.42, B.ceiling - 0.03, Z(zh), 0.42, B.ceiling - 0.005, Z(zh + 0.75), rgb('#c9cdd2'), 8);
   }
 
-  // --- front wall around the windscreen
+  // --- front wall below the windscreen (the cab builds the dash, pillars and overhead console)
   if (sec.isFront) {
     const fz = (y: number) => Z(frontZ(B, sec, y) + 0.07);
-    const metro = B.type === 'metro';
-    const g0 = metro ? 0.98 : 1.12, g1 = metro ? 2.58 : 2.72;
-    const xg = B.hw - (metro ? 0.22 : 0.15);
-    const ys = [0.34, g0, (g0 + g1) / 2, g1, B.ceiling];
-    for (let i = 0; i < ys.length - 1; i++) {
-      const ya = ys[i], yb = ys[i + 1];
-      const inGlass = ya >= g0 - 1e-3 && yb <= g1 + 1e-3;
-      const c = inGlass ? COL.frame : ya < g0 ? COL.partition : COL.frame;
-      if (inGlass) {
-        for (const s of [1, -1]) {
-          const [x0, x1] = s > 0 ? [xg, xi] : [-xi, -xg];
-          st.quad(V(x1, ya, fz(ya)), V(x0, ya, fz(ya)), V(x0, yb, fz(yb)), V(x1, yb, fz(yb)), c);
-        }
-      } else st.quad(V(xi, ya, fz(ya)), V(-xi, ya, fz(ya)), V(-xi, yb, fz(yb)), V(xi, yb, fz(yb)), c);
-    }
+    const g0 = B.type === 'metro' ? 0.98 : 1.12;
+    st.quad(V(xi, 0.34, fz(0.34)), V(-xi, 0.34, fz(0.34)), V(-xi, g0, fz(g0)), V(xi, g0, fz(g0)), COL.partition);
   }
   // --- rear wall with rear window
   if (sec.isRear) {
@@ -255,9 +246,10 @@ export function buildSaloon(B: BodyLayout, sec: SectionLayout, driver: boolean):
 
   // --- driver's platform and partition
   if (driver) {
-    st.box(0.18, B.floor, Z(0.15), xi, 0.8, Z(1.9), COL.platform, 2 | 4 | 16);
-    st.box(0.18, 0.8, Z(1.86), xi, 1.5, Z(1.92), COL.partition);
-    st.box(0.15, 0.8, Z(0.78), 0.21, 1.32, Z(1.9), COL.partition);
+    const dp = DRIVER_PLATFORM;
+    st.box(0.18, B.floor, Z(0.15), xi, dp, Z(1.9), COL.platform, 2 | 4 | 16);
+    st.box(0.18, dp, Z(1.86), xi, 1.5, Z(1.92), COL.partition);
+    st.box(0.15, dp, Z(0.78), 0.21, 1.32, Z(1.9), COL.partition);
     st.box(0.15, 1.5, Z(1.86), 0.72, 1.53, Z(1.92), COL.frame);
     st.box(0.15, 1.32, Z(1.86), 0.19, 2.22, Z(1.9), COL.frame);
   }
@@ -346,7 +338,9 @@ export function buildSaloon(B: BodyLayout, sec: SectionLayout, driver: boolean):
   const tint: RGB = [0.04, 0.06, 0.08];
   for (const side of [1, -1]) {
     const x = side * (xi + 0.035);
-    for (const w of side > 0 ? sec.windowsR : sec.windowsL) {
+    for (const w0 of side > 0 ? sec.windowsR : sec.windowsL) {
+      // a little larger than the opening so no sky shows past the wall edges at grazing angles
+      const w = { z0: w0.z0 - 0.04, z1: w0.z1 + 0.04, y0: w0.y0 - 0.04, y1: w0.y1 + 0.05 };
       if (side > 0) gl.quad(V(x, w.y0, Z(w.z0)), V(x, w.y0, Z(w.z1)), V(x, w.y1, Z(w.z1)), V(x, w.y1, Z(w.z0)), tint, undefined, 0.3);
       else gl.quad(V(x, w.y0, Z(w.z1)), V(x, w.y0, Z(w.z0)), V(x, w.y1, Z(w.z0)), V(x, w.y1, Z(w.z1)), tint, undefined, 0.3);
     }
@@ -359,8 +353,8 @@ export function buildSaloon(B: BodyLayout, sec: SectionLayout, driver: boolean):
   }
   if (driver) {
     // driver's safety screen
-    gl.quad(V(0.17, 1.53, Z(1.89)), V(0.17, 1.53, Z(0.95)), V(0.17, 2.2, Z(0.95)), V(0.17, 2.2, Z(1.89)), [0.55, 0.62, 0.66], undefined, 0.1);
-    gl.quad(V(0.17, 1.53, Z(1.89)), V(0.72, 1.53, Z(1.89)), V(0.72, 2.2, Z(1.89)), V(0.17, 2.2, Z(1.89)), [0.55, 0.62, 0.66], undefined, 0.1);
+    gl.quad(V(0.17, 1.53, Z(1.89)), V(0.17, 1.53, Z(0.95)), V(0.17, 2.2, Z(0.95)), V(0.17, 2.2, Z(1.89)), [0.3, 0.36, 0.4], undefined, 0.07);
+    gl.quad(V(0.17, 1.53, Z(1.89)), V(0.72, 1.53, Z(1.89)), V(0.72, 2.2, Z(1.89)), V(0.17, 2.2, Z(1.89)), [0.3, 0.36, 0.4], undefined, 0.07);
   }
   const glassMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false, side: THREE.DoubleSide });
   const glass = new THREE.Mesh(gl.build(), glassMat);

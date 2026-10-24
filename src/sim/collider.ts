@@ -71,18 +71,31 @@ export interface SimCollider extends Collider {
   resolve(pose: BusPose, spec: BusSpec): ResolveResult;
   /** Seconds covered by the next resolve() (the physics frame), for frame-rate independent contact response. */
   setStepTime(dt: number): void;
-  /** Road surface under (x, y) at the level closest to `hintZ` (see Heights.surfaceAt). */
-  surface(x: number, y: number, hintZ?: number, maxStep?: number): Surface;
+  /**
+   * Road surface under (x, y) at the level closest to `hintZ` (see Heights.surfaceAt; `heading` prefers
+   * the road running that way). Station bays beside the through-lanes are surfaces too (at the busway's
+   * height beside them, `road` = that busway), so wherever `drivable` is true there is a surface.
+   */
+  surface(x: number, y: number, hintZ?: number, maxStep?: number, heading?: number): Surface;
   ground(x: number, y: number): number;
   road(index: number): Road | undefined;
   /** True if (x, y) is inside a solid building footprint (at height z when given). */
   pointInBuilding(x: number, y: number, z?: number): boolean;
   /**
    * Fraction 0..1 along the 3D segment to the first building, wall or solid
-   * ground (1 = clear). Tunnel tubes, cuttings and station bays count as open
+   * ground (1 = clear), for cameras: also what the world draws over roads that
+   * buses pass under (buildings lifted over a road, canopies, car-park decks)
+   * and tube ceilings. Tunnel tubes, cuttings and station bays count as open
    * space, as does anything within `openNear` metres of the start (the bus itself).
    */
   lineOfSight(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, openNear?: number): number;
+  /**
+   * The lowest ceiling over (x, y) above height z (a covered tube's, a bridge deck's soffit, the underside
+   * of a building or canopy), or Infinity under open sky. For cameras.
+   */
+  ceilingAt(x: number, y: number, z: number): number;
+  /** A camera at (x, y, z) would be inside something drawn (building, canopy, ground or rock, deck). */
+  viewBlocked(x: number, y: number, z: number): boolean;
   /** Nearest drivable road; with `z` the road closest to that level wins. */
   nearestRoad(x: number, y: number, heading?: number, maxDist?: number, z?: number): RoadSnap | null;
   /** (x, y) is inside a carriageway or station bay at about level z. */
@@ -111,6 +124,9 @@ export interface SimCollider extends Collider {
     tunnelWalls: number;
     parapets: number;
     retainingWalls: number;
+    /** Camera-only: covered tube stretches (ceilings) and drawn-but-not-solid occluders. */
+    ceilings: number;
+    viewOccluders: number;
     bays: number;
     buildMs: number;
     /** Build time per phase (ms). */
@@ -273,6 +289,8 @@ interface Line {
   route: boolean;
   /** A station bay strip from a platform edge to its road (drivable, never snapped to). */
   bay?: boolean;
+  /** For a bay strip: the road it leads to. */
+  road?: number;
 }
 
 /** Projection scratch. */
@@ -475,6 +493,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     let qx = 0;
     let qy = 0;
     let qz = 0;
+    let qr = -1;
+    let qhw = 0;
     forEachRoadSegmentNear(px, py, 16, (sg) => {
       const l = lines[sLine[sg]];
       if (l.kind === RoadKind.Pedestrian) return;
@@ -493,10 +513,14 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
         qx = l.pts[2 * v] + (l.pts[2 * v + 2] - l.pts[2 * v]) * PROJ.t;
         qy = l.pts[2 * v + 1] + (l.pts[2 * v + 3] - l.pts[2 * v + 1]) * PROJ.t;
         qz = PROJ.z;
+        qr = sLine[sg];
+        qhw = l.width / 2;
       }
     });
     const d = Math.sqrt(bestD);
-    if (d >= 16 || d < 0.5) return;
+    // Nothing to fill where the carriageway already reaches the platform edge (wide busways, and the
+    // station bay carriageways the map data may carry as roads of their own).
+    if (d >= 16 || d < Math.max(0.5, qhw - 0.2)) return;
     // Only edges facing the road: the strip must not run across the platform itself.
     if (poly && pip(poly, 0, poly.length, px + ((qx - px) / d) * 0.6, py + ((qy - py) / d) * 0.6)) return;
     bayLines.push({
@@ -510,6 +534,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       link: false,
       route: false,
       bay: true,
+      road: qr,
     });
   };
   /**
@@ -636,6 +661,35 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     return found;
   };
 
+  /**
+   * Station bay surface under (x, y) within `maxStep` of level z: the strips' busway heights, blended by
+   * how far inside each strip the point is (smooth along the platform, where the strips overlap).
+   */
+  const bayAt = (x: number, y: number, z: number, maxStep: number): Surface | null => {
+    let wSum = 0;
+    let zSum = 0;
+    let edge = Infinity;
+    let road = -1;
+    let bestW = 0;
+    forEachBayNear(x, y, 3, (li) => {
+      const l = lines[li];
+      project(l, 0, x, y);
+      const hw = l.width / 2;
+      if (PROJ.d2 >= hw * hw || Math.abs(PROJ.z - z) > maxStep) return;
+      const d = Math.sqrt(PROJ.d2);
+      const w = hw - d;
+      wSum += w;
+      zSum += w * PROJ.z;
+      edge = Math.min(edge, -w);
+      if (w > bestW) {
+        bestW = w;
+        road = l.road ?? -1;
+      }
+    });
+    if (wSum <= 0 || road < 0) return null;
+    return { z: zSum / wSum, road, edge };
+  };
+
   lap('roads+bays');
   // --- 3. Drop footprints that a road / route passes through at the same level --------
   const exGrid = new Grid(gx0, gy0, gx1, gy1, 32);
@@ -647,6 +701,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     return true;
   });
   const excluded = new Uint8Array(polys.count);
+  /** Highest road / route through each excluded footprint (the world lifts the building over it). */
+  const exZ = new Float32Array(polys.count).fill(-Infinity);
   let excludedCount = 0;
   const seen = new Set<number>();
   const sampleLine = (pts: Float32Array, zs: Float32Array, offsets: readonly number[], dedupe: boolean) => {
@@ -682,14 +738,15 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
           const c = exGrid.cy(y) * exGrid.nx + exGrid.cx(x);
           for (let q = exGrid.start[c], e = exGrid.start[c + 1]; q < e; q++) {
             const b = exGrid.items[q];
-            if (excluded[b]) continue;
+            if (excluded[b] && z <= exZ[b]) continue;
             // Only if a bus on this road would actually be inside the building's height band.
             if (z + BUS_ENVELOPE <= polys.lo[b] || z >= polys.hi[b]) continue;
             const o = b * 4;
             if (x < polys.bb[o] || y < polys.bb[o + 1] || x > polys.bb[o + 2] || y > polys.bb[o + 3]) continue;
             if (pip(polys.v, polys.off[b], polys.off[b + 1], x, y)) {
+              if (!excluded[b]) excludedCount++;
               excluded[b] = 1;
-              excludedCount++;
+              exZ[b] = z;
             }
           }
         }
@@ -719,6 +776,46 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
   });
   const stamp = new Int32Array(solid.count);
   let stampId = 1;
+
+  // What the world draws over the roads but a bus never touches, for cameras: buildings a road runs
+  // through, lifted to 5.2 m over it (src/world/buildings.ts clearanceOver), canopies (roof slabs
+  // 0.6 m thick at the top of their height) and car-park decks over a road.
+  const viewRings: Float32Array[] = [];
+  const viewLo: number[] = [];
+  const viewHi: number[] = [];
+  for (let i = 0; i < polys.count; i++) {
+    if (!excluded[i]) continue;
+    const lo = Math.max(polys.lo[i], exZ[i] + 5.0);
+    if (polys.hi[i] - lo < 0.3) continue;
+    viewRings.push(polys.v.subarray(polys.off[i], polys.off[i + 1]));
+    viewLo.push(lo);
+    viewHi.push(polys.hi[i]);
+  }
+  for (const b of data.buildings) {
+    if (b.pts.length < 6 || b.height < 0.5) continue;
+    const bz = b.z ?? 0;
+    const top = bz + b.height;
+    if (b.kind === BuildingKind.Roof) {
+      viewRings.push(b.pts);
+      viewLo.push(Math.max(bz + b.minHeight, top - 0.6) - 0.1);
+      viewHi.push(top + 0.1);
+    } else if (b.kind === BuildingKind.Parking && b.minHeight > 0) {
+      viewRings.push(b.pts);
+      viewLo.push(bz + b.minHeight);
+      viewHi.push(top);
+    }
+  }
+  const view = packPolys(viewRings, viewLo, viewHi);
+  const viewGrid = new Grid(gx0, gy0, gx1, gy1, 32);
+  viewGrid.fill(view.count, (i, o) => {
+    o[0] = view.bb[i * 4];
+    o[1] = view.bb[i * 4 + 1];
+    o[2] = view.bb[i * 4 + 2];
+    o[3] = view.bb[i * 4 + 3];
+    return true;
+  });
+  const viewStamp = new Int32Array(view.count);
+  let viewStampId = 1;
 
   lap('exclusions');
   // --- 4. Edge walls -------------------------------------------------------------------
@@ -911,6 +1008,32 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     return hit;
   };
 
+  /**
+   * Height a retaining wall piece a-b, beside a road at level z, may reach: just under the deck of any
+   * road (a bridge, a busway viaduct) passing over it, else `hi`. The ground line's wall stops at the
+   * deck's soffit; left at the ground beside + 1 m it would stand on the deck above.
+   */
+  const capUnderDeck = (ax: number, ay: number, bx: number, by: number, z: number, hi: number): number => {
+    let cap = hi;
+    for (let k = 0; k <= 2; k++) {
+      const x = ax + ((bx - ax) * k) / 2;
+      const y = ay + ((by - ay) * k) / 2;
+      forEachRoadSegmentNear(x, y, 10, (sg) => {
+        const li = sLine[sg];
+        const l = lines[li];
+        if (l.kind === RoadKind.Pedestrian) return;
+        project(l, sIdx[sg], x, y);
+        // The deck, its parapets and a little beyond (the wall meets the abutment there).
+        const r = l.width / 2 + 1.0;
+        if (PROJ.d2 >= r * r || PROJ.z <= z + 3) return;
+        // Under the deck's soffit (src/world/roads.ts buildBridge: 1.9 m deep for main roads and busways).
+        const rd = data.roads[li];
+        const heavy = l.kind <= RoadKind.Trunk || l.kind === RoadKind.Busway || !!rd?.bus;
+        cap = Math.min(cap, PROJ.z - (heavy ? 1.9 : 1.3));
+      });
+    }
+    return cap;
+  };
   const pushWall = (ax: number, ay: number, bx: number, by: number, za: number, zb: number, onx: number, ony: number, ri: number) => {
     const r = data.roads[ri];
     const zm = (za + zb) / 2;
@@ -926,7 +1049,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       const g = H.ground(mx + onx * 2.5, my + ony * 2.5);
       if (g - zm < 1.5) return;
       kind = WallKind.Retaining;
-      hi = g + 1.0;
+      hi = capUnderDeck(ax, ay, bx, by, zm, g + 1.0);
+      if (hi < zm + 1.0) return;
     }
     // Openings: junction mouths, and wherever the space beyond is another carriageway at this level.
     if (inMouth(mx, my, zm)) return;
@@ -1056,6 +1180,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     }
   }
   const TUBE_EXT = 2.5;
+  /** Covered tube stretches: ax, ay, bx, by, road za, zb, reach left and right (to the walls), inside height. */
+  const ceil: number[] = [];
   const tubeWalls = (ri: number) => {
     const r = data.roads[ri];
     const p = r.pts;
@@ -1097,6 +1223,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     const P0 = ss.map(at);
     const cov = P0.map((c) => H.ground(c.x, c.y) - (c.z + TH) > -1.2);
     const nP = P0.length;
+    /** Per side (left, right) and sample: how far out the tube's hall reaches (past an underground platform). */
+    const reach: number[][] = [[], []];
     const joinStart = (tunNodes.get(nodeKey(p[0], p[1])) ?? 0) > 1;
     const joinEnd = (tunNodes.get(nodeKey(p[2 * n - 2], p[2 * n - 1])) ?? 0) > 1;
     const unit = (a: TubeAt, b: TubeAt): [number, number] => {
@@ -1122,6 +1250,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
         }
         return last;
       });
+      reach[side > 0 ? 0 : 1] = platEdge.map((e) => Math.max(wallOff, e >= 0 ? e + 0.9 : 0));
       const shared = P0.map((c, k) => {
         const last = platEdge[k];
         if (last < 0) return false;
@@ -1156,7 +1285,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
           const [gax, gay] = P(A, hw + 1.4);
           const [gbx, gby] = P(B, hw + 1.4);
           const top = Math.max(H.ground(gax, gay) + 0.9, A.z + 1.18, H.ground(gbx, gby) + 0.9, B.z + 1.18);
-          pushTube(ax, ay, bx, by, Math.min(A.z, B.z) - 0.4, top, WallKind.Retaining, ri);
+          const zm = (A.z + B.z) / 2;
+          pushTube(ax, ay, bx, by, Math.min(A.z, B.z) - 0.4, Math.max(zm + 1.18, capUnderDeck(ax, ay, bx, by, zm, top)), WallKind.Retaining, ri);
           continue;
         }
         if (k === 0 && joinStart) A = { ...A, x: A.x - dirS[0] * TUBE_EXT, y: A.y - dirS[1] * TUBE_EXT };
@@ -1165,6 +1295,13 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
         const [bx, by] = P(B, wo[k + 1]);
         pushTube(ax, ay, bx, by, Math.min(A.z, B.z) - 0.4, Math.max(A.z, B.z) + TUBE_WALL_H, WallKind.Tunnel, ri);
       }
+    }
+    // The tube's ceiling (for cameras), between covered samples, over the platforms beside it too.
+    for (let k = 0; k + 1 < nP; k++) {
+      if (!cov[k] || !cov[k + 1]) continue;
+      const rl = Math.max(reach[0][k], reach[0][k + 1]);
+      const rr = Math.max(reach[1][k], reach[1][k + 1]);
+      ceil.push(P0[k].x, P0[k].y, P0[k + 1].x, P0[k + 1].y, P0[k].z, P0[k + 1].z, rl, rr, TH);
     }
   };
 
@@ -1175,6 +1312,9 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       continue;
     }
     if (r.kind === RoadKind.Pedestrian) continue;
+    // A station stopping bay (map data, see Road.bay) runs between the busway and the platform kerb:
+    // no wall on either side (the deck edge beyond the platform still stops a bus, see BusPhysics).
+    if ((r as { bay?: boolean }).bay) continue;
     const p = r.pts;
     const zs = lines[ri].z;
     const n = p.length / 2;
@@ -1240,6 +1380,18 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     }
   }
   lap('walls');
+  const CEIL = 9;
+  const nCeil = ceil.length / CEIL;
+  const ceilGrid = new Grid(gx0, gy0, gx1, gy1, 24);
+  ceilGrid.fill(nCeil, (i, o) => {
+    const c = i * CEIL;
+    const r = Math.max(ceil[c + 6], ceil[c + 7]);
+    o[0] = Math.min(ceil[c], ceil[c + 2]) - r;
+    o[1] = Math.min(ceil[c + 1], ceil[c + 3]) - r;
+    o[2] = Math.max(ceil[c], ceil[c + 2]) + r;
+    o[3] = Math.max(ceil[c + 1], ceil[c + 3]) + r;
+    return true;
+  });
   // Bus routes crossing a wall at its level open a gap there (with a few metres either side).
   const crossings: number[] = [];
   for (let w = 0; w < wAx.length; w++) {
@@ -1402,13 +1554,47 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     return false;
   };
 
+  /**
+   * The covered tube around (x, y) at height z (between its floor and its ceiling): its ceiling height,
+   * else NaN. `roof` also counts the roof slab above the ceiling (3 m) as part of the tube.
+   */
+  const tubeCeiling = (x: number, y: number, z: number, roof = 0): number => {
+    const cell = ceilGrid.cy(y) * ceilGrid.nx + ceilGrid.cx(x);
+    let best = NaN;
+    for (let q = ceilGrid.start[cell], e = ceilGrid.start[cell + 1]; q < e; q++) {
+      const c = ceilGrid.items[q] * CEIL;
+      const ax = ceil[c];
+      const ay = ceil[c + 1];
+      const ex = ceil[c + 2] - ax;
+      const ey = ceil[c + 3] - ay;
+      const l2 = ex * ex + ey * ey || 1e-9;
+      let t = ((x - ax) * ex + (y - ay) * ey) / l2;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const px = x - ax - ex * t;
+      const py = y - ay - ey * t;
+      // Left of the road's direction (its normal -ey, ex) or right.
+      const r = px * -ey + py * ex >= 0 ? ceil[c + 6] : ceil[c + 7];
+      if (px * px + py * py > r * r) continue;
+      const zr = ceil[c + 4] + (ceil[c + 5] - ceil[c + 4]) * t;
+      const top = zr + ceil[c + 8];
+      if (z < zr - 0.5 || z > top + roof) continue;
+      if (!(best <= top)) best = top;
+    }
+    return best;
+  };
+
   /** Inside a road corridor's air space (tunnel tube, cutting, under a bridge deck) at height z. */
   const inCorridor = (x: number, y: number, z: number): boolean => {
+    // In a covered tube: only inside it (below the ceiling, between the walls).
+    const tc = tubeCeiling(x, y, z, 3);
+    if (tc === tc) return z < tc;
     let found = false;
     forEachRoadSegmentNear(x, y, 3, (s) => {
       const l = lines[sLine[s]];
       project(l, sIdx[s], x, y);
-      const w = l.width / 2 + 2.5;
+      // A tunnel's cutting or tube ends at its walls (hw + 0.9); other roads' verges and embankments
+      // run a little wider.
+      const w = l.width / 2 + (l.tunnel ? 1.0 : 2.5);
       if (PROJ.d2 < w * w && z > PROJ.z - 0.5 && z < PROJ.z + 6) {
         found = true;
         return true;
@@ -1441,6 +1627,74 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     });
     return found;
   };
+  /**
+   * First hit of segment 0-1 with polygon i of set P (its walls, its underside and its top), as a
+   * fraction of the segment, if below `best`.
+   */
+  const polyHit = (P: PolySet, i: number, x0: number, y0: number, z0: number, dx: number, dy: number, dz: number, best: number): number => {
+    const v = P.v;
+    const a = P.off[i];
+    const b = P.off[i + 1];
+    const lo = P.lo[i];
+    const hi = P.hi[i];
+    for (let k = a, j = b - 2; k < b; j = k, k += 2) {
+      const t = segHit(x0, y0, x0 + dx, y0 + dy, v[j], v[j + 1], v[k], v[k + 1]);
+      if (t < 0 || t >= best) continue;
+      const z = z0 + dz * t;
+      if (z >= lo && z <= hi) best = t;
+    }
+    if (Math.abs(dz) > 1e-6) {
+      for (const zf of [lo, hi]) {
+        const t = (zf - z0) / dz;
+        if (t <= 0 || t >= best) continue;
+        if (pip(v, a, b, x0 + dx * t, y0 + dy * t)) best = t;
+      }
+    }
+    return best;
+  };
+  /** Ceiling over (x, y) above height z: a covered tube's, a deck's soffit, or a building's (or canopy's) underside. */
+  const ceilingAt = (x: number, y: number, z: number): number => {
+    let best = Infinity;
+    const tc = tubeCeiling(x, y, z);
+    if (tc === tc) best = tc;
+    forEachRoadSegmentNear(x, y, 2, (s) => {
+      const li = sLine[s];
+      const l = lines[li];
+      if (!l.bridge) return;
+      project(l, sIdx[s], x, y);
+      const w = l.width / 2 + 0.45;
+      if (PROJ.d2 >= w * w) return;
+      const heavy = l.kind <= RoadKind.Trunk || l.kind === RoadKind.Busway || !!data.roads[li]?.bus;
+      const soffit = PROJ.z - (heavy ? 1.9 : 1.3);
+      if (soffit > z && soffit < best) best = soffit;
+    });
+    const scanSet = (P: PolySet, G: Grid) => {
+      const cell = G.cy(y) * G.nx + G.cx(x);
+      for (let q = G.start[cell], e = G.start[cell + 1]; q < e; q++) {
+        const i = G.items[q];
+        const o = i * 4;
+        if (P.lo[i] <= z || P.lo[i] >= best) continue;
+        if (x < P.bb[o] || y < P.bb[o + 1] || x > P.bb[o + 2] || y > P.bb[o + 3]) continue;
+        if (pip(P.v, P.off[i], P.off[i + 1], x, y)) best = P.lo[i];
+      }
+    };
+    scanSet(solid, grid);
+    scanSet(view, viewGrid);
+    return best;
+  };
+  /** Is a camera at (x, y, z) inside something drawn: a building, a canopy, the ground or rock, a deck? */
+  const viewBlocked = (x: number, y: number, z: number): boolean => {
+    if (pointInBuilding(x, y, z)) return true;
+    const cell = viewGrid.cy(y) * viewGrid.nx + viewGrid.cx(x);
+    for (let q = viewGrid.start[cell], e = viewGrid.start[cell + 1]; q < e; q++) {
+      const i = viewGrid.items[q];
+      const o = i * 4;
+      if (z < view.lo[i] || z > view.hi[i]) continue;
+      if (x < view.bb[o] || y < view.bb[o + 1] || x > view.bb[o + 2] || y > view.bb[o + 3]) continue;
+      if (pip(view.v, view.off[i], view.off[i + 1], x, y)) return true;
+    }
+    return (z < H.ground(x, y) - 0.4 && !inCorridor(x, y, z)) || underDeck(x, y, z);
+  };
   const lineOfSight = (x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, openNear = 0): number => {
     const dx = x1 - x0;
     const dy = y1 - y0;
@@ -1449,17 +1703,26 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     let best = 1;
     if (len > 1e-6) {
       gather(Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1));
-      for (const i of candidates) {
-        const v = solid.v;
-        const a = solid.off[i];
-        const b = solid.off[i + 1];
-        for (let k = a, j = b - 2; k < b; j = k, k += 2) {
-          const t = segHit(x0, y0, x1, y1, v[j], v[j + 1], v[k], v[k + 1]);
-          if (t < 0 || t >= best) continue;
-          const z = z0 + dz * t;
-          if (z >= solid.lo[i] && z <= solid.hi[i]) best = t;
+      for (const i of candidates) best = polyHit(solid, i, x0, y0, z0, dx, dy, dz, best);
+      // Buildings lifted over roads, canopies and car-park decks (drawn, but not solid to buses).
+      viewStampId++;
+      const a = viewGrid.cx(Math.min(x0, x1));
+      const b = viewGrid.cy(Math.min(y0, y1));
+      const c = viewGrid.cx(Math.max(x0, x1));
+      const d = viewGrid.cy(Math.max(y0, y1));
+      for (let gy = b; gy <= d; gy++)
+        for (let gx = a; gx <= c; gx++) {
+          const cell = gy * viewGrid.nx + gx;
+          for (let q = viewGrid.start[cell], e = viewGrid.start[cell + 1]; q < e; q++) {
+            const i = viewGrid.items[q];
+            if (viewStamp[i] === viewStampId) continue;
+            viewStamp[i] = viewStampId;
+            const o = i * 4;
+            if (view.bb[o] > Math.max(x0, x1) || view.bb[o + 2] < Math.min(x0, x1) || view.bb[o + 1] > Math.max(y0, y1) || view.bb[o + 3] < Math.min(y0, y1)) continue;
+            if (view.lo[i] > Math.max(z0, z1) || view.hi[i] < Math.min(z0, z1)) continue;
+            best = polyHit(view, i, x0, y0, z0, dx, dy, dz, best);
+          }
         }
-      }
       gatherWalls(Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1));
       for (const w of wallCands) {
         const t = segHit(x0, y0, x1, y1, walls.ax[w], walls.ay[w], walls.bx[w], walls.by[w]);
@@ -1481,6 +1744,12 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       const y = y0 + dy * t;
       const z = z0 + dz * t;
       if ((z < H.ground(x, y) - 0.4 && !inCorridor(x, y, z)) || underDeck(x, y, z)) {
+        best = Math.max(0, t - 1 / steps);
+        break;
+      }
+      // Up through a tube's ceiling (where the rock above may still be under the natural ground line).
+      const tc = tubeCeiling(x, y, z, 3);
+      if (tc === tc && z > tc) {
         best = Math.max(0, t - 1 / steps);
         break;
       }
@@ -1520,6 +1789,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
         const score =
           d +
           (l.kind === RoadKind.Service ? 4 : 0) +
+          ((data.roads[sLine[s]] as { bay?: boolean } | undefined)?.bay ? 3 : 0) +
           (z === undefined && l.tunnel ? 25 : 0) +
           (l.kind === RoadKind.Motorway && !l.link ? 6 : 0) +
           dh * 3 +
@@ -1927,12 +2197,19 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     setStepTime: (dt) => {
       stepTime = Math.max(1e-3, Math.min(0.1, dt));
     },
-    surface: (x, y, hintZ, maxStep) => H.surfaceAt(x, y, hintZ, maxStep),
+    surface: (x, y, hintZ, maxStep, heading) => {
+      const s = H.surfaceAt(x, y, hintZ, maxStep, heading);
+      // Inside a carriageway at this level: that's it. On a verge or off every road: a station bay?
+      if (hintZ === undefined || bayLines.length === 0 || (s.road >= 0 && s.edge <= 0)) return s;
+      return bayAt(x, y, hintZ, maxStep ?? 2.5) ?? s;
+    },
     ground: (x, y) => H.ground(x, y),
     road: (i) => data.roads[i],
     pointInBuilding,
     drivable: (x, y, z) => drivableAt(x, y, z, 2.5),
     lineOfSight,
+    ceilingAt,
+    viewBlocked,
     nearestRoad,
     onRoad,
     inWater,
@@ -1945,6 +2222,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       tunnelWalls: kindCount[WallKind.Tunnel],
       parapets: kindCount[WallKind.Parapet],
       retainingWalls: kindCount[WallKind.Retaining],
+      ceilings: nCeil,
+      viewOccluders: view.count,
       bays: bayLines.length,
       buildMs: performance.now() - t0,
       phases,

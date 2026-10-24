@@ -23,9 +23,10 @@ import { MeshGeo } from './geo';
 import { RoadIndex, roadHeight } from './roadindex';
 import { NOISE_GLSL, patch } from './shaders';
 import type { TerrainField } from './terrain';
-import { storyOutline } from './landmarks';
+import { greenBridgeSpan, storyOutline } from './landmarks';
 import { makeRoadTextTexture, makeSignTextTexture } from './textures';
 import { MASK_RAIL, MASK_WATER, clamp, pointInRing, yieldFrame } from './util';
+import { onAnyPlatform } from '../data/stations';
 
 export const KERB_H = 0.15;
 const ROAD_CHUNK = 2500;
@@ -534,6 +535,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   const inWater = (x: number, y: number) => mask.has(x, y, MASK_WATER);
   // the Story Bridge truss carries its own piers (landmarks.ts)
   const story = storyOutline(ctx);
+  // ... and the Green Bridge's cable-stayed span its own pylons
+  const green = greenBridgeSpan(ctx);
   const otherAt = (x: number, y: number, z: number, self: number, dz = 2.5) => index.penetrationZ(x, y, z, dz, self);
   /** Ground height for strips and wall tops that meet the terrain: the settled ground, never below the natural one. */
   const groundAt = (x: number, y: number) => Math.max(field.natAt(x, y), field.settledAt(x, y));
@@ -1296,7 +1299,10 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const c = roadAt(ri, Math.min(s, ri.len));
         const qx = c.x + c.nx * side * (hw + 0.25);
         const qy = c.y + c.ny * side * (hw + 0.25);
-        ok.push(otherAt(qx, qy, c.z, ri.i, 1.5) < -0.15);
+        // no parapet between a stopping bay and its platform either
+        const px = c.x + c.nx * side * (hw + 0.7);
+        const py = c.y + c.ny * side * (hw + 0.7);
+        ok.push(otherAt(qx, qy, c.z, ri.i, 1.5) < -0.15 && !(heavy && onAnyPlatform(ctx.data.platforms, px, py)));
         ss.push(Math.min(s, ri.len));
       }
       let k = 0;
@@ -1351,7 +1357,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
           placed = true;
           break;
         }
-        if ((highDeck(sp) && inWater(c.x, c.y)) || (story && pointInRing(c.x, c.y, story))) {
+        if ((highDeck(sp) && inWater(c.x, c.y)) || (story && pointInRing(c.x, c.y, story)) || green?.(c.x, c.y)) {
           placed = true;
           break;
         }

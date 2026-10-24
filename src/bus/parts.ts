@@ -80,17 +80,26 @@ export function buildDark(B: BodyLayout, sec: SectionLayout, opts: { underbody?:
     gb.box(-hw + 0.5, B.tyreR - 0.06, ax.z - 0.07 + zo, hw - 0.5, B.tyreR + 0.06, ax.z + 0.07 + zo, dark);
   }
   if (opts.jointCaps) {
-    // close the open ends of articulated bodies (seen only from outside)
+    // Close the open ends of articulated bodies with a lit end wall: grey
+    // panel, light gangway portal frame and the darker gangway itself, so a
+    // joint seen without its bellows reads as a bus end, not a black void.
     const ends: number[] = [];
     if (!sec.isFront) ends.push(sec.bodyFront + 0.004);
     if (!sec.isRear) ends.push(sec.bodyRear - 0.004);
+    const wall: RGB = rgb('#7a8088'), frame: RGB = rgb('#b4b9bf'), gang: RGB = rgb('#3c4047');
     for (const ze of ends) {
-      const z = ze + zo;
-      const x = hw - 0.03;
       const facingFwd = ze < (sec.bodyFront + sec.bodyRear) / 2;
-      const a = V(-x, 0.33, z), b = V(x, 0.33, z), c = V(x, B.yTop - 0.06, z), d = V(-x, B.yTop - 0.06, z);
-      if (facingFwd) gb.quad(b, a, d, c, rgb('#16171a'));
-      else gb.quad(a, b, c, d, rgb('#16171a'));
+      const rect = (x0: number, x1: number, y0: number, y1: number, dz: number, c: RGB) => {
+        const z = ze + zo + (facingFwd ? -dz : dz);
+        const a = V(x0, y0, z), b = V(x1, y0, z), cc = V(x1, y1, z), d = V(x0, y1, z);
+        if (facingFwd) gb.quad(b, a, d, cc, c);
+        else gb.quad(a, b, cc, d, c);
+      };
+      const x = hw - 0.03, yt = B.yTop - 0.06;
+      rect(-x, x, 0.33, yt, 0, wall);
+      const gx = Math.min(0.78, hw - 0.3), gy = Math.min(B.doorTop, yt - 0.25);
+      rect(-gx - 0.07, gx + 0.07, 0.34, gy + 0.07, 0.003, frame);
+      rect(-gx, gx, 0.36, gy, 0.006, gang);
     }
   }
   if (opts.doorWells) {
@@ -144,9 +153,79 @@ function roundedSlab(w: number, l: number, h: number, r: number): THREE.BufferGe
   return g;
 }
 
-export function addTrim(gb: GeoBuilder, B: BodyLayout, sec: SectionLayout, lv: Livery, low: boolean): void {
+export interface MirrorHead {
+  /** +1 driver's side (right), -1 kerb side (left). */
+  side: 1 | -1;
+  kind: 'wing' | 'camera';
+  /** Head centre, section-local. */
+  c: THREE.Vector3;
+  /** Glass width/height and housing depth. */
+  w: number;
+  h: number;
+  d: number;
+  /** Turn of the glass normal from straight back (+z) toward +x, and its tilt down. */
+  yaw: number;
+  pitch: number;
+  /** Support arm, body to head. */
+  arm: THREE.Vector3[];
+  armR: number;
+}
+
+/**
+ * Exterior mirrors as on the Brisbane fleet (photos of T2825, V2299, C2046):
+ * the Volgren Optimus has a rams-horn mirror hanging from the kerb-side roof
+ * corner (livery yellow on Transport for Brisbane) and a black mirror on a
+ * short arm beside the driver's window. The Brisbane Metro has no mirrors:
+ * small camera pods at the top front corners feed screens in the cab.
+ * Glass normals bisect "toward the driver's eye" and "straight back".
+ */
+export function mirrorHeads(B: BodyLayout, sec: SectionLayout): MirrorHead[] {
+  if (!sec.isFront) return [];
   const zo = -sec.axleFromFront;
   const hw = B.hw;
+  if (B.type === 'metro') {
+    const zf = frontZ(B, sec, 2.86);
+    return ([1, -1] as const).map((s) => {
+      const c = V(s * (hw + 0.07), 2.8, zf + 0.42 + zo);
+      return { side: s, kind: 'camera', c, w: 0.075, h: 0.09, d: 0.2, yaw: 0, pitch: 0, arm: [V(s * (hw - 0.02), 2.86, zf + 0.6 + zo), V(c.x, c.y + 0.02, c.z + 0.04)], armR: 0.022 };
+    });
+  }
+  const zl = frontZ(B, sec, 2.6);
+  const left: MirrorHead = {
+    side: -1,
+    kind: 'wing',
+    c: V(-(hw + 0.17), 2.22, zl - 0.32 + zo),
+    w: 0.2,
+    h: 0.36,
+    d: 0.085,
+    yaw: 0.46,
+    pitch: 0.065,
+    arm: [V(-(hw - 0.04), 2.96, zl + 0.32 + zo), V(-(hw + 0.08), 2.99, zl + zo), V(-(hw + 0.17), 2.84, zl - 0.26 + zo), V(-(hw + 0.17), 2.42, zl - 0.33 + zo)],
+    armR: 0.022,
+  };
+  const zr = frontZ(B, sec, 1.6);
+  const right: MirrorHead = {
+    side: 1,
+    kind: 'wing',
+    c: V(hw + 0.2, 1.62, zr + 0.14 + zo),
+    w: 0.19,
+    h: 0.31,
+    d: 0.08,
+    yaw: -0.3,
+    pitch: -0.1,
+    arm: [V(hw - 0.01, 1.3, zr + 0.42 + zo), V(hw + 0.13, 1.36, zr + 0.26 + zo), V(hw + 0.2, 1.47, zr + 0.17 + zo)],
+    armR: 0.02,
+  };
+  return [left, right];
+}
+
+/** Head frame: origin at the head centre, +z = glass normal. */
+export function mirrorFrame(m: MirrorHead): THREE.Matrix4 {
+  return mat4(m.c.x, m.c.y, m.c.z, m.pitch, m.yaw, 0);
+}
+
+export function addTrim(gb: GeoBuilder, B: BodyLayout, sec: SectionLayout, lv: Livery, low: boolean): void {
+  const zo = -sec.axleFromFront;
   const metro = B.type === 'metro';
   const black: RGB = rgb('#18191c');
   const white: RGB = rgb('#eceeef');
@@ -180,30 +259,21 @@ export function addTrim(gb: GeoBuilder, B: BodyLayout, sec: SectionLayout, lv: L
     }
   }
   if (!sec.isFront) return;
-  // mirrors (rams-horn on the Optimus, short stalks on the Metro)
-  const housing = lv.mirror;
-  for (const s of [1, -1]) {
-    const zf = frontZ(B, sec, 2.6);
-    if (metro) {
-      const base = V(s * (hw - 0.05), 2.55, zf + 0.45 + zo);
-      const head = V(s * (hw + 0.14), 2.42, zf + 0.12 + zo);
-      gb.rod(base, head, 0.02, black, 6);
-      gb.box(head.x - 0.075, head.y - 0.12, head.z - 0.035, head.x + 0.075, head.y + 0.12, head.z + 0.035, black);
-      if (!low) gb.quad(V(head.x - 0.065, head.y - 0.105, head.z + 0.037), V(head.x + 0.065, head.y - 0.105, head.z + 0.037), V(head.x + 0.065, head.y + 0.105, head.z + 0.037), V(head.x - 0.065, head.y + 0.105, head.z + 0.037), rgb('#556677'));
-    } else {
-      const p0 = V(s * (hw - 0.04), 2.96, zf + 0.32 + zo);
-      const p1 = V(s * (hw + 0.08), 2.99, zf + 0.0 + zo);
-      const p2 = V(s * (hw + 0.17), 2.86, zf - 0.28 + zo);
-      const p3 = V(s * (hw + 0.17), 2.68, zf - 0.36 + zo);
-      gb.rod(p0, p1, 0.022, black, 6);
-      gb.rod(p1, p2, 0.022, black, 6);
-      gb.rod(p2, p3, 0.022, black, 6);
-      const hx = s * (hw + 0.17), hy = 2.44, hz = zf - 0.37 + zo;
-      const g = roundedSlab(0.22, 0.38, 0.09, 0.05);
-      // slab is flat in XZ; stand it up so its large faces look forward/back
-      gb.add(g, new THREE.Matrix4().makeTranslation(hx, hy, hz).multiply(new THREE.Matrix4().makeRotationX(Math.PI / 2)).multiply(new THREE.Matrix4().makeTranslation(0, -0.045, 0)), housing);
-      g.dispose();
-      if (!low) gb.quad(V(hx - 0.09, hy - 0.16, hz + 0.047), V(hx + 0.09, hy - 0.16, hz + 0.047), V(hx + 0.09, hy + 0.16, hz + 0.047), V(hx - 0.09, hy + 0.16, hz + 0.047), rgb('#4f6070'));
+  // Optimus: kerb-side rams-horn mirror in the livery colour, short-arm black
+  // mirror on the driver's side. Metro: camera pods (camera monitor system).
+  for (const m of mirrorHeads(B, sec)) {
+    for (let i = 0; i < m.arm.length - 1; i++) gb.rod(m.arm[i], m.arm[i + 1], m.armR, black, 6);
+    const col = m.kind === 'camera' || m.side > 0 ? black : lv.mirror;
+    const g = roundedSlab(m.w + 0.03, m.h + 0.03, m.d, Math.min(0.05, m.w * 0.3));
+    // slab is flat in XZ; stand it up so its large faces look forward/back
+    gb.add(g, mirrorFrame(m).multiply(new THREE.Matrix4().makeRotationX(Math.PI / 2)).multiply(new THREE.Matrix4().makeTranslation(0, -m.d / 2 - 0.004, 0)), col);
+    g.dispose();
+    if (m.kind === 'camera' && !low) {
+      // lens on the rear face of the pod
+      const f = mirrorFrame(m);
+      const lens = new THREE.CylinderGeometry(0.022, 0.022, 0.01, 10);
+      gb.add(lens, f.multiply(new THREE.Matrix4().makeTranslation(0, -0.01, m.d / 2 + 0.002)).multiply(new THREE.Matrix4().makeRotationX(Math.PI / 2)), rgb('#0a1a2a'));
+      lens.dispose();
     }
   }
   if (low) return;
@@ -247,8 +317,9 @@ export function buildSignGeometry(B: BodyLayout, sec: SectionLayout, parts: ('fr
   const metro = B.type === 'metro';
   const white: RGB = [1, 1, 1];
   if (parts.includes('front') && sec.isFront) {
-    const [h0, h1] = metro ? [2.62, 2.84] : [2.755, 2.965];
-    const half = metro ? W / 2 - 0.36 : W / 2 - 0.3;
+    // ~1.7 x 0.32 m LED display (Hanover-style), behind the top of the glass
+    const [h0, h1] = metro ? [2.56, 2.88] : [2.53, 2.85];
+    const half = Math.min(0.86, W / 2 - 0.3);
     // follow the curved front in strips so the shell never pokes through
     const [u0, v0, u1, v1] = SIGN_UV.front;
     const n = 6;
@@ -377,6 +448,19 @@ function bellowsProfile(B: BodyLayout, low: boolean): [number, number, number, n
   return out.slice(0, PROFILE_N);
 }
 
+const _jm = new THREE.Matrix4();
+
+/**
+ * Centre of the rear face of section `prev` (at z = zRear in its own frame),
+ * expressed in the frame of section `cur`. Both roots must share a parent.
+ */
+export function jointInFrame(prev: THREE.Object3D, cur: THREE.Object3D, zRear: number, out: THREE.Vector3): THREE.Vector3 {
+  prev.updateMatrix();
+  cur.updateMatrix();
+  out.set(0, 0, zRear).applyMatrix4(prev.matrix);
+  return out.applyMatrix4(_jm.copy(cur.matrix).invert());
+}
+
 export class Bellows {
   readonly geometry: THREE.BufferGeometry;
   private readonly prof: [number, number, number, number][];
@@ -422,11 +506,13 @@ export class Bellows {
   /**
    * Fill the tube between the rear face of the section in front (centre `a`,
    * facing heading offset `angle` relative to this section, local frame) and
-   * this section's front face centre `b` (facing straight ahead).
+   * this section's front face centre `b` (facing straight ahead). `a.y` is
+   * the height of the other face relative to this section, so the tube stays
+   * closed when the sections sit at different levels or grades.
    */
   update(a: THREE.Vector3, angle: number, b: THREE.Vector3): void {
     // skip the rebuild when nothing moved (most AI buses most of the time)
-    const key = a.x * 1e3 + a.z * 7.1 + angle * 1e5 + b.z;
+    const key = a.x * 1e3 + a.z * 7.1 + a.y * 313.7 + angle * 1e5 + b.z;
     if (Math.abs(key - this.key) < 1e-3) return;
     this.key = key;
     const RINGS = this.rings;
@@ -439,6 +525,7 @@ export class Bellows {
       const dax = Math.sin(angle), daz = -Math.cos(angle);
       const cx = h00 * b.x + h10 * len * 0 + h01 * a.x + h11 * len * dax;
       const cz = h00 * b.z + h10 * len * -1 + h01 * a.z + h11 * len * daz;
+      const cy = b.y + (a.y - b.y) * (3 * t * t - 2 * t * t * t);
       const phi = angle * t;
       const rx = Math.cos(phi), rz = Math.sin(phi);
       const shrink = k % 2 ? 0.955 : 1;
@@ -449,7 +536,7 @@ export class Bellows {
         const sy = floor ? py : 0.34 + (py - 0.34) * (shrink === 1 ? 1 : 0.985);
         const j = (k * n + i) * 3;
         this.pos[j] = cx + rx * sx;
-        this.pos[j + 1] = sy;
+        this.pos[j + 1] = sy + cy;
         this.pos[j + 2] = cz + rz * sx;
         this.nor[j] = rx * nx;
         this.nor[j + 1] = ny;

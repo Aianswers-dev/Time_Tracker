@@ -4,6 +4,7 @@
  */
 import * as THREE from 'three';
 import { BuildingKind, RoadKind, type Building } from '../types';
+import { stationOwnsBuilding } from '../data/stations';
 import { type Ctx, densityAt } from './ctx';
 import { F_HIGHSET, F_PITCHED, F_ROOF, F_SOFFIT, F_TILE, Style, makeBuildingMaterial } from './facade';
 import { triangulate } from './ground';
@@ -402,6 +403,8 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
     const [x0, y0, x1, y1] = ringBounds(ring);
     box.set([x0, y0, x1, y1], bi * 4);
     grid.addBox(bi, x0, y0, x1, y1);
+    // canopy roofs, vaults and pavilions the station models replace (src/game/stations.ts)
+    if (stationOwnsBuilding(b, data.platforms)) continue;
     const area = Math.abs(signedArea(ring));
     // masts and spires mapped as tiny tall buildings read as white needles: skip them
     if (area < 30 && b.height > 25) continue;
