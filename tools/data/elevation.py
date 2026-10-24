@@ -1028,6 +1028,7 @@ def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5,
 
 
 OPEN_SPAN_DZ = 2.5  # m: a surface way this far above a tunnel road passes over it
+SHALLOW_CUT = 1.5  # m: a tunnel way with the ground less than this above it is in an open approach cut
 
 
 def _resample(xy: np.ndarray, z: np.ndarray, step: float):
@@ -1382,10 +1383,27 @@ def build(lines: list[Line], water_out: list[dict], buildings: list[dict], areas
 
     t = time.time()
     segs = []
+    nshallow = 0
     for ln, xy, z, piece_bridge in runs:
+        hw = 2.0 if ln.kind == RAIL else 0.5 * float(ln.meta.get("w", 6.0)) + 0.5
+        if ln.tunnel and not ln.bridge and not piece_bridge and len(xy) >= 2:
+            # the open approach of a tunnel way in a shallow cut (the ground
+            # less than SHALLOW_CUT above the road, short of the portal) is
+            # burned like an at-grade road, so the ground there is not above
+            # the carriageway (222 review #16: Eastern Busway tunnel exits)
+            rx, rz, _ = _resample(np.asarray(xy, np.float64), np.asarray(z, np.float64), 4.0)
+            shallow = (ground.sample(rx[:, 0], rx[:, 1]) - rz) < SHALLOW_CUT
+            idx = np.flatnonzero(shallow)
+            if len(idx):
+                for run in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1):
+                    if len(run) >= 2:
+                        segs.append((rx[run], rz[run], hw))
+                        nshallow += 1
+            continue
         if ln.bridge or ln.tunnel or piece_bridge:
             continue
-        segs.append((xy, z, 2.0 if ln.kind == RAIL else 0.5 * float(ln.meta.get("w", 6.0)) + 0.5))
+        segs.append((xy, z, hw))
+    log(f"{nshallow} shallow open approaches of tunnel ways burned like at-grade roads")
     platforms, buildings, bays, bay_segs = stations.build(roads, platforms or [], buildings)
     roads.extend(bays)
     segs.extend(bay_segs)
@@ -1518,11 +1536,12 @@ class RoadHeights:
     """The road segments of roads.json with their heights, for map matching."""
 
     def __init__(self, roads: list[dict]):
-        ax, ay, bx, by, za, zb, rid, ow = [], [], [], [], [], [], [], []
+        ax, ay, bx, by, za, zb, rid, ow, tn = [], [], [], [], [], [], [], [], []
         for k, r in enumerate(roads):
             if "z" not in r:
                 continue
             ow.append(np.full(len(r["p"]) // 2 - 1, bool(r.get("o"))))
+            tn.append(np.full(len(r["p"]) // 2 - 1, bool(r.get("t"))))
             p = np.asarray(r["p"], dtype=np.float64).reshape(-1, 2) * 0.1
             z = np.asarray(r["z"], dtype=np.float64) * 0.1
             ax.append(p[:-1, 0])
@@ -1536,10 +1555,11 @@ class RoadHeights:
         self.za, self.zb = np.concatenate(za), np.concatenate(zb)
         self.rid = np.concatenate(rid)
         self.oneway = np.concatenate(ow)
+        self.tunnel = np.concatenate(tn)
         segs = shapely.linestrings(np.stack([np.stack([self.ax, self.ay], -1), np.stack([self.bx, self.by], -1)], 1))
         self.tree = shapely.STRtree(segs)
 
-    def match(self, xy: np.ndarray, ground, radius: float = 18.0) -> tuple[np.ndarray, float]:
+    def match(self, xy: np.ndarray, ground, radius: float = 18.0, seg_out: np.ndarray | None = None) -> tuple[np.ndarray, float]:
         """Heights along a densely sampled polyline driven on the roads.
 
         A Viterbi pass over the candidate road segments near each sample:
@@ -1547,7 +1567,9 @@ class RoadHeights:
         fast as a road can climb, so a route on a viaduct stays up and one in
         a tunnel stays down even where other roads cross above or below it.
         Samples with no road nearby hold their height (drifting towards the
-        ground at 4 %). Returns (z per sample, fraction of samples off-road).
+        ground at 4 %). Returns (z per sample, fraction of samples off-road);
+        seg_out (int array, len(xy)) receives the matched segment of each
+        sample, -1 off-road.
         """
         n = len(xy)
         tang = np.zeros_like(xy)
@@ -1614,6 +1636,8 @@ class RoadHeights:
         for k in range(n - 1, -1, -1):
             out[k] = zs[k][s]
             off += s == len(zs[k]) - 1
+            if seg_out is not None:
+                seg_out[k] = -1 if s == len(zs[k]) - 1 else int(si[starts[k] + s])
             s = int(backs[k][s])
         # smooth the small steps between parallel candidates
         if n >= 5:
@@ -1621,6 +1645,77 @@ class RoadHeights:
             pad = np.concatenate([[out[0]] * 2, out, [out[-1]] * 2])
             out = np.convolve(pad, ker, mode="valid")
         return out, off / max(n, 1)
+
+
+    def snap_wrong_way(self, xy: np.ndarray, z: np.ndarray, seg: np.ndarray, blend: int = 6) -> tuple[np.ndarray, int]:
+        """Move route samples onto the tunnel tube their heights came from where
+        the GTFS line runs nearer a one-way road going the other way at another
+        level (twin tubes such as Ivory St's: 199 #1). The height match already
+        picks the right tube; with the plan left over the wrong one, the guide
+        lane follows the wrong tube. Only tunnels: GTFS lines in tubes are
+        often straight chords between the portals, while on the surface they
+        follow the street. Runs of moved samples blend back to the line over
+        `blend` samples, or 8 m per metre of offset if longer.
+        Returns (new xy, samples moved)."""
+        n = len(xy)
+        tang = np.zeros_like(xy)
+        tang[1:-1] = xy[2:] - xy[:-2]
+        tang[0] = xy[1] - xy[0]
+        tang[-1] = xy[-1] - xy[-2]
+        tang /= np.maximum(np.hypot(tang[:, 0], tang[:, 1]), 1e-9)[:, None]
+        off = np.zeros_like(xy)
+        mark = np.zeros(n, bool)
+        for k in np.flatnonzero(seg >= 0):
+            sg = int(seg[k])
+            if not self.oneway[sg] or not self.tunnel[sg]:
+                continue
+            dx, dy = self.bx[sg] - self.ax[sg], self.by[sg] - self.ay[sg]
+            L = math.hypot(dx, dy)
+            if L < 1e-6 or (dx * tang[k, 0] + dy * tang[k, 1]) / L < 0.3:
+                continue
+            t = min(1.0, max(0.0, ((xy[k, 0] - self.ax[sg]) * dx + (xy[k, 1] - self.ay[sg]) * dy) / (L * L)))
+            P = np.array([self.ax[sg] + t * dx, self.ay[sg] + t * dy])
+            dc = float(np.hypot(*(P - xy[k])))
+            if dc < 1.0:
+                continue
+            for c in self.tree.query(shapely.Point(xy[k]), predicate="dwithin", distance=dc - 0.5):
+                c = int(c)
+                if c == sg or not self.oneway[c] or self.rid[c] == self.rid[sg]:
+                    continue
+                ex, ey = self.bx[c] - self.ax[c], self.by[c] - self.ay[c]
+                Lc = math.hypot(ex, ey)
+                if Lc < 1e-6 or (ex * tang[k, 0] + ey * tang[k, 1]) / Lc > -0.3:
+                    continue
+                tc = min(1.0, max(0.0, ((xy[k, 0] - self.ax[c]) * ex + (xy[k, 1] - self.ay[c]) * ey) / (Lc * Lc)))
+                if abs(self.za[c] + tc * (self.zb[c] - self.za[c]) - z[k]) > 1.0:
+                    mark[k] = True
+                    off[k] = P - xy[k]
+                    break
+        if not mark.any():
+            return xy, 0
+        # close one- and two-sample holes, then blend each run's ends back to the line
+        idx = np.flatnonzero(mark)
+        for a, b in zip(idx[:-1], idx[1:]):
+            if 1 < b - a <= 3:
+                for k in range(a + 1, b):
+                    w = (k - a) / (b - a)
+                    off[k] = (1 - w) * off[a] + w * off[b]
+                    mark[k] = True
+        out = xy.copy()
+        out[mark] += off[mark]
+        idx = np.flatnonzero(mark)
+        runs = np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1)
+        step = float(np.median(np.hypot(*np.diff(xy, axis=0).T))) if n > 1 else 4.0
+        for run in runs:
+            a, b = int(run[0]), int(run[-1])
+            for end, sgn in ((a, -1), (b, 1)):
+                m = max(blend, int(math.ceil(8.0 * float(np.hypot(*off[end])) / max(step, 0.5))))
+                for j in range(1, m + 1):
+                    k = end + sgn * j
+                    if k < 0 or k >= n or mark[k]:
+                        break
+                    out[k] += (1.0 - j / (m + 1)) * off[end]
+        return out, int(mark.sum())
 
 
 def densify(xy: np.ndarray, step: float) -> np.ndarray:

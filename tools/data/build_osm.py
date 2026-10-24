@@ -16,8 +16,9 @@ import os
 import re
 import sys
 
+import numpy as np
 import osmium
-from shapely.geometry import Polygon, box
+from shapely.geometry import LineString, Polygon, box
 from shapely.ops import unary_union
 from shapely.validation import make_valid
 
@@ -149,6 +150,8 @@ class Handler(osmium.SimpleHandler):
         # (OSM node id, x, y, direction: +1 forward / -1 backward along the way, 0 both)
         self.signal_nodes: list[tuple[int, float, float, int]] = []
         self.width_tagged: set[int] = set()
+        # named man_made=bridge outlines: (polygon, name), see name_bridges()
+        self.bridge_outlines: list[tuple[Polygon, str]] = []
 
     def name(self, n: str | None) -> int:
         if not n:
@@ -250,8 +253,14 @@ class Handler(osmium.SimpleHandler):
                 "l": lanes,
                 "p": None,
             }
-            # the street name only: route numbers ("22;95") are not names (61 #19)
+            # the street name only: route numbers ("22;95") are not names (61 #19);
+            # on a busway bridge, the bridge's name when the way carries one (other
+            # roads keep their street name: landmarks.ts finds the Story Bridge deck
+            # by "Bradfield Highway")
             label = tags.get("name")
+            if bridge and (hw == "busway" or kind == 7) and tags.get("bridge:name"):
+                label = tags.get("bridge:name")
+                road["_bn"] = 1
             nm = self.name(label)
             if nm >= 0:
                 road["n"] = nm
@@ -296,6 +305,15 @@ class Handler(osmium.SimpleHandler):
     # Areas (buildings, water, parks) --------------------------------------
     def area(self, a):
         tags = a.tags
+        if tags.get("man_made") == "bridge" and tags.get("name"):
+            try:
+                for outer in a.outer_rings():
+                    xy = [project(n.lon, n.lat) for n in outer]
+                    if len(xy) >= 4 and any(in_bbox(n.lon, n.lat, 0.003) for n in outer):
+                        poly = Polygon(xy)
+                        self.bridge_outlines.append((poly if poly.is_valid else make_valid(poly), tags.get("name")))
+            except osmium.InvalidLocationError:
+                pass
         if a.from_way() and a.orig_id() in TAG_OVERRIDES:
             tags = {k: v for k, v in tags}
             for k, v in TAG_OVERRIDES[a.orig_id()].items():
@@ -456,6 +474,47 @@ class Handler(osmium.SimpleHandler):
 FOOTPATH = 1.5  # m kept between a kerb and a building face (cap_widths)
 
 
+def name_bridges(h: "Handler") -> int:
+    """Busway bridge ways inside a named man_made=bridge outline, with no
+    bridge:name of their own, take the bridge's name as their road name, so the
+    HUD names the bridge (Eleanor Schonell Bridge, rel 15398560, carries ways
+    named "Eastern Busway": M2 review #20). The way must run along the bridge
+    (within 25 degrees of the outline's long axis), not under or across it.
+    Only bus ways: other roads keep their street name (landmarks.ts finds the
+    Story Bridge deck by "Bradfield Highway")."""
+    if not h.bridge_outlines:
+        return 0
+    from shapely import STRtree
+    polys = [p for p, _ in h.bridge_outlines]
+    tree = STRtree(polys)
+    axes = []
+    for p in polys:
+        r = np.asarray(p.minimum_rotated_rectangle.exterior.coords)
+        e = [r[1] - r[0], r[2] - r[1]]
+        u = max(e, key=lambda v: float(np.hypot(*v)))
+        axes.append(u / max(float(np.hypot(*u)), 1e-9))
+    n = 0
+    for ln in h.lines:
+        if not ln.bridge or not ln.meta.get("bus") or ln.meta.get("_bn") or len(ln.xy) < 2:
+            continue
+        line = LineString(ln.xy)
+        best, share = None, 0.0
+        for i in tree.query(line, predicate="intersects"):
+            f = polys[int(i)].buffer(2.0).intersection(line).length / max(line.length, 1e-6)
+            if f > share:
+                best, share = int(i), f
+        if best is None or share < 0.6:
+            continue
+        d = np.asarray(ln.xy[-1], float) - np.asarray(ln.xy[0], float)
+        if abs(float(d @ axes[best])) < 0.9 * max(float(np.hypot(*d)), 1e-9):
+            continue
+        nm = h.bridge_outlines[best][1]
+        ln.meta["n"] = h.name(nm)
+        ln.name = nm
+        n += 1
+    return n
+
+
 def cap_widths(lines, buildings, tagged: set[int]) -> None:
     """Default road widths (lanes x lane width) that do not fit between the
     buildings along the road are narrowed to the building-free corridor less a
@@ -581,6 +640,8 @@ def main():
                     entry["h"] = [flat(r.coords[:-1]) for r in p.interiors if Polygon(r).area > 20]
                 water_out.append(entry)
 
+    nb = name_bridges(h)
+    print(f"bridges: {nb} bridge ways named after the man_made=bridge outline they lie in", file=sys.stderr)
     cap_widths(h.lines, h.buildings, h.width_tagged)
     # Heights: terrain cleaning, the road/rail solve, station platforms and bays,
     # terrain.bin, building bases.
@@ -589,6 +650,7 @@ def main():
     sig_road, sig_dir, sig_z = signal_roads(h.signal_nodes, h.lines, roads)
     for r in roads + rail:
         r.pop("_ln", None)
+        r.pop("_bn", None)
     for b in buildings:
         for k in ("_st", "_sh", "_up", "_id", "_br"):
             b.pop(k, None)
