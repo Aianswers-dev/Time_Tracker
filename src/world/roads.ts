@@ -23,6 +23,7 @@ import { MeshGeo } from './geo';
 import { RoadIndex, roadHeight } from './roadindex';
 import { NOISE_GLSL, patch } from './shaders';
 import type { TerrainField } from './terrain';
+import { storyOutline } from './landmarks';
 import { makeRoadTextTexture } from './textures';
 import { MASK_RAIL, MASK_WATER, clamp, pointInRing, yieldFrame } from './util';
 
@@ -398,6 +399,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   };
 
   const inWater = (x: number, y: number) => mask.has(x, y, MASK_WATER);
+  // the Story Bridge truss carries its own piers (landmarks.ts)
+  const story = storyOutline(ctx);
   const otherAt = (x: number, y: number, z: number, self: number, dz = 2.5) => index.penetrationZ(x, y, z, dz, self);
 
   for (let ri0 = 0; ri0 < infos.length; ri0++) {
@@ -1030,7 +1033,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
           placed = true;
           break;
         }
-        if (highDeck(sp) && inWater(c.x, c.y)) {
+        if ((highDeck(sp) && inWater(c.x, c.y)) || (story && pointInRing(c.x, c.y, story))) {
           placed = true;
           break;
         }

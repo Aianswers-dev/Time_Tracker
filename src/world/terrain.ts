@@ -408,7 +408,7 @@ export function makeTerrainMaterial(ctx: Ctx, land: { tex: THREE.Texture; rect: 
 // ---------------------------------------------------------------------------
 // Meshing
 
-const CH = 128;
+const CH = 192;
 const SKIRT = 8;
 
 interface LodChunk {
@@ -536,7 +536,7 @@ export async function buildTerrain(ctx: Ctx, f: TerrainField, mat: THREE.Materia
 
   // ---- outer horizon grid, with the inner area cut out (inner skirts cover the seam)
   const [ex0, ey0, ex1, ey1] = f.extent;
-  const OC = 72;
+  const OC = 144;
   for (let cj = 0; cj < f.ony - 1; cj += OC) {
     for (let ci = 0; ci < f.onx - 1; ci += OC) {
       const ci1 = Math.min(f.onx - 1, ci + OC);

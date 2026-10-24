@@ -300,11 +300,12 @@ export async function buildHouses(ctx: Ctx, roads: { infos: RI[]; index: RoadInd
   // ---- instanced meshes per building chunk
   const mat = makeHouseMaterial(ctx.tex.noise);
   const tpls = [houseTemplate(true, 0.12), houseTemplate(false, 0.28)];
-  const nx = Math.ceil((R[2] - R[0]) / CHUNK);
+  const HCH = CHUNK * 2;
+  const nx = Math.ceil((R[2] - R[0]) / HCH);
   const groups = new Map<number, H[][]>();
   for (const h of houses) {
-    const i = Math.max(0, Math.min(nx - 1, Math.floor((h.x - R[0]) / CHUNK)));
-    const j = Math.max(0, Math.floor((h.y - R[1]) / CHUNK));
+    const i = Math.max(0, Math.min(nx - 1, Math.floor((h.x - R[0]) / HCH)));
+    const j = Math.max(0, Math.floor((h.y - R[1]) / HCH));
     const key = j * nx + i;
     let g = groups.get(key);
     if (!g) {

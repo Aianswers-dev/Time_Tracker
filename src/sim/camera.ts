@@ -72,6 +72,8 @@ export class CameraRig {
   lookIntoTurns = true;
   /** The bus and cab last passed to update() (for tooling). */
   last: { bus: BusMesh; cab: Cab } | null = null;
+  /** Chase-camera internals from the last frame (for tooling). */
+  readonly debug: Record<string, number> = {};
 
   private collider: SimCollider | null;
   private interior: boolean | null = null;
@@ -355,6 +357,10 @@ export class CameraRig {
       if (oz < floor) oz = floor;
       // ...and pulled in along the line of sight past buildings, walls, tunnel walls and hillsides.
       const t = col.lineOfSight(cx, cy, bz + 2.0, cx + ox, cy + oy, bz + oz, L / 2 + 2);
+      this.debug.los = t;
+      this.debug.floor = floor;
+      this.debug.under = under.road;
+      this.debug.dist = Math.hypot(ox, oy);
       const lenO = Math.hypot(ox, oy, oz - 2);
       const target = t < 1 ? Math.max(0.15, t - 0.8 / Math.max(lenO, 1)) : 1;
       this.chasePull = damp(this.chasePull, target, target < this.chasePull ? 12 : 2, dt);

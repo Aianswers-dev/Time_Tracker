@@ -152,6 +152,8 @@ export class BusPhysics {
   private landing = 0;
   private save = { x: 0, y: 0, heading: 0, secs: [] as { x: number; y: number; heading: number }[] };
   private waterRecover = false;
+  /** Hill-start assist: seconds of brake hold left after the pedal is released at a stop. */
+  private hillHold = 0;
 
   constructor(readonly spec: BusSpec) {
     this.tuning = tuningFor(spec);
@@ -385,6 +387,18 @@ export class BusPhysics {
     let service = Math.max(0, pedal - retDecel);
     if (interlock) service = Math.max(service, 2.5);
     if (c.parkBrake) service = Math.max(service, 3.4);
+    // Hill-start assist: stopped on a grade with the brake applied, the brakes hold for up to 2.5 s after
+    // the pedal comes up, until the drive pulls harder than the slope.
+    const dirSign = selector === 'D' ? 1 : selector === 'R' ? -1 : 0;
+    const rollback = dirSign * gAlong < 0; // gravity pulls against the selected direction
+    const slopeAcc = rollback ? Math.abs(gAlong) : 0;
+    if (av < 0.05 && this.brakePressure > 0.25 && slopeAcc > 0.15) this.hillHold = 2.5;
+    else if (av > 0.3) this.hillHold = 0;
+    if (this.hillHold > 0) {
+      this.hillHold -= h;
+      if (Math.abs(drive) / m < slopeAcc) service = Math.max(service, slopeAcc + 0.2);
+      else this.hillHold = 0;
+    }
     if (kneelCap && av > 1.4) service = Math.max(service, 1.0);
     const engineDrag = throttle < 0.03 ? this.powertrain.dragForce(v) : 0;
     const grip = this.airborne ? 0 : 1;

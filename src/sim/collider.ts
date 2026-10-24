@@ -1162,6 +1162,21 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     return found;
   };
 
+  /** Inside the structure of a bridge deck (just under its surface, within its width)? */
+  const underDeck = (x: number, y: number, z: number): boolean => {
+    let found = false;
+    forEachRoadSegmentNear(x, y, 2, (s) => {
+      const l = lines[sLine[s]];
+      if (!l.bridge) return;
+      project(l, sIdx[s], x, y);
+      const w = l.width / 2 + 0.5;
+      if (PROJ.d2 < w * w && z < PROJ.z - 0.15 && z > PROJ.z - 1.8) {
+        found = true;
+        return true;
+      }
+    });
+    return found;
+  };
   const lineOfSight = (x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, openNear = 0): number => {
     const dx = x1 - x0;
     const dy = y1 - y0;
@@ -1189,9 +1204,11 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
         if (z >= walls.lo[w] && z <= walls.hi[w]) best = t;
       }
     }
-    // Solid ground (outside tunnel tubes, cuttings and bays).
+    // Solid ground (outside tunnel tubes, cuttings and bays), and bridge decks seen from below.
     const total = Math.hypot(len, dz);
-    const steps = Math.max(2, Math.ceil(total / 3));
+    const slope = Math.abs(dz) / Math.max(len, 1e-3);
+    const step = Math.min(3, 1.6 / Math.max(slope, 0.05));
+    const steps = Math.max(2, Math.ceil(total / step));
     for (let k = 1; k <= steps; k++) {
       const t = k / steps;
       if (t >= best) break;
@@ -1199,7 +1216,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       const x = x0 + dx * t;
       const y = y0 + dy * t;
       const z = z0 + dz * t;
-      if (z < H.ground(x, y) - 0.4 && !inCorridor(x, y, z)) {
+      if ((z < H.ground(x, y) - 0.4 && !inCorridor(x, y, z)) || underDeck(x, y, z)) {
         best = Math.max(0, t - 1 / steps);
         break;
       }

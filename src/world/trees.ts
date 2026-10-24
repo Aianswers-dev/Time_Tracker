@@ -74,7 +74,7 @@ const T_YARD: [SpName, number][] = [['street', 0.3], ['gum', 0.18], ['palm', 0.1
 const SPEC = [{ name: 'aPart', size: 1, type: 'f32' as const }];
 
 function lump(g: MeshGeo, cx: number, cy: number, cz: number, rx: number, ry: number, rz: number, detail: number, seed: number): void {
-  const ico = new THREE.IcosahedronGeometry(1, detail);
+  const ico = detail < 0 ? new THREE.OctahedronGeometry(1, 0) : new THREE.IcosahedronGeometry(1, detail);
   const p = ico.getAttribute('position');
   const idx: number[] = [];
   const r = rng(seed);
@@ -124,14 +124,14 @@ function trunk(g: MeshGeo, h: number, r0: number, r1: number, sides: number): vo
 
 function broadleaf(detail: number): THREE.BufferGeometry {
   const g = new MeshGeo(SPEC);
-  trunk(g, 0.42, 0.035, 0.022, detail > 0 ? 6 : 4);
+  trunk(g, 0.42, 0.035, 0.022, detail > 0 ? 6 : 3);
   if (detail > 0) {
     lump(g, 0, 0.56, 0, 0.38, 0.3, 0.38, 1, 11);
     lump(g, 0.17, 0.68, 0.1, 0.26, 0.24, 0.26, 0, 12);
     lump(g, -0.15, 0.66, -0.12, 0.27, 0.24, 0.27, 0, 13);
     lump(g, 0.02, 0.8, -0.02, 0.24, 0.2, 0.24, 0, 14);
   } else {
-    lump(g, 0, 0.62, 0, 0.47, 0.36, 0.47, 0, 15);
+    lump(g, 0, 0.62, 0, 0.5, 0.38, 0.5, -1, 15);
   }
   return g.build();
 }
@@ -253,6 +253,7 @@ export async function buildTrees(
 ): Promise<number> {
   const { data, mask, R } = ctx;
   const index = roads.index;
+  lodPairs.length = 0;
   const list: Inst[] = [];
   const r = rng(4242);
   const blocked = (x: number, y: number, rad: number, flags = MASK_BUILDING | MASK_WATER | MASK_POOL | MASK_RAIL | MASK_SPORT) =>
@@ -374,8 +375,10 @@ export async function buildTrees(
       const flower = new Float32Array(n * 4);
       const trunkC = new Float32Array(n * 3);
       const hi = new THREE.InstancedMesh(tplHi[tpl], mat, n);
-      let cx = 0;
-      let cz = 0;
+      let x0 = Infinity;
+      let x1 = -Infinity;
+      let z0 = Infinity;
+      let z1 = -Infinity;
       items.forEach((it, i) => {
         const sp: Species = SP[it.sp];
         const hgt = sp.h[0] + (sp.h[1] - sp.h[0]) * it.s;
@@ -393,8 +396,10 @@ export async function buildTrees(
         flower.set([col.r, col.g, col.b, sp.flowerAmt * (0.6 + hash2(it.x, it.y, 15) * 0.8)], i * 4);
         col.setHex(sp.trunk);
         trunkC.set([col.r, col.g, col.b], i * 3);
-        cx += it.x;
-        cz -= it.y;
+        x0 = Math.min(x0, it.x);
+        x1 = Math.max(x1, it.x);
+        z0 = Math.min(z0, -it.y);
+        z1 = Math.max(z1, -it.y);
       });
       const fAttr = new THREE.InstancedBufferAttribute(flower, 4);
       const tAttr = new THREE.InstancedBufferAttribute(trunkC, 3);
@@ -413,22 +418,22 @@ export async function buildTrees(
       lo.boundingSphere = hi.boundingSphere;
       lo.name = `trees-lo-${key}-${tpl}`;
       ctx.root.add(hi, lo);
-      cx /= n;
-      cz /= n;
-      ctx.cull.push({ obj: hi, x: cx, z: cz, range: 750 });
-      // far LOD shown beyond the near range (handled by a tick below)
-      lodPairs.push({ hi, lo, x: cx, z: cz });
+      // near/far LOD by distance to the chunk's extent (handled by a tick below)
+      lodPairs.push({ hi, lo, x0, x1, z0, z1 });
     }
   }
   ctx.tick.push((_dt, camera) => {
     const p = camera.position;
     for (const l of lodPairs) {
-      const d = Math.hypot(l.x - p.x, l.z - p.z);
-      l.lo.visible = d >= 750 && d < 7000;
+      const dx = Math.max(l.x0 - p.x, 0, p.x - l.x1);
+      const dz = Math.max(l.z0 - p.z, 0, p.z - l.z1);
+      const d = Math.hypot(dx, dz);
+      l.hi.visible = d < 380;
+      l.lo.visible = d >= 380 && d < 2600;
     }
   });
   progress(1);
   return list.length;
 }
 
-const lodPairs: { hi: THREE.InstancedMesh; lo: THREE.InstancedMesh; x: number; z: number }[] = [];
+const lodPairs: { hi: THREE.InstancedMesh; lo: THREE.InstancedMesh; x0: number; x1: number; z0: number; z1: number }[] = [];

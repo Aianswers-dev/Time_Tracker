@@ -415,6 +415,17 @@ function grade(spec: BusSpec): void {
   check('grade: rolls back with no brake (speed)', roll.p.pose.speed, -10, -0.5, 'm/s');
   const pb = drive(spec, col, [0, 200, 0, zAt(200)], 6, (t) => ({ gear: 'N', pressed: new Set(t === 0 ? ['parkBrake' as const] : []) }));
   check('grade: park brake holds on 6 %', Math.abs(pb.p.pose.speed), 0, 0.01, 'm/s');
+  // Hill-start assist: stop on the hill, release the brake, throttle a second later: no roll-back.
+  let y0 = 0;
+  let minY = Infinity;
+  const ha = drive(spec, col, [0, 200, 0, zAt(200)], 6, (t, p) => {
+    if (t < 1) return { brake: 1 };
+    if (t < 1 + DT) y0 = p.pose.y;
+    if (t > 1) minY = Math.min(minY, p.pose.y);
+    return t < 2 ? {} : { throttle: 0.6 };
+  });
+  check('grade: hill-start assist, roll-back before pulling away', y0 - minY, 0, 0.05, 'm');
+  check('grade: hill-start assist, then pulls away uphill', ha.p.pose.y - y0, 0.5, 100, 'm');
   // Hill start at full throttle.
   const hs = rollFrom(15, { throttle: 1 });
   check('grade: full-throttle hill start, speed after 15 s', hs.p.pose.speed * 3.6, 25, 60, 'km/h');
