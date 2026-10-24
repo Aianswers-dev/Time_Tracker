@@ -184,6 +184,7 @@ let mats: {
   tactile: THREE.MeshLambertMaterial;
   canopy: THREE.MeshLambertMaterial;
   caseMat: THREE.MeshLambertMaterial;
+  lamp: THREE.MeshBasicMaterial;
   ads: THREE.MeshBasicMaterial[];
 } | null = null;
 
@@ -239,8 +240,9 @@ function materials(): NonNullable<typeof mats> {
     bench: new THREE.MeshLambertMaterial({ color: 0x8a6a4a }),
     concrete: new THREE.MeshLambertMaterial({ color: 0xb9b6ae }),
     tactile: new THREE.MeshLambertMaterial({ color: 0xf2c200, emissive: 0x332700 }),
-    canopy: new THREE.MeshLambertMaterial({ color: 0xeef1f4, side: THREE.DoubleSide }),
+    canopy: new THREE.MeshLambertMaterial({ color: 0xeef1f4, emissive: 0x3c4248, side: THREE.DoubleSide }),
     caseMat: new THREE.MeshLambertMaterial({ color: 0x1b2a44 }),
+    lamp: new THREE.MeshBasicMaterial({ color: 0xfff1d6 }),
     ads,
   };
   return mats;
@@ -276,6 +278,8 @@ export function shelterParts(adVariant: number): Part[] {
   const parts: Part[] = [
     // Roof slab, cantilevered towards the road.
     { geo: box(D + 0.35, 0.12, L + 0.3, 0.2, H, 0), mat: m.roof },
+    // LED strip under the roof.
+    { geo: box(0.12, 0.02, L - 0.6, -0.1, H - 0.07, 0), mat: m.lamp },
     // Back posts.
     { geo: box(0.08, H, 0.08, -D / 2, H / 2, -L / 2 + 0.1), mat: m.frame },
     { geo: box(0.08, H, 0.08, -D / 2, H / 2, L / 2 - 0.1), mat: m.frame },
@@ -369,6 +373,7 @@ export function stationGroup(name: string): THREE.Group {
   // Canopy on a row of columns at the back.
   for (let z = -L / 2 + 2; z <= L / 2 - 2; z += 6) add(box(0.22, 4.2, 0.22, -W + 0.4, 2.42, z), m.frame);
   add(box(W + 1.0, 0.18, L - 1, -W / 2 + 0.3, 4.55, 0), m.canopy);
+  for (const x of [-W + 1.0, -1.0]) add(box(0.14, 0.03, L - 3, x, 4.44, 0), m.lamp);
   add(box(0.12, 0.35, L - 1, 0.75, 4.4, 0), m.roof);
   // Back glass balustrade.
   add(box(0.03, 1.1, L - 2, -W + 0.15, 0.32 + 0.55, 0), m.glass);

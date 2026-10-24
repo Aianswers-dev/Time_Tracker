@@ -5,6 +5,8 @@
 import * as THREE from 'three';
 import { AreaKind, BuildingKind, type MapData, type WorldHandle } from '../types';
 import { buildBuildings } from './buildings';
+import { buildHouses } from './houses';
+import { buildTrees } from './trees';
 import type { Ctx, Extras } from './ctx';
 import { INNER_PAD, buildGround, buildOuter, makeGroundMaterial } from './ground';
 import { buildRoads } from './roads';
@@ -140,7 +142,12 @@ export async function buildWorld(
   const roads = await buildRoads(ctx, [], (f) => onProgress(0.16 + f * 0.24, 'Paving roads…'));
 
   await step(0.4, 'Raising buildings…');
-  await buildBuildings(ctx, (f) => onProgress(0.4 + f * 0.35, 'Raising buildings…'));
+  const bidx = await buildBuildings(ctx, (f) => onProgress(0.4 + f * 0.3, 'Raising buildings…'));
+  await step(0.7, 'Building Queenslanders…');
+  const houses = await buildHouses(ctx, roads, bidx, (f) => onProgress(0.7 + f * 0.1, 'Building Queenslanders…'));
+  await step(0.8, 'Planting jacarandas…');
+  const nTrees = await buildTrees(ctx, roads, houses.yards, (f) => onProgress(0.8 + f * 0.1, 'Planting jacarandas…'));
+  console.info(`[world] ${houses.count} generated houses, ${nTrees} trees`);
 
   await step(1, 'City ready');
   console.info(`[world] built in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
@@ -148,7 +155,8 @@ export async function buildWorld(
   const camPos = new THREE.Vector3();
   let infoTimer = 0;
   const debug = location.search.includes('world=debug');
-  const dbgWin = window as unknown as { __worldCam?: number[]; __worldHours?: number; __worldInfo?: () => string };
+  const dbgWin = window as unknown as { __worldCam?: number[]; __worldHours?: number; __worldInfo?: () => string; __worldRoot?: THREE.Group };
+  if (debug) dbgWin.__worldRoot = root;
   if (debug) dbgWin.__worldInfo = () => `calls ${renderer.info.render.calls} tris ${renderer.info.render.triangles} geos ${renderer.info.memory.geometries} tex ${renderer.info.memory.textures}`;
   return {
     update(dt: number, camera: THREE.Camera, hours: number) {

@@ -242,8 +242,8 @@ function optimusLayout(type: BusType): BodyLayout {
         isFront: true,
         isRear: true,
         doors: [
-          { z0: 0.28, z1: 1.43, style: 'swing' },
-          { z0: 5.6, z1: 6.8, style: 'swing' },
+          { z0: 0.28, z1: 1.43, style: 'slide' },
+          { z0: 5.6, z1: 6.8, style: 'slide' },
         ],
         windowsL: [W(1.55, 3.4, sill, top), W(3.5, 5.45, sill, top), W(6.95, 8.1, sill, top), W(8.2, 10.05, sill, top), W(10.15, 11.55, sill, top), W(11.65, 12.15, sill + 0.1, top)],
         windowsR: [W(0.24, 1.55, 0.98, top), W(1.65, 3.4, sill, top), W(3.5, 5.45, sill, top), W(5.55, 7.4, sill, top), W(7.5, 9.35, sill, top), W(9.45, 11.55, sill, top), W(11.65, 12.15, sill + 0.1, top)],

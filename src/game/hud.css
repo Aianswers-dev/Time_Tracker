@@ -592,7 +592,8 @@
 .bbh-prompt {
   position: absolute;
   left: 50%;
-  bottom: calc(max(16px, env(safe-area-inset-bottom)) + 8px);
+  /* Above the in-cab dashboard. */
+  bottom: max(26vh, 150px);
   transform: translate(-50%, 10px);
   padding: 9px 16px;
   font-size: 15px;
@@ -1015,6 +1016,8 @@
     font-size: 17px;
   }
 }
+/* Narrow screens: keep the prompt clear of the minimap and the cluster. */
+
 /* Touch devices: the driving controls own the bottom of the screen and the
    top-right corner, so the console stacks down the left and right edges. */
 @media (pointer: coarse) {

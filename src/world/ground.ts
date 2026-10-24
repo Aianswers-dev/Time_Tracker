@@ -302,7 +302,7 @@ varying float vSurf;
 varying vec3 vGPos;
 ${NOISE_GLSL}
 vec3 srgb(vec3 c) { return pow(c, vec3(2.2)); }
-float w_aa(float v, float w) { float f = fwidth(v); return smoothstep(w + f, w - f, v); }
+float w_aa(float v, float w, float fwv) { float f = max(fwv, 1e-3); return 1.0 - w_ss(w - f, w + f, v); }
 vec3 lawnCol(vec2 p, vec4 n1, vec4 n2, vec4 n3) {
   vec3 green = vec3(0.38, 0.47, 0.25);
   vec3 dry = vec3(0.56, 0.53, 0.36);
@@ -316,10 +316,12 @@ vec3 groundAlbedo(out float emis) {
   vec4 n1 = texture2D(uNoise, p / 23.0);
   vec4 n2 = texture2D(uNoise, p / 190.0);
   vec4 n3 = texture2D(uNoise, p / 4.3);
+  vec4 o = texture2D(uOuter, (p - uOuterRect.xy) * uOuterRect.zw);
+  float dens = texture2D(uDensity, (p - uDensityRect.xy) * uDensityRect.zw).r;
+  vec2 FWP = fwidth(p);
   float s = floor(vSurf + 0.5);
   vec3 c;
   if (s < 0.5) {
-    float dens = texture2D(uDensity, (p - uDensityRect.xy) * uDensityRect.zw).r;
     vec3 lawn = lawnCol(p, n1, n2, n3);
     vec3 conc = vec3(0.60, 0.59, 0.55) * (0.88 + 0.2 * n3.r) * (0.9 + 0.2 * n1.g);
     vec3 lot = vec3(0.30, 0.30, 0.31) * (0.9 + 0.2 * n3.r);
@@ -337,7 +339,7 @@ vec3 groundAlbedo(out float emis) {
     c = mix(lawnCol(p, n1, n2, n3), vec3(0.62, 0.61, 0.58), g * 0.8);
   } else if (s < 5.5) {
     vec2 q = fract(p / 0.6);
-    float joint = max(w_aa(abs(q.x - 0.5), 0.03), w_aa(abs(q.y - 0.5), 0.03));
+    float joint = max(w_aa(0.5 - abs(q.x - 0.5), 0.03, FWP.x / 0.6), w_aa(0.5 - abs(q.y - 0.5), 0.03, FWP.y / 0.6));
     c = mix(vec3(0.70, 0.66, 0.60), vec3(0.58, 0.55, 0.50), n1.g * 0.6) * (0.94 + 0.12 * n3.r);
     c *= 1.0 - joint * 0.18;
   } else if (s < 6.5) {
@@ -347,7 +349,6 @@ vec3 groundAlbedo(out float emis) {
     c = mix(vec3(0.22, 0.62, 0.74), vec3(0.55, 0.85, 0.92), smoothstep(0.55, 0.85, rip));
     emis = uNight * 0.35;
   } else if (s < 8.5) {
-    float dens = texture2D(uDensity, (p - uDensityRect.xy) * uDensityRect.zw).r;
     float h = vGPos.y;
     vec3 mud = mix(vec3(0.33, 0.29, 0.22), vec3(0.22, 0.20, 0.16), smoothstep(-1.2, -2.4, h));
     vec3 top = mix(vec3(0.30, 0.36, 0.20), mud, smoothstep(-0.2, -0.9, h + (n3.r - 0.5) * 0.5));
@@ -356,7 +357,6 @@ vec3 groundAlbedo(out float emis) {
     c = mix(top, wall, smoothstep(0.15, 0.35, dens));
     c *= 0.85 + 0.3 * n1.r;
   } else if (s < 9.5) {
-    vec4 o = texture2D(uOuter, (p - uOuterRect.xy) * uOuterRect.zw);
     float veg = o.g;
     vec3 lawn = lawnCol(p, n1, n2, n3);
     // suburb: little roofs and trees on ~18 m lots, faded out where too fine to see
@@ -369,7 +369,7 @@ vec3 groundAlbedo(out float emis) {
     float tree = smoothstep(0.55, 0.7, n1.g + n3.r * 0.3);
     vec3 sub = mix(lawn, roofCol, roof);
     sub = mix(sub, vec3(0.20, 0.30, 0.15), tree * 0.7);
-    float far = smoothstep(2.0, 6.0, length(fwidth(p)));
+    float far = smoothstep(2.0, 6.0, length(FWP));
     vec3 subAvg = mix(lawn, vec3(0.45, 0.42, 0.38), 0.35 + o.r * 0.4) * 0.85;
     sub = mix(sub, subAvg, far);
     vec3 forest = mix(vec3(0.17, 0.25, 0.12), vec3(0.24, 0.32, 0.16), n2.g) * (0.85 + 0.3 * n1.r);

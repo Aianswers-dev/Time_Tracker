@@ -320,6 +320,8 @@ export class Hud {
       if (!g.shiftStarted && Math.abs(f.speedKmh) < 1.5) prompt = f.parkBrake ? 'Ready to depart · release the park brake <kbd>F</kbd> and pull out' : 'Ready to depart · indicate <kbd>E</kbd> and pull out when clear';
       else if (hasNext && g.canServe && !f.doorsOpen) prompt = `Open the doors <kbd>O</kbd> to serve ${escapeHtml(g.nextStopName)}`;
       else if (hasNext && g.atStop && !f.doorsOpen && f.speedKmh > 2) prompt = 'Stop at the flag to serve this stop';
+      else if (f.doorsOpen && f.speedKmh < 1 && g.shiftStarted && !g.atStop && g.scheduleDelta < -59)
+        prompt = `Running early · hold here for ${fmtDelta(-g.scheduleDelta).replace('+', '')}`;
       else if (f.doorsOpen && f.speedKmh < 1 && g.shiftStarted && !g.atStop) prompt = 'Close the doors <kbd>O</kbd> when ready';
     }
     if (prompt) {
@@ -407,7 +409,6 @@ export class Hud {
     this.mapOpen = !this.mapOpen;
     this.f.map.set(this.mapOpen);
     if (this.mapOpen && this.full && this.lastFrame) {
-      this.full.invalidate();
       requestAnimationFrame(() => {
         const f = this.lastFrame;
         if (!f || !this.full) return;

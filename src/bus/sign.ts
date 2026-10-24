@@ -52,7 +52,7 @@ function splitHeadsign(h: string): [string, string] | null {
 
 /** Rasterise a panel's text at LED resolution, returning per-LED brightness 0..1. */
 function rasterise(panel: Panel, draw: (c: CanvasRenderingContext2D, cols: number, rows: number) => void): Float32Array {
-  const { ctx } = makeCanvas(panel.cols, panel.rows);
+  const { ctx } = makeCanvas(panel.cols, panel.rows, true);
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, panel.cols, panel.rows);
   ctx.fillStyle = '#fff';

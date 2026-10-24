@@ -166,11 +166,11 @@ export function mat4(x: number, y: number, z: number, rx = 0, ry = 0, rz = 0, sx
 // ---------------------------------------------------------------------------
 // Canvas helpers
 
-export function makeCanvas(w: number, h: number): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } {
+export function makeCanvas(w: number, h: number, readback = false): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } {
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', readback ? { willReadFrequently: true } : undefined);
   if (!ctx) throw new Error('2D canvas unavailable');
   return { canvas, ctx };
 }

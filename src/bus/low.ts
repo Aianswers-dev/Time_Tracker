@@ -12,7 +12,7 @@ import { atlasLayout, buildShell } from './shell';
 import { paintSection } from './paint';
 import { liveryFor, makeLivery, type Livery, type LiveryId } from './livery';
 import { lampGeometry } from './lamps';
-import { buildDark, buildSignGeometry, lowBellowsGeometry } from './parts';
+import { Bellows, buildDark, buildSignGeometry } from './parts';
 import { envMap } from './materials';
 import { blankSignMaterial, signMaterial } from './sign';
 import { canvasTexture } from './util';
@@ -35,10 +35,11 @@ interface LowSec {
 interface LowAssets {
   lv: Livery;
   secs: LowSec[];
-  bellows: THREE.BufferGeometry | null;
 }
 
 const cache = new Map<string, LowAssets>();
+const _a = new THREE.Vector3();
+const _b = new THREE.Vector3();
 let darkMat: THREE.MeshLambertMaterial | null = null;
 let glowMat: THREE.MeshBasicMaterial | null = null;
 let bellowsMat: THREE.MeshLambertMaterial | null = null;
@@ -65,13 +66,13 @@ function assetsFor(type: BusType, id: LiveryId): LowAssets {
     const map = canvasTexture(paint.color);
     const emissiveMap = canvasTexture(paint.emissive);
     const roughnessMap = canvasTexture(paint.rough, false);
-    const base = { map, roughnessMap, roughness: 1, metalness: 0, alphaTest: 0.5, envMap: env, emissive: new THREE.Color(0xfff0d8), emissiveMap };
+    const base = { map, roughnessMap, roughness: 1, metalness: 0, alphaTest: 0.5, envMap: env, emissive: new THREE.Color(0xfff4e6), emissiveMap };
     const day = new THREE.MeshStandardMaterial({ ...base, envMapIntensity: 0.8, emissiveIntensity: 0 });
-    const night = new THREE.MeshStandardMaterial({ ...base, envMapIntensity: 0.2, emissiveIntensity: 0.85 });
+    const night = new THREE.MeshStandardMaterial({ ...base, envMapIntensity: 0.2, emissiveIntensity: 0.6 });
     return {
       L,
       shell: buildShell(B, L, atlas, { detail: 'low' }),
-      dark: buildDark(B, L, { doorWells: true, staticWheels: true, lowTrim: lv }),
+      dark: buildDark(B, L, { doorWells: true, staticWheels: true, jointCaps: true, lowTrim: lv }),
       day,
       night,
       sign: buildSignGeometry(B, L, ['front', 'side', 'rear']),
@@ -82,7 +83,7 @@ function assetsFor(type: BusType, id: LiveryId): LowAssets {
       indB: lampGeometry(B, L, ['indL', 'indR'], 0.008, 1.3),
     };
   });
-  const a: LowAssets = { lv, secs, bellows: B.sections.length > 1 ? lowBellowsGeometry(B) : null };
+  const a: LowAssets = { lv, secs };
   cache.set(key, a);
   return a;
 }
@@ -98,7 +99,7 @@ export function createLowBus(spec: BusSpec, route: Route | undefined): BusMesh {
     halo: THREE.Mesh | null;
     brake: THREE.Mesh | null;
     ind: THREE.Mesh | null;
-    bellows: THREE.Mesh | null;
+    bellows: Bellows | null;
     a: LowSec;
   };
   const parts: Parts[] = A.secs.map((a, i) => {
@@ -119,12 +120,13 @@ export function createLowBus(spec: BusSpec, route: Route | undefined): BusMesh {
     if (h) h.renderOrder = 5;
     const brake = mk(a.brake, M.glow, false);
     const ind = mk(a.indB, M.glow, false);
-    let bellows: THREE.Mesh | null = null;
-    if (i > 0 && A.bellows) {
-      bellows = new THREE.Mesh(A.bellows, M.bellows);
-      bellows.position.set(0, 0, a.L.bodyFront - a.L.axleFromFront - 0.3);
-      bellows.scale.set(1, 1, 0.6);
-      root.add(bellows);
+    let bellows: Bellows | null = null;
+    if (i > 0) {
+      // per-bus (tiny) deforming bellows so bent joints stay closed
+      bellows = new Bellows(layoutFor(spec.type), true);
+      const bm = new THREE.Mesh(bellows.geometry, M.bellows);
+      bm.frustumCulled = false;
+      root.add(bm);
     }
     return { root, shell, sign, halo: h, brake, ind, bellows, a };
   });
@@ -155,9 +157,9 @@ export function createLowBus(spec: BusSpec, route: Route | undefined): BusMesh {
         const bz = s.a.L.bodyFront - s.a.L.axleFromFront;
         let ang = pp.heading - pc.heading;
         ang = Math.atan2(Math.sin(ang), Math.cos(ang));
-        s.bellows.position.set(ax / 2, 0, (az + bz) / 2);
-        s.bellows.rotation.y = -ang / 2;
-        s.bellows.scale.z = Math.max(0.05, Math.hypot(ax, az - bz));
+        _a.set(ax, 0, az);
+        _b.set(0, 0, bz);
+        s.bellows.update(_a, ang, _b);
       }
     },
     setLights(l: BusLights, t: number) {
@@ -187,7 +189,10 @@ export function createLowBus(spec: BusSpec, route: Route | undefined): BusMesh {
     },
     setInteriorView() {},
     dispose() {
-      for (const p of parts) p.root.removeFromParent();
+      for (const p of parts) {
+        p.root.removeFromParent();
+        p.bellows?.geometry.dispose();
+      }
     },
   };
   if (route) mesh.setDestination({ route: route.id, headsign: route.headsign });

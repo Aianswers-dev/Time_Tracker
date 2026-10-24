@@ -1,10 +1,10 @@
 // Screenshot helper for the bus preview (adapted from tools/shot/shot.mjs).
 // Usage: node src/bus/shot.mjs "<query>" out.png [waitMs] [evalExpr]
-//   SHOT_URL defaults to http://localhost:5175/src/bus/preview.html
+//   SHOT_URL defaults to http://localhost:5176/src/bus/preview.html
 import { chromium } from 'playwright-core';
 
 const [query = '', out = 'shot.png', wait = '6000', expr = ''] = process.argv.slice(2);
-const base = process.env.SHOT_URL ?? 'http://localhost:5175/src/bus/preview.html';
+const base = process.env.SHOT_URL ?? 'http://localhost:5176/src/bus/preview.html';
 const browser = await chromium.launch({
   executablePath: process.env.CHROMIUM ?? '/opt/pw-browsers/chromium-1243/chrome-linux64/chrome',
   args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'],

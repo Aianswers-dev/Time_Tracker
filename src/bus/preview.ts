@@ -27,7 +27,7 @@ const sun = new THREE.DirectionalLight(0xffffff, night ? 0.05 : 1.6);
 sun.position.set(-30, 60, 25);
 scene.add(sun);
 const ground = new THREE.Mesh(new THREE.PlaneGeometry(400, 400).rotateX(-Math.PI / 2), new THREE.MeshLambertMaterial({ color: 0x55585c }));
-scene.add(ground);
+if (q.get('bare') !== '1') scene.add(ground);
 // lane markings + kerb for scale
 const marks = new THREE.Group();
 for (let z = -100; z < 100; z += 6) {
@@ -41,7 +41,7 @@ marks.add(kerb);
 const footpath = new THREE.Mesh(new THREE.BoxGeometry(4, 0.15, 200), new THREE.MeshLambertMaterial({ color: 0x9c978c }));
 footpath.position.set(-4.5, 0.075, 0);
 marks.add(footpath);
-scene.add(marks);
+if (q.get('bare') !== '1') scene.add(marks);
 
 const ROUTES: Record<string, [string, string]> = {
   '60': ['West End Ferry', 'BT'],
@@ -140,7 +140,9 @@ function place(time: number): void {
   if (q.get('view') === 'cab' && cab) {
     const g = buses[0].bus.sections[0];
     g.updateMatrixWorld();
-    camera.position.copy(cab.eye).applyMatrix4(g.matrixWorld);
+    const e = cab.eye.clone();
+    if (q.has('ez')) e.set(num('ex', e.x), num('ey', e.y), num('ez', e.z));
+    camera.position.copy(e).applyMatrix4(g.matrixWorld);
     camera.rotation.set((num('cpitch', 0) * Math.PI) / 180, (num('look', 0) * Math.PI) / 180, 0, 'YXZ');
     return;
   }

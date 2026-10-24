@@ -51,7 +51,7 @@ export function wheelSlots(B: BodyLayout, sec: SectionLayout): WheelSlot[] {
 // ---------------------------------------------------------------------------
 // Underbody, wheel housings, door wells, mud flaps (dark, double sided)
 
-export function buildDark(B: BodyLayout, sec: SectionLayout, opts: { underbody?: boolean; doorWells: boolean; staticWheels: boolean; lowTrim?: Livery | null }): THREE.BufferGeometry {
+export function buildDark(B: BodyLayout, sec: SectionLayout, opts: { underbody?: boolean; doorWells: boolean; staticWheels: boolean; jointCaps?: boolean; lowTrim?: Livery | null }): THREE.BufferGeometry {
   const gb = new GeoBuilder();
   const zo = -sec.axleFromFront;
   const dark: RGB = rgb('#141517');
@@ -78,6 +78,20 @@ export function buildDark(B: BodyLayout, sec: SectionLayout, opts: { underbody?:
     }
     // axle beam
     gb.box(-hw + 0.5, B.tyreR - 0.06, ax.z - 0.07 + zo, hw - 0.5, B.tyreR + 0.06, ax.z + 0.07 + zo, dark);
+  }
+  if (opts.jointCaps) {
+    // close the open ends of articulated bodies (seen only from outside)
+    const ends: number[] = [];
+    if (!sec.isFront) ends.push(sec.bodyFront + 0.004);
+    if (!sec.isRear) ends.push(sec.bodyRear - 0.004);
+    for (const ze of ends) {
+      const z = ze + zo;
+      const x = hw - 0.03;
+      const facingFwd = ze < (sec.bodyFront + sec.bodyRear) / 2;
+      const a = V(-x, 0.33, z), b = V(x, 0.33, z), c = V(x, B.yTop - 0.06, z), d = V(-x, B.yTop - 0.06, z);
+      if (facingFwd) gb.quad(b, a, d, c, rgb('#16171a'));
+      else gb.quad(a, b, c, d, rgb('#16171a'));
+    }
   }
   if (opts.doorWells) {
     for (const d of sec.doors) {
@@ -122,8 +136,9 @@ function roundedSlab(w: number, l: number, h: number, r: number): THREE.BufferGe
   s.quadraticCurveTo(x0, y1, x0, y1 - r);
   s.lineTo(x0, y0 + r);
   s.quadraticCurveTo(x0, y0, x0 + r, y0);
-  const bev = Math.min(0.06, h * 0.45);
-  const g = new THREE.ExtrudeGeometry(s, { depth: h - bev, bevelEnabled: true, bevelThickness: bev, bevelSize: bev * 0.9, bevelSegments: 2, curveSegments: 3 });
+  // bevel grows both caps outward, so the core depth is h - 2 * bev
+  const bev = Math.min(0.06, h * 0.3);
+  const g = new THREE.ExtrudeGeometry(s, { depth: Math.max(0.001, h - 2 * bev), bevelEnabled: true, bevelThickness: bev, bevelSize: bev * 0.9, bevelSegments: 2, curveSegments: 3 });
   g.rotateX(-Math.PI / 2);
   g.translate(0, bev, 0);
   return g;
@@ -160,11 +175,11 @@ export function addTrim(gb: GeoBuilder, B: BodyLayout, sec: SectionLayout, lv: L
   for (const s of [1, -1]) {
     const zf = frontZ(B, sec, 2.6);
     if (metro) {
-      const base = V(s * (hw - 0.03), 2.35, zf + 0.25 + zo);
-      const head = V(s * (hw + 0.2), 2.3, zf - 0.05 + zo);
-      gb.rod(base, head, 0.025, black, 6);
-      gb.box(head.x - 0.1, head.y - 0.16, head.z - 0.04, head.x + 0.1, head.y + 0.16, head.z + 0.04, black);
-      if (!low) gb.quad(V(head.x - 0.085, head.y - 0.14, head.z + 0.042), V(head.x + 0.085, head.y - 0.14, head.z + 0.042), V(head.x + 0.085, head.y + 0.14, head.z + 0.042), V(head.x - 0.085, head.y + 0.14, head.z + 0.042), rgb('#556677'));
+      const base = V(s * (hw - 0.05), 2.55, zf + 0.45 + zo);
+      const head = V(s * (hw + 0.14), 2.42, zf + 0.12 + zo);
+      gb.rod(base, head, 0.02, black, 6);
+      gb.box(head.x - 0.075, head.y - 0.12, head.z - 0.035, head.x + 0.075, head.y + 0.12, head.z + 0.035, black);
+      if (!low) gb.quad(V(head.x - 0.065, head.y - 0.105, head.z + 0.037), V(head.x + 0.065, head.y - 0.105, head.z + 0.037), V(head.x + 0.065, head.y + 0.105, head.z + 0.037), V(head.x - 0.065, head.y + 0.105, head.z + 0.037), rgb('#556677'));
     } else {
       const p0 = V(s * (hw - 0.04), 2.96, zf + 0.32 + zo);
       const p1 = V(s * (hw + 0.08), 2.99, zf + 0.0 + zo);
@@ -261,6 +276,8 @@ export interface LeafSlot {
   height: number;
   yc: number;
   style: 'swing' | 'slide';
+  /** Local z of the body front (to keep front leaves from passing the nose). */
+  nose: number;
 }
 
 export function leafSlots(B: BodyLayout, sec: SectionLayout): LeafSlot[] {
@@ -270,8 +287,9 @@ export function leafSlots(B: BodyLayout, sec: SectionLayout): LeafSlot[] {
   const x = -(sideX(B, sec, 1.5) - 0.02);
   for (const d of sec.doors) {
     const w = (d.z1 - d.z0) / 2 - 0.01;
-    out.push({ hinge: V(x, 0, d.z0 + 0.01 + zo), dir: 1, width: w, height: y1 - y0, yc: (y0 + y1) / 2, style: d.style });
-    out.push({ hinge: V(x, 0, d.z1 - 0.01 + zo), dir: -1, width: w, height: y1 - y0, yc: (y0 + y1) / 2, style: d.style });
+    const nose = sec.bodyFront + zo;
+    out.push({ hinge: V(x, 0, d.z0 + 0.01 + zo), dir: 1, width: w, height: y1 - y0, yc: (y0 + y1) / 2, style: d.style, nose });
+    out.push({ hinge: V(x, 0, d.z1 - 0.01 + zo), dir: -1, width: w, height: y1 - y0, yc: (y0 + y1) / 2, style: d.style, nose });
   }
   return out;
 }
@@ -295,9 +313,14 @@ export function leafMatrix(slot: LeafSlot, t: number, out: THREE.Matrix4): THREE
     _p.y = slot.yc;
     _p.z += slot.hinge.z;
   } else {
-    const out1 = Math.min(1, k * 4) * 0.09;
-    const slide = Math.max(0, (k - 0.25) / 0.75) * slot.width * 0.96;
-    _q.identity();
+    // plug door: swings out on its arms (small yaw), then glides along the body
+    const e = k * k * (3 - 2 * k);
+    const out1 = Math.min(1, e * 3.2) * 0.1;
+    // the front leaf of a door at the very nose only partly clears the opening
+    const room = slot.dir > 0 && slot.hinge.z + 0.1 < slot.nose + 0.5 ? 0.55 : 0.95;
+    const slide = Math.max(0, (e - 0.2) / 0.8) * slot.width * room;
+    const yaw = Math.sin(Math.min(1, e * 2) * Math.PI) * 0.12 * slot.dir;
+    _q.setFromEuler(_e.set(0, yaw, 0));
     _p.set(slot.hinge.x - out1, slot.yc, slot.hinge.z + (slot.dir * slot.width) / 2 - slot.dir * slide);
   }
   _s.set(1, slot.height, slot.width * slot.dir);
@@ -314,9 +337,14 @@ export function leafGeometry(): THREE.BufferGeometry {
 // Bellows (Metro): rings between two section faces, rebuilt each frame.
 
 const PROFILE_N = 22;
-const RINGS = 25;
 
-function bellowsProfile(B: BodyLayout): [number, number, number, number][] {
+function bellowsProfile(B: BodyLayout, low: boolean): [number, number, number, number][] {
+  if (low) {
+    const hw = B.hw - 0.06, yb = 0.34, yt = B.yTop - 0.1;
+    return [
+      [-hw, yb, -1, 0], [-hw, yt - 0.2, -1, 0], [-hw + 0.2, yt, 0, 1], [hw - 0.2, yt, 0, 1], [hw, yt - 0.2, 1, 0], [hw, yb, 1, 0], [-hw, yb, 0, 1],
+    ];
+  }
   // [x, y, nx, ny] around the cross-section, bottom-left -> top -> bottom-right
   const out: [number, number, number, number][] = [];
   const hw = B.hw - 0.06;
@@ -344,8 +372,11 @@ export class Bellows {
   private readonly prof: [number, number, number, number][];
   private readonly pos: Float32Array;
   private readonly nor: Float32Array;
-  constructor(B: BodyLayout) {
-    this.prof = bellowsProfile(B);
+  private readonly rings: number;
+  private key = NaN;
+  constructor(B: BodyLayout, low = false) {
+    this.prof = bellowsProfile(B, low);
+    const RINGS = (this.rings = low ? 9 : 25);
     const n = this.prof.length;
     this.pos = new Float32Array(RINGS * n * 3);
     this.nor = new Float32Array(RINGS * n * 3);
@@ -355,7 +386,7 @@ export class Bellows {
     for (let k = 0; k < RINGS; k++) {
       for (let i = 0; i < n; i++) {
         const j = k * n + i;
-        const floor = i >= n - 2;
+        const floor = i >= n - 2 && !low;
         const c = floor ? [0.33, 0.34, 0.36] : k % 2 ? [0.48, 0.5, 0.54] : [0.8, 0.82, 0.86];
         col.set(c, j * 3);
         uv[j * 2] = k / (RINGS - 1);
@@ -384,6 +415,11 @@ export class Bellows {
    * this section's front face centre `b` (facing straight ahead).
    */
   update(a: THREE.Vector3, angle: number, b: THREE.Vector3): void {
+    // skip the rebuild when nothing moved (most AI buses most of the time)
+    const key = a.x * 1e3 + a.z * 7.1 + angle * 1e5 + b.z;
+    if (Math.abs(key - this.key) < 1e-3) return;
+    this.key = key;
+    const RINGS = this.rings;
     const n = this.prof.length;
     const len = Math.max(0.05, a.distanceTo(b));
     for (let k = 0; k < RINGS; k++) {
@@ -398,7 +434,7 @@ export class Bellows {
       const shrink = k % 2 ? 0.955 : 1;
       for (let i = 0; i < n; i++) {
         const [px, py, nx, ny] = this.prof[i];
-        const floor = i >= n - 2;
+        const floor = i >= n - 2 && this.rings > 9;
         const sx = floor ? px : px * shrink;
         const sy = floor ? py : 0.34 + (py - 0.34) * (shrink === 1 ? 1 : 0.985);
         const j = (k * n + i) * 3;
@@ -415,22 +451,6 @@ export class Bellows {
     (g.getAttribute('normal') as THREE.BufferAttribute).needsUpdate = true;
     g.computeBoundingSphere();
   }
-}
-
-/** Static bellows for low detail: a straight corrugated tube of length 1 along z, centred. */
-export function lowBellowsGeometry(B: BodyLayout): THREE.BufferGeometry {
-  const gb = new GeoBuilder();
-  const hw = B.hw - 0.06;
-  const yb = 0.34, yt = B.yTop - 0.1;
-  const N = 6;
-  for (let k = 0; k < N; k++) {
-    const z0 = -0.5 + k / N, z1 = -0.5 + (k + 1) / N;
-    const c: RGB = k % 2 ? [0.5, 0.52, 0.56] : [0.78, 0.8, 0.84];
-    gb.quad(V(hw, yb, z1), V(hw, yb, z0), V(hw, yt, z0), V(hw, yt, z1), c);
-    gb.quad(V(-hw, yb, z0), V(-hw, yb, z1), V(-hw, yt, z1), V(-hw, yt, z0), c);
-    gb.quad(V(-hw, yt, z1), V(hw, yt, z1), V(hw, yt, z0), V(-hw, yt, z0), c);
-  }
-  return gb.build();
 }
 
 export { ringAt };

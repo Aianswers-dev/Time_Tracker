@@ -404,14 +404,31 @@ function optimusHeadUnits(p: RP, W: number): void {
     const A = (a: number) => (flip ? W - a : a);
     const c = p.ctx;
     c.beginPath();
-    const pts: Pt[] = [[A(0.08), 0.76], [A(0.56), 0.745], [A(0.6), 0.83], [A(0.5), 0.905], [A(0.1), 0.915]];
+    const pts: Pt[] = [[A(0.05), 0.745], [A(0.6), 0.735], [A(0.66), 0.8], [A(0.58), 0.915], [A(0.08), 0.935]];
     pts.forEach(([s, h], i) => (i ? c.lineTo(p.X(s), p.Y(h)) : c.moveTo(p.X(s), p.Y(h))));
     c.closePath();
-    c.fillStyle = '#1b1e23';
+    const g = c.createLinearGradient(0, p.Y(0.935), 0, p.Y(0.735));
+    g.addColorStop(0, '#30353c');
+    g.addColorStop(0.5, '#15181c');
+    g.addColorStop(1, '#22262b');
+    c.fillStyle = g;
     c.fill();
-    c.strokeStyle = '#6d737b';
-    c.lineWidth = 0.008 * p.sy;
+    c.strokeStyle = '#8a9099';
+    c.lineWidth = 0.01 * p.sy;
     c.stroke();
+    // chrome reflector bowls behind the LED projectors
+    for (const a of [0.3, 0.44]) {
+      p.local(A(a), 0.835, (cc) => {
+        const rg = cc.createRadialGradient(0, 0, 0.01, 0, 0, 0.065);
+        rg.addColorStop(0, '#f4f6f8');
+        rg.addColorStop(0.6, '#9aa1aa');
+        rg.addColorStop(1, '#2a2e34');
+        cc.fillStyle = rg;
+        cc.beginPath();
+        cc.arc(0, 0, 0.062, 0, Math.PI * 2);
+        cc.fill();
+      });
+    }
   }
 }
 
@@ -946,14 +963,16 @@ function paintMaps(B: BodyLayout, sec: SectionLayout, atlas: AtlasLayout, lv: Li
     const pr = new RP(ro.ctx, rect, Lb, B.y0, B.yTop, side === 'R');
     const wins = side === 'L' ? sec.windowsL : sec.windowsR;
     for (const w of wins) {
-      pe.fill(S(w.z0), S(w.z1), w.y0, w.y1, pe.vgrad(w.y0, w.y1, [[0, '#fff3dc'], [0.6, '#e9dcc4'], [1, '#6e665a']]));
+      pe.fill(S(w.z0), S(w.z1), w.y0, w.y1, pe.vgrad(w.y0, w.y1, [[0, '#f4f6f8'], [0.35, '#c9ccd0'], [1, '#55595e']]));
+      // yellow poles catching the light
+      for (let s = S(w.z0) + 0.5; s < S(w.z1) - 0.2; s += 1.5) pe.fill(s - 0.02, s + 0.02, w.y0, w.y1, 'rgba(200,160,20,0.9)');
       // seat backs and heads silhouettes
       for (let s = S(w.z0) + 0.25; s < S(w.z1) - 0.1; s += 0.78) pe.fill(s - 0.2, s + 0.2, w.y0, w.y0 + 0.28, 'rgba(40,40,60,0.7)');
       pr.fill(S(w.z0), S(w.z1), w.y0, w.y1, 'rgb(0,18,0)');
     }
     if (side === 'L')
       for (const d of sec.doors) {
-        pe.fill(S(d.z0), S(d.z1), B.y0 + 0.15, B.doorTop - 0.05, pe.vgrad(B.y0, B.doorTop, [[0, '#ffefd0'], [1, '#6e665a']]));
+        pe.fill(S(d.z0), S(d.z1), B.y0 + 0.15, B.doorTop - 0.05, pe.vgrad(B.y0, B.doorTop, [[0, '#e8eaee'], [1, '#55595e']]));
         pr.fill(S(d.z0), S(d.z1), B.y0, B.doorTop, 'rgb(0,18,0)');
       }
     pr.fill(0, Lb, B.y0, 0.345, 'rgb(0,170,0)');
@@ -963,14 +982,14 @@ function paintMaps(B: BodyLayout, sec: SectionLayout, atlas: AtlasLayout, lv: Li
     const pr = new RP(ro.ctx, q(atlas.front), W, B.y0, B.yTop, false);
     const metro = lv.id === 'metro';
     const g0 = metro ? 0.96 : 1.11, g1 = metro ? B.yTop - 0.13 : 2.73;
-    pe.fill(0.2, W - 0.2, g0 + 0.4, g1 - 0.3, 'rgba(120,110,95,0.55)');
+    pe.fill(0.2, W - 0.2, g0 + 0.55, g1 - 0.35, 'rgba(70,72,78,0.5)');
     pr.fill(0.13, W - 0.13, g0, g1, 'rgb(0,12,0)');
   }
   if (atlas.rear) {
     const pe = new RP(em.ctx, q(atlas.rear), W, B.y0, B.yTop, false);
     const pr = new RP(ro.ctx, q(atlas.rear), W, B.y0, B.yTop, false);
     const metro = lv.id === 'metro';
-    pe.fill(0.3, W - 0.3, metro ? 1.05 : 1.95, 2.45, 'rgba(160,150,130,0.6)');
+    pe.fill(0.3, W - 0.3, metro ? 1.3 : 2.05, 2.5, 'rgba(90,92,98,0.5)');
     pr.fill(0.24, W - 0.24, metro ? 1.03 : 1.92, 2.8, 'rgb(0,18,0)');
   }
   return { emissive: em.canvas, rough: ro.canvas };

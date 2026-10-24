@@ -25,6 +25,8 @@ interface Edge {
   limit: number;
   kind: RoadKind;
   weight: number;
+  /** Priority class at junctions. */
+  rank: number;
   mx: number;
   my: number;
   /** Stop lines (distance along the directed lane) and signal coordinates, per direction. */
@@ -39,6 +41,8 @@ interface Node {
   deg: number;
   until: number;
   holder: number;
+  /** Highest road class meeting here (side roads give way to it). */
+  rank: number;
 }
 
 interface Car {
@@ -63,6 +67,8 @@ interface Car {
   stuck: number;
   ghost: number;
   claimed: number;
+  /** Seconds held up by a bus (for overtaking on multi-lane roads). */
+  busWait: number;
 }
 
 interface Model {
@@ -262,7 +268,7 @@ export class CarTraffic {
       let n = nodeOf.get(kk);
       if (n === undefined) {
         n = this.nodes.length;
-        this.nodes.push({ x, y, out: [], deg: 0, until: -1, holder: -1 });
+        this.nodes.push({ x, y, out: [], deg: 0, until: -1, holder: -1, rank: 0 });
         nodeOf.set(kk, n);
       }
       return n;
@@ -295,6 +301,7 @@ export class CarTraffic {
           limit: speedLimitOf(r),
           kind: r.kind,
           weight: len * (CLASS_W[r.kind] ?? 0.3) * (r.link ? 0.3 : 1),
+          rank: (CLASS_W[r.kind] ?? 0.3) * (r.link ? 0.5 : 1),
           mx: (pts[0] + pts[pts.length - 2]) / 2,
           my: (pts[1] + pts[pts.length - 1]) / 2,
           sig: [[], []],
@@ -305,6 +312,8 @@ export class CarTraffic {
         this.nodes[a].out.push(id * 2);
         this.nodes[a].deg++;
         this.nodes[b].deg++;
+        this.nodes[a].rank = Math.max(this.nodes[a].rank, e.rank);
+        this.nodes[b].rank = Math.max(this.nodes[b].rank, e.rank);
         if (!r.oneway) this.nodes[b].out.push(id * 2 + 1);
       }
     }
@@ -564,6 +573,7 @@ export class CarTraffic {
       stuck: 0,
       ghost: 0,
       claimed: -1,
+      busWait: 0,
     };
     const sig = e.sig[lane & 1];
     while (c.sigI < sig.length && sig[c.sigI] < u) c.sigI++;
@@ -671,6 +681,7 @@ export class CarTraffic {
       }
       if (gap < 120) acc = Math.min(acc, idm(gap, vLead, 2.2));
       // Buses (AI and player) ahead on the path.
+      let busBlock = false;
       if (c.ghost <= 0) {
         const look = 6 + c.v * 2.2;
         for (let d = c.len / 2 + 1; d <= look; d += 2.5) {
@@ -678,10 +689,18 @@ export class CarTraffic {
           const hit = bg.nearest(pt.x, pt.y, 2.1);
           if (hit >= 0) {
             acc = Math.min(acc, idm(d - c.len / 2 - 0.6, bg.pv[hit] * 0.8, 1.5));
+            busBlock = bg.pv[hit] < 1;
             break;
           }
         }
       } else c.ghost -= dt;
+      // Stuck behind a stopped bus on a multi-lane road: move over and overtake.
+      if (busBlock && c.v < 1.5) c.busWait += dt;
+      else c.busWait = Math.max(0, c.busWait - dt);
+      if (c.busWait > 2.5 && this.lanesIn(c.lane) > 1) {
+        c.laneIdx = (c.laneIdx + 1) % this.lanesIn(c.lane);
+        c.busWait = 0;
+      }
       // Signals.
       const sig = e.sig[c.lane & 1];
       if (c.sigI < sig.length) {
@@ -700,14 +719,18 @@ export class CarTraffic {
           if (c.sigState === 'red' || (c.sigState === 'amber' && sgap > stopDist + 2)) acc = Math.min(acc, idm(sgap, 0, 0.8));
         }
       }
-      // Unsignalised junctions: first come, first served.
-      const endN = this.nodes[this.endNode(c.lane)];
-      if (!signalAt || !e.sig[c.lane & 1].length) {
-        if (endN.deg >= 3 && remain < 14 && c.claimed !== this.endNode(c.lane)) {
-          if (endN.until < time || endN.holder === c.lane) {
-            endN.until = time + 1.8;
-            endN.holder = c.lane;
-            c.claimed = this.endNode(c.lane);
+      // Unsignalised junctions: side roads give way to the main road.
+      const endId = this.endNode(c.lane);
+      const endN = this.nodes[endId];
+      if ((!signalAt || !e.sig[c.lane & 1].length) && endN.deg >= 3 && remain < 16) {
+        const minor = e.rank + 0.01 < endN.rank;
+        if (!minor) {
+          // Main-road traffic marks the junction busy as it passes.
+          endN.until = time + 1.6;
+          endN.holder = c.lane;
+        } else if (c.claimed !== endId) {
+          if (endN.until < time) {
+            c.claimed = endId;
           } else acc = Math.min(acc, idm(Math.max(0.1, remain - 4), 0, 0.5));
         }
       }
@@ -716,7 +739,7 @@ export class CarTraffic {
       c.v = Math.max(0, c.v + acc * dt);
       if (c.v < 0.1) c.stuck += dt;
       else c.stuck = 0;
-      if (c.stuck > 14) {
+      if (c.stuck > 30) {
         c.ghost = 3;
         c.stuck = 0;
       }

@@ -213,6 +213,9 @@ export function toDisplay(c: THREE.Color, exposure: number, out: THREE.Color): T
 
 /** Common GLSL noise helpers. */
 export const NOISE_GLSL = /* glsl */ `
+// smoothstep that tolerates reversed or equal edges (GLSL leaves those undefined)
+float w_ss(float a, float b, float x) { float d = b - a; d = abs(d) < 1e-6 ? 1e-6 : d; float t = clamp((x - a) / d, 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+vec2 w_ss2(vec2 a, vec2 b, vec2 x) { return vec2(w_ss(a.x, b.x, x.x), w_ss(a.y, b.y, x.y)); }
 float w_hash(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
 float w_hash3(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
 float w_noise(vec2 p) {

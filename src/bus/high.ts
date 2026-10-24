@@ -108,7 +108,7 @@ export function createHighBus(spec: BusSpec, route: Route | undefined): BusMesh 
         alphaTest: 0.5,
         envMap: env,
         envMapIntensity: 0.9,
-        emissive: new THREE.Color(0xfff0d8),
+        emissive: new THREE.Color(0xfff4e6),
         emissiveIntensity: 0,
       }),
     );
@@ -120,8 +120,8 @@ export function createHighBus(spec: BusSpec, route: Route | undefined): BusMesh 
     dark.name = 'underbody';
     inner.add(dark);
     let wells: THREE.Mesh | null = null;
-    if (L.doors.length) {
-      wells = new THREE.Mesh(own(buildDark(B, L, { underbody: false, doorWells: true, staticWheels: false })), darkMat);
+    if (L.doors.length || !L.isFront || !L.isRear) {
+      wells = new THREE.Mesh(own(buildDark(B, L, { underbody: false, doorWells: true, staticWheels: false, jointCaps: true })), darkMat);
       wells.name = 'doorWells';
       inner.add(wells);
     }
@@ -291,7 +291,7 @@ export function createHighBus(spec: BusSpec, route: Route | undefined): BusMesh 
       if (lastNight !== l.headlights) {
         lastNight = l.headlights;
         for (const s of secs) {
-          s.shellMat.emissiveIntensity = l.headlights ? 0.85 : 0;
+          s.shellMat.emissiveIntensity = l.headlights ? 0.6 : 0;
           s.shellMat.envMapIntensity = l.headlights ? 0.25 : 0.9;
           s.interior?.setNight(l.headlights);
         }

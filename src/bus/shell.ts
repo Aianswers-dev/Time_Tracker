@@ -65,8 +65,9 @@ export function ringAt(L: BodyLayout, sec: SectionLayout, y: number): Ring {
   const hw = L.hw - L.sideInset(y) - sh;
   const zf = sec.bodyFront + (sec.isFront ? L.frontInset(y) : tuck) + sh;
   const zr = sec.bodyRear - (sec.isRear ? L.rearInset(y) : tuck) - sh;
-  const rf = Math.max(0.02, (sec.isFront ? L.frontRadius : 0.1) - sh * 0.85);
-  const rr = Math.max(0.02, (sec.isRear ? L.rearRadius : 0.1) - sh * 0.85);
+  // articulated ends get generous corner radii so bodies clear each other at ~40 deg
+  const rf = Math.max(0.02, (sec.isFront ? L.frontRadius : 0.26) - sh * 0.85);
+  const rr = Math.max(0.02, (sec.isRear ? L.rearRadius : 0.26) - sh * 0.85);
   return { hw, zf, zr, rf, rr };
 }
 
@@ -137,6 +138,8 @@ export function buildShell(L: BodyLayout, sec: SectionLayout, atlas: AtlasLayout
   ];
 
   S.forEach((samples, si) => {
+    // articulated joint faces are left open (bellows + an exterior-only cap cover them)
+    if ((si === 0 && !sec.isFront) || (si === 2 && !sec.isRear)) return;
     const base = pos.length / 3;
     const ns = samples.length;
     for (let j = 0; j < levels.length; j++) {

@@ -407,10 +407,25 @@ function buildFurniture(B: BodyLayout, sec: SectionLayout, dz: number): { geo: T
   gb.add(stripe, mat4(0.62, 1.7, Z(1.745), -0.12), rgb('#1f50c8'));
   back.dispose();
   stripe.dispose();
-  // destination sign box backside above the windscreen
-  const zh = fz(2.86);
-  gb.box(-B.hw + 0.12, B.type === 'metro' ? 2.35 : 2.73, Z(zh), B.hw - 0.12, 2.99, Z(zh + 0.22), rgb('#464a51'), 2 | 1 | 8 | 16);
-  for (const x of [-0.7, 0.0, 0.7]) gb.box(x - 0.03, 2.8, Z(zh + 0.22), x + 0.03, 2.86, Z(zh + 0.24), rgb('#9aa0a7'));
+  // destination sign cabinet behind the front display
+  const metro = B.type === 'metro';
+  const [hb0, hb1] = metro ? [2.43, 2.69] : [2.73, 2.99];
+  const zh = fz(metro ? 2.56 : 2.86) - 0.02;
+  const depth = metro ? 0.1 : 0.22;
+  gb.box(-B.hw + (metro ? 0.36 : 0.12), hb0, Z(zh), B.hw - (metro ? 0.36 : 0.12), hb1, Z(zh + depth), rgb(metro ? '#1c1e22' : '#464a51'), 2 | 1 | 8 | 16);
+  if (!metro) for (const x of [-0.7, 0.0, 0.7]) gb.box(x - 0.03, hb0 + 0.08, Z(zh + depth), x + 0.03, hb0 + 0.14, Z(zh + depth + 0.02), rgb('#9aa0a7'));
+  // black rubber seal around the inside of the windscreen
+  const g0 = metro ? 0.98 : 1.12, g1 = metro ? 2.4 : 2.72, xg = B.hw - (metro ? 0.22 : 0.15);
+  const seal = rgb('#08090a');
+  gb.quad(V(xg, g1 - 0.03, Z(fz(g1) - 0.015)), V(-xg, g1 - 0.03, Z(fz(g1) - 0.015)), V(-xg, g1, Z(fz(g1) - 0.015)), V(xg, g1, Z(fz(g1) - 0.015)), seal);
+  for (const sx of [1, -1]) {
+    const xa = sx * xg, xb = sx * (xg - 0.03);
+    gb.quad(V(xa, g0, Z(fz(g0) - 0.015)), V(xb, g0, Z(fz(g0) - 0.015)), V(xb, g1, Z(fz(g1) - 0.015)), V(xa, g1, Z(fz(g1) - 0.015)), seal);
+  }
+  // convex saloon mirror at the top of the windscreen
+  gb.rod(V(0.05, g1 - 0.01, Z(fz(g1) + 0.01)), V(0.05, g1 - 0.08, Z(fz(g1) + 0.12)), 0.01, rgb('#202226'), 5);
+  gb.box(-0.12, g1 - 0.2, Z(fz(g1) + 0.12), 0.22, g1 - 0.06, Z(fz(g1) + 0.15), rgb('#202226'));
+  gb.quad(V(-0.105, g1 - 0.19, Z(fz(g1) + 0.152)), V(0.205, g1 - 0.19, Z(fz(g1) + 0.152)), V(0.205, g1 - 0.07, Z(fz(g1) + 0.152)), V(-0.105, g1 - 0.07, Z(fz(g1) + 0.152)), rgb('#7d8ea0'));
   // go card readers on the door poles
   for (const d of sec.doors.slice(0, 2)) {
     const zr = d.z1 + 0.06 - dz;
@@ -533,9 +548,17 @@ export function createCab(type: BusType): Cab {
   // sun visor (tinted roller blind) on the driver's side
   const vg = new GeoBuilder();
   vg.alpha = [];
-  const zv = frontZ(B, sec, 2.58) + 0.1;
-  const vy0 = metro ? 2.05 : 2.42, vy1 = metro ? 2.34 : 2.71;
-  vg.quad(V(1.12, vy0, Z(zv)), V(0.12, vy0, Z(zv)), V(0.12, vy1, Z(zv + 0.02)), V(1.12, vy1, Z(zv + 0.02)), [0.03, 0.03, 0.04], undefined, 0.62);
+  const zv = frontZ(B, sec, 2.62) + 0.1;
+  const vy0 = metro ? 2.22 : 2.56, vy1 = metro ? 2.39 : 2.715;
+  // roller blind: darker toward the top edge
+  const c0 = vg.vertex(1.1, vy0, Z(zv), 0, 0, 1, 0, 0, [0.02, 0.02, 0.03], 0.35);
+  const c1 = vg.vertex(0.16, vy0, Z(zv), 0, 0, 1, 0, 0, [0.02, 0.02, 0.03], 0.35);
+  const c2 = vg.vertex(0.16, vy1, Z(zv + 0.02), 0, 0, 1, 0, 0, [0.02, 0.02, 0.03], 0.75);
+  const c3 = vg.vertex(1.1, vy1, Z(zv + 0.02), 0, 0, 1, 0, 0, [0.02, 0.02, 0.03], 0.75);
+  vg.tri(c0, c1, c2);
+  vg.tri(c0, c2, c3);
+  // bottom rail of the blind
+  vg.quad(V(1.1, vy0 - 0.012, Z(zv)), V(0.16, vy0 - 0.012, Z(zv)), V(0.16, vy0, Z(zv)), V(1.1, vy0, Z(zv)), [0.08, 0.08, 0.09], undefined, 1);
   const visorMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false, side: THREE.DoubleSide });
   const visor = new THREE.Mesh(vg.build(), visorMat);
   visor.renderOrder = 3;

@@ -40,9 +40,9 @@ export function lampsFor(B: BodyLayout, sec: SectionLayout): LampDef[] {
       both(L('indR', 'front', false, 0.15, 0.72, 0.06, 0.08), 'indL');
       both(L('markerF', 'front', true, 0.32, 3.0, 0.05, 0.05));
     } else {
-      both(L('head', 'front', true, 0.3, 0.835, 0.08, 0.08));
-      both(L('head', 'front', true, 0.44, 0.835, 0.08, 0.08));
-      both(L('drl', 'front', false, 0.33, 0.777, 0.38, 0.018));
+      both(L('head', 'front', true, 0.3, 0.835, 0.085, 0.085));
+      both(L('head', 'front', true, 0.44, 0.835, 0.085, 0.085));
+      both(L('drl', 'front', false, 0.34, 0.762, 0.46, 0.016));
       both(L('indR', 'front', false, 0.155, 0.835, 0.07, 0.07), 'indL');
       both(L('markerF', 'front', true, 0.2, 2.86, 0.06, 0.06));
     }

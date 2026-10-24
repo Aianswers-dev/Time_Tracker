@@ -51,7 +51,7 @@ export class Minimap {
       this.dpr = dpr;
       this.canvas.width = px;
       this.canvas.height = px;
-      this.caches = ZOOMS.map((m) => new TileCache(this.data, px / m, this.route, this.routeColor, 20));
+      this.caches = ZOOMS.map((m) => new TileCache(this.data, px / m, this.route, this.routeColor, 12));
     }
     return true;
   }

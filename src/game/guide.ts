@@ -214,6 +214,10 @@ export class RouteGuide {
       const off = ts.kerb + (ts.station ? 0.05 : 0.6);
       return { x: this.tmp.x + lx * off, y: this.tmp.y + ly * off, heading: this.tmp.heading, kerb: ts.kerb, station: ts.station };
     });
+    // Seed the projection window at the start stop (loop routes start where they end).
+    const s0 = Math.max(route.stops[0] ? route.stops[0].s : 0, this.busLength + 2);
+    this.state.s = s0;
+    this.segI = pointAlong(route.pts, route.cum, s0).i;
     this.group.name = 'route-guide';
     scene.add(this.group);
     this.buildRouteStops();
@@ -330,7 +334,7 @@ export class RouteGuide {
   /** Where the player's bus should start: map x/y of the FRONT of the bus and heading. */
   startPose(): { x: number; y: number; heading: number } {
     const first = this.route.stops[0];
-    const s = Math.max(first ? first.s : 0, this.busLength + 2);
+    const s = Math.min(this.route.length - 1, Math.max(first ? first.s : 0, this.busLength + 2));
     const kerb = this.track.kerbAt(s);
     const pull = Math.max(0, kerb - 1.7);
     this.track.sample(s, this.tmp, pull);
@@ -383,17 +387,53 @@ export class RouteGuide {
     while (from > 0 && cum[from] > s0 - 150) from--;
     let to = this.segI;
     while (to < cum.length - 1 && cum[to] < s0 + 400) to++;
-    let pr = projectOnto(r.pts, cum, x, y, from, to + 1);
-    if (pr.dist > 25 || !this.initialised) {
+    let pr = this.projectNear(x, y, from, to + 1, s0);
+    if (pr.dist > 25 || (!this.initialised && pr.dist > 12)) {
+      // Not near the expected place (teleport, shortcut): search the whole route,
+      // preferring a stretch that runs the way we are heading (loops overlap themselves).
       const g = projectOnto(r.pts, cum, x, y);
       const aligned = (() => {
         const p = pointAlong(r.pts, cum, g.s);
         return Math.cos(p.heading - this.motionHeading) > 0.2;
       })();
-      if (!this.initialised || (g.dist < pr.dist - 5 && g.dist < 20 && g.s > s0 - 30 && aligned)) pr = g;
+      if ((!this.initialised && (aligned || g.dist < pr.dist - 5)) || (g.dist < pr.dist - 5 && g.dist < 20 && g.s > s0 - 30 && aligned)) pr = g;
     }
     this.segI = pr.i;
     return { s: pr.s, dist: pr.dist };
+  }
+
+  /**
+   * Windowed projection that prefers continuity: where the route doubles back
+   * on itself (hairpins, out-and-back legs) the nearest segment by distance
+   * alone can belong to a later part of the route.
+   */
+  private projectNear(x: number, y: number, from: number, to: number, s0: number): { s: number; dist: number; i: number } {
+    const pts = this.route.pts;
+    const cum = this.route.cum;
+    let best = Infinity;
+    let bs = s0;
+    let bd = Infinity;
+    let bi = this.segI;
+    const end = Math.min(to, cum.length - 1);
+    for (let i = Math.max(0, from); i < end; i++) {
+      const ax = pts[2 * i];
+      const ay = pts[2 * i + 1];
+      const dx = pts[2 * i + 2] - ax;
+      const dy = pts[2 * i + 3] - ay;
+      const len2 = dx * dx + dy * dy || 1e-9;
+      let t = ((x - ax) * dx + (y - ay) * dy) / len2;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const d = Math.hypot(x - ax - dx * t, y - ay - dy * t);
+      const s = cum[i] + t * Math.sqrt(len2);
+      const score = d + Math.max(0, Math.abs(s - s0) - 25) * 0.08;
+      if (score < best) {
+        best = score;
+        bs = s;
+        bd = d;
+        bi = i;
+      }
+    }
+    return { s: bs, dist: bd, i: bi };
   }
 
   update(dt: number, frontX: number, frontY: number, doorsOpen: boolean, speed: number, heading?: number, hours = 12): GuideState {

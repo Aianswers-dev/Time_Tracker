@@ -216,7 +216,7 @@ uniform sampler2D uNoise;
 varying vec3 vFoot;
 varying vec3 vGPos;
 ${NOISE_GLSL}
-float fl(float v, float period, float w) { float x = v / period; float f = fwidth(x); return smoothstep(w / period + f, w / period - f, abs(fract(x) - 0.5) * -1.0 + 0.5); }
+float fl(float v, float period, float w, float fwv) { float x = v / period; float f = max(fwv / period, 1e-3); float d = 0.5 - abs(fract(x) - 0.5); return 1.0 - w_ss(w / period * 0.5 - f, w / period * 0.5 + f, d); }
 vec3 footAlbedo() {
   vec2 p = vec2(vGPos.x, -vGPos.z);
   vec4 n1 = texture2D(uNoise, p / 5.0);
@@ -224,6 +224,7 @@ vec3 footAlbedo() {
   float across = vFoot.x;
   float along = vFoot.y;
   float style = floor(vFoot.z + 0.5);
+  float FA = fwidth(along);
   vec3 conc = vec3(0.66, 0.65, 0.61) * (0.9 + 0.16 * n1.r) * (0.94 + 0.1 * n2.g);
   vec3 kerb = vec3(0.72, 0.71, 0.68) * (0.9 + 0.12 * n1.r);
   if (style > 2.5) return kerb * 0.92;
@@ -231,7 +232,7 @@ vec3 footAlbedo() {
   if (style < 0.5) {
     vec3 grass = mix(vec3(0.36, 0.45, 0.24), vec3(0.52, 0.50, 0.33), smoothstep(0.4, 0.75, n2.g)) * (0.85 + 0.3 * n1.r);
     float path = step(2.4, across) * step(across, 3.75);
-    float joint = fl(along, 1.5, 0.02) * path;
+    float joint = fl(along, 1.5, 0.02, FA) * path;
     return mix(grass, conc * (1.0 - joint * 0.25), path);
   }
   if (style < 1.5) {
@@ -241,7 +242,7 @@ vec3 footAlbedo() {
     vec3 pav = mix(vec3(0.56, 0.55, 0.53), vec3(0.66, 0.64, 0.60), w_hash(floor(q)));
     return pav * (0.92 + 0.12 * n1.r) * (1.0 - j * 0.22);
   }
-  float joint = fl(along, 1.8, 0.02);
+  float joint = fl(along, 1.8, 0.02, FA);
   return conc * (1.0 - joint * 0.25);
 }
 `;
@@ -513,9 +514,7 @@ export async function buildRoads(ctx: Ctx, noPierZones: Float32Array[], progress
     const footKinds = r.kind >= RoadKind.Primary && r.kind <= RoadKind.Residential && !r.bridge && !r.link;
     const expressway = r.kind === RoadKind.Trunk && (r.oneway && r.lanes >= 3);
     if ((footKinds || (r.kind === RoadKind.Trunk && !r.bridge && !r.link)) && !expressway) {
-      const dens = densityAt(ctx, mid.x, mid.y);
-      const style = dens > 0.3 ? 1 : dens > 0.12 ? 2 : 0;
-      const W = style === 1 ? 4.2 : style === 2 ? 3.2 : 3.9;
+      const W = 4.0;
       for (const side of [1, -1]) {
         const step = 4;
         const valid: boolean[] = [];
@@ -545,7 +544,14 @@ export async function buildRoads(ctx: Ctx, noPierZones: Float32Array[], progress
           while (e + 1 < valid.length && valid[e + 1]) e++;
           const a = Math.max(0, ss[k] - (k > 0 ? 1.5 : 0));
           const b = Math.min(ri.len, ss[e] + (e < valid.length - 1 ? 1.5 : 0));
-          if (b - a > 3) footRun(L.foot, ri, a, b, side, W, style, y);
+          if (b - a > 3) {
+            // footpath style from the local land use: CBD paving, mid concrete, suburban verge
+            const c = roadAt(ri, (a + b) / 2);
+            const dens = densityAt(ctx, c.x + c.nx * side * (hw + 6), c.y + c.ny * side * (hw + 6));
+            const style = dens > 0.28 ? 1 : dens > 0.1 ? 2 : 0;
+            const w = style === 1 ? 4.2 : style === 2 ? 3.2 : 3.9;
+            footRun(L.foot, ri, a, b, side, w, style, y);
+          }
           k = e + 1;
         }
       }

@@ -19,6 +19,7 @@ const RADIUS = 1500;
 const DESPAWN = 1800;
 const VIEW_DIST = 950;
 const MAX_BUSES = 48;
+const LOOK_MAX = 40;
 
 const enum State {
   Drive = 0,
@@ -108,6 +109,8 @@ export class Traffic {
   private tmp: TrackSample = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
   private tmp2: TrackSample = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
   private playerBody = makeBody(12);
+  private aheadX = new Float32Array(LOOK_MAX);
+  private aheadY = new Float32Array(LOOK_MAX);
   private playerSpec: BusSpec | null = null;
   private markersOut: MapMarker[] = [];
   private costEma = 0.5;
@@ -587,17 +590,24 @@ export class Traffic {
       }
     }
 
-    // Car following against other buses and the player.
+    // Car following against other buses, the player and cars: sample our
+    // path ahead once, then test every nearby body against it.
     const look = 9 + b.v * 3.2;
     const bodyF = b.body;
+    const ns = Math.min(LOOK_MAX, Math.floor((look - 1.5) / 2.5) + 1);
+    const ax = this.aheadX;
+    const ay = this.aheadY;
+    for (let k = 0; k < ns; k++) {
+      tr.sample(b.s + 1.5 + k * 2.5, this.tmp2, b.pull);
+      ax[k] = this.tmp2.x;
+      ay[k] = this.tmp2.y;
+    }
     let bestGap = Infinity;
     let bestV = 0;
     let bestId = 0;
+    const reach = look + 30;
     const consider = (o: Body, id: number, other: AiBus | null) => {
-      const dx = o.fx - bodyF.fx;
-      const dy = o.fy - bodyF.fy;
-      const reach = look + 30;
-      if (Math.abs(dx) > reach || Math.abs(dy) > reach) return;
+      if (Math.abs(o.fx - bodyF.fx) > reach || Math.abs(o.fy - bodyF.fy) > reach) return;
       const rel = wrapAngle(o.heading - bodyF.heading);
       const crossing = Math.abs(rel) > 0.9 && Math.abs(rel) < 2.4;
       if (other && crossing) {
@@ -605,29 +615,27 @@ export class Traffic {
         // Two buses waiting on each other: the older id goes first.
         if (other.obstacle === b.id && other.id < b.id) return;
       }
-      for (let d = 1.5; d <= look; d += 2.5) {
-        tr.sample(b.s + d, this.tmp2, b.pull);
-        for (let k = 0; k < o.n; k++) {
-          const ex = o.x[k] - this.tmp2.x;
-          const ey = o.y[k] - this.tmp2.y;
+      for (let k = 0; k < ns; k++) {
+        const d = 1.5 + k * 2.5;
+        if (d > bestGap) return;
+        for (let j = 0; j < o.n; j++) {
+          const ex = o.x[j] - ax[k];
+          const ey = o.y[j] - ay[k];
           if (ex * ex + ey * ey < 3.4) {
-            if (d < bestGap) {
-              bestGap = d;
-              bestV = Math.max(0, o.speed * Math.cos(rel));
-              bestId = id;
-            }
+            bestGap = d;
+            bestV = Math.max(0, o.speed * Math.cos(rel));
+            bestId = id;
             return;
           }
         }
-        if (d > bestGap) return;
       }
     };
     for (const o of this.active) if (o !== b) consider(o.body, o.id, o);
     consider(this.playerBody, -1, null);
-    // Cars in the way.
-    for (let d = 1.5; d <= look && d < bestGap; d += 2.5) {
-      tr.sample(b.s + d, this.tmp2, b.pull);
-      const cv = this.cars.probe(this.tmp2.x, this.tmp2.y, 1.9);
+    for (let k = 0; k < ns; k++) {
+      const d = 1.5 + k * 2.5;
+      if (d >= bestGap) break;
+      const cv = this.cars.probe(ax[k], ay[k], 1.9);
       if (cv >= 0) {
         bestGap = d;
         bestV = cv;
