@@ -1040,7 +1040,12 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       const inJ = skips.some(([a, b]) => ss[k] > a && ss[k] < b);
       const probe = t === 2 ? e0[k] + 0.3 : e0[k] + 1.5;
       const nb = otherAt(ox(probe), oy(probe), c.z, ri.i, 3) > -0.4 || (t === 1 && otherAt(ox(e0[k] + 5), oy(e0[k] + 5), c.z, ri.i, 3) > -0.4);
-      if (nb || (inJ && t !== 2)) type[k] = 0;
+      // a batter would run down into the space of a road passing 2-8 m below (a street over a busway
+      // portal): none there, the lower road's own earthworks and tunnel hold the ground (a batter
+      // climbing to the ground above stays, as over the tunnels under King George Square)
+      const lower = (o: number) => Math.max(index.penetrationZ(ox(o), oy(o), zE[k] - 5, 3, ri.i), tunnels.penetrationZ(ox(o), oy(o), zE[k] - 5, 3, ri.i)) > -1;
+      const below = t === 1 && depth[k] < 0.3 && (lower(e0[k] + 1.5) || lower(e0[k] + 4));
+      if (nb || below || (inJ && t !== 2)) type[k] = 0;
       else type[k] = t;
       if (t === 2 && (nb || inJ)) type[k] = 4; // cutting but open toward a neighbour: floor only
     }
@@ -1094,8 +1099,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const i3 = g.vert(a1x, a1z, a1y);
         g.quad(i0, i1, i2, i3, 0, 1, 0);
         // small skirt so the strip edge never shows a gap
-        const s2 = g.vert(b1x, b1z - 0.4, b1y);
-        const s3 = g.vert(a1x, a1z - 0.4, a1y);
+        const s2 = g.vert(b1x, stripZ(b1x, b1y, b1z - 0.4), b1y);
+        const s3 = g.vert(a1x, stripZ(a1x, a1y, a1z - 0.4), a1y);
         g.quad(i3, i2, s2, s3, fx, 0, -fy);
         field.clampQuad([a0x, a0y, zE[k], b0x, b0y, zE[kb], b1x, b1y, b1z, a1x, a1y, a1z], 0.25);
         k = kb - 1;
@@ -1931,7 +1936,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
 
   /** Where a tunnel box's ground was held below its roof (by a road beside or over it): carve it off the box and roof the box over. */
   function roofBoxes(): void {
-    for (const { ri, tp, L, reach, boxSeg } of tubesBuilt) {
+    for (const { ri, tp, L, reach, boxSeg, open } of tubesBuilt) {
       const { ss, P0, hc } = tp;
       const g = L.strip;
       for (let k = 0; k + 1 < ss.length; k++) {
@@ -1972,6 +1977,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
           pb = ib;
         }
         for (const o of [eL, -eR]) {
+          // (no skirt on a side open toward the next carriageway: it would hang across it)
+          if (open[o > 0 ? 0 : 1][k]) continue;
           const sd = Math.sign(o) || 1;
           const [ax, ay] = at(A, o);
           const [bx, by] = at(B, o);
