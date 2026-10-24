@@ -8,7 +8,7 @@ import * as THREE from 'three';
 import type { BusFactory, BusLights, BusMesh, BusPose, BusSpec, BusType, Collider, MapData, Route, WorldHandle } from '../types';
 import { wrapAngle } from '../data/coords';
 import { busTypeForRoute, stopUsage } from './routeMeta';
-import { TRACK_STEP, hasTrack, trackFor, type RouteTrack, type TrackSample, type TrackSignal } from './track';
+import { TRACK_STEP, hasTrack, trackFor, type RouteTrack, type TrackSample, type TrackSignal, type TrackStop } from './track';
 import type { MapMarker } from './minimap';
 import { brighten, rng } from './util';
 import { CarTraffic, PLAYER_HOLD, STALL_HIDDEN, STALL_VISIBLE, Wait, type BusJunction } from './cars';
@@ -857,8 +857,10 @@ export class Traffic {
     if (st) {
       // At a busway platform the front bay is the target; queued behind
       // another bus inside the platform we serve the bay we are at.
-      const zone = tr.stops[b.nextStop]?.zone;
-      const gap = (zone ? zone.s1 - 1.5 : st.s) - b.s;
+      // (Tracks that give each stop its own front target and pull, src/game/track.ts, are used as given.)
+      const ts = tr.stops[b.nextStop] as (TrackStop & { target?: number; pull?: number }) | undefined;
+      const zone = ts?.zone;
+      const gap = (ts?.target ?? (zone ? zone.s1 - 1.5 : st.s)) - b.s;
       const atBay = !!zone && b.s > zone.s0 + 10 && b.s < zone.s1 + 1 && b.v < 0.3 && b.wait === Wait.Bus;
       if (b.serve) {
         if ((gap < 1.2 && b.v < 0.35) || atBay) {
@@ -870,9 +872,9 @@ export class Traffic {
         if (gap < 140) acc = Math.min(acc, idm(b.v, v0, gap + 0.6, 0, 0.6));
         // Kerbside stops pull in to the kerb (where one was found near the lane);
         // at platforms the lane already runs along the platform edge.
-        const ts = tr.stops[b.nextStop];
         const kerb = tr.kerbAt(st.s);
-        b.pullTarget = gap < 45 && !zone && !ts?.station && kerb < 4.5 ? Math.max(0, Math.min(1.8, kerb - 1.75)) : 0;
+        const pull = ts?.pull !== undefined ? Math.max(0, Math.min(3, ts.pull)) : !zone && !ts?.station && kerb < 4.5 ? Math.max(0, Math.min(1.8, kerb - 1.75)) : 0;
+        b.pullTarget = gap < 45 ? pull : 0;
       } else if (gap < -2) {
         b.nextStop++;
         b.serve = this.decideServe(b);
