@@ -5,7 +5,7 @@ import { RoadKind, type MapData, type Road, type Route } from '../types';
 import { pointAlong, wrapAngle } from '../data/coords';
 import { drivable, roadIndexFor, speedLimitOf } from './roadIndex';
 import { isStationStop } from './routeMeta';
-import { matchStopPlatform, type PlatformZone } from './platforms';
+import { matchStopPlatform, platformEdgeAt, type PlatformZone } from './platforms';
 import { LEVEL_GAP, heightsOf } from './height';
 import { activeCollider } from '../sim/collider';
 import { specFor } from '../bus/spec';
@@ -28,8 +28,18 @@ export interface TrackStop {
   station: boolean;
   /** Distance from the lane centre to the kerb at the stop (left, metres). */
   kerb: number;
-  /** Busway platform the stop is served from: any bay along [s0, s1] will do. */
+  /**
+   * Busway platform the stop is served from: any bay along [s0, s1] will do (trimmed to where the
+   * lane runs alongside the platform edge).
+   */
   zone: PlatformZone | null;
+  /** Where a bus serving the stop stands with its front: the platform's front bay, else the stop. */
+  target: number;
+  /**
+   * How far left of the lane a bus moves to stand ~0.35 m off the kerb or platform edge at `target`
+   * (about 0 alongside a platform, where the lane already runs at the edge).
+   */
+  pull: number;
 }
 
 /** Lane centre this far from a platform edge puts the bus side ~0.35 m off it. */
@@ -40,8 +50,8 @@ const PLATFORM_LANE = 1.6;
  * body swinging out on bends.
  */
 const WALL_CLEAR = 2.1;
-/** The bus's vertical span above the road (m): walls outside it are not in the way. */
-const BUS_LO = -0.2;
+/** The bus body's vertical span above the road (m; the collider's sections start 0.25 m up): walls outside it are not in the way. */
+const BUS_LO = 0.25;
 const BUS_HI = 3.4;
 /** Sideways metres per metre the lane may move away from a walled stretch. */
 const WALL_SLOPE = 0.35;
@@ -1161,12 +1171,19 @@ export class RouteTrack {
       this.tx[i] = dx;
       this.ty[i] = dy;
     }
+    // The kerb from the lane as it finally runs, and the platform zones trimmed to where it runs alongside.
+    this.fitKerb(data, zones);
     // Speed profile: curvature, posted limits, then braking pass.
+    // (Over the lane's own length: through a station hall or round the outside of a bend a sample's 4 m of
+    // route can be twice that of lane, and on the inside much less.)
+    const chord = new Float32Array(n);
+    for (let i = 0; i + 1 < n; i++) chord[i] = Math.hypot(this.x[i + 1] - this.x[i], this.y[i + 1] - this.y[i]);
     const kappa = new Float32Array(n);
     for (let i = 2; i < n - 2; i++) {
       const h0 = Math.atan2(this.tx[i - 2], this.ty[i - 2]);
       const h1 = Math.atan2(this.tx[i + 2], this.ty[i + 2]);
-      kappa[i] = Math.abs(wrapAngle(h1 - h0)) / (4 * TRACK_STEP);
+      const len = chord[i - 2] + chord[i - 1] + chord[i] + chord[i + 1];
+      kappa[i] = Math.abs(wrapAngle(h1 - h0)) / Math.max(len, TRACK_STEP);
     }
     const kSm = boxSmooth(kappa, 1);
     this.vmax = new Float32Array(n);
@@ -1177,7 +1194,7 @@ export class RouteTrack {
       this.vmax[i] = Math.max(2.5, Math.min(vCurve, vLim, 22));
     }
     for (let i = n - 2; i >= 0; i--) {
-      this.vmax[i] = Math.min(this.vmax[i], Math.sqrt(this.vmax[i + 1] ** 2 + 2 * 1.1 * TRACK_STEP));
+      this.vmax[i] = Math.min(this.vmax[i], Math.sqrt(this.vmax[i + 1] ** 2 + 2 * 1.1 * Math.max(chord[i], 0.5)));
     }
     const nc = Math.max(1, Math.floor((L - 70) / 40));
     this.coarse = new Float32Array(nc * 3);
@@ -1192,7 +1209,10 @@ export class RouteTrack {
     this.stops = route.stops.map((st, index) => {
       const i = Math.max(0, Math.min(n - 1, Math.round(st.s / TRACK_STEP)));
       const zone = zones[index];
-      return { index, s: st.s, station: !!zone || isStationStop(data.stops[st.stop].name), kerb: this.kerb[i], zone };
+      const target = zone ? zone.s1 - 1.5 : st.s;
+      const kerbT = this.kerbAt(target);
+      const pull = Math.max(0, Math.min(zone ? 2.5 : 3, kerbT - PLATFORM_LANE));
+      return { index, s: st.s, station: !!zone || isStationStop(data.stops[st.stop].name), kerb: this.kerb[i], zone, target, pull };
     });
     // Signals: one stop line per signalised junction the lane passes through, before the junction.
     this.signals = this.findSignals(data, H);
@@ -1649,6 +1669,74 @@ export class RouteTrack {
       if (!moved) break;
       look = next;
     }
+  }
+
+  /**
+   * Kerb distances from the lane as it finally runs (the refits move the lane, not the kerb): to the
+   * matched road's left edge, or alongside a platform to its edge. Each platform zone is trimmed to
+   * the longest stretch where the lane really runs alongside the edge (walls at a tunnel mouth can
+   * hold it off the platform's end), so the front bay a bus is sent to is one it can pull up at.
+   */
+  private fitKerb(data: MapData, zones: (PlatformZone | null)[]): void {
+    const n = this.n;
+    const X = this.x;
+    const Y = this.y;
+    const kerb = Float32Array.from(this.kerb);
+    for (let i = 0; i < n; i++) {
+      const ri = this.road[i];
+      if (ri < 0) continue;
+      const r = data.roads[ri];
+      const p = r.pts;
+      let best = Infinity;
+      let lat = 0;
+      for (let k = 0; k + 3 < p.length; k += 2) {
+        const ex = p[k + 2] - p[k];
+        const ey = p[k + 3] - p[k + 1];
+        const l2 = ex * ex + ey * ey || 1e-9;
+        const t = Math.max(0, Math.min(1, ((X[i] - p[k]) * ex + (Y[i] - p[k + 1]) * ey) / l2));
+        const d = Math.hypot(X[i] - p[k] - ex * t, Y[i] - p[k + 1] - ey * t);
+        if (d < best) {
+          best = d;
+          const sg = ex * this.tx[i] + ey * this.ty[i] >= 0 ? 1 : -1;
+          lat = (sg * (ex * (Y[i] - p[k + 1]) - ey * (X[i] - p[k]))) / Math.sqrt(l2);
+        }
+      }
+      if (best < 15) kerb[i] = halfWidthLeft(r) - lat;
+    }
+    const km = median7(kerb);
+    for (let i = 0; i < n; i++) if (this.road[i] >= 0) this.kerb[i] = Math.max(1.3, Math.min(6, km[i]));
+    zones.forEach((z, k) => {
+      if (!z) return;
+      const i0 = Math.max(0, Math.ceil(z.s0 / TRACK_STEP));
+      const i1 = Math.min(n - 1, Math.floor(z.s1 / TRACK_STEP));
+      if (i1 < i0) return;
+      const ok = new Uint8Array(i1 - i0 + 1);
+      for (let i = i0; i <= i1; i++) {
+        const d = platformEdgeAt(data, z.platform, X[i], Y[i], -this.ty[i], this.tx[i], 12);
+        if (Number.isFinite(d)) this.kerb[i] = Math.max(1.3, Math.min(6, d));
+        ok[i - i0] = d <= PLATFORM_LANE + 0.7 ? 1 : 0;
+      }
+      // The longest stretch alongside.
+      let ba = -1;
+      let bb = -2;
+      for (let a = 0; a < ok.length; a++) {
+        if (!ok[a]) continue;
+        let b = a;
+        while (b + 1 < ok.length && ok[b + 1]) b++;
+        if (b - a > bb - ba) {
+          ba = a;
+          bb = b;
+        }
+        a = b;
+      }
+      // (Nowhere a bus fits alongside, or all of it: as matched.)
+      if (ba < 0 || (bb - ba) * TRACK_STEP < 12 || (ba === 0 && bb === ok.length - 1)) return;
+      const s0 = Math.max(z.s0, (i0 + ba) * TRACK_STEP - TRACK_STEP / 2);
+      const s1 = Math.min(z.s1, (i0 + bb) * TRACK_STEP + TRACK_STEP / 2);
+      const e0 = Math.max(0, Math.round((s0 - z.s0) / z.step));
+      const e1 = Math.min(z.edge.length, e0 + Math.floor((s1 - s0) / z.step) + 1);
+      zones[k] = { ...z, s0, s1, edge: z.edge.slice(e0, e1) };
+    });
   }
 
   /**
@@ -2263,6 +2351,31 @@ export class RouteTrack {
       }
     }
     return push;
+  }
+
+  /**
+   * Nearest point of the lane to (x, y) between route distances `from` and `to`: its route distance and
+   * how far (x, y) is from it. (The lane can run well off the GTFS line, e.g. through a station hall.)
+   */
+  project(x: number, y: number, from: number, to: number): { s: number; dist: number } {
+    const i0 = Math.max(0, Math.floor(from / TRACK_STEP));
+    const i1 = Math.min(this.n - 2, Math.ceil(to / TRACK_STEP));
+    let bd = Infinity;
+    let bs = Math.max(0, Math.min(this.length, from));
+    for (let i = i0; i <= i1; i++) {
+      const ax = this.x[i];
+      const ay = this.y[i];
+      const dx = this.x[i + 1] - ax;
+      const dy = this.y[i + 1] - ay;
+      const l2 = dx * dx + dy * dy || 1e-9;
+      const t = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / l2));
+      const d = Math.hypot(x - ax - dx * t, y - ay - dy * t);
+      if (d < bd) {
+        bd = d;
+        bs = (i + t) * TRACK_STEP;
+      }
+    }
+    return { s: bs, dist: bd };
   }
 
   zAt(s: number): number {

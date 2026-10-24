@@ -317,6 +317,24 @@ function rayHit(g: PlatformGeom, x: number, y: number, dx: number, dy: number, m
 }
 
 /**
+ * How far left of (x, y), across (lx, ly) (unit), the edge of platform `index` is (negative a little
+ * way inside its slab), or Infinity if it is not within `maxT`.
+ */
+export function platformEdgeAt(data: MapData, index: number, x: number, y: number, lx: number, ly: number, maxT = 18): number {
+  const g = platformGeoms(data).find((q) => q.index === index);
+  if (!g) return Infinity;
+  return rayHit(g, x - lx * 1.5, y - ly * 1.5, lx, ly, maxT + 1.5) - 1.5;
+}
+
+/** Point and heading at route distance s, carried straight on past either end (a platform can reach past a terminus). */
+function routeAt(route: Route, s: number): { x: number; y: number; heading: number } {
+  if (s >= 0 && s <= route.length) return pointAlong(route.pts, route.cum, s);
+  const end = s < 0 ? 0 : route.length;
+  const q = pointAlong(route.pts, route.cum, end);
+  return { x: q.x + Math.sin(q.heading) * (s - end), y: q.y + Math.cos(q.heading) * (s - end), heading: q.heading };
+}
+
+/**
  * The platform (if any) a route stop is served from, and the stretch of the
  * route alongside its kerb. Name and platform number are preferred; geometry
  * (a platform edge just left of the route) is required.
@@ -339,11 +357,12 @@ export function matchStopPlatform(data: MapData, route: Route, stopIndex: number
     const pl = g.plane;
     if (Math.abs(pl.z0 + pl.slope * ((stop.x - pl.px) * pl.tx + (stop.y - pl.py) * pl.ty) - zr) > LEVEL_GAP) continue;
     // Walk the route around the stop and cast to the left.
-    const from = Math.max(0, rs.s - 110);
-    const to = Math.min(route.length, rs.s + 110);
+    // (Past the route's ends too: at a terminus the platform can start behind the first stop.)
+    const from = Math.max(-60, rs.s - 110);
+    const to = Math.min(route.length + 60, rs.s + 110);
     const hits: { s: number; h: number }[] = [];
     for (let s = from; s <= to; s += step) {
-      const q = pointAlong(route.pts, route.cum, s);
+      const q = routeAt(route, s);
       const lx = -Math.cos(q.heading);
       const ly = Math.sin(q.heading);
       const h = rayHit(g, q.x - lx * 1.5, q.y - ly * 1.5, lx, ly, 18);
