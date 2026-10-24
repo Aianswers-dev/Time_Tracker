@@ -300,6 +300,7 @@ export class BusPhysics {
       this.sinkT -= dt;
       if (this.sinkT <= 0 && !this.recover()) this.sinkT = 0;
     } else if (collider) {
+      if (isSimCollider(collider)) collider.setStepTime(dt);
       const r = collider.resolve(this.pose, this.spec);
       out.hit = r.hit;
       out.impact = Math.max(out.impact, r.impact);

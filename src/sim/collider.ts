@@ -69,6 +69,8 @@ export interface SimCollider extends Collider {
   readonly heights: Heights;
   readonly waterLevel: number;
   resolve(pose: BusPose, spec: BusSpec): ResolveResult;
+  /** Seconds covered by the next resolve() (the physics frame), for frame-rate independent contact response. */
+  setStepTime(dt: number): void;
   /** Road surface under (x, y) at the level closest to `hintZ` (see Heights.surfaceAt). */
   surface(x: number, y: number, hintZ?: number, maxStep?: number): Surface;
   ground(x: number, y: number): number;
@@ -1315,6 +1317,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     wallIndex: number;
   }
   const best: Contact = { depth: 0, px: 0, py: 0, qx: 0, qy: 0, sec: 0, wall: false, wallIndex: -1 };
+  let stepTime = 1 / 60;
+  let hadContact = false;
 
   const sectionBox = (pose: BusPose, spec: BusSpec, s: number) => {
     const sp = pose.sections[s] ?? pose;
@@ -1478,17 +1482,29 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       secWalls[s].length = 0;
       for (const c of wallCands) secWalls[s].push(c);
     }
+    const f0x = Math.sin(pose.heading);
+    const f0y = Math.cos(pose.heading);
+    const v0 = pose.speed;
+    let tAlong = 0; // translation along the heading (m): negative = pushed back
+    let tLat = 0; // sideways translation (m)
+    let turned = 0; // heading change imposed by the contact (rad, all sections)
+    let firstVn = 0;
     for (let iter = 0; iter < 4; iter++) {
       if (!findContact(pose, spec)) break;
       out.hit = true;
-      const d = best.depth;
-      const nx = best.px / d;
-      const ny = best.py / d;
-      const push = d + 0.002;
-      // Split the push into a turn and a shift. A contact well ahead of (or behind) the pivot is
-      // resolved mostly by turning the section about it - its rear axle for the front section, its hitch
-      // for a trailer - so a bus pressed against a wall swings parallel to it and scrapes along instead of
-      // being pinned; what the turn doesn't fix (and contacts near the pivot) moves the whole bus.
+      const depth = best.depth + 0.002;
+      const nx = best.px / best.depth;
+      const ny = best.py / best.depth;
+      if (iter === 0) {
+        out.nx = nx;
+        out.ny = ny;
+        out.depth = best.depth;
+        out.wall = best.wall;
+        if (best.wall) out.wallIndex = best.wallIndex;
+      }
+      // Resolve a glancing contact by turning the section about its pivot - the rear axle for the front
+      // section, the hitch for a trailer - so a bus pressed against a wall swings parallel and slides along
+      // it. Head-on contacts and contacts near the pivot are pushed straight out instead.
       const sec = pose.sections[best.sec] ?? pose;
       const ssec = spec.sections[best.sec];
       const sfx = Math.sin(sec.heading);
@@ -1499,20 +1515,18 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       const pivY = sec.y + sfy * dH;
       const qa = (best.qx - pivX) * sfx + (best.qy - pivY) * sfy; // along the section from the pivot
       const qw = (best.qx - pivX) * sfy - (best.qy - pivY) * sfx; // to its right
-      const pX = nx * push;
-      const pY = ny * push;
-      const dLat = pX * sfy - pY * sfx;
-      const reach = Math.abs(qa);
-      const wr = reach < 1.5 ? 0 : reach > 4 ? 1 : ((reach - 1.5) / 2.5) ** 2 * (3 - (2 * (reach - 1.5)) / 2.5);
-      let dpsi = wr > 0 ? (wr * dLat) / qa : 0;
-      dpsi = dpsi > 0.1 ? 0.1 : dpsi < -0.1 ? -0.1 : dpsi;
-      // Displacement of the contact point by that turn: dpsi * (a * right - w * forward).
-      const rotX = dpsi * (qa * sfy - qw * sfx);
-      const rotY = dpsi * (qa * -sfx - qw * sfy);
+      const rn = sfy * nx - sfx * ny; // right . n
+      const fn = sfx * nx + sfy * ny; // forward . n
+      // A turn by dpsi moves the contact point by dpsi * (qa * right - qw * forward).
+      const den = qa * rn - qw * fn;
+      const lever = Math.min(1, Math.max(0, (Math.abs(qa) - 1.5) / 2.5));
+      const lateral = Math.min(1, Math.max(0, (Math.abs(rn) - 0.3) / 0.4));
+      const wRot = lever * lateral * (Math.abs(den) > 0.5 ? 1 : 0);
+      let dpsi = wRot > 0 ? (wRot * depth) / den : 0;
+      dpsi = dpsi > 0.12 ? 0.12 : dpsi < -0.12 ? -0.12 : dpsi;
       if (dpsi !== 0) {
         const h2 = sec.heading + dpsi;
         if (trailer) {
-          // Swing the trailer about its hitch.
           sec.x = pivX - Math.sin(h2) * dH;
           sec.y = pivY - Math.cos(h2) * dH;
           sec.heading = h2;
@@ -1520,9 +1534,12 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
           pose.heading = h2;
           sec.heading = h2;
         }
+        turned += Math.abs(dpsi);
       }
-      const tX = pX - rotX;
-      const tY = pY - rotY;
+      // Whatever the turn didn't take out, push straight out along the normal.
+      const rest = depth - dpsi * den;
+      const tX = nx * rest;
+      const tY = ny * rest;
       pose.x += tX;
       pose.y += tY;
       for (const sp of pose.sections) {
@@ -1535,28 +1552,27 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
         pose.sections[0].y = pose.y;
         pose.sections[0].heading = pose.heading;
       }
-      if (iter === 0) {
-        out.nx = nx;
-        out.ny = ny;
-        out.depth = d;
-        out.wall = best.wall;
-        if (best.wall) out.wallIndex = best.wallIndex;
-      }
-      // Velocity: the into-obstacle component goes (a small bounce on hard hits); a glancing contact that
-      // the turn takes up costs less speed. Scrape friction is proportional to the hit (Coulomb), so a
-      // bus sliding along a wall keeps going.
-      const fn = sfx * nx + sfy * ny;
-      const vn = pose.speed * fn;
-      if (vn < 0) {
-        const impact = -vn;
-        out.impact = Math.max(out.impact, impact);
-        const e = impact > 2 ? 0.12 : 0;
-        let v = pose.speed - (1 + e) * vn * fn * (1 - 0.6 * wr);
-        const fr = Math.min(Math.abs(v), 0.35 * impact * Math.sqrt(Math.max(0, 1 - fn * fn)));
-        v -= Math.sign(v) * fr;
-        pose.speed = v;
-      }
+      tAlong += tX * f0x + tY * f0y;
+      tLat += Math.abs(tX * f0y - tY * f0x);
+      if (iter === 0) firstVn = Math.max(0, -v0 * fn);
     }
+    if (out.hit) {
+      // Speed: lose what was actually blocked along the heading this frame (head-on: all of it; sliding
+      // along a wall: none), then scrape friction in proportion to how hard the wall turns or shoves the bus.
+      const dt = stepTime;
+      const reach = Math.max(1e-4, Math.abs(v0) * dt);
+      const blocked = v0 > 0 ? Math.max(0, -tAlong) / reach : v0 < 0 ? Math.max(0, tAlong) / reach : 0;
+      let v = v0 * Math.max(0, 1 - Math.min(1, blocked));
+      const fr = 0.35 * (turned * Math.abs(v0) + (0.3 * tLat) / dt);
+      v = Math.sign(v) * Math.max(0, Math.abs(v) - fr);
+      const lost = Math.abs(v0) - Math.abs(v);
+      // A fresh hit: report the speed into the obstacle (thump); a small bounce off a hard head-on hit.
+      if (!hadContact) out.impact = Math.max(firstVn, lost);
+      else out.impact = lost;
+      if (!hadContact && blocked > 0.8 && Math.abs(v0) > 2) v = -0.12 * v0;
+      pose.speed = v;
+    }
+    hadContact = out.hit;
     // River: front axle over water, at or below the water surface, and not on any road, bridge or route.
     const s0 = pose.sections[0] ?? pose;
     const fx = Math.sin(pose.heading);
@@ -1578,6 +1594,9 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     heights: H,
     waterLevel,
     resolve,
+    setStepTime: (dt) => {
+      stepTime = Math.max(1e-3, Math.min(0.1, dt));
+    },
     surface: (x, y, hintZ, maxStep) => H.surfaceAt(x, y, hintZ, maxStep),
     ground: (x, y) => H.ground(x, y),
     road: (i) => data.roads[i],

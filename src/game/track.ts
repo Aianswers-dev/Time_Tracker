@@ -32,6 +32,14 @@ export interface TrackStop {
 
 /** Lane centre this far from a platform edge puts the bus side ~0.35 m off it. */
 const PLATFORM_LANE = 1.6;
+/**
+ * Where a road has walls (tunnel walls, viaduct parapets, cutting retaining
+ * walls; see sim/collider.ts) the lane centre stays this far inside them:
+ * half a bus plus a margin for the body swinging out on bends.
+ */
+const WALL_CLEAR = 1.8;
+/** Sideways metres per metre the lane may move away from a walled stretch. */
+const WALL_SLOPE = 0.3;
 
 export interface TrackSignal {
   /** Stop line distance along the route. */
@@ -136,6 +144,9 @@ export class RouteTrack {
     const target = new Float32Array(n);
     const kerbBase = new Float32Array(n);
     const known = new Uint8Array(n);
+    // Walled stretches: lane-offset bounds that keep the bus inside the carriageway.
+    const lo = new Float32Array(n).fill(-Infinity);
+    const hi = new Float32Array(n).fill(Infinity);
     this.limit = new Uint8Array(n);
     this.road = new Int32Array(n).fill(-1);
     this.z = new Float32Array(n);
@@ -167,6 +178,15 @@ export class RouteTrack {
         target[i] = dC + fromCentre;
         kerbBase[i] = dC + (road.oneway ? w / 2 : Math.max(w / 2, 3.2));
         known[i] = 1;
+        // Walls stand just outside the carriageway (never closer than 2.6 m to the centreline):
+        // along tunnels and viaducts, and in cuttings where the ground beside is well above the road.
+        const wallAt = Math.max(road.width / 2 + 0.6, 2.6);
+        const cx = p.x + nx[i] * dC;
+        const cy = p.y + ny[i] * dC;
+        const walled = (side: number) =>
+          road.tunnel || road.bridge || H.ground(cx + nx[i] * side * (wallAt + 2.5), cy + ny[i] * side * (wallAt + 2.5)) - hit.z > 1.2;
+        if (walled(1)) hi[i] = dC + wallAt - WALL_CLEAR;
+        if (walled(-1)) lo[i] = dC - wallAt + WALL_CLEAR;
         this.limit[i] = speedLimitOf(road);
         this.road[i] = hit.road;
       }
@@ -197,7 +217,8 @@ export class RouteTrack {
     this.offset = new Float32Array(n);
     this.kerb = new Float32Array(n);
     for (let i = 0; i < n; i++) {
-      const off = Math.max(-3, Math.min(8, tS[i]));
+      // (GTFS shapes can run well off the mapped road, e.g. 12 m off a busway tunnel: follow the road.)
+      const off = Math.max(-16, Math.min(16, tS[i]));
       this.offset[i] = off;
       this.kerb[i] = Math.max(1.3, Math.min(6, kS[i] - off));
     }
@@ -222,7 +243,10 @@ export class RouteTrack {
         this.kerb[i] += (Math.max(PLATFORM_LANE, kerbNow - this.offset[i]) - this.kerb[i]) * w;
         if (s >= z.s0 && s <= z.s1) this.kerb[i] = PLATFORM_LANE;
       }
+      // Alongside the platform the space up to its edge is bay, not wall.
+      for (let i = Math.max(0, Math.floor((z.s0 - 2) / TRACK_STEP)); i <= Math.min(n - 1, Math.ceil((z.s1 + 2) / TRACK_STEP)); i++) hi[i] = Infinity;
     }
+    this.keepInside(lo, hi);
     for (let i = 0; i < n; i++) {
       this.x[i] = bx[i] + nx[i] * this.offset[i];
       this.y[i] = by[i] + ny[i] * this.offset[i];
@@ -343,6 +367,54 @@ export class RouteTrack {
   }
 
   /** Road height (m AHD) at route distance s. */
+  /**
+   * Clamp the lane offsets into [lo, hi] (walled stretches), smoothing the
+   * steps that creates without leaving the bounds; kerb distances follow.
+   */
+  private keepInside(lo: Float32Array, hi: Float32Array): void {
+    const n = this.n;
+    const off = this.offset;
+    let any = false;
+    for (let i = 0; i < n; i++) if (lo[i] > -Infinity || hi[i] < Infinity) any = true;
+    if (!any) return;
+    const before = Float32Array.from(off);
+    // Approach and leave a walled stretch gently: the bounds widen by at most
+    // WALL_SLOPE per metre away from it (platform lead-ins swerve inside the
+    // platform's own length, not across a parapet or a tunnel portal).
+    const step = WALL_SLOPE * TRACK_STEP;
+    for (let i = 1; i < n; i++) {
+      hi[i] = Math.min(hi[i], hi[i - 1] + step);
+      lo[i] = Math.max(lo[i], lo[i - 1] - step);
+    }
+    for (let i = n - 2; i >= 0; i--) {
+      hi[i] = Math.min(hi[i], hi[i + 1] + step);
+      lo[i] = Math.max(lo[i], lo[i + 1] - step);
+    }
+    const clamp = () => {
+      for (let i = 0; i < n; i++) {
+        // A band narrower than a bus (a narrow walled road): its middle.
+        if (lo[i] > hi[i]) off[i] = (lo[i] + hi[i]) / 2;
+        else off[i] = Math.max(lo[i], Math.min(hi[i], off[i]));
+      }
+    };
+    clamp();
+    // Ease the steps the clamp made (only around them), without leaving the bounds.
+    const near = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      if (Math.abs(off[i] - before[i]) < 0.01) continue;
+      for (let j = Math.max(0, i - 6); j <= Math.min(n - 1, i + 6); j++) near[j] = 1;
+    }
+    for (let k = 0; k < 4; k++) {
+      const sm = boxSmooth(off, 2);
+      for (let i = 0; i < n; i++) if (near[i]) off[i] = sm[i];
+      clamp();
+    }
+    for (let i = 0; i < n; i++) {
+      const d = off[i] - before[i];
+      if (d !== 0) this.kerb[i] = Math.max(1.3, Math.min(6, this.kerb[i] - d));
+    }
+  }
+
   zAt(s: number): number {
     const f = Math.max(0, Math.min(this.n - 1.0001, s / TRACK_STEP));
     const i = Math.floor(f);

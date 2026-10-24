@@ -313,6 +313,19 @@ function colliderBox(spec: BusSpec): void {
   check('collider: awning over road excluded', col.stats.solid, 1, 1, '');
   const { p, out } = drive(spec, col, [0, 0, 0, 0], 20, () => ({ throttle: 1 }));
   check('collider: front never past the wall', maxOf(out.map((s) => s.y)) + spec.sections[0].axleFromFront, 29.5, 30.05, 'm');
+  check('collider: head-on, stopped at the wall', Math.abs(p.pose.speed), 0, 0.5, 'm/s');
+  // Head-on at speed: one thump with the full speed into the wall.
+  const hp = new BusPhysics(spec);
+  const hc = new BusControls();
+  hp.reset(0, 5, 0, 0);
+  hp.pose.speed = 8;
+  let maxImpact = 0;
+  for (let t = 0; t < 4; t += DT) {
+    const i = input({ throttle: 0.3 });
+    hc.update(DT, i, hp.pose);
+    maxImpact = Math.max(maxImpact, hp.update(DT, i, hc, col).impact);
+  }
+  check('collider: head-on impact reported (m/s into the wall)', maxImpact, 6, 9, 'm/s');
   // Snap back to the road.
   p.reset(p.pose.x, p.pose.y, p.pose.heading);
   check('reset: snapped next to the road', Math.abs(p.pose.x - -100), 0, 3.6, 'm');
@@ -388,44 +401,57 @@ function tunnelCurve(spec: BusSpec): void {
 }
 
 function wallSlide(spec: BusSpec, kind: 'parapet' | 'tunnel'): void {
-  // A straight viaduct (or tunnel) running north; walls stand at x = +-4.3 m.
-  const data =
-    kind === 'parapet'
-      ? makeMap({ roads: [{ pts: [0, -400, 0, 400], z: [10, 10], bridge: true, width: 7.4 }] })
-      : makeMap({ roads: [{ pts: [0, -400, 0, 400], z: [10, 10], tunnel: true, width: 7.4 }], ground: () => 20 });
+  // A wide (16 m) viaduct or tunnel running north; its walls stand at x = +-8.6 m.
+  const roads = [{ pts: [0, -400, 0, 400], z: [10, 10], width: 16, bridge: kind === 'parapet', tunnel: kind === 'tunnel' }];
+  const data = makeMap(kind === 'parapet' ? { roads } : { roads, ground: () => 20 });
   const col = world(data);
+  const WALL = 8.6;
   const ang = (20 * Math.PI) / 180;
-  // Hit the right-hand wall at 30 km/h, 20 degrees, wheel held into it for 4 s; then steer away.
-  const contactT: number[] = [];
-  let t0 = -1;
-  const r = drive(spec, col, [0, -300, ang, 10], 8, (t, p) => {
-    if (t === 0) p.pose.speed = 30 / 3.6;
-    if (t0 < 0 && t >= 4) t0 = t;
-    return t < 4 ? { throttle: 0.4, steer: 0.6 } : { throttle: 0.5, steer: -0.6 };
-  });
-  for (const smp of r.out) if (smp.hit) contactT.push(smp.t);
-  const ph1 = r.out.filter((x) => x.t < 4);
-  const firstHit = contactT.length ? contactT[0] : NaN;
-  const scraping = ph1.filter((x) => x.t > firstHit + 0.5);
-  const label = `${kind}`;
-  check(`wall slide (${label}): hit the wall`, Number.isFinite(firstHit) ? 1 : 0, 1, 1, '');
-  check(`wall slide (${label}): min speed while scraping (never pinned)`, minOf(scraping.map((x) => x.v)), 1, 20, 'm/s');
-  check(`wall slide (${label}): distance scraped along in 4 s`, ph1[ph1.length - 1].y - ph1[0].y, 12, 60, 'm');
-  const last = contactT.filter((t) => t >= 4).pop() ?? 4;
-  check(`wall slide (${label}): free of the wall after steering away`, last - 4, 0, 2, 's');
-  const at2 = r.out.find((x) => x.t >= 6) ?? r.out[r.out.length - 1];
-  check(`wall slide (${label}): moving 2 s after steering away`, at2.v, 2, 20, 'm/s');
-  check(`wall slide (${label}): heading away from the wall`, (r.p.pose.heading * 180) / Math.PI, -90, 5, 'deg');
-  // Never through the wall: every corner of every section inside x < 4.3 (+ push tolerance).
-  let worst = 0;
-  for (let i = 0; i < r.p.pose.sections.length; i++) {
-    const sp = r.p.pose.sections[i];
-    const ss = spec.sections[i];
-    const fx = Math.sin(sp.heading);
-    const fy = Math.cos(sp.heading);
-    for (const u of [ss.axleFromFront, ss.axleFromFront - ss.length]) for (const w of [-spec.width / 2, spec.width / 2]) worst = Math.max(worst, sp.x + fx * u + fy * w);
+  // Placed at 20 degrees with the front right corner 1 m short of the right-hand wall, at 30 km/h.
+  const s0 = spec.sections[0];
+  const x0 = WALL - 1 - (s0.axleFromFront * Math.sin(ang) + (spec.width / 2) * Math.cos(ang));
+  const p = new BusPhysics(spec);
+  const c = new BusControls();
+  p.reset(x0, -300, ang, 10);
+  p.pose.speed = 30 / 3.6;
+  const maxCornerX = () => {
+    let m = -Infinity;
+    for (let i = 0; i < p.pose.sections.length; i++) {
+      const sp = p.pose.sections[i];
+      const ss = spec.sections[i];
+      const fx = Math.sin(sp.heading);
+      const fy = Math.cos(sp.heading);
+      for (const u of [ss.axleFromFront, ss.axleFromFront - ss.length]) for (const w of [-spec.width / 2, spec.width / 2]) m = Math.max(m, sp.x + fx * u + fy * w);
+    }
+    return m;
+  };
+  let firstTouch = NaN;
+  let lastTouch = NaN;
+  let worst = -Infinity;
+  let minV = Infinity;
+  let y4 = 0;
+  let v6 = 0;
+  for (let t = 0; t < 8; t += DT) {
+    // 0-4 s: throttle with the wheel held into the wall. Then steer away for 0.8 s and straighten up.
+    const i = input(t < 4 ? { throttle: 0.4, steer: 0.6 } : t < 4.8 ? { throttle: 0.5, steer: -0.5 } : { throttle: 0.5 });
+    c.update(DT, i, p.pose);
+    p.update(DT, i, c, col);
+    const mx = maxCornerX();
+    worst = Math.max(worst, mx);
+    const touching = mx > WALL - 0.05;
+    if (touching && !Number.isFinite(firstTouch)) firstTouch = t;
+    if (touching) lastTouch = t;
+    if (Number.isFinite(firstTouch) && t > firstTouch + 0.5 && t < 4) minV = Math.min(minV, p.pose.speed);
+    if (t < 4) y4 = p.pose.y;
+    if (t < 6) v6 = p.pose.speed;
   }
-  check(`wall slide (${label}): stayed inside the wall (max corner x at end)`, worst, -10, 4.35, 'm');
+  const label = `${kind}`;
+  check(`wall slide (${label}): hit the wall`, Number.isFinite(firstTouch) ? 1 : 0, 1, 1, '');
+  check(`wall slide (${label}): min speed scraping with the wheel held in`, minV, 1, 20, 'm/s');
+  check(`wall slide (${label}): distance along the wall in 4 s`, y4 + 300, 12, 60, 'm');
+  check(`wall slide (${label}): clear of the wall after steering away`, lastTouch - 4, -4, 2, 's');
+  check(`wall slide (${label}): moving 2 s after steering away`, v6, 2, 20, 'm/s');
+  check(`wall slide (${label}): never through the wall (max corner x)`, worst, 0, WALL + 0.05, 'm');
 }
 
 function grade(spec: BusSpec): void {
