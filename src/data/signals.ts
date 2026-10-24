@@ -9,10 +9,12 @@
  *   a motorway, or a busway viaduct over a street, are separate junctions).
  * - Arms are the roads at the junction's level within 24 m: tunnel portal
  *   approaches and pieces shorter than the 16 m probe count too.
- * - Phases: arms roughly opposite each other (straight-through flows) share a
- *   phase; every other incoming arm gets one of its own. Crossing or merging
- *   streams are therefore never green together, and every incoming arm has a
- *   green in every cycle: no approach is ever permanently red.
+ * - Arms a signal node faces (the pipeline's signal direction along its road)
+ *   are controlled; an approach no node faces has no light and gives way.
+ * - Phases: controlled arms roughly opposite each other (straight-through
+ *   flows) share a phase; every other one gets one of its own. Crossing or
+ *   merging controlled streams are therefore never green together, and every
+ *   controlled arm has a green in every cycle: none is ever permanently red.
  * - `stateAt` picks the junction (on the asker's level, matching its travel
  *   direction) and the arm pointing back along the travel direction.
  *
@@ -43,7 +45,7 @@ export interface SignalArm {
   kind: RoadKind;
   /** Traffic can arrive on this arm. */
   incoming: boolean;
-  /** Phase index (into SignalJunction.phases) of incoming arms, -1 for exits. */
+  /** Phase index (into SignalJunction.phases) of controlled incoming arms, -1 for exits and arms no signal faces. */
   phase: number;
   /** Stop line distance from (ox, oy) along the arm. */
   stop: number;
@@ -105,6 +107,8 @@ const ROUTE_COORD_R = 400;
 const IN_R = 12;
 /** Arms whose direction scores are this close (cos; ~40 degrees apart) are told apart by where we stand. */
 const TIE = 0.25;
+/** A signal node controls the arm whose traffic heads its facing way to within this (cos; 60 degrees). */
+const FACE = 0.5;
 
 const CLASS_W: Partial<Record<RoadKind, number>> = {
   [RoadKind.Motorway]: 3,
@@ -178,6 +182,29 @@ function project(r: Road, g: RoadGeo, x: number, y: number): { s: number; d: num
   return { s: bs, d: best, z: bz };
 }
 
+/** Unit direction (vertex order) of the road's segment nearest (x, y). */
+function segmentDir(r: Road, x: number, y: number): [number, number] {
+  const p = r.pts;
+  let best = Infinity;
+  let ux = 0;
+  let uy = 1;
+  for (let k = 0; k + 3 < p.length; k += 2) {
+    const dx = p[k + 2] - p[k];
+    const dy = p[k + 3] - p[k + 1];
+    const l2 = dx * dx + dy * dy;
+    if (l2 < 1e-6) continue;
+    const t = Math.max(0, Math.min(1, ((x - p[k]) * dx + (y - p[k + 1]) * dy) / l2));
+    const d = Math.hypot(p[k] + dx * t - x, p[k + 1] + dy * t - y);
+    if (d < best) {
+      best = d;
+      const l = Math.sqrt(l2);
+      ux = dx / l;
+      uy = dy / l;
+    }
+  }
+  return [ux, uy];
+}
+
 /** Uniform grid of road segments (all roads, tunnels included). */
 class SegGrid {
   private cells = new Map<number, number[]>();
@@ -228,6 +255,8 @@ export class SignalModel {
   /** Junction of each signal node (index into junctions). */
   readonly nodeJunction: Int32Array;
   private grid = new Map<number, number[]>();
+  /** Per junction: its directed signal nodes, [x, y, fx, fy, ...] with f the way the traffic it faces heads. */
+  private faces: Float32Array[] = [];
 
   constructor(data: MapData) {
     const roads = data.roads;
@@ -340,10 +369,19 @@ export class SignalModel {
       cx /= members.length;
       cy /= members.length;
       cz /= members.length;
-      const j = this.buildJunction(roads, geo, segs, cx, cy, cz);
+      const j = this.buildJunction(data, geo, segs, cx, cy, cz, members);
       j.nodes = members;
       const ji = this.junctions.length;
       this.junctions.push(j);
+      const f: number[] = [];
+      for (const m of members) {
+        const d = data.signalDir?.[m] ?? 0;
+        const ri = sigRoad?.[m] ?? -1;
+        if (!d || ri < 0) continue;
+        const [rx, ry] = segmentDir(roads[ri], sig[2 * m], sig[2 * m + 1]);
+        f.push(sig[2 * m], sig[2 * m + 1], rx * d, ry * d);
+      }
+      this.faces.push(Float32Array.from(f));
       for (const m of members) this.nodeJunction[m] = ji;
       const key = Math.floor(cx / 60) * 65536 + Math.floor(cy / 60);
       let l = this.grid.get(key);
@@ -353,7 +391,8 @@ export class SignalModel {
     this.coordinate(data.routes);
   }
 
-  private buildJunction(roads: Road[], geo: RoadGeo[], segs: SegGrid, cx: number, cy: number, cz: number): SignalJunction {
+  private buildJunction(data: MapData, geo: RoadGeo[], segs: SegGrid, cx: number, cy: number, cz: number, nodes: number[]): SignalJunction {
+    const roads = data.roads;
     interface Found extends Omit<SignalArm, 'phase' | 'stop'> {
       name?: string;
     }
@@ -410,10 +449,34 @@ export class SignalModel {
       for (const b of arms) if (b !== a) ds = Math.max(ds, b.hw + 2.5);
       a.stop = Math.min(ds, 22);
     }
-    // Phases: pair opposite incoming arms (straight through each other), the rest alone.
+    // The incoming arms the junction's signal nodes face. The pipeline gives each
+    // node the road it stands on and the direction of the traffic it faces along
+    // that road (OSM traffic_signals:direction): a node controls the arm that
+    // traffic arrives on, heading its way, on the node's side of the centre. An
+    // arm no node faces has no light (a free slip lane, the through busway at
+    // Buranda): it gives way in the box as at an unsignalised junction, as the
+    // player's guide (src/game/track.ts) shows it no light. Untagged nodes, or
+    // map data without directions, control every arm.
+    const sig = data.signals;
+    const controlled = new Set<number>();
+    for (const m of nodes) {
+      const ri = data.signalRoad?.[m] ?? -1;
+      const d = data.signalDir?.[m] ?? 0;
+      if (ri < 0 || !d) {
+        arms.forEach((_, i) => controlled.add(i));
+        break;
+      }
+      const x = sig[2 * m];
+      const y = sig[2 * m + 1];
+      const [rx, ry] = segmentDir(roads[ri], x, y);
+      arms.forEach((a, i) => {
+        if (a.incoming && -(a.ux * rx + a.uy * ry) * d > FACE && (x - cx) * a.ux + (y - cy) * a.uy > -6) controlled.add(i);
+      });
+    }
+    // Phases: pair opposite controlled arms (straight through each other), the rest alone.
     // Signals nobody can see (every approach is inside a tunnel, e.g. in an
     // underground bus station, where no heads are drawn) control nothing.
-    const inc = arms.filter((a) => a.incoming);
+    const inc = arms.filter((a, i) => a.incoming && (controlled.has(i) || !controlled.size));
     if (inc.every((a) => a.open < 5)) inc.length = 0;
     const pairs: { a: number; b: number; score: number }[] = [];
     for (let i = 0; i < inc.length; i++) {
@@ -811,17 +874,43 @@ export class SignalModel {
 
   /**
    * Approach direction of a path (a route lane) through the junction of the
-   * signal node at (x, y): the chord over the 15 m before the path's point
-   * nearest the junction centre, whatever the path does after it (a stop
-   * line or signal node on the exit arm doesn't matter), and the point 12 m
-   * before the junction to ask stateAt from. `at(s, out)` samples the path;
-   * `s` is the path distance of the signal. Null when no junction.
+   * signal node at (x, y), and the point to ask stateAt from. Where the path
+   * comes up to one of the junction's signal nodes facing its way (within
+   * 9 m, its last 12 m heading within 60 degrees of the node's facing), that
+   * chord, asked from just before the node: the arm that node controls,
+   * however the path turns before the centre of a wide junction. Else the chord over the 15 m before the path's
+   * point nearest the junction centre, whatever the path does after it (a
+   * stop line or signal node on the exit arm doesn't matter), asked 12 m
+   * before the junction. `at(s, out)` samples the path; `s` is the path
+   * distance of the signal. Null when no junction.
    */
   approachDir(x: number, y: number, z: number | undefined, at: (s: number, out: { x: number; y: number }) => unknown, s: number): { dx: number; dy: number; x: number; y: number } | null {
     const ji = this.junctionAt(x, y, undefined, undefined, z);
     if (ji < 0) return null;
     const j = this.junctions[ji];
     const p = { x: 0, y: 0 };
+    const f = this.faces[ji];
+    if (f.length) {
+      const b = { x: 0, y: 0 };
+      for (let q = s - 30; q <= s + 40; q += 1) {
+        at(q, p);
+        for (let k = 0; k < f.length; k += 4) {
+          if (Math.hypot(p.x - f[k], p.y - f[k + 1]) > 9) continue;
+          at(q - 12, b);
+          const l = Math.hypot(p.x - b.x, p.y - b.y);
+          if (l < 1) continue;
+          const dx = (p.x - b.x) / l;
+          const dy = (p.y - b.y) / l;
+          if (dx * f[k + 2] + dy * f[k + 3] <= FACE) continue;
+          // (asked from just before the node: its own junction, whatever lies near the path further
+          // back; a node far out on a big junction's approach is asked nearer its centre)
+          const ax = f[k] - f[k + 2] * 2 - j.x;
+          const ay = f[k + 1] - f[k + 3] * 2 - j.y;
+          const c = Math.min(1, 30 / (Math.hypot(ax, ay) || 1));
+          return { dx, dy, x: j.x + ax * c, y: j.y + ay * c };
+        }
+      }
+    }
     let sc = s;
     let bd = Infinity;
     for (let q = s - 30; q <= s + 40; q += 1) {
@@ -862,7 +951,8 @@ export class SignalModel {
     const j = this.junctions[ji];
     if (!j.phases.length) return null;
     const a = this.approachArm(ji, x, y, dirX, dirY);
-    if (a < 0) return null;
+    // (an arm no signal faces has no light)
+    if (a < 0 || j.arms[a].phase < 0) return null;
     return phaseLight(j, j.arms[a].phase, t);
   }
 }

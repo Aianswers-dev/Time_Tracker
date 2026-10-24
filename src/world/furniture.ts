@@ -164,7 +164,8 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
   junctions.forEach((jn, ji) => {
     if (!jn.phases.length) return;
     for (const a of jn.arms) {
-      if (!a.incoming) continue;
+      // (an approach no signal faces has no light: src/data/signals.ts)
+      if (!a.incoming || a.phase < 0) continue;
       // Stop line clear of the widest other road, in the open (not inside a tunnel portal).
       const ds = Math.min(a.stop, a.open - 1);
       if (ds < 4) continue;
