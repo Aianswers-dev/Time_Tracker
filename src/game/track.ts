@@ -628,6 +628,143 @@ function signalGrid(data: MapData): Map<number, number[]> {
   return g;
 }
 
+/**
+ * Signal nodes grouped into junctions the way the world groups them for its
+ * heads, stop lines and phases (nodes within 28 m chain together; the
+ * junction is at their centroid).
+ */
+interface SignalJunctions {
+  /** Junction of each signal node. */
+  id: Int32Array;
+  cx: Float32Array;
+  cy: Float32Array;
+  /** Stop line distance back from the centre (NaN until asked). */
+  ds: Float32Array;
+}
+const signalJunctionCache = new WeakMap<MapData, SignalJunctions>();
+function signalJunctions(data: MapData): SignalJunctions {
+  let J = signalJunctionCache.get(data);
+  if (J) return J;
+  const sig = data.signals;
+  const ns = sig.length >> 1;
+  const parent = new Int32Array(ns).map((_, i) => i);
+  const find = (i: number): number => {
+    while (parent[i] !== i) {
+      parent[i] = parent[parent[i]];
+      i = parent[i];
+    }
+    return i;
+  };
+  const grid = signalGrid(data);
+  for (let i = 0; i < ns; i++) {
+    const gx = Math.floor(sig[2 * i] / 40) + 1000;
+    const gy = Math.floor(sig[2 * i + 1] / 40) + 1000;
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        for (const j of grid.get((gx + ox) * 4096 + gy + oy) ?? []) {
+          if (j <= i) continue;
+          if (Math.hypot(sig[2 * j] - sig[2 * i], sig[2 * j + 1] - sig[2 * i + 1]) < 28) parent[find(j)] = find(i);
+        }
+      }
+    }
+  }
+  const root = new Map<number, number>();
+  const id = new Int32Array(ns);
+  const sx: number[] = [];
+  const sy: number[] = [];
+  const cnt: number[] = [];
+  for (let i = 0; i < ns; i++) {
+    const r = find(i);
+    let j = root.get(r);
+    if (j === undefined) {
+      j = sx.length;
+      root.set(r, j);
+      sx.push(0);
+      sy.push(0);
+      cnt.push(0);
+    }
+    id[i] = j;
+    sx[j] += sig[2 * i];
+    sy[j] += sig[2 * i + 1];
+    cnt[j]++;
+  }
+  J = {
+    id,
+    cx: Float32Array.from(sx, (v, j) => v / cnt[j]),
+    cy: Float32Array.from(sy, (v, j) => v / cnt[j]),
+    ds: new Float32Array(sx.length).fill(NaN),
+  };
+  signalJunctionCache.set(data, J);
+  return J;
+}
+/** Road ends (rounded to 0.1 m) and the roads ending there, per map. */
+const roadEnds = new WeakMap<MapData, Map<number, number[]>>();
+const endKey = (x: number, y: number) => Math.round(x * 10) * 1048576 + Math.round(y * 10);
+/**
+ * How far from road ri's start (end = 0) or end (end = 1) the nearest junction
+ * (three or more roads meeting) is, following plain continuations (two roads
+ * meeting) up to `max` metres; Infinity if none.
+ */
+function junctionBeyond(data: MapData, ri: number, end: 0 | 1, max: number): number {
+  let m = roadEnds.get(data);
+  if (!m) {
+    m = new Map();
+    data.roads.forEach((r, k) => {
+      const p = r.pts;
+      if (p.length < 4) return;
+      for (const q of [endKey(p[0], p[1]), endKey(p[p.length - 2], p[p.length - 1])]) {
+        const l = m!.get(q);
+        if (l) l.push(k);
+        else m!.set(q, [k]);
+      }
+    });
+    roadEnds.set(data, m);
+  }
+  let dist = 0;
+  let r = ri;
+  let e = end;
+  for (let hop = 0; hop < 8; hop++) {
+    const p = data.roads[r].pts;
+    const q = e ? endKey(p[p.length - 2], p[p.length - 1]) : endKey(p[0], p[1]);
+    const at = m.get(q) ?? [];
+    if (at.length >= 3) return dist;
+    const next = at.find((k) => k !== r);
+    if (next === undefined) return Infinity;
+    const np = data.roads[next].pts;
+    const cum = roadCum(data.roads[next]);
+    dist += cum[cum.length - 1];
+    if (dist > max) return Infinity;
+    // (Carry on out of the far end of the next road.)
+    e = endKey(np[0], np[1]) === q ? 1 : 0;
+    r = next;
+  }
+  return Infinity;
+}
+/** Junction j's stop line distance back from its centre: the widest road at its level within 24 m, half of it + 2.5 m. */
+function junctionStop(data: MapData, J: SignalJunctions, j: number): number {
+  if (!Number.isNaN(J.ds[j])) return J.ds[j];
+  const idx = roadIndexFor(data);
+  const cx = J.cx[j];
+  const cy = J.cy[j];
+  // The junction's level: the street nearest its centre.
+  let nd = Infinity;
+  let level = 0;
+  idx.forEachNear(cx, cy, 30, (ri, _ax, _ay, _ux, _uy, _len, d, zz) => {
+    if (!data.roads[ri].tunnel && d < nd) {
+      nd = d;
+      level = zz;
+    }
+  });
+  let hw = 0;
+  idx.forEachNear(cx, cy, 24, (ri, _ax, _ay, _ux, _uy, _len, _d, zz) => {
+    const r = data.roads[ri];
+    if (r.tunnel || r.kind === RoadKind.Pedestrian || Math.abs(zz - level) > 3) return;
+    hw = Math.max(hw, r.width / 2);
+  });
+  J.ds[j] = Math.max(6, Math.min(22, hw + 2.5));
+  return J.ds[j];
+}
+
 export class RouteTrack {
   readonly n: number;
   readonly length: number;
@@ -1057,43 +1194,119 @@ export class RouteTrack {
       const zone = zones[index];
       return { index, s: st.s, station: !!zone || isStationStop(data.stops[st.stop].name), kerb: this.kerb[i], zone };
     });
-    // Signals near the GTFS line, deduped per intersection.
+    // Signals: one stop line per signalised junction the lane passes through, before the junction.
+    this.signals = this.findSignals(data, H);
+  }
+
+  /**
+   * The signalised junctions along the lane, each with its stop line. A signal
+   * node counts if the lane passes within 9 m of it at its level: the level of
+   * the road the node is on (not a street signal over a busway tunnel, nor one
+   * on a viaduct deck above the street), and not on a one-way carriageway
+   * running the other way (the general lanes beside a contraflow bus lane).
+   * A node out on an approach applies to traffic heading into the junction,
+   * not to traffic leaving it. Nodes are grouped into junctions as the world's
+   * signals are (within 28 m): one stop line per junction, where the world
+   * paints it (back along the lane from the junction centre by the widest
+   * road's half width + 2.5 m, 6..22 m) or 7 m before the first of its nodes
+   * the lane meets, whichever comes first. (x, y) is the junction centre, for
+   * `signalStateAt`.
+   */
+  private findSignals(data: MapData, H: ReturnType<typeof heightsOf>): TrackSignal[] {
+    const n = this.n;
+    const X = this.x;
+    const Y = this.y;
+    const J = signalJunctions(data);
+    const idx = roadIndexFor(data);
     const grid = signalGrid(data);
-    const found: { s: number; x: number; y: number }[] = [];
-    const seen = new Set<number>();
     const sig = data.signals;
+    /** Per junction pass: the nodes' lane positions. */
+    const hits: { j: number; s: number }[] = [];
+    const seen = new Set<number>();
     for (let i = 0; i < n; i++) {
-      const gx = Math.floor(bx[i] / 40) + 1000;
-      const gy = Math.floor(by[i] / 40) + 1000;
+      const gx = Math.floor(X[i] / 40) + 1000;
+      const gy = Math.floor(Y[i] / 40) + 1000;
       for (let oy = -1; oy <= 1; oy++) {
         for (let ox = -1; ox <= 1; ox++) {
           const list = grid.get((gx + ox) * 4096 + gy + oy);
           if (!list) continue;
           for (const k of list) {
             if (seen.has(k)) continue;
-            const d = Math.hypot(sig[2 * k] - bx[i], sig[2 * k + 1] - by[i]);
-            if (d > 9) continue;
-            // Along-track position of the signal: refine with the local tangent.
-            // Tangent is (ny, -nx).
-            const along = (sig[2 * k] - bx[i]) * ny[i] - (sig[2 * k + 1] - by[i]) * nx[i];
-            const sAlong = i * TRACK_STEP + along;
+            const sx = sig[2 * k];
+            const sy = sig[2 * k + 1];
+            if (Math.hypot(sx - X[i], sy - Y[i]) > 9) continue;
+            const along = (sx - X[i]) * this.tx[i] + (sy - Y[i]) * this.ty[i];
             if (Math.abs(along) > TRACK_STEP * 0.75) continue;
-            // Signals are on the streets: ignore them from a tunnel or viaduct.
-            if (Math.abs(H.surfaceAt(sig[2 * k], sig[2 * k + 1]).z - this.z[i]) > LEVEL_GAP) continue;
             seen.add(k);
-            found.push({ s: sAlong, x: sig[2 * k], y: sig[2 * k + 1] });
+            const z = this.z[i];
+            // The roads the node is on (streets first: a busway tunnel may pass right under it).
+            let level = false;
+            let onRoad = false;
+            let applies = false;
+            let tunnelOnly = true;
+            idx.forEachNear(sx, sy, 1.2, (ri) => {
+              if (!data.roads[ri].tunnel) tunnelOnly = false;
+            });
+            idx.forEachNear(sx, sy, 1.2, (ri, _ax, _ay, ux, uy, _len, _d, zz) => {
+              const r = data.roads[ri];
+              if (r.tunnel && !tunnelOnly) return;
+              onRoad = true;
+              if (Math.abs(zz - z) > LEVEL_GAP || r.kind === RoadKind.Pedestrian) return;
+              level = true;
+              const fwd = ux * this.tx[i] + uy * this.ty[i];
+              // (A one-way carriageway the other way: the general lanes beside a contraflow bus lane.)
+              if (r.oneway && fwd < -0.5) return;
+              // A node out on an approach to a junction controls the traffic heading into it: not the
+              // traffic leaving it (the signal for the other direction, on the arm the lane turns into).
+              const cum = roadCum(r);
+              const L = cum[cum.length - 1];
+              const u = projectOnRoad(r, cum, sx, sy);
+              const d0 = u + junctionBeyond(data, ri, 0, 40);
+              const d1 = L - u + junctionBeyond(data, ri, 1, 40);
+              if (Math.min(d0, d1) < 3 || Math.min(d0, d1) > 40) applies = true;
+              else if (d0 < d1) applies ||= fwd < 0;
+              else applies ||= fwd > 0;
+            });
+            if (onRoad ? !level || !applies : Math.abs(H.ground(sx, sy) - z) > LEVEL_GAP) continue;
+            hits.push({ j: J.id[k], s: i * TRACK_STEP + along });
           }
         }
       }
     }
-    found.sort((a, b) => a.s - b.s);
-    this.signals = [];
-    for (const f of found) {
-      const last = this.signals[this.signals.length - 1];
-      if (last && f.s - (last.s + 7) < 30) continue;
-      if (f.s < 12) continue;
-      this.signals.push({ s: f.s - 7, x: f.x, y: f.y });
+    hits.sort((p, q) => p.s - q.s);
+    const out: TrackSignal[] = [];
+    for (let h = 0; h < hits.length; h++) {
+      const j = hits[h].j;
+      // The nodes of this junction on this pass.
+      let s0 = hits[h].s;
+      let s1 = s0;
+      for (let q = h + 1; q < hits.length; q++) {
+        if (hits[q].j !== j) continue;
+        if (hits[q].s - s1 > 60) break;
+        s1 = hits[q].s;
+        hits.splice(q, 1);
+        q--;
+      }
+      const cx = J.cx[j];
+      const cy = J.cy[j];
+      // Where the lane passes the junction centre.
+      let best = Infinity;
+      let sc = s0;
+      for (let i = Math.max(0, Math.floor((s0 - 40) / TRACK_STEP)); i <= Math.min(n - 1, Math.ceil((s1 + 40) / TRACK_STEP)); i++) {
+        const d = Math.hypot(X[i] - cx, Y[i] - cy);
+        if (d < best) {
+          best = d;
+          sc = i * TRACK_STEP;
+        }
+      }
+      // At the world's stop line, or before the first signal for this approach if that comes first (the
+      // junction centre can lie off to one side of a turning lane).
+      const stop = Math.min(s0 - 7, best < 15 ? sc - junctionStop(data, J, j) : Infinity);
+      const last = out[out.length - 1];
+      if (stop < 12 || (last && stop - last.s < 30)) continue;
+      out.push({ s: stop, x: cx, y: cy });
     }
+    return out;
   }
 
   /** Interpolated lane sample at distance s, optionally shifted left. */
