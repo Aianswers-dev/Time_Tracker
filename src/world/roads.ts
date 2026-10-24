@@ -1277,7 +1277,9 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       const shared = P0.map((c, k) => {
         const last = platEdge[k];
         if (last < 0) return false;
-        for (let o = last + 0.5; o <= last + 8; o += 0.5) if (tubeNb(c.x + c.nx * side * o, c.y + c.ny * side * o, c.z) > -0.5) return true;
+        // Search 22 m past the platform: Queen St platform 2's far carriageway is ~13.5 m beyond its kerb.
+        // Keep in step with the matching search in src/sim/collider.ts.
+        for (let o = last + 0.5; o <= last + 22; o += 0.5) if (tubeNb(c.x + c.nx * side * o, c.y + c.ny * side * o, c.z) > -0.5) return true;
         return false;
       });
       const wo = platEdge.map((last, k) => (last >= 0 && !shared[k] ? Math.max(wallOff, last + 1.2) : wallOff));

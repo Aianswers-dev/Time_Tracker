@@ -89,7 +89,8 @@ function boxSmooth(src: Float32Array, half: number): Float32Array {
   return out;
 }
 
-const ALONG_3 = [-2, 0, 2];
+/** Half the length of route (m) each lane sample keeps clear of walls: a little over half a sample step. */
+const STRIP = 2.6;
 
 /**
  * The walls the lane keeps clear of, and where a bus may drive: the driving
@@ -311,20 +312,28 @@ export class RouteTrack {
               if (wallSeen[w] === i + 1) continue;
               wallSeen[w] = i + 1;
               if (W.hi[w] <= zr + BUS_LO || W.lo[w] >= zr + BUS_HI) continue;
-              const ax = W.ax[w];
-              const ay = W.ay[w];
-              const ex = W.bx[w] - ax;
-              const ey = W.by[w] - ay;
-              const den = ex * ny[i] - ey * nx[i];
-              if (Math.abs(den) < 1e-6) continue;
-              for (const along of ALONG_3) {
-                const qx = p.x + dx * along - ax;
-                const qy = p.y + dy * along - ay;
-                const u = (qx * ny[i] - qy * nx[i]) / den;
-                if (u < 0 || u > 1) continue;
-                const t = (qx * ey - qy * ex) / den;
-                if (Math.abs(t) <= reach) wallPos.push(t);
+              // The piece in this sample's frame (along the route, sideways), clipped to the strip
+              // the sample stands for: the sideways span it blocks there.
+              const a0 = (W.ax[w] - p.x) * dx + (W.ay[w] - p.y) * dy;
+              const a1 = (W.bx[w] - p.x) * dx + (W.by[w] - p.y) * dy;
+              const l0 = (W.ax[w] - p.x) * nx[i] + (W.ay[w] - p.y) * ny[i];
+              const l1 = (W.bx[w] - p.x) * nx[i] + (W.by[w] - p.y) * ny[i];
+              let u0 = 0;
+              let u1 = 1;
+              const da = a1 - a0;
+              if (Math.abs(da) < 1e-6) {
+                if (Math.abs(a0) > STRIP) continue;
+              } else {
+                const ua = (-STRIP - a0) / da;
+                const ub = (STRIP - a0) / da;
+                u0 = Math.max(u0, Math.min(ua, ub));
+                u1 = Math.min(u1, Math.max(ua, ub));
+                if (u0 > u1) continue;
               }
+              const la = l0 + (l1 - l0) * u0;
+              const lb = l0 + (l1 - l0) * u1;
+              if (Math.min(la, lb) > reach || Math.max(la, lb) < -reach) continue;
+              wallPos.push(Math.min(la, lb), Math.max(la, lb));
             }
           }
         }
@@ -397,34 +406,45 @@ export class RouteTrack {
     // drive (a carriageway or station bay: platform bays are open in the collider), else the nearest
     // such gap, staying on the side chosen just before; where none fits (a junction hall, a tight
     // turnaround), the middle of the gap the carriageway is in.
-    const ws: number[] = [];
+    const spans: [number, number][] = [];
     let prev = NaN;
     for (let i = 0; i < n; i++) {
       const h = home[i];
-      ws.length = 0;
-      for (let k = wallStart[i]; k < wallStart[i + 1]; k++) ws.push(wallPos[k]);
-      if (!ws.length || !TW) {
+      // Sideways spans blocked by walls here, merged where they overlap.
+      spans.length = 0;
+      for (let k = wallStart[i]; k < wallStart[i + 1]; k += 2) spans.push([wallPos[k], wallPos[k + 1]]);
+      if (!spans.length || !TW) {
         prev = NaN;
         continue;
       }
-      ws.sort((p1, p2) => p1 - p2);
+      spans.sort((p1, p2) => p1[0] - p2[0]);
+      const obLo: number[] = [];
+      const obHi: number[] = [];
+      for (const [a, b] of spans) {
+        if (obLo.length && a <= obHi[obHi.length - 1]) obHi[obHi.length - 1] = Math.max(obHi[obHi.length - 1], b);
+        else {
+          obLo.push(a);
+          obHi.push(b);
+        }
+      }
       const z = this.z[i];
       const at = (t: number) => TW.drivable(bx[i] + nx[i] * t, by[i] + ny[i] * t, z);
-      const gapLo = (g: number) => (g > 0 ? ws[g - 1] + WALL_CLEAR : -Infinity);
-      const gapHi = (g: number) => (g < ws.length ? ws[g] - WALL_CLEAR : Infinity);
+      // Gap g lies between blocked span g - 1 and span g.
+      const gapLo = (g: number) => (g > 0 ? obHi[g - 1] + WALL_CLEAR : -Infinity);
+      const gapHi = (g: number) => (g < obLo.length ? obLo[g] - WALL_CLEAR : Infinity);
       const fits = (g: number, ref: number) => {
         const a = gapLo(g);
         const b = gapHi(g);
         return a <= b && at(Math.max(a, Math.min(b, ref)));
       };
       let gi = 0;
-      while (gi < ws.length && ws[gi] < h) gi++;
+      while (gi < obLo.length && obHi[gi] < h) gi++;
       let pick = -1;
       if (fits(gi, h)) pick = gi;
       else {
         const ref = Number.isNaN(prev) ? h : prev;
         let best = Infinity;
-        for (let g = 0; g <= ws.length; g++) {
+        for (let g = 0; g <= obLo.length; g++) {
           if (g === gi || !fits(g, ref)) continue;
           const a = gapLo(g);
           const b = gapHi(g);
@@ -441,15 +461,15 @@ export class RouteTrack {
       } else {
         // No gap a bus fits with room to spare: the middle of the drivable gap nearest the road lane.
         let g = gi;
-        for (let d = 0; d <= ws.length; d++) {
-          const cand = [gi - d, gi + d].find((k) => k >= 0 && k <= ws.length && k > 0 && k < ws.length && at((ws[k - 1] + ws[k]) / 2));
+        for (let d = 0; d <= obLo.length; d++) {
+          const cand = [gi - d, gi + d].find((k) => k > 0 && k < obLo.length && at((obHi[k - 1] + obLo[k]) / 2));
           if (cand !== undefined) {
             g = cand;
             break;
           }
         }
-        const a = g > 0 ? ws[g - 1] : h - 3;
-        const b = g < ws.length ? ws[g] : h + 3;
+        const a = g > 0 ? obHi[g - 1] : h - 3;
+        const b = g < obLo.length ? obLo[g] : h + 3;
         const m = Number.isFinite(a) && Number.isFinite(b) ? (a + b) / 2 : h;
         const half = Math.max(0, (b - a) / 2 - WALL_CLEAR);
         lo[i] = m - half;
@@ -843,6 +863,23 @@ export class RouteTrack {
         const w = Math.min(1, (k + 1) / (M + 1), (m - k) / (M + 1));
         this.x[i] += (px[k] - this.x[i]) * w;
         this.y[i] += (py[k] - this.y[i]) * w;
+      }
+      // Ease out the steps where the matched road changes (a junction): a light smoothing in place.
+      for (let pass = 0; pass < 2; pass++) {
+        const sx = Float32Array.from(this.x.subarray(a, b + 1));
+        const sy = Float32Array.from(this.y.subarray(a, b + 1));
+        for (let k = 1; k < m - 1; k++) {
+          const k0 = Math.max(0, k - 2);
+          const k1 = Math.min(m - 1, k + 2);
+          let ax = 0;
+          let ay = 0;
+          for (let q = k0; q <= k1; q++) {
+            ax += sx[q];
+            ay += sy[q];
+          }
+          this.x[a + k] = ax / (k1 - k0 + 1);
+          this.y[a + k] = ay / (k1 - k0 + 1);
+        }
       }
     }
   }
