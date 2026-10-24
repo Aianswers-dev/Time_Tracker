@@ -1294,6 +1294,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const b3 = L.foot.vert(q0x, A.z - 0.02, q0y, 0.5, ss[k], 4);
         L.foot.quad(b0, b1, b2, b3, 0, 1, 0);
         field.clampQuad([h0x, h0y, A.z, h1x, h1y, B.z, q1x, q1y, B.z, q0x, q0y, A.z], 0.25);
+        // (and the ground never pokes up through it between the grid vertices: the platform stands on it)
+        if (!r.tunnel) surfQuads.push(h0x, h0y, A.z - 0.02, h1x, h1y, B.z - 0.02, q1x, q1y, B.z - 0.02, q0x, q0y, A.z - 0.02, 0);
       }
       if (t === 1) {
         // graded shoulder to the natural ground
