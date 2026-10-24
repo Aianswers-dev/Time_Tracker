@@ -53,6 +53,20 @@ const WALL_CLEAR = 2.1;
 /** The bus body's vertical span above the road (m; the collider's sections start 0.25 m up): walls outside it are not in the way. */
 const BUS_LO = 0.25;
 const BUS_HI = 3.4;
+/**
+ * On a two-way road a lane keeps at least this far left of the centre line (opposing lanes ~3 m apart),
+ * except inside a junction box (up to the stop lines), where turning paths cross.
+ */
+const OWN_MIN = 1.5;
+/** Junction box reach either side of a junction node (m), within these bounds. */
+const JUNCTION_BOX_MIN = 4.5;
+const JUNCTION_BOX_MAX = 12;
+/**
+ * The furthest a wall gap may be from the lane's own road lane and still bound it (m): a gap further
+ * off is another carriageway seen along a skewed GTFS normal (a junction, a shape far off the road),
+ * and the slope limit would drag the lane tens of metres towards it, over the centre line.
+ */
+const BAND_REACH = 5;
 /** Sideways metres per metre the lane may move away from a walled stretch. */
 const WALL_SLOPE = 0.35;
 /** The same while pulling in to or out of a platform. */
@@ -355,6 +369,73 @@ function roadCum(r: Road): Float32Array {
   for (let k = 1; k < c.length; k++) c[k] = c[k - 1] + Math.hypot(p[2 * k] - p[2 * k - 2], p[2 * k + 1] - p[2 * k - 1]);
   return c;
 }
+/**
+ * Per road, where along it other roads join (distance along the road of every vertex where three or more
+ * road ends meet, a road passing through counting as two) and how far either side of each the junction
+ * box reaches (to just short of where the stop lines go: half the widest road there + 2 m), and whether
+ * its start and end are dead ends (no other road there).
+ */
+interface RoadNodes {
+  junctions: Float32Array[];
+  box: Float32Array[];
+  deadStart: Uint8Array;
+  deadEnd: Uint8Array;
+  cum: Float32Array[];
+}
+const roadNodesCache = new WeakMap<MapData, RoadNodes>();
+function roadNodes(data: MapData): RoadNodes {
+  const hit = roadNodesCache.get(data);
+  if (hit) return hit;
+  const deg = new Map<number, number>();
+  const wide = new Map<number, number>();
+  for (const r of data.roads) {
+    const p = r.pts;
+    const nv = p.length / 2;
+    for (let k = 0; k < nv; k++) {
+      const q = endKey(p[2 * k], p[2 * k + 1]);
+      deg.set(q, (deg.get(q) ?? 0) + (k === 0 || k === nv - 1 ? 1 : 2));
+      if (r.kind !== RoadKind.Pedestrian) wide.set(q, Math.max(wide.get(q) ?? 0, r.width));
+    }
+  }
+  const n = data.roads.length;
+  const out: RoadNodes = { junctions: new Array(n), box: new Array(n), deadStart: new Uint8Array(n), deadEnd: new Uint8Array(n), cum: new Array(n) };
+  data.roads.forEach((r, i) => {
+    const p = r.pts;
+    const nv = p.length / 2;
+    const cum = roadCum(r);
+    out.cum[i] = cum;
+    const js: number[] = [];
+    const bs: number[] = [];
+    for (let k = 0; k < nv; k++) {
+      const q = endKey(p[2 * k], p[2 * k + 1]);
+      if ((deg.get(q) ?? 0) < 3) continue;
+      js.push(cum[k]);
+      bs.push(Math.max(JUNCTION_BOX_MIN, Math.min(JUNCTION_BOX_MAX, (wide.get(q) ?? 0) / 2 + 2)));
+    }
+    out.junctions[i] = Float32Array.from(js);
+    out.box[i] = Float32Array.from(bs);
+    if (nv >= 2) {
+      out.deadStart[i] = (deg.get(endKey(p[0], p[1])) ?? 0) <= 1 ? 1 : 0;
+      out.deadEnd[i] = (deg.get(endKey(p[2 * nv - 2], p[2 * nv - 1])) ?? 0) <= 1 ? 1 : 0;
+    }
+  });
+  roadNodesCache.set(data, out);
+  return out;
+}
+
+/**
+ * Whether a lane at `along` on two-way road `ri` may leave its own half: inside a junction box, where
+ * turning paths cross, or near a dead end, where the route turns round. (A road that simply carries on
+ * as the next way is no junction.)
+ */
+function ownHalfFree(nodes: RoadNodes, ri: number, along: number): boolean {
+  const js = nodes.junctions[ri];
+  const bs = nodes.box[ri];
+  for (let q = 0; q < js.length; q++) if (Math.abs(js[q] - along) < bs[q]) return true;
+  const cum = nodes.cum[ri];
+  return (nodes.deadStart[ri] === 1 && along < 20) || (nodes.deadEnd[ri] === 1 && along > cum[cum.length - 1] - 20);
+}
+
 function projectOnRoad(r: Road, cum: Float32Array, x: number, y: number): number {
   const p = r.pts;
   let best = Infinity;
@@ -1143,9 +1224,29 @@ export class RouteTrack {
         lo[i] = m - half;
         hi[i] = m + half;
       }
+      if (Math.max(lo[i] - h, h - hi[i], 0) > BAND_REACH) {
+        lo[i] = -Infinity;
+        hi[i] = Infinity;
+        prev = NaN;
+        continue;
+      }
       prev = Math.max(lo[i], Math.min(hi[i], h));
     }
-    this.keepInside(lo, hi, home, skew);
+    // On a two-way road the walls may narrow the lane's room but not push it over the centre line while
+    // they leave room on its own side (outside junction boxes and platform lead-ins).
+    const floor = new Float32Array(n).fill(-Infinity);
+    if (TW) {
+      const nodes = roadNodes(data);
+      for (let i = 0; i < n; i++) {
+        const ri = this.road[i];
+        if (!known[i] || ri < 0 || skew[i] & 14) continue;
+        const r = data.roads[ri];
+        if (r.oneway || r.width < 6) continue;
+        const along = projectOnRoad(r, nodes.cum[ri], bx[i] + nx[i] * roadC[i], by[i] + ny[i] * roadC[i]);
+        if (!ownHalfFree(nodes, ri, along)) floor[i] = roadC[i] + Math.min(OWN_MIN, fromC[i]);
+      }
+    }
+    this.keepInside(lo, hi, home, skew, floor);
     this.bandLo = lo;
     this.bandHi = hi;
     for (let i = 0; i < n; i++) {
@@ -1380,7 +1481,7 @@ export class RouteTrack {
    * Clamp the lane offsets into [lo, hi] (walled stretches), smoothing the
    * steps that creates without leaving the bounds; kerb distances follow.
    */
-  private keepInside(lo: Float32Array, hi: Float32Array, home: Float32Array, skew: Uint8Array): void {
+  private keepInside(lo: Float32Array, hi: Float32Array, home: Float32Array, skew: Uint8Array, floor: Float32Array): void {
     const n = this.n;
     const off = this.offset;
     let any = false;
@@ -1415,6 +1516,9 @@ export class RouteTrack {
       hi[i] = Math.min(hi[i], hi[i + 1] - home[i + 1] + home[i] + step);
       lo[i] = Math.max(lo[i], lo[i + 1] - home[i + 1] + home[i] - step);
     }
+    // Not over the centre line unless the walls leave no room on the lane's own side (then as far over as
+    // they allow, not midway).
+    for (let i = 0; i < n; i++) if (hi[i] < Infinity || lo[i] > -Infinity) lo[i] = Math.max(lo[i], Math.min(hi[i], floor[i]));
     const clamp = () => {
       for (let i = 0; i < n; i++) {
         // Bounds that cannot both be met (neighbours' walls, the slope limit): midway.
@@ -2068,21 +2172,18 @@ export class RouteTrack {
     const W = TW?.walls;
     // Lane radius aimed for: a 24.7 m Metro's trailers and a 12.5 m bus's swing need ~10 m and up.
     const RMIN = 11;
-    // Mid-block on a two-way road (away from the junctions at its ends, not at a platform) the lane keeps
-    // to its own half: its nearest segment of the matched road, and the road's length along it.
+    // On a two-way road (not inside a junction, not at a platform) the lane keeps to its own half, at
+    // least OWN_MIN from the centre line so opposing lanes stay a lane apart: its nearest segment of the
+    // matched road, and the road's length along it.
     const own = new Int32Array(n).fill(-1);
-    const cumOf = new Map<number, Float32Array>();
+    const nodes = roadNodes(data);
     for (let i = 0; i < n; i++) {
       const ri = this.road[i];
       if (ri < 0 || skew[i] & 2) continue;
       const r = data.roads[ri];
       if (r.oneway || r.width < 6) continue;
       const p = r.pts;
-      let cum = cumOf.get(ri);
-      if (!cum) {
-        cum = roadCum(r);
-        cumOf.set(ri, cum);
-      }
+      const cum = nodes.cum[ri];
       let best = 12;
       for (let k = 0; k + 1 < cum.length; k++) {
         const ex = p[2 * k + 2] - p[2 * k];
@@ -2095,11 +2196,11 @@ export class RouteTrack {
         }
       }
     }
-    /** How far left of the matched road's centre line (x, y) is, facing (ux, uy); Infinity near the road's ends. */
+    /** How far left of the matched road's centre line (x, y) is, facing (ux, uy); Infinity in a junction or near a dead end. */
     const sideOf = (i: number, x: number, y: number, ux: number, uy: number): number => {
       const ri = this.road[i];
       const p = data.roads[ri].pts;
-      const cum = cumOf.get(ri)!;
+      const cum = nodes.cum[ri];
       const last = cum.length - 1;
       let best = Infinity;
       let lat = Infinity;
@@ -2112,7 +2213,7 @@ export class RouteTrack {
         if (d >= best) continue;
         best = d;
         const along = cum[k] + (cum[k + 1] - cum[k]) * t;
-        if (along < 20 || along > cum[last] - 20) {
+        if (ownHalfFree(nodes, ri, along)) {
           lat = Infinity;
           continue;
         }
@@ -2140,8 +2241,11 @@ export class RouteTrack {
         if (TW.pointInBuilding(x + lx * 1.5, y + ly * 1.5, z + 1.5)) bad += 2;
         if (TW.pointInBuilding(x - lx * 1.5, y - ly * 1.5, z + 1.5)) bad += 2;
       }
-      // (The body may lean over the centre line, not the lane.)
-      if (own[i] >= 0 && sideOf(i, x, y, ux, uy) < 0.5) bad += 1;
+      // (Over the centre line into the oncoming lane outweighs a wall's clearance.)
+      if (own[i] >= 0) {
+        const lat = sideOf(i, x, y, ux, uy);
+        if (lat < OWN_MIN) bad += 4 + (OWN_MIN - lat) * 2;
+      }
       return bad;
     };
     const dirAt = (i: number): [number, number] => {
