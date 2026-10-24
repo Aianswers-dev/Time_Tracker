@@ -96,6 +96,8 @@ export class SGeo {
   v = 0;
   pk = 0;
   ps = 1;
+  /** Interior lighting (underground halls): lit regardless of the sun. */
+  lit = false;
   /** Local pattern frame: origin and unit axis (map) for Tiles/Coffer u/v. */
   private ox = 0;
   private oy = 0;
@@ -142,7 +144,7 @@ export class SGeo {
     this.uv.push(u, v);
     const dx = x - this.ox;
     const dy = y - this.oy;
-    this.pat.push(this.pk, this.ps, dx * this.tx + dy * this.ty, -dx * this.ty + dy * this.tx);
+    this.pat.push(this.pk + (this.lit ? 8 : 0), this.ps, dx * this.tx + dy * this.ty, -dx * this.ty + dy * this.tx);
     return i;
   }
   /** Triangle facing (fx, fy, fz) in three.js space; flat normal. */
@@ -694,7 +696,7 @@ float sLine(float c, float s, float lw) {
   return (1.0 - smoothstep(lw, lw + w * 1.5, f)) * fade;
 }
 vec3 sPattern(vec3 col) {
-  float k = floor(vSPat.x + 0.5);
+  float k = mod(floor(vSPat.x + 0.5), 8.0);
   float s = max(vSPat.y, 0.05);
   vec2 l = vSPat.zw;
   if (k == 1.0) {
@@ -726,10 +728,12 @@ vec3 sPattern(vec3 col) {
   return col;
 }
 // Undersides (soffits, ceilings) only see the hemisphere's ground colour; in
-// reality bounce light from the platform keeps them bright.
+// reality bounce light from the platform keeps them bright. Underground halls
+// (flag 8 on the pattern kind) are lit by their own lights.
 float sGlow() {
-  float k = floor(vSPat.x + 0.5);
-  return (k == 4.0 || k == 5.0) ? 0.42 : 0.0;
+  float k = mod(floor(vSPat.x + 0.5), 8.0);
+  float g = (k == 4.0 || k == 5.0) ? 0.42 : 0.0;
+  return max(g, step(7.5, vSPat.x) * 0.6);
 }
 `;
 
@@ -751,7 +755,7 @@ export function stationMaterial(atlas: Atlas): THREE.MeshLambertMaterial {
       .replace('#include <color_fragment>', '#include <color_fragment>\ndiffuseColor.rgb = sPattern(diffuseColor.rgb);')
       .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += diffuseColor.rgb * sGlow();');
   };
-  m.customProgramCacheKey = () => 'station-opaque-v2';
+  m.customProgramCacheKey = () => 'station-opaque-v3';
   return m;
 }
 

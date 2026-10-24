@@ -56,6 +56,23 @@ export interface TowerDef {
   ground?: boolean;
 }
 
+/**
+ * A concourse building spanning the busway (RBWH): a raised box on columns
+ * with white horizontal bands and glass, station lettering on its long faces.
+ */
+export interface ConcourseDef {
+  x: number;
+  y: number;
+  /** Unit axis along the busway, extent along it [s0, s1] and width across. */
+  ax: number;
+  ay: number;
+  len: [number, number];
+  w: number;
+  /** Underside above the busway, and height of the box (m). */
+  clear: number;
+  h: number;
+}
+
 export interface StationDef {
   key: string;
   /** Name on the totems. */
@@ -103,6 +120,13 @@ export interface StationDef {
   ownRoofs?: number;
   /** Other buildings replaced by the model, by footprint centroid (within 3 m). */
   ownBuildings?: [number, number][];
+  concourse?: ConcourseDef;
+  /**
+   * Street entrance canopies: centre, unit facing (towards the street), length
+   * across the facing, depth and underside height; the station name stands on
+   * the front edge of the roof.
+   */
+  entrances?: { x: number; y: number; fx: number; fy: number; len: number; d: number; h: number }[];
 }
 
 // Line palettes (photos: Greenslopes/Gabba SEB charcoal, PAH/Boggo/Stones/Langlands EB bronze, INB green).
@@ -359,7 +383,10 @@ export const STATIONS: StationDef[] = [
     roof: 'flat',
     canopyDepth: 4.5,
     median: 'fence',
-    overbridges: [{ x: 2579, y: -3304, len: [-12, 12], w: 3.6, glass: 0x8fb3ad, frame: 0x4a3b30, towers: true, clear: 6.2 }],
+    // lift towers on the landings behind both platforms (platform outlines), joined across the busway
+    overbridges: [{ x: 2579, y: -3304, ax: 0, ay: 1, len: [-22, 22], w: 3.6, glass: 0x8fb3ad, frame: 0x4a3b30, towers: true, clear: 6.2 }],
+    // the bronze entrance canopy with "Langlands Park" lettering on Old Cleveland Rd
+    entrances: [{ x: 2556, y: -3326, fx: 0, fy: -1, len: 18, d: 5, h: 3.4 }],
     ownRoofs: 40,
   },
   {
@@ -447,6 +474,8 @@ export const STATIONS: StationDef[] = [
     tactile: 'charcoal',
     roof: 'flat',
     median: 'fence',
+    // the white-banded concourse over the busway at the south end (imagery: x 537-565, y 2351-2388)
+    concourse: { x: 551, y: 2369.5, ax: 0, ay: 1, len: [-18.5, 18.5], w: 28, clear: 5.4, h: 5.2 },
   },
 ];
 

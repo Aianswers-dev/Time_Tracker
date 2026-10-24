@@ -7,7 +7,7 @@
 // and one glass mesh; signs come from a shared atlas.
 import * as THREE from 'three';
 import { RoadKind, type MapData, type Road } from '../types';
-import { DEFAULT_STATION, STATIONS, enclosureStyle, stationAt, type OverbridgeDef, type StationDef, type TowerDef } from '../data/stations';
+import { DEFAULT_STATION, STATIONS, enclosureStyle, stationAt, type ConcourseDef, type OverbridgeDef, type StationDef, type TowerDef } from '../data/stations';
 import type { Heights } from '../data/height';
 import { heightsOf } from './height';
 import { roadIndexFor } from './roadIndex';
@@ -181,6 +181,7 @@ function dedupe(plats: PlatformGeom[]): PlatformGeom[] {
 // ---------------------------------------------------------------------------
 
 export function buildStations(scene: THREE.Scene, data: MapData, geoms: PlatformGeom[]): THREE.Group {
+  const t0 = performance.now();
   const group = new THREE.Group();
   group.name = 'stations';
   const c: Ctx = { data, heights: heightsOf(data), idx: roadIndexFor(data), atlas: new Atlas(), lines: [] };
@@ -215,6 +216,8 @@ export function buildStations(scene: THREE.Scene, data: MapData, geoms: Platform
     buildChargers(c, b);
     if (b.def.key === 'kgs') buildPavilions(c, b);
     if (b.def.key === 'roma') buildRomaP1(c, b);
+    if (b.def.concourse) buildConcourse(c, b, b.def.concourse);
+    for (const e of b.def.entrances ?? []) buildEntrance(c, b, e);
   }
   // INB enclosures (QUT Kelvin Grove to Herston)
   for (const bld of data.buildings) {
@@ -255,6 +258,9 @@ export function buildStations(scene: THREE.Scene, data: MapData, geoms: Platform
     group.add(m);
   }
   scene.add(group);
+  let tris = 0;
+  for (const m of group.children) tris += ((m as THREE.Mesh).geometry.index?.count ?? 0) / 3;
+  console.info(`[stations] ${all.length} stations, ${group.children.length} meshes, ${Math.round(tris / 1000)}k triangles, built in ${Math.round(performance.now() - t0)} ms`);
   return group;
 }
 
@@ -269,6 +275,7 @@ function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
   const zf = (x: number, y: number) => pl.z0 + pl.slope * ((x - pl.px) * pl.tx + (y - pl.py) * pl.ty);
   const top = (x: number, y: number) => zf(x, y) + SLAB;
   const underground = isUnder(def, g);
+  geo.lit = underground;
   const main = g.kerbs.reduce<KerbChain | null>((a, k) => (!a || k.len > a.len ? k : a), null);
   if (main) {
     const s0 = at(main, 0);
@@ -424,6 +431,7 @@ function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
 
   if (underground) {
     buildUndergroundPlatform(c, b, g, top);
+    geo.lit = false;
     return;
   }
 
@@ -1306,6 +1314,157 @@ function buildOverbridge(c: Ctx, b: StationBuild, o: OverbridgeDef): void {
   }
 }
 
+/** Street entrance canopy (Langlands Park): flat roof on posts, the station name standing on its front edge. */
+function buildEntrance(c: Ctx, b: StationBuild, e: NonNullable<StationDef['entrances']>[number]): void {
+  const geo = b.geo;
+  const z = c.heights.ground(e.x, e.y);
+  const tx = e.fy; // along the front (right of the facing)
+  const ty = -e.fx;
+  const h0 = z + e.h;
+  const h1 = h0 + 0.45;
+  geo.paint(b.def.fascia);
+  geo.box(e.x, e.y, h0, h1, tx, ty, e.len / 2, e.d / 2, false);
+  geo.paint(b.def.soffit, Pat.Soffit, 1.2);
+  const P = (s: number, f: number): [number, number] => [e.x + tx * s + e.fx * f, e.y + ty * s + e.fy * f];
+  const cs = [P(-e.len / 2, -e.d / 2), P(e.len / 2, -e.d / 2), P(e.len / 2, e.d / 2), P(-e.len / 2, e.d / 2)];
+  geo.face(
+    cs.map(([x, y]) => [x, y, h0 - 0.01] as V3),
+    0,
+    0,
+    -1,
+  );
+  geo.paint(b.def.post);
+  const np = Math.max(2, Math.round(e.len / 6) + 1);
+  for (let i = 0; i < np; i++) {
+    const s = -e.len / 2 + 0.6 + ((e.len - 1.2) * i) / (np - 1);
+    for (const f of [-e.d / 2 + 0.6, e.d / 2 - 0.6]) {
+      const [x, y] = P(s, f);
+      geo.box(x, y, c.heights.ground(x, y) - 0.3, h0, tx, ty, 0.1, 0.1);
+    }
+  }
+  if (b.def.name) {
+    const key = c.atlas.want({ kind: 'lettering', text: b.def.name });
+    const [x, y] = P(-e.len / 2 + 4.2, e.d / 2 - 0.3);
+    geo.deferSign(c.atlas, key, x, y, h1 + 0.42, e.fx, e.fy, 7.5, 0.7, 0.05);
+  }
+}
+
+/** A concourse box over the busway (RBWH): white horizontal bands and glass on columns, lettering. */
+function buildConcourse(c: Ctx, b: StationBuild, o: ConcourseDef): void {
+  const geo = b.geo;
+  const glass = b.glass;
+  const hit = c.idx.nearest(o.x, o.y, 30, undefined, 0, isBus);
+  const z0 = (hit ? hit.z : c.heights.ground(o.x, o.y)) + o.clear;
+  const z1 = z0 + o.h;
+  const { ax, ay } = o;
+  const nx = -ay;
+  const ny = ax;
+  const [s0, s1] = o.len;
+  const w = o.w / 2;
+  const P = (s: number, off: number): [number, number] => [o.x + ax * s + nx * off, o.y + ay * s + ny * off];
+  const cs: [number, number][] = [P(s0, -w), P(s1, -w), P(s1, w), P(s0, w)];
+  // glass skin, set back behind the bands
+  for (let i = 0; i < 4; i++) {
+    const a = cs[i];
+    const e = cs[(i + 1) % 4];
+    const fx = (a[0] + e[0]) / 2 - o.x;
+    const fy = (a[1] + e[1]) / 2 - o.y;
+    glass.paint(0x6f8f96);
+    glass.face(
+      [
+        [a[0], a[1], z0 + 0.6],
+        [e[0], e[1], z0 + 0.6],
+        [e[0], e[1], z1 - 0.6],
+        [a[0], a[1], z1 - 0.6],
+      ],
+      fx,
+      fy,
+      0,
+    );
+    // white bands: floor edge, mid rail and the deep roof band, with rounded corners
+    // approximated by an outward bulge at mid-height
+    geo.paint(WHITE);
+    for (const [h0, h1, out] of [
+      [z0 - 0.1, z0 + 0.6, 0.25],
+      [z0 + 2.1, z0 + 2.5, 0.35],
+      [z1 - 1.2, z1 + 0.1, 0.45],
+    ] as [number, number, number][]) {
+      const fl = Math.hypot(fx, fy) || 1;
+      const ox = (fx / fl) * out;
+      const oy = (fy / fl) * out;
+      geo.face(
+        [
+          [a[0] + ox, a[1] + oy, h0],
+          [e[0] + ox, e[1] + oy, h0],
+          [e[0] + ox, e[1] + oy, h1],
+          [a[0] + ox, a[1] + oy, h1],
+        ],
+        fx,
+        fy,
+        0,
+      );
+      geo.face(
+        [
+          [a[0], a[1], h0],
+          [e[0], e[1], h0],
+          [e[0] + ox, e[1] + oy, h0],
+          [a[0] + ox, a[1] + oy, h0],
+        ],
+        0,
+        0,
+        -1,
+      );
+      geo.face(
+        [
+          [a[0], a[1], h1],
+          [e[0], e[1], h1],
+          [e[0] + ox, e[1] + oy, h1],
+          [a[0] + ox, a[1] + oy, h1],
+        ],
+        0,
+        0,
+        1,
+      );
+    }
+    // lettering on the long faces
+    if (Math.abs(fx * nx + fy * ny) > 0.5 * Math.hypot(fx, fy) && b.def.name) {
+      const fl = Math.hypot(fx, fy) || 1;
+      const key = c.atlas.want({ kind: 'lettering', text: `${b.def.name} station` });
+      const mx = a[0] + (e[0] - a[0]) * 0.3 + (fx / fl) * 0.47;
+      const my = a[1] + (e[1] - a[1]) * 0.3 + (fy / fl) * 0.47;
+      geo.deferSign(c.atlas, key, mx, my, z1 - 0.55, fx / fl, fy / fl, 8, 0.75, 0, false);
+    }
+  }
+  // roof and soffit
+  geo.paint(0xd9d9d6);
+  geo.face(
+    cs.map(([x, y]) => [x, y, z1] as V3),
+    0,
+    0,
+    1,
+  );
+  geo.paint(0xe8e8e4, Pat.Soffit, 1.2);
+  geo.face(
+    cs.map(([x, y]) => [x, y, z0 - 0.1] as V3),
+    0,
+    0,
+    -1,
+  );
+  // columns along the long sides, off the roads below
+  for (const side of [-1, 1]) {
+    for (let s = s0 + 1; s <= s1 - 1 + 1e-6; s += (s1 - s0 - 2) / Math.max(1, Math.round((s1 - s0 - 2) / 9))) {
+      const p = P(s, side * (w - 0.6));
+      const gz = c.heights.ground(p[0], p[1]);
+      const under = c.idx.nearest(p[0], p[1], 12, undefined, 0, undefined, gz, 3);
+      if (under && under.dist < c.data.roads[under.road].width / 2 + 0.8) continue;
+      const bus = c.idx.nearest(p[0], p[1], 12, undefined, 0, isBus);
+      if (bus && bus.dist < c.data.roads[bus.road].width / 2 + 0.8) continue;
+      geo.paint(WHITE);
+      geo.cylinder(p[0], p[1], Math.min(gz, z0) - 1, z0, 0.35, 10, false);
+    }
+  }
+}
+
 /** Lift/stair tower: dark steel frame, glass and louvres, flat white cantilevered "hat" roof. */
 function buildTower(c: Ctx, b: StationBuild, t: TowerDef, base: number | null): void {
   const geo = b.geo;
@@ -1709,6 +1868,9 @@ function buildVault(c: Ctx, b: StationBuild, foot: Float32Array): void {
     acc += sl;
   }
   if (ribs.length < 2) return;
+  // over the stations the vault is sheeted in metal over the platforms with a
+  // glazed crown; between them (the INB enclosures) it is glazed throughout
+  const atStation = Math.hypot((x0 + x1) / 2 - b.def.x, (y0 + y1) / 2 - b.def.y) < b.def.r + 10;
   const N = 12;
   const arch = (rb: (typeof ribs)[number], k: number): V3 => {
     const u = k / N;
@@ -1750,7 +1912,7 @@ function buildVault(c: Ctx, b: StationBuild, foot: Float32Array): void {
       const q1 = arch(e, k + 1);
       const quad: V3[] = [p0, p1, q1, q0];
       const centre = Math.abs((k + 0.5) / N - 0.5) < 0.2;
-      if (b.def.key === 'qutkg' && !centre) {
+      if (atStation && !centre) {
         // corrugated metal deck over the platforms (both faces)
         geo.paint(0xb9bcbc, Pat.Louvre, 0.25);
         geo.panel(quad, 0, 0, 1);
