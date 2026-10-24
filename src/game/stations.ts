@@ -659,7 +659,7 @@ function canopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front:
     const b0 = B(i);
     const b1 = B(i + 1);
     // top
-    geo.paint(def.panels ? def.panels[i % def.panels.length] : def.roofTop);
+    geo.paint(def.panels ? def.panels[(i >> 1) % def.panels.length] : def.roofTop);
     geo.face(
       [
         [f0[0], f0[1], hU(f0) + T],
@@ -672,7 +672,7 @@ function canopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front:
       1,
     );
     // soffit
-    geo.paint(def.panels ? mixCol(def.panels[i % def.panels.length], def.soffit, 0.5) : def.soffit, Pat.Soffit, 1.2);
+    geo.paint(def.panels ? mixCol(def.panels[(i >> 1) % def.panels.length], def.soffit, 0.5) : def.soffit, Pat.Soffit, 1.2);
     geo.face(
       [
         [f0[0], f0[1], hU(f0)],

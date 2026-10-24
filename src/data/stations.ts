@@ -179,7 +179,8 @@ export const STATIONS: StationDef[] = [
     fascia: 0x5a4636,
     roofTop: 0xa8a49c,
     soffit: 0xd9d4ca,
-    panels: [0xa8a49c, 0xb59b7c, 0xcfcfcc, 0xb59b7c],
+    // translucent panels seen from above: peach and white squares between dark brown beams (imagery)
+    panels: [0xdca07a, 0xdcdcd6, 0xdca07a, 0xcfcfc9],
     paving: 0xc9bfae,
     tile: 0.6,
     glass: 0x9fb7b0,
