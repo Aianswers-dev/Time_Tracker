@@ -95,6 +95,8 @@ const LEVEL = 3.5;
 const PICK_R = 40;
 /** Junctions closer than this (centres, m) along a road run coordinated. */
 const COORD_R = 70;
+/** Bus-route links: consecutive junctions along a route closer than this run one cycle, offset for the bus flow. */
+const ROUTE_COORD_R = 400;
 /** An approach chord ends where the path comes this close to the junction centre. */
 const IN_R = 12;
 /** Arms whose direction scores are this close (cos; ~40 degrees apart) are told apart by where we stand. */
@@ -469,6 +471,8 @@ export class SignalModel {
    * halves of a dual-carriageway crossing, offset T junctions). The flow a
    * pair is set for is the bus routes' through it (by trips), else the
    * heaviest road feeding the link; a group is a maximum spanning tree.
+   * Consecutive junctions along a bus route up to ROUTE_COORD_R apart that
+   * run the same cycle are linked the same way: a green wave for the buses.
    */
   private coordinate(routes: readonly Route[]): void {
     const J = this.junctions;
@@ -559,7 +563,11 @@ export class SignalModel {
       for (let i = 1; i < visits.length; i++) {
         const a = visits[i - 1];
         const b = visits[i];
-        if (b.s - a.s > COORD_R + 30 || Math.hypot(J[a.j].x - J[b.j].x, J[a.j].y - J[b.j].y) >= COORD_R) continue;
+        const dab = Math.hypot(J[a.j].x - J[b.j].x, J[a.j].y - J[b.j].y);
+        if (b.s - a.s > ROUTE_COORD_R * 1.4 || dab >= ROUTE_COORD_R) continue;
+        // (a long link joins junctions that run the same cycle anyway: one with
+        // more phases would stretch a whole corridor's cycle)
+        if (dab >= COORD_R && J[a.j].cycle !== J[b.j].cycle) continue;
         const pa = phaseOf(a);
         const pb = phaseOf(b);
         if (pa < 0 || pb < 0) continue;
