@@ -154,6 +154,9 @@ interface Car {
   stall: number;
   /** Legitimately waiting (red light, the player, or a queue behind those). */
   exempt: boolean;
+  /** Why it was held up last frame, and by whom (diagnostics). */
+  why: Wait;
+  ref: number;
   visible: boolean;
   dead: boolean;
 }
@@ -341,6 +344,8 @@ export class CarTraffic {
   readonly grid = new PointGrid(8, 1024);
   private buckets = new Map<number, Car[]>();
   private byId = new Map<number, Car>();
+  /** Signal-model junction of each signalised node (-1 elsewhere): nodes of one junction share one light per approach. */
+  private nodeSigJ: Int32Array = new Int32Array(0);
   /** Stop-line distance from the end node for each directed lane (0 = uncontrolled). */
   private stopD: Float32Array = new Float32Array(0);
   /** Junction nodes (3+ arms) on a coarse grid, for mapping bus routes onto them. */
@@ -645,6 +650,17 @@ export class CarTraffic {
       }
     }
     this.buildBuswayCrossings(edgeGrid);
+    const model = signalsFor(this.data);
+    this.nodeSigJ = new Int32Array(this.nodes.length).fill(-1);
+    this.nodes.forEach((nd, n) => {
+      if (nd.sig) this.nodeSigJ[n] = model.junctionAt(nd.x, nd.y, undefined, undefined, nd.z);
+    });
+  }
+
+  /** Are graph nodes a and b parts of one signalised junction? */
+  sameSignalJunction(a: number, b: number): boolean {
+    const j = this.nodeSigJ[a];
+    return j >= 0 && j === this.nodeSigJ[b];
   }
 
   /**
@@ -1233,6 +1249,8 @@ export class CarTraffic {
       odo: 0,
       mark: 0,
       stall: 0,
+      why: Wait.None,
+      ref: 0,
       exempt: false,
       visible: false,
       dead: false,
@@ -1304,6 +1322,18 @@ export class CarTraffic {
     return true;
   }
 
+  /** Cars within r of (x, y) with their state (diagnostics: film runs, probes). */
+  debugNear(x: number, y: number, r: number): object[] {
+    const out: object[] = [];
+    for (const c of this.cars) {
+      if (c.dead || Math.hypot(c.x - x, c.y - y) > r) continue;
+      const n = this.endNode(c.lane);
+      const e = this.edges[c.lane >> 1];
+      out.push({ id: c.id, x: +c.x.toFixed(1), y: +c.y.toFixed(1), v: +c.v.toFixed(1), why: c.why, ref: c.ref, exempt: c.exempt, idle: +c.idle.toFixed(0), stall: +c.stall.toFixed(0), lane: c.lane, u: +c.u.toFixed(1), len: +e.len.toFixed(1), node: n, sig: this.nodes[n].sig, holds: c.holds.map((h) => h.node), visible: c.visible });
+    }
+    return out;
+  }
+
   /** Is the car with this id waiting legitimately (red light, player, or a queue behind those)? */
   isExempt(id: number): boolean {
     return this.byId.get(id)?.exempt ?? false;
@@ -1321,13 +1351,17 @@ export class CarTraffic {
     const nd = this.nodes[N];
     const [inX, inY] = this.laneEndDir(lane);
     const [outX, outY] = this.laneStartDir(next);
+    const e0 = this.edges[lane >> 1];
     if (nd.sig) {
-      const st = this.signalFor(N, inX, inY, time);
+      // On a short link between two nodes of one junction we are already in it:
+      // its light was ours at the first node (asked again here with the link's
+      // direction it would be some other arm's).
+      const inside = e0.len < 40 && this.sameSignalJunction(lane & 1 ? e0.b : e0.a, N);
+      const st = inside ? null : this.signalFor(N, inX, inY, time);
       if (st === 'red') return Wait.Red;
       if (st === 'amber' && stopAt > (c.v * c.v) / (2 * 3.5)) return Wait.Red;
     } else {
-      const e = this.edges[lane >> 1];
-      if (e.rank + 0.01 < nd.rank && nd.until > time && nd.holder !== lane) return nd.holder === PLAYER_HOLD ? Wait.Player : Wait.Junction;
+      if (e0.rank + 0.01 < nd.rank && nd.until > time && nd.holder !== lane) return nd.holder === PLAYER_HOLD ? Wait.Player : Wait.Junction;
     }
     const cls = classify(wrapAngle(Math.atan2(outX, outY) - Math.atan2(inX, inY)));
     // The player's bus in (or about to enter) the box: waiting for it is legitimate.
@@ -1651,6 +1685,8 @@ export class CarTraffic {
       c.pitch += (Math.atan(pt.g) - c.pitch) * Math.min(1, dt * 5);
       // Waiting legitimately? (Red light, the player, or queued behind someone who is.)
       const why = wt.why;
+      c.why = why;
+      c.ref = wt.ref;
       c.exempt =
         why === Wait.Red ||
         why === Wait.Player ||

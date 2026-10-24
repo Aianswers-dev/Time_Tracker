@@ -193,6 +193,8 @@ export class Traffic {
     this.scheduleBuild();
     this.cars = new CarTraffic(scene, data, world);
     this.cars.fixedCaps = this.film;
+    // Film/test runs: the traffic is inspectable from the page (window.__traffic.debugNear).
+    if (this.film) Object.assign(globalThis, { __traffic: this });
     buildPlatforms(scene, data);
     session.traffic = this;
     session.world = world;
@@ -1078,7 +1080,10 @@ export class Traffic {
   private junctionOk(b: AiBus, k: number, stopAt: number, time: number): Wait {
     const j = b.jl[k];
     this.jRef = 0;
-    if (j.sig) {
+    // A second node of the junction we just entered: its light was the first node's.
+    const p = b.jl[k - 1];
+    const inside = !!p && p.sig && j.s - p.s < 40 && this.cars.sameSignalJunction(p.node, j.node);
+    if (j.sig && !inside) {
       const a = b.jAsk[k];
       const st = a ? (this.world.signalStateAt?.(a.x, a.y, time, a.dx, a.dy, a.z) ?? null) : this.cars.signalFor(j.node, j.inX, j.inY, time);
       if (st === 'red') return Wait.Red;
@@ -1339,6 +1344,34 @@ export class Traffic {
     out.length = 0;
     for (const b of this.active) out.push(b.marker);
     return out;
+  }
+
+  /** AI buses and cars within r of (x, y) with their state, and recent valve events (diagnostics). */
+  debugNear(x: number, y: number, r = 60): object {
+    const buses = this.active
+      .filter((b) => Math.hypot(b.body.fx - x, b.body.fy - y) < r + b.len)
+      .map((b) => {
+        const j = b.jl[b.jNext];
+        return {
+          id: b.id,
+          route: `${b.route.id}/${b.route.dir}`,
+          x: +b.body.fx.toFixed(1),
+          y: +b.body.fy.toFixed(1),
+          s: +b.s.toFixed(1),
+          v: +b.v.toFixed(1),
+          state: b.state,
+          wait: b.wait,
+          obstacle: b.obstacle,
+          exempt: b.exempt,
+          idle: +b.idle.toFixed(0),
+          stall: +b.stall.toFixed(0),
+          visible: b.visible,
+          next: j ? { node: j.node, stop: +(j.stopS - b.s).toFixed(1), sig: j.sig, minor: j.minor } : null,
+          holds: b.holds.map((q) => b.jl[q].node),
+          touching: this.touching.has(b.id),
+        };
+      });
+    return { buses, cars: this.cars.debugNear(x, y, r), events: [...this.events.slice(-8), ...this.cars.events.slice(-8)], stats: { ...this.stats, cars: { ...this.cars.stats } } };
   }
 
   /** Number of AI buses currently active (diagnostics). */
