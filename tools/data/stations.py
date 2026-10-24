@@ -729,10 +729,22 @@ def _conflicts(bxy: np.ndarray, bz: np.ndarray, half: float, net: BusNet, chain_
         if np.any(~other & (d < 1.05) & level):  # samples are 2 m apart
             bad[m] = True
             continue
+        host = ~other & level
+        jh = int(np.argmin(np.where(host, d, np.inf))) if host.any() else -1
         for qxy, qz, qh in placed:
             dd = np.hypot(qxy[:, 0] - x, qxy[:, 1] - y)
             k = int(np.argmin(dd))
             if dd[k] < qh + half - 0.3 and abs(float(qz[k]) - float(bz[m])) < 3.0:
+                # the tapers of bays on opposite kerbs meet inside the busway they
+                # both merge into, under its asphalt: no conflict (Normanby)
+                if jh >= 0:
+                    ux, uy = net.dir[jh]
+                    ax_, ay_ = net.a[jh]
+                    c1 = ux * (y - ay_) - uy * (x - ax_)
+                    c2 = ux * (qxy[k, 1] - ay_) - uy * (qxy[k, 0] - ax_)
+                    lo, hi = max(c1 - half, c2 - qh), min(c1 + half, c2 + qh)
+                    if hi <= lo or (lo > -net.hw[jh] + 0.2 and hi < net.hw[jh] - 0.2):
+                        continue
                 bad[m] = True
                 break
     return bad
