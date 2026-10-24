@@ -387,6 +387,47 @@ function tunnelCurve(spec: BusSpec): void {
   check(`curved tunnel: every section stays underground (max z, ${zs2.length} sections)`, maxOf(zs2), 9.5, 10.5, 'm');
 }
 
+function wallSlide(spec: BusSpec, kind: 'parapet' | 'tunnel'): void {
+  // A straight viaduct (or tunnel) running north; walls stand at x = +-4.3 m.
+  const data =
+    kind === 'parapet'
+      ? makeMap({ roads: [{ pts: [0, -400, 0, 400], z: [10, 10], bridge: true, width: 7.4 }] })
+      : makeMap({ roads: [{ pts: [0, -400, 0, 400], z: [10, 10], tunnel: true, width: 7.4 }], ground: () => 20 });
+  const col = world(data);
+  const ang = (20 * Math.PI) / 180;
+  // Hit the right-hand wall at 30 km/h, 20 degrees, wheel held into it for 4 s; then steer away.
+  const contactT: number[] = [];
+  let t0 = -1;
+  const r = drive(spec, col, [0, -300, ang, 10], 8, (t, p) => {
+    if (t === 0) p.pose.speed = 30 / 3.6;
+    if (t0 < 0 && t >= 4) t0 = t;
+    return t < 4 ? { throttle: 0.4, steer: 0.6 } : { throttle: 0.5, steer: -0.6 };
+  });
+  for (const smp of r.out) if (smp.hit) contactT.push(smp.t);
+  const ph1 = r.out.filter((x) => x.t < 4);
+  const firstHit = contactT.length ? contactT[0] : NaN;
+  const scraping = ph1.filter((x) => x.t > firstHit + 0.5);
+  const label = `${kind}`;
+  check(`wall slide (${label}): hit the wall`, Number.isFinite(firstHit) ? 1 : 0, 1, 1, '');
+  check(`wall slide (${label}): min speed while scraping (never pinned)`, minOf(scraping.map((x) => x.v)), 1, 20, 'm/s');
+  check(`wall slide (${label}): distance scraped along in 4 s`, ph1[ph1.length - 1].y - ph1[0].y, 12, 60, 'm');
+  const last = contactT.filter((t) => t >= 4).pop() ?? 4;
+  check(`wall slide (${label}): free of the wall after steering away`, last - 4, 0, 2, 's');
+  const at2 = r.out.find((x) => x.t >= 6) ?? r.out[r.out.length - 1];
+  check(`wall slide (${label}): moving 2 s after steering away`, at2.v, 2, 20, 'm/s');
+  check(`wall slide (${label}): heading away from the wall`, (r.p.pose.heading * 180) / Math.PI, -90, 5, 'deg');
+  // Never through the wall: every corner of every section inside x < 4.3 (+ push tolerance).
+  let worst = 0;
+  for (let i = 0; i < r.p.pose.sections.length; i++) {
+    const sp = r.p.pose.sections[i];
+    const ss = spec.sections[i];
+    const fx = Math.sin(sp.heading);
+    const fy = Math.cos(sp.heading);
+    for (const u of [ss.axleFromFront, ss.axleFromFront - ss.length]) for (const w of [-spec.width / 2, spec.width / 2]) worst = Math.max(worst, sp.x + fx * u + fy * w);
+  }
+  check(`wall slide (${label}): stayed inside the wall (max corner x at end)`, worst, -10, 4.35, 'm');
+}
+
 function grade(spec: BusSpec): void {
   // A 6 % ramp: 0 m at y = 0 up to 30 m at y = 500 (on an embankment), then flat.
   const data = makeMap({ roads: [{ pts: [0, -100, 0, 0, 0, 500, 0, 700], z: [0, 0, 30, 30], width: 8 }] });
@@ -464,6 +505,8 @@ async function main(): Promise<void> {
   viaduct(S.rigid);
   tunnel(S.rigid);
   tunnelCurve(S.rigid);
+  wallSlide(S.rigid, 'parapet');
+  wallSlide(S.rigid, 'tunnel');
   grade(S.rigid);
   river(S.rigid);
   console.log('--- glider ---');
@@ -481,6 +524,8 @@ async function main(): Promise<void> {
   viaduct(S.metro);
   tunnel(S.metro);
   tunnelCurve(S.metro);
+  wallSlide(S.metro, 'parapet');
+  wallSlide(S.metro, 'tunnel');
   grade(S.metro);
   console.log(failures ? `\n${failures} check(s) FAILED` : '\nall checks passed');
 }
