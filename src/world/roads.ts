@@ -1263,20 +1263,30 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const q = (o: number, hh: number) => t.vert(c.x + c.nx * side * o, c.z + hh, c.y + c.ny * side * o, ...wallC);
         t.quad(q(wallOff, 0), q(end, 0), q(end, H), q(wallOff, H), c.ny, 0, c.nx);
       };
-      // underground platform beside the road: push the wall out past its far edge
-      const wo = P0.map((c) => {
+      // underground platform beside the road: push the wall out past its far
+      // edge, unless another carriageway lies just beyond it (an island
+      // platform): then the two share one hall and there is no wall between
+      const platEdge = P0.map((c) => {
         let last = -1;
         for (let o = hw + 0.3; o < hw + 26; o += 0.5) {
           if (inPlatform(c.x + c.nx * side * o, c.y + c.ny * side * o)) last = o;
           else if (last >= 0 || o > hw + 8) break;
         }
-        return last >= 0 ? Math.max(wallOff, last + 1.2) : wallOff;
+        return last;
       });
+      const shared = P0.map((c, k) => {
+        const last = platEdge[k];
+        if (last < 0) return false;
+        for (let o = last + 0.5; o <= last + 4; o += 0.5) if (tubeNb(c.x + c.nx * side * o, c.y + c.ny * side * o, c.z) > -0.5) return true;
+        return false;
+      });
+      const wo = platEdge.map((last, k) => (last >= 0 && !shared[k] ? Math.max(wallOff, last + 1.2) : wallOff));
       for (let k = 0; k + 1 < ss.length; k++) {
         let A = P0[k];
         let B = P0[k + 1];
-        const isOpen = segOpen[k];
-        if (k > 0 && segOpen[k - 1] !== isOpen) nose(k);
+        const isShared = shared[k] || shared[k + 1];
+        const isOpen = segOpen[k] || isShared;
+        if (k > 0 && (segOpen[k - 1] || shared[k - 1] || shared[k]) !== isOpen) nose(k);
         if (!cov[k] && !cov[k + 1]) {
           // approach in an open cutting
           cutSeg(L, A, B, side, ss[k], ss[k + 1], 0, 0, hw + 0.3, hw + 0.3, hw, !isOpen);
@@ -1293,8 +1303,9 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const fy = side * A.ny;
         const woA = isOpen ? wallOff : wo[k];
         const woB = isOpen ? wallOff : wo[k + 1];
-        const ceilA = isOpen ? wallOff + 6 : woA;
-        const ceilB = isOpen ? wallOff + 6 : woB;
+        // shared hall: ceiling reaches over the platform into the other carriageway
+        const ceilA = isShared ? Math.max(wallOff + 6, platEdge[k] + 3) : isOpen ? wallOff + 6 : woA;
+        const ceilB = isShared ? Math.max(wallOff + 6, platEdge[k + 1] + 3) : isOpen ? wallOff + 6 : woB;
         if (isOpen) {
           // toward a neighbouring carriageway: a flush floor under the gap, no kerb
           const f0 = t.vert(...P(A, hw - 0.2, -0.04), ...walkC);
