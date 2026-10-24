@@ -230,6 +230,14 @@ async function main() {
         for (let i = 0; i < n; i++) tick(step, opts.draw !== false && i === n - 1);
         return api.state();
       },
+      /** Put the bus on the guide lane with its front at route distance s, stopped (route tours). */
+      place(s: number) {
+        const p = guide.trackPose(s);
+        const [px, py] = headingDir(p.heading);
+        physics.reset(p.x - px * rearOffset, p.y - py * rearOffset, p.heading, p.z);
+        auto?.reset(physics.pose);
+        return api.state();
+      },
       /** Render the current state again (after a camera change). */
       draw() {
         tick(1 / 120, true);

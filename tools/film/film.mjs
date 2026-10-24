@@ -11,6 +11,8 @@
 //   --every-s 6      ...or every N sim seconds when (nearly) stopped
 //   --chase 8        also a chase-camera frame every N cab frames (0 = never)
 //   --fast           no frames at all: just drive and log (minutes, not hours)
+//   --tour           don't drive: place the bus on the lane every --every-m metres
+//                    (from --s to --to) and film it there (visual review only)
 //   --hours 10 --traffic normal|light|off --s 0 (start distance)
 //   --w 960 --h 540  frame size
 //   --max 5400       give up after this many sim seconds
@@ -37,6 +39,8 @@ const everyM = Number(opt('every-m', 15));
 const everyS = Number(opt('every-s', 6));
 const chaseEvery = Number(opt('chase', 8));
 const fast = flag('fast');
+const tour = flag('tour');
+const tourTo = Number(opt('to', 1e9));
 const maxT = Number(opt('max', 5400));
 const W = Number(opt('w', 960));
 const H = Number(opt('h', 540));
@@ -72,6 +76,35 @@ const shot = async (name) => {
   await page.screenshot({ path: join(out, 'frames', name), timeout: 600000 });
 };
 const caption = [];
+if (tour) {
+  // Visual tour: the bus is placed on the lane every everyM metres, settles for a moment, and is filmed.
+  const from = Number(opt('s', 0));
+  const to = Math.min(st.length - 5, tourTo);
+  for (let s = from; s <= to; s += everyM) {
+    st = await page.evaluate((s) => {
+      window.__film.place(s);
+      return window.__film.advance(0.5);
+    }, s);
+    appendFileSync(trackFile, JSON.stringify(st) + '\n');
+    const name = `cab_${String(frame).padStart(5, '0')}.png`;
+    await shot(name);
+    caption.push({ frame, file: name, ...st });
+    if (chaseEvery > 0 && frame % chaseEvery === 0) {
+      await page.evaluate(() => {
+        window.__film.view('chase');
+        window.__film.advance(0.3);
+      });
+      await shot(`chase_${String(frame / chaseEvery).padStart(5, '0')}.png`);
+      await page.evaluate(() => window.__film.view('cab'));
+    }
+    frame++;
+    if (frame % 10 === 0) {
+      console.log(`frame ${frame} s=${st.s}/${Math.round(st.length)} [${((Date.now() - t0) / 1000).toFixed(0)} s wall]`);
+      writeFileSync(join(out, 'frames.json'), JSON.stringify(caption, null, 0));
+    }
+  }
+  st.finished = true;
+}
 while (!st.finished && st.t < maxT) {
   if (fast) {
     // Big steps, no rendering; state sampled every second.

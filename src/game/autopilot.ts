@@ -279,15 +279,22 @@ export class Autopilot {
 
     // --- Pedals ------------------------------------------------------------------------
     const err = target - v;
-    if (target < 0.05 && v < 0.6) {
+    // Gravity along the road when going downhill (m/s^2), which the brakes have to hold as well.
+    const downhill = Math.max(0, -g.grade) * 9.81;
+    if (target < 0.05 && v < 2) {
+      // Stopping or holding: firm, so it neither creeps past the stop on a hill nor rolls into the car ahead.
       out.throttle = 0;
-      out.brake = 0.6;
+      out.brake = v < 0.6 ? 0.65 : 0.8;
     } else if (err > 0.15) {
       out.throttle = clamp(0.25 + err * 0.35 + Math.max(0, g.grade) * 4, 0, 1);
       out.brake = 0;
-    } else if (err < -0.4) {
+    } else if (err < -0.3) {
+      // Decelerate on the planned profile (DECEL) when slowing for something ahead, plus the speed
+      // error and the grade; the service brake gives 4.3 * pedal^1.25 m/s^2.
       out.throttle = 0;
-      out.brake = clamp(-err * 0.18, 0, 0.85);
+      const planned = Number.isFinite(limitDist) && limitDist < 150 ? Math.min(2.2, (v * v - target * target) / (2 * Math.max(1, limitDist - 1))) : 0;
+      const aWant = clamp(planned + -err * 0.9 + downhill, 0, 4.3);
+      out.brake = clamp(Math.pow(aWant / 4.3, 0.8), 0, 1);
     } else {
       out.throttle = clamp(0.12 + Math.max(0, g.grade) * 4, 0, 0.5);
       out.brake = 0;
