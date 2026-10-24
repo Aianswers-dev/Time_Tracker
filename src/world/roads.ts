@@ -26,6 +26,7 @@ import type { TerrainField } from './terrain';
 import { greenBridgeSpan, storyOutline } from './landmarks';
 import { makeRoadTextTexture } from './textures';
 import { MASK_RAIL, MASK_WATER, clamp, pointInRing, yieldFrame } from './util';
+import { onAnyPlatform } from '../data/stations';
 
 export const KERB_H = 0.15;
 const ROAD_CHUNK = 2500;
@@ -1047,7 +1048,10 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const c = roadAt(ri, Math.min(s, ri.len));
         const qx = c.x + c.nx * side * (hw + 0.25);
         const qy = c.y + c.ny * side * (hw + 0.25);
-        ok.push(otherAt(qx, qy, c.z, ri.i, 1.5) < -0.15);
+        // no parapet between a stopping bay and its platform either
+        const px = c.x + c.nx * side * (hw + 0.7);
+        const py = c.y + c.ny * side * (hw + 0.7);
+        ok.push(otherAt(qx, qy, c.z, ri.i, 1.5) < -0.15 && !(heavy && onAnyPlatform(ctx.data.platforms, px, py)));
         ss.push(Math.min(s, ri.len));
       }
       let k = 0;

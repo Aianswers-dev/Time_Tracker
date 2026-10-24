@@ -607,6 +607,19 @@ function boxesOf(ps: Platform[]): PlatBox[] {
 }
 
 /**
+ * True if (x, y) lies on a surface platform (or within `pad` m of one). Used
+ * by the world to leave bridge parapets out between a stopping bay and its
+ * platform.
+ */
+export function onAnyPlatform(platforms: Platform[], x: number, y: number, pad = 0.3): boolean {
+  for (const q of boxesOf(platforms)) {
+    if (x < q.x0 - pad || x > q.x1 + pad || y < q.y0 - pad || y > q.y1 + pad) continue;
+    if (q.p.area ? inRing(q.p.pts, x, y) || nearLine(q.p.pts, x, y, pad) : nearLine(q.p.pts, x, y, 2.2 + pad)) return true;
+  }
+  return false;
+}
+
+/**
  * True when a building stands on a surface busway platform: covering at least
  * half of it, or lying mostly on it. OSM maps several stations' shelters as
  * plain buildings (Herston, Buranda, Woolloongabba, Stones Corner, PA
