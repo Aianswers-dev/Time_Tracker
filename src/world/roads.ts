@@ -486,6 +486,16 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   const tunnels = new RoadIndex(roads, data.bounds, (r) => r.tunnel);
   const mask = ctx.mask;
   const underPlatforms = data.platforms.filter((p) => p.underground || p.layer < 0);
+  // each underground platform's level: the bus tunnel beside it, where src/game/platforms.ts takes the
+  // slab's height from (NaN when there is none)
+  const underZ = underPlatforms.map((pf) => {
+    let best: { dist: number; z: number } | null = null;
+    for (let i = 0; i + 1 < pf.pts.length; i += 2) {
+      const n = tunnels.nearest(pf.pts[i], pf.pts[i + 1], 25, (q) => roads[q].bus || roads[q].kind === RoadKind.Busway);
+      if (n && (!best || n.dist < best.dist)) best = n;
+    }
+    return best ? best.z : NaN;
+  });
   // platforms in the open (at grade or in a cutting), with their bounding boxes, for the earthworks beside them
   const gradePlatforms = data.platforms
     .filter((p) => !(p.underground || p.layer < 0) && p.pts.length >= 4)
@@ -1758,11 +1768,42 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const wallOff = hw + 0.9;
     const { ss, P0, cov, hc, pd } = tp;
     const busway = r.kind === RoadKind.Busway || r.bus;
-    const inPlatform = (x: number, y: number) => underPlatforms.some((pf) => pf.area && pointInRing(x, y, pf.pts));
+    // the underground platforms beside this tube: within 40 m of its centreline and at its level (a
+    // service ramp passing over a station's hall is no part of it)
+    const plats = underPlatforms.filter((pf, i) => {
+      if (!pf.area) return false;
+      let x0 = Infinity;
+      let y0 = Infinity;
+      let x1 = -Infinity;
+      let y1 = -Infinity;
+      for (let j = 0; j + 1 < pf.pts.length; j += 2) {
+        x0 = Math.min(x0, pf.pts[j]);
+        x1 = Math.max(x1, pf.pts[j]);
+        y0 = Math.min(y0, pf.pts[j + 1]);
+        y1 = Math.max(y1, pf.pts[j + 1]);
+      }
+      return P0.some((c) => c.x > x0 - 40 && c.x < x1 + 40 && c.y > y0 - 40 && c.y < y1 + 40 && !(Math.abs(c.z - underZ[i]) > 3));
+    });
+    /**
+     * An underground platform beside the road, along the ray from (x, y) in direction (dx, dy): where the
+     * ray enters and leaves the first platform it meets within 8 m of the kerb (exact, against the outline
+     * the station model draws), or null.
+     */
+    const platSpan = (x: number, y: number, dx: number, dy: number): [number, number] | null => {
+      let best: [number, number] | null = null;
+      for (const pf of plats) {
+        if (!pf.area) continue;
+        const run = rayRuns(pf.pts, x, y, dx, dy, hw + 40).find(([a, b]) => b > hw - 0.5 && a < hw + 8);
+        // (a ray running on along a platform at a shallow angle meets its end, not its side)
+        if (run && run[1] - Math.max(run[0], hw) < 20 && (!best || run[1] > best[1])) best = run;
+      }
+      return best;
+    };
+    const platExit = (x: number, y: number, dx: number, dy: number) => platSpan(x, y, dx, dy)?.[1] ?? -1;
     const hallAt = (x: number, y: number) => {
       let best: (typeof underPlatforms)[number] | null = null;
       let bd = 60;
-      for (const pf of underPlatforms) {
+      for (const pf of plats) {
         const d = Math.hypot(pf.pts[0] - x, pf.pts[1] - y);
         if (d < bd + 150 && pf.area) {
           // distance to the platform outline's vertices is enough to name the hall
@@ -1801,6 +1842,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       const c = P0[k];
       return hallAt(c.x, c.y);
     });
+    const nearPlat = plats.length > 0;
     for (const side of [1, -1]) {
       const wl: number[] = [];
       const rc: number[] = [];
@@ -1828,6 +1870,12 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
           }
         }
         if (end < 0) return;
+        // (never across an underground platform: the hall is open there)
+        for (let o = wallOff + 0.5; o < end; o += 1) {
+          const x = c.x + c.nx * side * o;
+          const y = c.y + c.ny * side * o;
+          if (plats.some((pf) => pointInRing(x, y, pf.pts))) return;
+        }
         const pal = pals[k];
         const q = (o: number, hh: number) => t.vert(c.x + c.nx * side * o, c.z + hh, c.y + c.ny * side * o, ...pal.wall, ss[k] + o, hh, 0, pd[k]);
         t.quad(q(wallOff, 0), q(end, 0), q(end, hc[k]), q(wallOff, hc[k]), c.ny, 0, c.nx);
@@ -1835,14 +1883,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       // underground platform beside the road: push the wall out past its far
       // edge, unless another carriageway lies just beyond it (an island
       // platform): then the two share one hall and there is no wall between
-      const platEdge = P0.map((c) => {
-        let last = -1;
-        for (let o = hw + 0.3; o < hw + 26; o += 0.5) {
-          if (inPlatform(c.x + c.nx * side * o, c.y + c.ny * side * o)) last = o;
-          else if (last >= 0 || o > hw + 8) break;
-        }
-        return last;
-      });
+      const platEdge = P0.map((c) => platExit(c.x, c.y, c.nx * side, c.ny * side));
       const shared = P0.map((c, k) => {
         const last = platEdge[k];
         if (last < 0) return false;
@@ -1851,7 +1892,40 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         for (let o = last + 0.5; o <= last + 22; o += 0.5) if (tubeNb(c.x + c.nx * side * o, c.y + c.ny * side * o, c.z) > -0.5) return true;
         return false;
       });
-      const wo = platEdge.map((last, k) => (last >= 0 && !shared[k] ? Math.max(wallOff, last + 1.2) : wallOff));
+      // the wall stands 0.35 m behind the platform's far edge (the hall's tiled back wall is 0.15 m in front
+      // of that edge), from one sample before each platform end on, so it never cuts across a corner
+      const sideFine = (s0: number, s1: number) => {
+        let m = -1;
+        const steps = Math.max(1, Math.ceil((s1 - s0) / 0.5));
+        for (let q = 0; q <= steps; q++) {
+          const c = roadAt(ri, s0 + ((s1 - s0) * q) / steps);
+          m = Math.max(m, platExit(c.x, c.y, c.nx * side, c.ny * side));
+        }
+        return m;
+      };
+      const wo = ss.map((_, k) => {
+        if (!nearPlat || shared[k] || (k > 0 && shared[k - 1]) || (k + 1 < ss.length && shared[k + 1])) return wallOff;
+        const e = sideFine(ss[Math.max(0, k - 1)], ss[Math.min(ss.length - 1, k + 1)]);
+        return e >= 0 ? Math.max(wallOff, e + 0.35) : wallOff;
+      });
+      // a wall that would still stand inside a platform (a road meeting the platform's end at an angle):
+      // that side stays open to the hall instead
+      for (let k = 0; k + 1 < ss.length; k++) {
+        if (!boxSeg(k) || segOpen[k] || shared[k] || shared[k + 1]) continue;
+        const A = P0[k];
+        const B = P0[k + 1];
+        for (let f = 0.1; f < 1; f += 0.2) {
+          const o = wo[k] + (wo[k + 1] - wo[k]) * f;
+          const x = A.x + (B.x - A.x) * f + (A.nx + (B.nx - A.nx) * f) * side * o;
+          const y = A.y + (B.y - A.y) * f + (A.ny + (B.ny - A.ny) * f) * side * o;
+          if (plats.some((pf) => pointInRing(x, y, pf.pts))) {
+            segOpen[k] = true;
+            break;
+          }
+        }
+      }
+      const walledSeg = (q: number) => boxSeg(q) && !(segOpen[q] || shared[q] || shared[q + 1]);
+      const baySeg = (q: number) => walledSeg(q) && (wo[q] > wallOff + 0.05 || wo[q + 1] > wallOff + 0.05);
       for (let k = 0; k + 1 < ss.length; k++) {
         let A = P0[k];
         let B = P0[k + 1];
@@ -1908,14 +1982,28 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
           t.quad(V(A, hw - 0.2, -0.04, pal.walk, sA, 2), V(B, hw - 0.2, -0.04, pal.walk, sB, 2), V(B, floorB, -0.04, pal.walk, sB, 2), V(A, floorA, -0.04, pal.walk, sA, 2), 0, 1, 0);
         } else {
           wl[k] = (woA + woB) / 2;
-          // walkway and kerb
-          const w0 = V(A, hw, 0.25, pal.walk, sA, 2);
-          const w1 = V(B, hw, 0.25, pal.walk, sB, 2);
-          t.quad(w0, w1, V(B, woB, 0.25, pal.walk, sB, 2), V(A, woA, 0.25, pal.walk, sA, 2), 0, 1, 0);
-          t.quad(V(A, hw, 0, KERB_TUBE, sA, 2), V(B, hw, 0, KERB_TUBE, sB, 2), V(B, hw, 0.25, KERB_TUBE, sB, 2), V(A, hw, 0.25, KERB_TUBE, sA, 2), -fx, 0, fy);
+          const bay = baySeg(k);
+          const wz = bay ? -0.04 : 0.25;
+          if (bay) {
+            // beside an underground platform: a flush floor (the stopping bay) out to the wall, under the
+            // platform slab the station draws; the walkway ends with a face where it meets the bay
+            t.quad(V(A, hw - 0.2, -0.04, pal.walk, sA, 2), V(B, hw - 0.2, -0.04, pal.walk, sB, 2), V(B, woB, -0.04, pal.walk, sB, 2), V(A, woA, -0.04, pal.walk, sA, 2), 0, 1, 0);
+            const ux = B.x - A.x;
+            const uy = B.y - A.y;
+            if (walledSeg(k - 1) && !baySeg(k - 1))
+              t.quad(V(A, hw, -0.04, KERB_TUBE, sA, 2), V(A, wallOff, -0.04, KERB_TUBE, sA, 2), V(A, wallOff, 0.25, KERB_TUBE, sA, 2), V(A, hw, 0.25, KERB_TUBE, sA, 2), ux, 0, -uy);
+            if (walledSeg(k + 1) && !baySeg(k + 1))
+              t.quad(V(B, wallOff, -0.04, KERB_TUBE, sB, 2), V(B, hw, -0.04, KERB_TUBE, sB, 2), V(B, hw, 0.25, KERB_TUBE, sB, 2), V(B, wallOff, 0.25, KERB_TUBE, sB, 2), -ux, 0, uy);
+          } else {
+            // walkway and kerb
+            const w0 = V(A, hw, 0.25, pal.walk, sA, 2);
+            const w1 = V(B, hw, 0.25, pal.walk, sB, 2);
+            t.quad(w0, w1, V(B, woB, 0.25, pal.walk, sB, 2), V(A, woA, 0.25, pal.walk, sA, 2), 0, 1, 0);
+            t.quad(V(A, hw, 0, KERB_TUBE, sA, 2), V(B, hw, 0, KERB_TUBE, sB, 2), V(B, hw, 0.25, KERB_TUBE, sB, 2), V(A, hw, 0.25, KERB_TUBE, sA, 2), -fx, 0, fy);
+          }
           // wall (the shader paints the dado, delineator line and panel joints, or the hall's tiles)
           const wp = hall && pal === TUBE_PAL.kgs ? 7 : 0;
-          t.quad(V(A, woA, 0.25, pal.wall, sA, wp), V(B, woB, 0.25, pal.wall, sB, wp), V(B, woB, hB, pal.wall, sB, wp), V(A, woA, hA, pal.wall, sA, wp), -fx, 0, fy);
+          t.quad(V(A, woA, wz, pal.wall, sA, wp), V(B, woB, wz, pal.wall, sB, wp), V(B, woB, hB, pal.wall, sB, wp), V(A, woA, hA, pal.wall, sA, wp), -fx, 0, fy);
           if (!hall) {
             // cable tray under the ceiling edge
             const tr = [70, 72, 74];
@@ -2072,7 +2160,16 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       const oy = end === 0 ? -dirS[1] : dirE[1];
       const pal = pals[k];
       const e = (o: number, hh: number) => t.vert(c.x + c.nx * o + ox * 0.05, c.z + hh, c.y + c.ny * o + oy * 0.05, ...pal.wall, o, hh, 0, pd[k]);
-      t.quad(e(-wallOff, -0.3), e(wallOff, -0.3), e(wallOff, hc[k]), e(-wallOff, hc[k]), -ox, 0, oy);
+      // across the tube's full width there (out to a pushed-back wall beside a platform, but not across
+      // a platform running on past the end: the station closes its hall)
+      const sg = end === 0 ? 0 : ss.length - 2;
+      const span = (sd: number, rc: number) => {
+        const sp = platSpan(c.x, c.y, c.nx * sd, c.ny * sd);
+        return Math.max(wallOff, sp ? Math.min(rc, sp[0] - 0.05) : rc);
+      };
+      const oL = span(1, reach[0][sg] ?? 0);
+      const oR = span(-1, reach[1][sg] ?? 0);
+      t.quad(e(-oR, -0.3), e(oL, -0.3), e(oL, hc[k]), e(-oR, hc[k]), -ox, 0, oy);
     }
     tubesBuilt.push({ ri, tp, L, reach, open: openSide, boxSeg });
   }
