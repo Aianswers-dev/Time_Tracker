@@ -37,6 +37,12 @@ npx -y tsx src/sim/selftest.ts   # physics sanity checks
 - Screenshots: start `npx vite --port 5174 --strictPort` and run
   `SHOT_URL=http://localhost:5174/ node tools/shot/shot.mjs "route=61&cam=chase" out.png 30000`.
   Headless Chromium uses SwiftShader, so it is slow; give long waits.
+- Route films: `SHOT_URL=http://localhost:5174/ node tools/film/film.mjs --route M2 --dir 0 --out /tmp/f/m2`
+  drives the whole route on autopilot (`?film=1`, `src/game/autopilot.ts`) and
+  records cab/chase frames, mp4s and captioned contact sheets; `--fast` skips
+  rendering and just logs problems (wall hits, wrong level, stuck, missed
+  stops) to `report.json` in a few minutes. `?autopilot=1` lets the bus drive
+  itself in a normal session.
 - `src/bus/preview.html` previews bus models; `?world=debug` and `?simdebug`
   expose debug hooks on `window`.
 - Stop servers by port (`fuser -k 5174/tcp`). Never `pkill -f` a pattern that

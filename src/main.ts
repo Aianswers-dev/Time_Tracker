@@ -5,7 +5,8 @@ import { headingDir } from './data/coords';
 import { buildWorld } from './world';
 import { busFactory } from './bus';
 import { BusAudio, BusControls, BusPhysics, CameraRig, InputManager, buildCollider } from './sim';
-import { Hud, RouteGuide, Traffic, busTypeForRoute, showMenu } from './game';
+import { Autopilot, Hud, RouteGuide, Traffic, busTypeForRoute, showMenu } from './game';
+import type { ResolveResult } from './sim';
 
 const app = document.getElementById('app')!;
 
@@ -93,6 +94,14 @@ async function main() {
   const hud = new Hud(document.body, data, { traffic, guide });
   // Player collides with buildings and with the AI buses and cars.
   const playerCollider = traffic.wrapCollider(collider);
+  // ?autopilot=1 drives the route by itself; ?film=1 also stops the clock so a
+  // test harness can step the sim and grab frames (window.__film).
+  const film = params.has('film');
+  const auto = params.has('autopilot') || film ? new Autopilot(guide.track, bus.spec, traffic) : null;
+  let lastHit: ResolveResult | null = null;
+  const driveCollider = auto ? Object.create(playerCollider) : playerCollider;
+  if (auto)
+    driveCollider.resolve = (p: Parameters<typeof playerCollider.resolve>[0], s: Parameters<typeof playerCollider.resolve>[1]) => (lastHit = playerCollider.resolve(p, s) as ResolveResult);
 
   // startPose gives the FRONT of the bus; physics tracks the rear axle.
   const start = guide.startPose();
@@ -103,6 +112,7 @@ async function main() {
   const [fx, fy] = headingDir(start.heading);
   // The route height picks the level (stays in a tunnel / up on a viaduct when starting there).
   physics.reset(start.x - fx * rearOffset, start.y - fy * rearOffset, start.heading, start.z);
+  auto?.reset(physics.pose);
   controls.lights.headlights = choice.hours < 6.5 || choice.hours > 18;
 
   for (let i = 0; i < Number(params.get('cam') === 'chase' ? 1 : params.get('cam') === 'top' ? 2 : 0); i++) rig.cycle();
@@ -114,11 +124,11 @@ async function main() {
   let splashed = false;
   let dingedStop = -1;
 
-  const frame = () => {
-    requestAnimationFrame(frame);
-    const dt = Math.min(0.05, clock.getDelta());
+  /** One sim step; `draw` = also update the cab, HUD and world and render (film mode skips it between frames). */
+  let worldDt = 0;
+  const tick = (dt: number, draw: boolean) => {
     fps += (1 / Math.max(dt, 1e-3) - fps) * 0.05;
-    const inp = input.poll(dt);
+    let inp = input.poll(dt);
     if (inp.pressed.has('pause')) paused = !paused;
     if (inp.pressed.has('camera')) rig.cycle();
     if (inp.pressed.has('map')) hud.toggleMap();
@@ -130,15 +140,25 @@ async function main() {
       const p = physics.pose;
       physics.reset(p.x, p.y, p.heading);
     }
-    if (paused) {
+    if (paused && !film) {
       renderer.render(scene, camera);
       return;
+    }
+    if (auto) {
+      const a = auto.update({ dt, pose: physics.pose, guide: guide.state, doorsOpen: controls.doorsOpen, interlock: controls.interlock, hit: lastHit ?? undefined, z: physics.pose.z });
+      inp = { ...inp, throttle: a.throttle, brake: a.brake, steer: a.steer, gear: a.gear, pressed: new Set([...inp.pressed, ...a.pressed]) };
+      lastHit = null;
+      if (auto.rescue) {
+        const r = auto.rescue;
+        physics.reset(r.x, r.y, r.heading, r.z);
+        auto.rescue = null;
+      }
     }
     simTime += dt;
     hours = (hours + dt / 3600) % 24;
 
     controls.update(dt, inp, physics.pose);
-    const hit = physics.update(dt, inp, controls, playerCollider);
+    const hit = physics.update(dt, inp, controls, driveCollider);
     if (hit.impact > 1) audio.impact(hit.impact);
     guide.noteImpact(hit.impact);
     if (hit.water && !splashed) hud.toast('Splash! The bus is going back on the road…');
@@ -162,6 +182,13 @@ async function main() {
       audio.ding();
     }
 
+    rig.update(dt, bus, cab, pose, inp);
+    audio.update({ rpm: physics.rpm, throttle: inp.throttle, speed: pose.speed, brake: inp.brake });
+    audio.horn(inp.held.has('horn'));
+
+    traffic.update(dt, simTime, pose, camera, hours);
+    worldDt += dt;
+    if (!draw) return;
     cab.update({
       speedKmh: Math.abs(pose.speed) * 3.6,
       rpm: physics.rpm,
@@ -172,12 +199,8 @@ async function main() {
       timeSeconds: simTime,
       gear: inp.gear,
     });
-    rig.update(dt, bus, cab, pose, inp);
-    audio.update({ rpm: physics.rpm, throttle: inp.throttle, speed: pose.speed, brake: inp.brake });
-    audio.horn(inp.held.has('horn'));
-
-    traffic.update(dt, simTime, pose, camera, hours);
-    world.update(dt, camera, hours);
+    world.update(worldDt, camera, hours);
+    worldDt = 0;
     hud.update({
       route,
       pose,
@@ -194,6 +217,73 @@ async function main() {
       paused,
     });
     renderer.render(scene, camera);
+  };
+
+  if (film) {
+    // Test harness API: advance the sim by `seconds` in fixed steps and render the last one.
+    const api = {
+      ready: true,
+      route: { id: route.id, dir: route.dir, headsign: route.headsign, length: route.length },
+      advance(seconds: number, opts: { step?: number; draw?: boolean } = {}) {
+        const step = opts.step ?? 1 / 30;
+        const n = Math.max(1, Math.round(seconds / step));
+        for (let i = 0; i < n; i++) tick(step, opts.draw !== false && i === n - 1);
+        return api.state();
+      },
+      /** Render the current state again (after a camera change). */
+      draw() {
+        tick(1 / 120, true);
+      },
+      view(mode: 'cab' | 'chase' | 'top' | 'cinematic') {
+        rig.setMode(mode);
+      },
+      state() {
+        const p = physics.pose;
+        const g = guide.state;
+        const f = auto!.frame;
+        return {
+          t: +simTime.toFixed(2),
+          s: +g.s.toFixed(1),
+          length: route.length,
+          x: +p.x.toFixed(1),
+          y: +p.y.toFixed(1),
+          z: +(p.z ?? 0).toFixed(2),
+          heading: +((p.heading * 180) / Math.PI).toFixed(1),
+          kmh: +(Math.abs(p.speed) * 3.6).toFixed(1),
+          phase: f.phase,
+          why: f.limitWhy,
+          target: +(f.target * 3.6).toFixed(0),
+          lateral: +f.lateral.toFixed(2),
+          nextStop: g.nextStopName,
+          nextStopIndex: g.nextStopIndex,
+          nextStopDistance: Number.isFinite(g.nextStopDistance) ? Math.round(g.nextStopDistance) : -1,
+          served: g.stopsServed,
+          missed: g.stopsMissed,
+          total: g.stopsTotal,
+          offRoute: g.offRoute,
+          road: g.roadName,
+          level: g.roadLevel,
+          limit: g.speedLimit,
+          signal: g.signal ? `${g.signal.state}@${Math.round(g.signal.distance)}` : null,
+          collisions: g.collisions,
+          finished: g.finished,
+          problems: auto!.problems.length,
+          ai: traffic.count,
+          events: g.events.slice(-3).map((e) => `${e.kind}: ${e.text}`),
+        };
+      },
+      report() {
+        return { ...auto!.report(), summary: guide.state.summary, served: guide.state.stopsServed, missed: guide.state.stopsMissed, total: guide.state.stopsTotal, events: guide.state.events.map((e) => `${e.kind}: ${e.text}`) };
+      },
+    };
+    Object.assign(window, { __film: api });
+    tick(1 / 60, true);
+    return;
+  }
+
+  const frame = () => {
+    requestAnimationFrame(frame);
+    tick(Math.min(0.05, clock.getDelta()), true);
   };
   frame();
 }
