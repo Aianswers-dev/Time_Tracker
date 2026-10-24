@@ -117,6 +117,7 @@ export class CameraRig {
 
   private readonly tmpV = new THREE.Vector3();
   private readonly tmpV2 = new THREE.Vector3();
+  private readonly tmpV3 = new THREE.Vector3();
   private readonly tmpQ = new THREE.Quaternion();
   private readonly tmpE = new THREE.Euler(0, 0, 0, 'YXZ');
   private readonly tmpM = new THREE.Matrix4();
@@ -355,6 +356,11 @@ export class CameraRig {
       const under = col.surface(gx, gy, bz, 2.5);
       const floor = (under.road >= 0 ? under.z : tf > 0.5 ? bz : col.ground(gx, gy)) + 1.2 - bz;
       if (oz < floor) oz = floor;
+      // ...and under the ceiling there and on the way (tube, deck soffit, a building or canopy over the
+      // road): lower rather than pulled in through the ceiling.
+      const top = Math.min(col.ceilingAt(gx, gy, bz + 0.5), col.ceilingAt(cx + ox * 0.5, cy + oy * 0.5, bz + 0.5)) - 0.5 - bz;
+      if (oz > top) oz = Math.max(1.0, top);
+      this.debug.ceil = top;
       // ...and pulled in along the line of sight past buildings, walls, tunnel walls and hillsides.
       const t = col.lineOfSight(cx, cy, bz + 2.0, cx + ox, cy + oy, bz + oz, L / 2 + 2);
       this.debug.los = t;
@@ -369,7 +375,20 @@ export class CameraRig {
       oz = 2 + (oz - 2) * this.chasePull;
     }
     const off = this.tmpV.set(ox, oz, -oy);
-    const o = this.chaseOffset.update(off, 6, dt);
+    const o = this.tmpV3.copy(this.chaseOffset.update(off, 6, dt));
+    if (col) {
+      // The spring lags behind the target: never leave the camera up in a ceiling or behind a wall.
+      const top = col.ceilingAt(cx + o.x, cy - o.z, bz + 0.5) - 0.35 - bz;
+      if (o.y > top) o.y = Math.max(1.0, top);
+      const t = col.lineOfSight(cx, cy, bz + 2.0, cx + o.x, cy - o.z, bz + o.y, L / 2 + 2);
+      if (t < 1) {
+        const k = Math.max(0.1, t - 0.5 / Math.max(1, Math.hypot(o.x, o.z, o.y - 2)));
+        o.x *= k;
+        o.z *= k;
+        o.y = 2 + (o.y - 2) * k;
+      }
+      this.debug.hard = t;
+    }
     const lead = Math.min(L * 0.25 + speed * 0.3, 14);
     const turn = clamp(telemetry.yawRate * Math.max(speed, 2) * 0.9, -8, 8);
     const fH = this.chaseHeading;
@@ -468,8 +487,9 @@ export class CameraRig {
       let z = bz + (tunnel ? Math.min(s.h, 3.2) : s.h);
       const col = this.collider;
       if (col && !tunnel) z = Math.max(z, col.ground(s.x, s.y) + 1);
+      if (col) z = Math.min(z, Math.max(bz + 1, col.ceilingAt(s.x, s.y, bz + 0.5) - 0.4));
       s.z = z;
-      if (col && (col.pointInBuilding(s.x, s.y, z) || col.lineOfSight(s.x, s.y, z, cx, cy, bz + 1.6) < 0.9)) s.maxT = Math.min(s.maxT, s.t + 0.3);
+      if (col && (col.viewBlocked(s.x, s.y, z) || col.lineOfSight(s.x, s.y, z, cx, cy, bz + 1.6) < 0.9)) s.maxT = Math.min(s.maxT, s.t + 0.3);
     }
 
     const first = s.t < dt * 1.5;
@@ -515,8 +535,9 @@ export class CameraRig {
       if (col) {
         const sfc = col.surface(px, py, bz, 2.5);
         if (tunnel && sfc.road < 0) continue;
-        pz = (sfc.road >= 0 ? sfc.z : col.ground(px, py)) + h;
-        if (col.pointInBuilding(px, py, pz)) continue;
+        const gz = sfc.road >= 0 ? sfc.z : col.ground(px, py);
+        pz = gz + h;
+        if (col.viewBlocked(px, py, pz) || col.ceilingAt(px, py, gz + 0.3) < pz + 0.3) continue;
         if (col.lineOfSight(px, py, pz, cx, cy, bz + 1.6) < 0.98) continue;
       }
       return { ...base, kind, x: px, y: py, h, z: pz, side: sd, maxT: kind === 'drone' ? 12 : 16 };
