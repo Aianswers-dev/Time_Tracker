@@ -273,7 +273,13 @@ function treeMaterial(): THREE.MeshLambertMaterial {
       ['#include <color_fragment>', ''],
       [
         'vec4 diffuseColor = vec4( diffuse, opacity );',
-        `vec3 leaf = vLeaf;
+        `// Close to the camera (a chase camera beside a street tree, the cab under an overhanging crown)
+        // the tree dissolves (screen-door) instead of filling the view: gone within 1.5 m, solid from 4 m.
+        if (vWDist < 4.0) {
+          float sd = fract(sin(dot(floor(gl_FragCoord.xy), vec2(12.9898, 78.233))) * 43758.5453);
+          if (sd > (vWDist - 1.5) / 2.5) discard;
+        }
+        vec3 leaf = vLeaf;
         float blot = t_hash(floor(vLocal * 9.0 + vFlower.w * 31.0));
         leaf = mix(leaf, vFlower.rgb, step(blot, vFlower.w));
         leaf *= 0.82 + 0.3 * t_hash(floor(vLocal * 23.0));
