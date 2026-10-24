@@ -304,8 +304,8 @@ export class BusPhysics {
       out.hit = r.hit;
       out.impact = Math.max(out.impact, r.impact);
       if (r.hit) {
-        // Kill the yaw rate partially so the bus doesn't keep rotating into the wall.
-        this.yaw *= 0.6;
+        // Take a little of the yaw rate out; the contact itself turns the bus parallel to the wall.
+        this.yaw *= 0.9;
         if (r.impact > 0.25 && this.impactCooldown <= 0) {
           emitSim(this, r.impact > 1 ? { type: 'impact', strength: r.impact } : { type: 'scrape', strength: r.impact });
           this.impactCooldown = r.impact > 1 ? 0.25 : 0.08;
