@@ -251,9 +251,17 @@ export class SignalModel {
       }
     });
     const nz = new Float32Array(ns);
+    // Signals the pipeline found on paths and cycleways only control no road traffic.
+    const sigRoad = data.signalRoad;
+    const live = (i: number) => !sigRoad || sigRoad[i] >= 0;
     for (let i = 0; i < ns; i++) {
       const x = sig[2 * i];
       const y = sig[2 * i + 1];
+      // (the pipeline's height of the signal's own road, where it gives one)
+      if (data.signalZ && sigRoad && sigRoad[i] >= 0) {
+        nz[i] = data.signalZ[i];
+        continue;
+      }
       const veh = onVertex[i].filter((v) => roads[v.road].kind !== RoadKind.Pedestrian);
       const on = veh.length ? veh : onVertex[i];
       if (on.length) {
@@ -290,12 +298,14 @@ export class SignalModel {
     };
     const ngrid = new Map<number, number[]>();
     for (let i = 0; i < ns; i++) {
+      if (!live(i)) continue;
       const key = Math.floor(sig[2 * i] / CLUSTER_R) * 65536 + Math.floor(sig[2 * i + 1] / CLUSTER_R);
       let l = ngrid.get(key);
       if (!l) ngrid.set(key, (l = []));
       l.push(i);
     }
     for (let i = 0; i < ns; i++) {
+      if (!live(i)) continue;
       const x = sig[2 * i];
       const y = sig[2 * i + 1];
       const gx = Math.floor(x / CLUSTER_R);
@@ -311,6 +321,7 @@ export class SignalModel {
     }
     const groups = new Map<number, number[]>();
     for (let i = 0; i < ns; i++) {
+      if (!live(i)) continue;
       const r = find(i);
       let g = groups.get(r);
       if (!g) groups.set(r, (g = []));
