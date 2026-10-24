@@ -742,8 +742,8 @@ export class RouteTrack {
         const z = this.z[i];
         // The route's general direction here (GTFS shapes wobble round junction halls: a bus carrying
         // straight on does not tour the turnaround beside it).
-        const sa = pointAlong(this.route.pts, this.route.cum, i * TRACK_STEP - 16);
-        const sb = pointAlong(this.route.pts, this.route.cum, i * TRACK_STEP + 16);
+        const sa = pointAlong(this.route.pts, this.route.cum, i * TRACK_STEP - 30);
+        const sb = pointAlong(this.route.pts, this.route.cum, i * TRACK_STEP + 30);
         const sl = Math.hypot(sb.x - sa.x, sb.y - sa.y) || 1;
         const tdx = (sb.x - sa.x) / sl;
         const tdy = (sb.y - sa.y) / sl;
@@ -758,7 +758,8 @@ export class RouteTrack {
           if (r.oneway ? Math.max(dot, ldot) < 0.2 : Math.max(Math.abs(dot), Math.abs(ldot)) < 0.2) return;
           const t = Math.max(0, Math.min(slen, (qx - ax) * sdx + (qy - ay) * sdy));
           const sg = (Math.abs(dot) > Math.abs(ldot) ? dot : ldot) < 0 ? -1 : 1;
-          const cost = d * 0.5 + (1 - Math.abs(dot)) * 30;
+          // (Main carriageways over narrow ramps and turnaround loops beside them.)
+          const cost = d * 0.5 + (1 - Math.abs(dot)) * 30 + (r.width < 5 ? 4 : 0);
           const old = list.find((c) => c.road === ri);
           if (old && old.cost <= cost) return;
           const c = { road: ri, px: ax + sdx * t, py: ay + sdy * t, dx: sdx * sg, dy: sdy * sg, cost };
