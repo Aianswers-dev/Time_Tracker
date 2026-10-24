@@ -762,10 +762,10 @@ export class Traffic {
       if (j.s + j.boxR + len < s) continue;
       if (!j.sig && !j.minor && v > 1 && j.s - s < ahead) this.cars.markMajor(j.node, time, PLAYER_HOLD);
       const inBox = s > j.s - j.boxR;
-      // (Cars in the next lane do not turn across ours in front of us: a left turn from the lane on our right.)
+      // (Cars in the next lane do not turn across ours in front of us, oncoming ones not across our path.)
       if (inBox || (v > 1 && j.s - s < ahead)) {
         g.track.sample(j.stopS, this.tmp);
-        this.cars.claimApproach(j.node, this.tmp.x, this.tmp.y, j.inX, j.inY, j.cls, time + 0.5);
+        this.cars.claimApproach(j.node, this.tmp.x, this.tmp.y, j.inX, j.inY, j.cls, inBox ? 0 : (j.s - s) / Math.max(v, 1), time + 0.5);
       }
       const committed = v > 1 && j.stopS - s < (v * v) / (2 * 3) + 2;
       if (inBox || committed) this.cars.enter(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time + 0.5);
