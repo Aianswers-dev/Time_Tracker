@@ -57,6 +57,8 @@ interface AiBus {
   mids: TrackSignal[];
   /** Per junction of `jl`: how its light is asked (the guide's way, from the route's own signal), else null. */
   jAsk: (SignalAsk | null)[];
+  /** Per junction of `jl`: where the bus stops for its light (the route's own stop line where it has one). */
+  jLine: number[];
   /** Junctions on the route, the next one to commit to, and the ones we hold. */
   jl: BusJunction[];
   jNext: number;
@@ -158,7 +160,7 @@ export class Traffic {
   private maxActive = this.capBuses;
   private radius = 1100;
   private byId = new Map<number, AiBus>();
-  private plans = new WeakMap<RouteTrack, { mids: TrackSignal[]; jAsk: (SignalAsk | null)[] }>();
+  private plans = new WeakMap<RouteTrack, { mids: TrackSignal[]; jAsk: (SignalAsk | null)[]; jLine: number[] }>();
   private asks = new WeakMap<TrackSignal, SignalAsk>();
   private bodiesOut: Body[] = [];
   private exemptOut: boolean[] = [];
@@ -398,6 +400,7 @@ export class Traffic {
       sigCommit: false,
       mids: this.signalPlan(c.track).mids,
       jAsk: this.signalPlan(c.track).jAsk,
+      jLine: this.signalPlan(c.track).jLine,
       jl: this.cars.junctionsAlong(c.track),
       jNext: 0,
       holds: [],
@@ -796,12 +799,14 @@ export class Traffic {
    * exactly as the player's guide asks it (so the AI and the HUD agree); every
    * other track signal is a mid-block light obeyed at its own stop line.
    */
-  private signalPlan(track: RouteTrack): { mids: TrackSignal[]; jAsk: (SignalAsk | null)[] } {
+  private signalPlan(track: RouteTrack): { mids: TrackSignal[]; jAsk: (SignalAsk | null)[]; jLine: number[] } {
     let p = this.plans.get(track);
     if (!p) {
       const jl = this.cars.junctionsAlong(track);
       const model = signalsFor(this.data);
       const jAsk: (SignalAsk | null)[] = jl.map(() => null);
+      // (A bus waits for the light where the player does, not at the node's own box edge 10-20 m on.)
+      const jLine = jl.map((j) => j.stopS);
       const mids = track.signals.filter((sg) => {
         const q = this.signalAsk(track, sg);
         const ji = model.junctionAt(q.x, q.y, q.dx, q.dy, q.z);
@@ -810,11 +815,15 @@ export class Traffic {
         jl.forEach((j, k) => {
           if (!j.sig || Math.abs(j.s - sg.s) >= 30 || this.cars.signalJunction(j.node, j.inX, j.inY) !== ji) return;
           managed = true;
-          jAsk[k] ??= q;
+          if (jAsk[k]) return;
+          jAsk[k] = q;
+          // (Not for a junction's second node, nor back inside the box of the junction before.)
+          const prev = k > 0 ? jl[k - 1].s + jl[k - 1].boxR : -Infinity;
+          if (!j.inside) jLine[k] = Math.min(j.stopS, Math.max(sg.s, prev));
         });
         return !managed;
       });
-      this.plans.set(track, (p = { mids, jAsk }));
+      this.plans.set(track, (p = { mids, jAsk, jLine }));
     }
     return p;
   }
@@ -911,14 +920,16 @@ export class Traffic {
     const j = jl[b.jNext];
     if (j) {
       if (!j.sig && !j.minor && j.s - b.s < Math.max(30, b.v * 4)) this.cars.markMajor(j.node, time, -1);
-      const stopAt = j.stopS - b.s;
+      // Its stop line (where the bus waits), unless it is already past that (spawned there): the box edge.
+      const line = (q: number) => (b.s <= b.jLine[q] + 1 ? b.jLine[q] : jl[q].stopS);
+      const stopAt = line(b.jNext) - b.s;
       const commitDist = Math.max(3, (b.v * b.v) / (2 * 2.2)) + 2;
       if (stopAt < commitDist + 35) {
         // Junctions closer together than our length are taken in one go.
         let res = this.junctionOk(b, b.jNext, stopAt, time);
         let k = b.jNext + 1;
         while (res === Wait.None && k < jl.length && jl[k].s - j.s < j.boxR + jl[k].boxR + b.len) {
-          res = this.junctionOk(b, k, stopAt + (jl[k].stopS - j.stopS), time);
+          res = this.junctionOk(b, k, line(k) - b.s, time);
           k++;
         }
         if (res !== Wait.None) lim(idm(b.v, v0, Math.max(0.05, stopAt), 0, 0.8), res, this.jRef);
@@ -1378,7 +1389,7 @@ export class Traffic {
           idle: +b.idle.toFixed(0),
           stall: +b.stall.toFixed(0),
           visible: b.visible,
-          next: j ? { node: j.node, stop: +(j.stopS - b.s).toFixed(1), sig: j.sig, minor: j.minor } : null,
+          next: j ? { node: j.node, stop: +(j.stopS - b.s).toFixed(1), line: +(b.jLine[b.jNext] - b.s).toFixed(1), sig: j.sig, minor: j.minor } : null,
           holds: b.holds.map((q) => b.jl[q].node),
           touching: this.touching.has(b.id),
         };
