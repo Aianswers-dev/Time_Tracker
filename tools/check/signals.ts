@@ -1,7 +1,7 @@
 /**
  * Traffic-signal checks over the whole map (no browser):
  *
- *   npx -y tsx tools/check/signals.ts [--routes] [--verbose]
+ *   npx -y tsx tools/check/signals.ts [--routes [--walls]] [--verbose]
  *
  * 1. Every signalised junction: every incoming arm, asked from its stop line
  *    the way a vehicle arrives (signalStateAt with direction and level), sees
@@ -13,6 +13,8 @@
  *    way the player's guide (and the AI buses, traffic.ts signalPlan) ask, see
  *    green within a cycle; and where the AI cars' junction node is the same
  *    junction, the guide and the cars agree (per cent of a 240 s window).
+ *    With --walls the route lanes are fitted to the driving collider's walls
+ *    first, as the game fits them (src/game/track.ts); slower.
  *
  * Exits non-zero when a check fails.
  */
@@ -20,7 +22,8 @@ import * as THREE from 'three';
 import { loadMapNode } from './load';
 import { signalsFor, phaseLight } from '../../src/data/signals';
 import { CarTraffic } from '../../src/game/cars';
-import { trackFor } from '../../src/game/track';
+import { trackFor, useTrackWalls } from '../../src/game/track';
+import { buildCollider } from '../../src/sim/collider';
 import type { WorldHandle } from '../../src/types';
 
 const args = process.argv.slice(2);
@@ -122,6 +125,7 @@ if (deadLanes) fail++;
 
 // ---- 3. routes
 if (args.includes('--routes')) {
+  if (args.includes('--walls')) useTrackWalls(data, buildCollider(data));
   let sigs = 0;
   let deadSigs = 0;
   let pairs = 0;
