@@ -142,6 +142,22 @@ export interface Route {
   stops: RouteStop[];
 }
 
+/** A bus platform (busway station or interchange) from OSM. */
+export interface Platform {
+  /** e.g. "King George Square Platform 1"; may be empty. */
+  name: string;
+  /** Platform number/letter when tagged. */
+  ref: string;
+  /** Outline (area = true) or centre/edge line (area = false), flat [x, y, ...]. */
+  pts: Float32Array;
+  area: boolean;
+  /** Has a roof/shelter over it. */
+  covered: boolean;
+  /** OSM layer (negative for underground). */
+  layer: number;
+  underground: boolean;
+}
+
 export interface MapData {
   /** [minX, minY, maxX, maxY] metres. */
   bounds: [number, number, number, number];
@@ -158,6 +174,8 @@ export interface MapData {
   trees: Float32Array;
   stops: Stop[];
   routes: Route[];
+  /** Bus platforms at busway stations and interchanges (not solid buildings). */
+  platforms: Platform[];
 }
 
 // ---------------------------------------------------------------------------

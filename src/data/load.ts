@@ -1,4 +1,4 @@
-import type { Area, Building, MapData, Rail, Road, Route, Stop } from '../types';
+import type { Area, Building, MapData, Platform, Rail, Road, Route, Stop } from '../types';
 import { cumulative } from './coords';
 
 /* Raw JSON shapes written by tools/data/*.py. Coordinates are decimetre ints. */
@@ -8,6 +8,7 @@ interface RawBuilding { h: number; m?: number; k?: number; pt?: 1; c?: string; r
 interface RawArea { k?: number; p: number[]; h?: number[][] }
 interface RawAreas { water: RawArea[]; areas: RawArea[]; trees: number[] }
 interface RawRoute { id: string; name: string; dir: number; headsign: string; color: string; text: string; op: string; trips: number; len: number; p: number[]; stops: [number, number, number][] }
+interface RawPlatforms { platforms: { n: string; r: string; p: number[]; a?: 1; cv?: 1; y?: number; u?: 1 }[] }
 interface RawRoutes { stops: { n: string; c: string; x: number; y: number }[]; routes: RawRoute[] }
 
 const dm = (p: number[]): Float32Array => {
@@ -40,11 +41,12 @@ export async function loadMapData(onProgress: (fraction: number, label: string) 
     got += n;
     onProgress(Math.min(0.95, got / EXPECTED_BYTES), 'Downloading Brisbane…');
   };
-  const [r, b, a, rt] = await Promise.all([
+  const [r, b, a, rt, pf] = await Promise.all([
     fetchJson<RawRoads>('roads.json', bump),
     fetchJson<RawBuildings>('buildings.json', bump),
     fetchJson<RawAreas>('areas.json', bump),
     fetchJson<RawRoutes>('routes.json', bump),
+    fetchJson<RawPlatforms>('platforms.json', bump),
   ]);
   onProgress(0.97, 'Decoding map…');
 
@@ -107,6 +109,17 @@ export async function loadMapData(onProgress: (fraction: number, label: string) 
     trees: dm(a.trees),
     stops,
     routes,
+    platforms: pf.platforms.map(
+      (x): Platform => ({
+        name: x.n,
+        ref: x.r,
+        pts: dm(x.p),
+        area: !!x.a,
+        covered: !!x.cv,
+        layer: x.y ?? 0,
+        underground: !!x.u,
+      }),
+    ),
   };
 }
 

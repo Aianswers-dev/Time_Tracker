@@ -80,6 +80,17 @@ def num(v: str | None) -> float | None:
         return None
 
 
+def is_bus_platform(tags) -> bool:
+    """Bus platforms and their shelters; excludes railway platforms."""
+    if tags.get("public_transport") != "platform" and tags.get("highway") != "platform":
+        return False
+    if tags.get("railway") == "platform" or tags.get("train") == "yes" or tags.get("tram") == "yes":
+        return False
+    if tags.get("ferry") == "yes" or tags.get("amenity") == "ferry_terminal" or tags.get("bus") == "no":
+        return False
+    return True
+
+
 def flat(coords) -> list[int]:
     out: list[int] = []
     for x, y in coords:
@@ -109,6 +120,7 @@ class Handler(osmium.SimpleHandler):
         self.names: list[str] = []
         self.name_idx: dict[str, int] = {}
         self.water_polys: list[Polygon] = []
+        self.platforms: list[dict] = []
 
     def name(self, n: str | None) -> int:
         if not n:
@@ -139,6 +151,14 @@ class Handler(osmium.SimpleHandler):
     # Ways (roads, rail) ----------------------------------------------------
     def way(self, w):
         tags = w.tags
+        if is_bus_platform(tags) and not w.is_closed():
+            try:
+                pts = [(nd.lon, nd.lat) for nd in w.nodes]
+            except osmium.InvalidLocationError:
+                return
+            if len(pts) >= 2 and any(in_bbox(lon, lat) for lon, lat in pts):
+                self.add_platform(tags, [project(lon, lat) for lon, lat in pts], closed=False)
+            return
         hw = tags.get("highway")
         rw = tags.get("railway")
         if hw is None and rw is None:
@@ -224,6 +244,17 @@ class Handler(osmium.SimpleHandler):
     # Areas (buildings, water, parks) --------------------------------------
     def area(self, a):
         tags = a.tags
+        if is_bus_platform(tags):
+            # Bus platforms (incl. their shelters tagged building=transportation/roof)
+            # are exported separately so they are not solid buildings.
+            try:
+                for outer in a.outer_rings():
+                    oc = [(n.lon, n.lat) for n in outer]
+                    if any(in_bbox(lon, lat) for lon, lat in oc):
+                        self.add_platform(tags, [project(lon, lat) for lon, lat in oc][:-1], closed=True)
+            except osmium.InvalidLocationError:
+                pass
+            return
         is_building = "building" in tags or "building:part" in tags
         akind = None
         for (k, v), code in AREA_KIND.items():
@@ -278,6 +309,27 @@ class Handler(osmium.SimpleHandler):
                 if p.interiors:
                     entry["h"] = [flat(r.coords[:-1]) for r in p.interiors]
                 self.areas.append(entry)
+
+    def add_platform(self, tags, xy, closed: bool):
+        if len(xy) < 2:
+            return
+        layer = num(tags.get("layer")) or 0
+        level = num(tags.get("level"))
+        under = tags.get("location") == "underground" or layer < 0 or (level is not None and level < 0)
+        entry = {
+            "n": tags.get("name") or "",
+            "r": tags.get("ref") or tags.get("local_ref") or "",
+            "p": flat(xy),
+        }
+        if closed:
+            entry["a"] = 1
+        if tags.get("covered") == "yes" or tags.get("shelter") == "yes" or "building" in tags:
+            entry["cv"] = 1
+        if layer:
+            entry["y"] = int(layer)
+        if under:
+            entry["u"] = 1
+        self.platforms.append(entry)
 
     def add_building(self, tags, p: Polygon):
         h = num(tags.get("height")) or num(tags.get("building:height"))
@@ -349,6 +401,9 @@ def main():
         json.dump({**meta, "buildings": h.buildings}, f, separators=(",", ":"))
     with open(os.path.join(OUT, "areas.json"), "w") as f:
         json.dump({**meta, "water": water_out, "areas": h.areas, "trees": h.trees}, f, separators=(",", ":"))
+    with open(os.path.join(OUT, "platforms.json"), "w") as f:
+        json.dump({**meta, "platforms": h.platforms}, f, separators=(",", ":"))
+    print("platforms", len(h.platforms), file=sys.stderr)
     for name in ("roads.json", "buildings.json", "areas.json"):
         print(name, os.path.getsize(os.path.join(OUT, name)) // 1024, "KB", file=sys.stderr)
 
