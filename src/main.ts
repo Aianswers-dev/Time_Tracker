@@ -90,7 +90,7 @@ async function main() {
   const audio = new BusAudio();
   audio.setType(choice.type);
   audio.start();
-  const guide = new RouteGuide(scene, data, route, { busLength: bus.spec.sections.reduce((a, s) => a + s.length, 0), walls: collider });
+  const guide = new RouteGuide(scene, data, route, { busLength: bus.spec.sections.reduce((a, s) => a + s.length, 0), walls: collider, busType: choice.type });
   const hud = new Hud(document.body, data, { traffic, guide });
   // Player collides with buildings and with the AI buses and cars.
   const playerCollider = traffic.wrapCollider(collider);
@@ -145,7 +145,7 @@ async function main() {
       return;
     }
     if (auto) {
-      const a = auto.update({ dt, pose: physics.pose, guide: guide.state, doorsOpen: controls.doorsOpen, interlock: controls.interlock, hit: lastHit ?? undefined, z: physics.pose.z });
+      const a = auto.update({ dt, pose: physics.pose, guide: guide.state, doorsOpen: controls.doorsOpen, interlock: controls.interlock, kneel: controls.kneel, hit: lastHit ?? undefined, z: physics.pose.z });
       inp = { ...inp, throttle: a.throttle, brake: a.brake, steer: a.steer, gear: a.gear, pressed: new Set([...inp.pressed, ...a.pressed]) };
       lastHit = null;
       if (auto.rescue) {
@@ -175,7 +175,8 @@ async function main() {
     // Height at the front of the bus, so the guide keeps the right level under viaducts and in tunnels.
     const s0 = pose.sections[0];
     const frontZ = (s0.z ?? pose.z ?? 0) + Math.tan(s0.pitch ?? 0) * rearOffset;
-    const g = guide.update(dt, frontX, frontY, controls.doorsOpen, pose.speed, pose.heading, hours, frontZ);
+    // The controls give the guide the door opening and kneel, so passengers only move with the doors fully open.
+    const g = guide.update(dt, frontX, frontY, controls.doorsOpen, pose.speed, pose.heading, hours, frontZ, controls);
     // Stop-request bell once per stop as it comes within 250 m.
     if (!g.finished && g.nextStopDistance < 250 && g.nextStopIndex !== dingedStop) {
       dingedStop = g.nextStopIndex;
@@ -274,6 +275,14 @@ async function main() {
           limit: g.speedLimit,
           signal: g.signal ? `${g.signal.state}@${Math.round(g.signal.distance)}` : null,
           collisions: g.collisions,
+          load: g.load,
+          capacity: g.capacity,
+          dwell: g.dwell
+            ? { stop: g.dwell.stop, off: g.dwell.alighting, offTotal: g.dwell.alightTotal, on: g.dwell.boarding, onTotal: g.dwell.boardTotal, full: g.dwell.full, done: g.dwell.done, doors: g.dwell.doors, kneelFor: g.dwell.kneelFor }
+            : null,
+          carried: g.passengersCarried,
+          leftBehind: g.passengersLeft,
+          delta: Math.round(g.scheduleDelta),
           finished: g.finished,
           problems: auto!.problems.length,
           ai: traffic.count,
