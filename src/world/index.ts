@@ -10,7 +10,7 @@ import { buildHouses } from './houses';
 import { buildTrees } from './trees';
 import type { Ctx, Extras } from './ctx';
 import { INNER_PAD, buildPools } from './ground';
-import { buildStoryBridge } from './landmarks';
+import { buildGreenBridge, buildStoryBridge, buildVictoriaBridge } from './landmarks';
 import { buildRoads } from './roads';
 import { TerrainField, buildTerrain, makeLandcover, makeTerrainMaterial } from './terrain';
 import { U } from './shaders';
@@ -150,6 +150,8 @@ export async function buildWorld(
   buildWater(ctx);
   buildPools(ctx, field);
   buildStoryBridge(ctx);
+  buildGreenBridge(ctx);
+  buildVictoriaBridge(ctx);
 
   await step(0.4, 'Raising buildings…');
   const bidx = await buildBuildings(ctx, roads, (f) => onProgress(0.4 + f * 0.3, 'Raising buildings…'));

@@ -69,7 +69,7 @@ export function makeLivery(id: LiveryId, seedText = ''): Livery {
     case 'glider-blue':
       return { id, sign: 'white', mirror: rgb(C.btYellow), electric: false, fleet: `T28${String(17 + (r % 37)).padStart(2, '0')}`, plate };
     case 'glider-maroon':
-      return { id, sign: 'amber', mirror: rgb('#e9d27a'), electric: false, fleet: `C20${36 + (r % 13)}`, plate };
+      return { id, sign: 'amber', mirror: rgb('#f0c419'), electric: false, fleet: `C20${36 + (r % 13)}`, plate };
     case 'metro':
       return { id, sign: 'white', mirror: rgb('#1b1e24'), electric: true, fleet: `90${String(1 + (r % 60)).padStart(2, '0')}`, plate: `XB${n(1)}${n(2)}${LETTERS[r % LETTERS.length]}${LETTERS[(r >>> 5) % LETTERS.length]}` };
     case 'cityloop':

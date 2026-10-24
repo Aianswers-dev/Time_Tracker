@@ -256,8 +256,8 @@ function plate(p: RP, a: number, h: number, text: string): void {
 }
 
 function hailSticker(p: RP, a: number, h: number, w: number): void {
-  p.fill(a - w / 2, a + w / 2, h - 0.035, h + 0.035, '#f7d117');
-  p.text('PLEASE HAIL DRIVER', a, h, 0.05, '#111', { weight: '900', maxW: w * 0.86 });
+  p.fill(a - w / 2, a + w / 2, h - 0.042, h + 0.042, '#f7d117');
+  p.text('PLEASE HAIL DRIVER', a, h, 0.06, '#111', { weight: '900', maxW: w * 0.86 });
   p.local(a - w / 2 + 0.035, h, (c) => {
     c.fillStyle = '#111';
     c.beginPath();
@@ -456,21 +456,27 @@ function optimusFront(p: RP, B: BodyLayout, f: OptFront, lv: Livery, lamps: Lamp
   p.rrect(0.11, W - 0.11, 0.985, 1.12, 0.02, '#0a0c0f');
   const letters = 'VOLGREN';
   letters.split('').forEach((ch, i) => p.text(ch, W / 2 + (i - 3) * 0.085, 1.05, 0.05, f.bandText, { weight: '600' }));
-  // windscreen
-  glass(p, 0.13, W - 0.13, 1.11, 2.73, 'std', 0.08);
+  // windscreen: clear up to ~2.47 m; above it the tall black destination box
+  glass(p, 0.13, W - 0.13, 1.11, 2.47, 'std', 0.08);
+  // driver's smoked roller blind, partly down (driver on the viewer's left)
+  p.ctx.save();
+  p.ctx.globalAlpha = 0.3;
+  p.fill(0.16, 1.15, 2.29, 2.47, '#9aa2ab');
+  p.fill(0.16, 1.15, 2.28, 2.3, '#1a1c20');
+  p.ctx.restore();
   // dashboard / wheel silhouette behind the glass (driver on the viewer's left)
   p.ctx.save();
   p.ctx.globalAlpha = 0.55;
   p.rrect(0.16, W - 0.16, 1.11, 1.5, 0.05, '#05070a');
-  p.local(B.hw - 0.62, 1.62, (c) => {
+  p.local(B.hw - 0.62, 1.38, (c) => {
     c.strokeStyle = '#05070a';
     c.lineWidth = 0.045;
     c.beginPath();
     c.ellipse(0, 0, 0.26, 0.09, 0, 0, Math.PI * 2);
     c.stroke();
   });
-  p.local(B.hw - 0.62, 1.98, (c) => {
-    // driver
+  p.local(B.hw - 0.62, 1.86, (c) => {
+    // driver (eyes ~1.9 m above the road)
     c.fillStyle = '#05070a';
     c.beginPath();
     c.ellipse(0, 0, 0.11, 0.13, 0, 0, Math.PI * 2);
@@ -480,9 +486,9 @@ function optimusFront(p: RP, B: BodyLayout, f: OptFront, lv: Livery, lamps: Lamp
     c.fill();
   });
   p.ctx.restore();
-  hailSticker(p, W / 2 + 0.22, 2.63, 0.82);
+  hailSticker(p, W / 2 + 0.22, 2.39, 1.0);
   // destination box (the LED sign mesh sits on top)
-  p.rrect(0.13, W - 0.13, 2.72, 3.0, 0.03, '#050607');
+  p.rrect(0.13, W - 0.13, 2.46, 3.0, 0.03, '#050607');
   for (const a of [0.2, W - 0.2]) {
     p.local(a, 2.86, (c) => {
       c.fillStyle = '#c9ccd0';
@@ -811,7 +817,7 @@ function metroFront(p: RP, B: BodyLayout, lv: Livery, lamps: LampDef[]): void {
   p.ctx.globalAlpha = 0.5;
   p.rrect(0.24, W - 0.24, 0.96, 1.35, 0.05, '#030405');
   p.ctx.restore();
-  p.rrect(0.32, W - 0.32, 2.57, 2.9, 0.03, '#030405'); // sign box
+  p.rrect(0.34, W - 0.34, 2.52, 2.92, 0.03, '#030405'); // sign box
   // white lower nose and blue centre panel
   p.ctx.beginPath();
   p.spline([[0, 0.98], [0.5, 0.9], [W / 2, 0.88], [W - 0.5, 0.9], [W, 0.98]]);
@@ -819,15 +825,41 @@ function metroFront(p: RP, B: BodyLayout, lv: Livery, lamps: LampDef[]): void {
   p.ctx.closePath();
   p.ctx.fillStyle = '#f1f2f4';
   p.ctx.fill();
-  p.rrect(0.62, W - 0.62, 0.36, 0.9, 0.08, C.metroBlue);
-  translinkLogo(p, W / 2 - 0.15, 0.77, 0.075, '#ffffff', C.metroBlue, true);
-  p.text(lv.fleet, W / 2 + 0.42, 0.77, 0.11, '#ffffff', { weight: '800' });
-  p.text('Dedicated to a better Brisbane', W / 2, 0.6, 0.032, '#dfe6f5', { weight: '600', italic: true });
+  // blue panel: full width under the glass, sweeping in to the number plate
+  // between the white lamp cheeks (as on the HESS lighTram 25 / Brisbane Metro)
+  {
+    const c = p.ctx;
+    c.beginPath();
+    c.moveTo(p.X(0.08), p.Y(0.99));
+    c.lineTo(p.X(W - 0.08), p.Y(0.99));
+    c.quadraticCurveTo(p.X(W - 0.6), p.Y(0.95), p.X(W - 0.66), p.Y(0.36));
+    c.lineTo(p.X(0.66), p.Y(0.36));
+    c.quadraticCurveTo(p.X(0.6), p.Y(0.95), p.X(0.08), p.Y(0.99));
+    c.closePath();
+    c.fillStyle = C.metroBlue;
+    c.fill();
+  }
+  translinkLogo(p, W / 2 - 0.5, 0.8, 0.07, '#ffffff', C.metroBlue, true);
+  // Brisbane City Council crest: gold City Hall (portico, clock tower) on a blue tile
+  {
+    const x = W / 2 - 0.03;
+    p.rrect(x, x + 0.18, 0.66, 0.9, 0.01, '#f2f4f8');
+    p.fill(x + 0.012, x + 0.168, 0.672, 0.888, '#2350c4');
+    const gold = '#efbd1c';
+    p.fill(x + 0.025, x + 0.155, 0.72, 0.765, gold);
+    p.fill(x + 0.05, x + 0.13, 0.765, 0.78, gold);
+    p.fill(x + 0.079, x + 0.101, 0.78, 0.845, gold);
+    p.fill(x + 0.084, x + 0.096, 0.845, 0.87, gold);
+    p.fill(x + 0.035, x + 0.145, 0.705, 0.712, gold);
+    p.text('BRISBANE CITY', x + 0.09, 0.688, 0.016, '#ffffff', { weight: '800', maxW: 0.15 });
+  }
+  p.text(lv.fleet, W / 2 + 0.56, 0.8, 0.11, '#ffffff', { weight: '800' });
+  p.text('Dedicated to a better Brisbane', W / 2 + 0.06, 0.62, 0.03, '#dfe6f5', { weight: '600', italic: true });
   p.fill(0, W, B.y0, 0.34, '#2b2e33');
-  // headlamp pods
-  for (const a of [0.34, W - 0.34]) p.rrect(a - 0.26, a + 0.26, 0.5, 0.82, 0.12, '#dfe2e6');
+  // headlamp cheeks
+  for (const a of [0.3, W - 0.3]) p.rrect(a - 0.2, a + 0.2, 0.5, 0.8, 0.12, '#e3e6ea');
   paintLamps(p, lamps, 'front');
-  p.text('HESS', W / 2 + 0.55, 1.02, 0.035, '#b8bec6', { weight: '800' });
+  p.text('HESS', W / 2, 1.04, 0.04, '#b8bec6', { weight: '800' });
   wheelchair(p, W - 0.55, 1.08, 0.09);
   plate(p, W / 2, 0.47, lv.plate);
 }
@@ -981,7 +1013,7 @@ function paintMaps(B: BodyLayout, sec: SectionLayout, atlas: AtlasLayout, lv: Li
     const pe = new RP(em.ctx, q(atlas.front), W, B.y0, B.yTop, false);
     const pr = new RP(ro.ctx, q(atlas.front), W, B.y0, B.yTop, false);
     const metro = lv.id === 'metro';
-    const g0 = metro ? 0.96 : 1.11, g1 = metro ? B.yTop - 0.13 : 2.73;
+    const g0 = metro ? 0.96 : 1.11, g1 = metro ? B.yTop - 0.13 : 2.47;
     pe.fill(0.2, W - 0.2, g0 + 0.55, g1 - 0.35, 'rgba(70,72,78,0.5)');
     pr.fill(0.13, W - 0.13, g0, g1, 'rgb(0,12,0)');
   }

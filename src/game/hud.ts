@@ -55,6 +55,47 @@ export interface HudOptions {
 
 type ToastKind = 'info' | 'good' | 'bad' | 'warn';
 
+interface LiveToast {
+  el: HTMLDivElement;
+  key: string;
+  n: number;
+  timer: number;
+  badge: HTMLElement | null;
+}
+
+/** A displayed value that only changes once a new value has held for `hold` seconds of sim time. */
+class Steady<T> {
+  private pend: T;
+  private since = 0;
+  private fresh = true;
+  constructor(
+    public shown: T,
+    readonly hold: number,
+  ) {
+    this.pend = shown;
+  }
+  update(v: T, t: number): T {
+    if (this.fresh) {
+      this.fresh = false;
+      this.shown = this.pend = v;
+    }
+    if (v === this.shown) {
+      this.pend = v;
+      return v;
+    }
+    if (v !== this.pend) {
+      this.pend = v;
+      this.since = t;
+    }
+    if (t - this.since >= this.hold) this.shown = v;
+    return this.shown;
+  }
+}
+
+/** OSM `ref`s used as a name when a way has none ('22;95', '5'): not a street name. */
+const REF_ONLY = /^[A-Z]{0,2}\d+[A-Z]?(\s*[;,/]\s*[A-Z]{0,2}\d+[A-Z]?)*$/;
+const TOAST_MS = 3200;
+
 export class Hud {
   private root: HTMLDivElement;
   private mini: Minimap | null = null;
@@ -81,6 +122,16 @@ export class Hud {
   private dwellStop = -1;
   private loadKey = '';
   private readonly toasts: HTMLDivElement;
+  private live: LiveToast[] = [];
+  /** Sim time (s) from the frames' clock, for debouncing what the guide reports. */
+  private simT = 0;
+  private lastHours = NaN;
+  // 2 s: a branch joining the road (Eastern Busway onto the SEB, 222 #15) wins the lookup for
+  // up to ~2 s; a real turn onto a new street still shows within a couple of seconds.
+  private road = new Steady('', 2);
+  private limit = new Steady(50, 1.2);
+  private offStartT = -1e9;
+  private lastOnToastT = -1e9;
 
   // Slots
   private s: Record<string, TextSlot> = {};
@@ -158,6 +209,7 @@ export class Hud {
     this.f.loadBusy = new FlagSlot(e.load, 'busy');
     this.f.loadFull = new FlagSlot(e.load, 'full');
     this.f.night = new FlagSlot(root, 'night');
+    this.f.cab = new FlagSlot(root, 'cab');
     this.f.map = new FlagSlot(e.map, 'show');
     this.f.ribbonOff = new FlagSlot(e.ribbonBtn, 'off');
     this.f.sig = new FlagSlot(e.sig, 'show');
@@ -212,9 +264,20 @@ export class Hud {
     const g = f.guide;
     const s = this.s;
     const fl = this.f;
+    // Sim seconds since the last frame (the time-of-day key jumps the clock by hours: not elapsed time).
+    if (Number.isFinite(this.lastHours)) {
+      const dh = ((((f.hours - this.lastHours) % 24) + 24) % 24) * 3600;
+      if (dh < 60) this.simT += dh;
+    }
+    this.lastHours = f.hours;
+    // In the cab the dashboard has the speedo, gear and lamps: the HUD keeps only the limit.
+    fl.cab.set(f.cameraMode === 'cab');
 
-    // Route card.
-    s.road.set(g.roadName ? `on ${g.roadName}` : '');
+    // Route card. Names that flick to a side street or the road below for a moment at a
+    // junction are held back until they have lasted a moment; route refs are not names.
+    const name = REF_ONLY.test(g.roadName.trim()) ? '' : g.roadName;
+    const road = this.road.update(name, this.simT);
+    s.road.set(road ? `on ${road}` : '');
     s.lvl.set(g.roadLevel === 'tunnel' ? 'Tunnel' : g.roadLevel === 'viaduct' ? 'Viaduct' : g.roadLevel === 'bridge' ? 'Bridge' : '');
     // Gradient over 4 % (with a little hysteresis so it does not flicker).
     const pct = Math.abs(g.grade) * 100;
@@ -322,8 +385,10 @@ export class Hud {
     // Cluster.
     const kmh = Math.round(f.speedKmh);
     s.speed.set(String(kmh));
-    s.limit.set(String(g.speedLimit));
-    fl.over.set(g.speeding);
+    // A limit seen for a moment (a slip lane's 10 km/h beside us) does not flash up.
+    const limit = this.limit.update(g.speedLimit, this.simT);
+    s.limit.set(String(limit));
+    fl.over.set(g.speeding && f.speedKmh > limit + 5);
     fl.gR.set(f.gear === 'R');
     fl.gN.set(f.gear === 'N');
     fl.gD.set(f.gear === 'D');
@@ -398,10 +463,15 @@ export class Hud {
           this.toast(ev.text, 'warn');
           break;
         case 'offroute':
-          this.toast(ev.text, 'warn');
+          // The Off route card says it (and points the way back).
+          this.offStartT = this.simT;
           break;
         case 'onroute':
-          this.toast(ev.text, 'good');
+          // Only after a real spell off the route, and not every time the line is grazed.
+          if (this.simT - this.offStartT >= 3 && this.simT - this.lastOnToastT >= 10) {
+            this.lastOnToastT = this.simT;
+            this.toast(ev.text, 'good');
+          }
           break;
         case 'finished':
           this.summaryTimer = 1.4;
@@ -496,6 +566,20 @@ export class Hud {
   }
 
   toast(msg: string, kind: ToastKind = 'info', html = false): void {
+    // The same message again while it is still up: count it instead of stacking a copy.
+    const key = `${kind}|${msg}`;
+    const same = this.live.find((x) => x.key === key);
+    if (same) {
+      same.n++;
+      if (!same.badge) {
+        same.badge = el('b', 'bbh-tn');
+        same.el.appendChild(same.badge);
+      }
+      same.badge.textContent = `×${same.n}`;
+      clearTimeout(same.timer);
+      same.timer = this.expire(same);
+      return;
+    }
     const t = el('div', `bbh-panel bbh-toast ${kind}`);
     const i = el('i');
     const span = el('span');
@@ -503,11 +587,24 @@ export class Hud {
     else span.textContent = msg;
     t.append(i, span);
     this.toasts.appendChild(t);
-    while (this.toasts.children.length > 3) this.toasts.firstElementChild?.remove();
-    setTimeout(() => {
-      t.classList.add('out');
-      setTimeout(() => t.remove(), 360);
-    }, 3200);
+    const lt: LiveToast = { el: t, key, n: 1, timer: 0, badge: null };
+    lt.timer = this.expire(lt);
+    this.live.push(lt);
+    // Small screens keep two, so the stack never reaches the cards below it.
+    const max = matchMedia('(max-height: 560px), (max-width: 760px)').matches ? 2 : 3;
+    while (this.live.length > max) {
+      const old = this.live.shift()!;
+      clearTimeout(old.timer);
+      old.el.remove();
+    }
+  }
+
+  private expire(lt: LiveToast): number {
+    return window.setTimeout(() => {
+      this.live = this.live.filter((x) => x !== lt);
+      lt.el.classList.add('out');
+      setTimeout(() => lt.el.remove(), 360);
+    }, TOAST_MS);
   }
 
   toggleMap(): void {

@@ -86,7 +86,7 @@ async function main() {
   const physics = new BusPhysics(bus.spec);
   const controls = new BusControls();
   const input = new InputManager();
-  const rig = new CameraRig(camera);
+  const rig = new CameraRig(camera, collider);
   const audio = new BusAudio();
   audio.setType(choice.type);
   audio.start();
@@ -302,6 +302,17 @@ async function main() {
         for (let i = 0; i < g.count; i++) if (near(g.px[i], g.py[i])) cars.push({ id: g.pid[i], x: +g.px[i].toFixed(1), y: +g.py[i].toFixed(1), z: +g.pz[i].toFixed(1), v: +g.pv[i].toFixed(1) });
         return { buses, cars };
       },
+      /** Guide lane samples from s0 to s1 (lane geometry and speed plan, for diagnosing a stretch). */
+      lane(s0: number, s1: number, step = 2) {
+        const T = auto!.track;
+        const o = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
+        const out: { s: number; x: number; y: number; z: number; heading: number; vmax: number; limit: number }[] = [];
+        for (let s = s0; s <= s1; s += step) {
+          T.sample(s, o);
+          out.push({ s, x: +o.x.toFixed(2), y: +o.y.toFixed(2), z: +T.zAt(s).toFixed(2), heading: +((o.heading * 180) / Math.PI).toFixed(1), vmax: +(T.vmaxAt(s) * 3.6).toFixed(0), limit: T.limitAt(s) });
+        }
+        return out;
+      },
       report() {
         return { ...auto!.report(), summary: guide.state.summary, served: guide.state.stopsServed, missed: guide.state.stopsMissed, total: guide.state.stopsTotal, events: guide.state.events.map((e) => `${e.kind}: ${e.text}`) };
       },
@@ -311,9 +322,24 @@ async function main() {
     return;
   }
 
+  // Resolution governor: a GPU that cannot hold ~55 fps for 3 s running steps the
+  // pixel ratio down by 0.25, never below the screen's own pixels. A lone hitch
+  // (GC, shader compile) does not count: the average has to stay slow.
+  let frameTime = 1 / 60;
+  let slow = 0;
   const frame = () => {
     requestAnimationFrame(frame);
-    tick(Math.min(0.05, clock.getDelta()), true);
+    const dt = clock.getDelta();
+    tick(Math.min(0.05, dt), true);
+    if (document.hidden || dt > 0.25) return;
+    frameTime += (dt - frameTime) * 0.05;
+    slow = frameTime > 1 / 55 ? slow + dt : 0;
+    const ratio = renderer.getPixelRatio();
+    if (slow > 3 && ratio > 1) {
+      renderer.setPixelRatio(Math.max(1, ratio - 0.25));
+      console.info(`[render] ${Math.round(1 / frameTime)} fps: pixel ratio ${renderer.getPixelRatio()}`);
+      slow = 0;
+    }
   };
   frame();
 }

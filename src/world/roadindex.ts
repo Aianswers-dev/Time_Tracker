@@ -192,7 +192,8 @@ export function roadRank(r: Road): number {
     case RoadKind.Trunk:
       return 6;
     case RoadKind.Busway:
-      return 7;
+      // station bays draw under the busway they widen (its lane lines stay on top)
+      return r.bay ? 6 : 7;
     case RoadKind.Motorway:
       return 8;
   }
