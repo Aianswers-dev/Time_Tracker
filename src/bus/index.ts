@@ -5,8 +5,8 @@
 //
 // createBus({ detail: 'high' })  player bus, ~25 draw calls (rigid), ~40 (Metro)
 // createBus({ detail: 'low' })   AI bus, shared resources, 2-4 visible meshes per section
-// createCab(type)                driver's cab + saloon, ~9 draw calls; eye at
-//                                (0.62, 2.2, 1.4 m behind the nose) in section 0's frame
+// createCab(type)                driver's cab + saloon, ~11 draw calls; eye at
+//                                (0.62, 1.9, 1.4 m behind the nose) in section 0's frame
 import type { BusFactory, BusMesh, BusType, Cab, Route } from '../types';
 import { specFor } from './spec';
 import { createHighBus } from './high';

@@ -16,6 +16,9 @@ import { isSimInput, onSimEvent, telemetry } from './hub';
 
 export type CameraMode = 'cab' | 'chase' | 'top' | 'cinematic';
 const MODES: CameraMode[] = ['cab', 'chase', 'top', 'cinematic'];
+/** Resting cab head pitch: a driver looks slightly down the road, so the
+ * windscreen top sits near the top of the view and the dash below. */
+const CAB_PITCH = -0.12;
 
 const clamp = (v: number, a: number, b: number) => (v < a ? a : v > b ? b : v);
 const wrap = (a: number) => {
@@ -314,7 +317,7 @@ export class CameraRig {
     // Orientation: section frame x head look x a share of the body roll.
     this.tmpM.extractRotation(g.matrixWorld);
     this.camera.quaternion.setFromRotationMatrix(this.tmpM);
-    const headPitch = this.lookPitch + aLong * 0.004 + vib * 0.6 + shake * 0.2;
+    const headPitch = CAB_PITCH + this.lookPitch + aLong * 0.004 + vib * 0.6 + shake * 0.2;
     const headRoll = -pose.roll * 0.5 + aLat * 0.0035;
     this.tmpE.set(headPitch, this.lookYaw, headRoll, 'YXZ');
     this.tmpQ.setFromEuler(this.tmpE);

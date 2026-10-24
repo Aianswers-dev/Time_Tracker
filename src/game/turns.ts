@@ -61,26 +61,24 @@ function streetAt(data: MapData, route: Route, s: number, offsets: number[]): st
   return best;
 }
 
-/**
- * Does a right turn at s cross oncoming traffic? Yes from a two-way road, or
- * from a one-way carriageway with an opposite-direction carriageway on its
- * right (a divided road). Australia drives on the left.
- */
-function crossesOncoming(data: MapData, route: Route, s: number): boolean {
-  const idx = roadIndexFor(data);
-  const H = heightsOf(data);
-  const ss = Math.max(0, s - 25);
+/** The road the route runs on at s (null off the road network). */
+function roadAt(data: MapData, route: Route, s: number) {
+  const ss = Math.max(0, Math.min(route.length, s));
   const p = pointAlong(route.pts, route.cum, ss);
-  const z = H.routeZ(route, ss);
-  // (nearest() reuses one result object: keep the id)
-  const own = idx.nearest(p.x, p.y, 8, p.heading, 0.85, drivable, z)?.road ?? -1;
-  if (own < 0) return false;
-  if (!data.roads[own].oneway) return true;
-  const rx = Math.cos(p.heading);
-  const ry = -Math.sin(p.heading);
-  for (const off of [6, 10, 14, 18]) {
-    const opp = idx.nearest(p.x + rx * off, p.y + ry * off, 4, p.heading + Math.PI, 0.85, drivable, z);
-    if (opp && data.roads[opp.road].oneway && opp.road !== own) return true;
+  const hit = roadIndexFor(data).nearest(p.x, p.y, 12, p.heading, 0.85, drivable, heightsOf(data).routeZ(route, ss));
+  return hit ? data.roads[hit.road] : null;
+}
+
+/** A traffic signal node within r of the route at s, at street level (not on a bridge or in a tunnel). */
+function signalAt(data: MapData, route: Route, s: number, r: number): boolean {
+  const road = roadAt(data, route, s);
+  if (road && (road.bridge || road.tunnel)) return false;
+  const p = pointAlong(route.pts, route.cum, Math.max(0, Math.min(route.length, s)));
+  const g = data.signals;
+  for (let k = 0; k + 1 < g.length; k += 2) {
+    const dx = g[k] - p.x;
+    const dy = g[k + 1] - p.y;
+    if (Math.abs(dx) < r && Math.abs(dy) < r && dx * dx + dy * dy < r * r) return true;
   }
   return false;
 }
@@ -148,9 +146,10 @@ export function computeTurns(data: MapData, route: Route): TurnHint[] {
     if (abs > 150 * DEG) kind = 'uturn';
     else if (abs > 115 * DEG) kind = right ? 'sharp-right' : 'sharp-left';
     else if (abs > 52 * DEG) kind = right ? 'right' : 'left';
+    // A gentle angle is still a turn at the lights, or turning right off a two-way road across the
+    // oncoming lanes; "keep" is for forks and slip lanes.
+    else if (signalAt(data, route, t.s, 25) || (right && roadAt(data, route, t.s - 30)?.oneway === false)) kind = right ? 'right' : 'left';
     else kind = right ? 'slight-right' : 'slight-left';
-    // Bearing right across the oncoming lanes onto another street is a turn at the junction, not a fork.
-    if (kind === 'slight-right' && street && street !== from && crossesOncoming(data, route, t.s)) kind = 'right';
     const verb =
       kind === 'uturn'
         ? 'Make a U-turn'

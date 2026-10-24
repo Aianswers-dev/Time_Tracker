@@ -7,7 +7,7 @@ import { canvasTexture, makeCanvas } from './util';
 
 const PITCH = 5;
 const CW = 1024;
-const CH = 256;
+const CH = 288;
 
 interface Panel {
   x: number;
@@ -16,9 +16,10 @@ interface Panel {
   rows: number;
 }
 
-const FRONT: Panel = { x: 12, y: 4, cols: 200, rows: 24 };
-const SIDE: Panel = { x: 24, y: 132, cols: 144, rows: 24 };
-const REAR: Panel = { x: 776, y: 132, cols: 48, rows: 24 };
+// front: ~1.7 x 0.32 m display (about 10 mm pitch), side and rear 24 rows
+const FRONT: Panel = { x: 12, y: 4, cols: 168, rows: 30 };
+const SIDE: Panel = { x: 24, y: 162, cols: 144, rows: 24 };
+const REAR: Panel = { x: 776, y: 162, cols: 48, rows: 24 };
 
 function uvOf(p: Panel): [number, number, number, number] {
   const x0 = p.x, x1 = p.x + p.cols * PITCH;
@@ -85,21 +86,23 @@ function routeWidth(c: CanvasRenderingContext2D, route: string, size: number): n
 }
 
 function drawDestination(c: CanvasRenderingContext2D, cols: number, rows: number, sign: DestinationSign, routeRight: boolean): void {
-  const rSize = 23;
+  const k = rows / 24;
+  const rSize = Math.round(23 * k);
   const rw = Math.min(cols * 0.32, routeWidth(c, sign.route, rSize)) + 2;
   const textX0 = routeRight ? 2 : rw + 6;
   const textX1 = routeRight ? cols - rw - 6 : cols - 2;
   fitText(c, sign.route, routeRight ? cols - 1 : 1, rows - 2, rSize, cols * 0.32, routeRight ? 'right' : 'left');
   const avail = textX1 - textX0;
   const head = sign.headsign;
-  c.font = `bold 16px ${FONT_LED}`;
+  const s1 = Math.round(16 * k), s2 = Math.round(11 * k);
+  c.font = `bold ${s1}px ${FONT_LED}`;
   const single = c.measureText(head).width;
   const two = splitHeadsign(head);
   if (single <= avail * 1.05 || !two) {
-    fitText(c, head, (textX0 + textX1) / 2, rows - 6, 16, avail, 'center');
+    fitText(c, head, (textX0 + textX1) / 2, rows - Math.round(6 * k), s1, avail, 'center');
   } else {
-    fitText(c, two[0], (textX0 + textX1) / 2, 10, 11, avail, 'center');
-    fitText(c, two[1], (textX0 + textX1) / 2, rows - 1, 11, avail, 'center');
+    fitText(c, two[0], (textX0 + textX1) / 2, Math.round(10 * k), s2, avail, 'center');
+    fitText(c, two[1], (textX0 + textX1) / 2, rows - 1, s2, avail, 'center');
   }
 }
 
