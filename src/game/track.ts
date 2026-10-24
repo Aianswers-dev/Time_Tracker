@@ -825,7 +825,16 @@ export class RouteTrack {
           continue;
         }
         const r = data.roads[c.road];
-        const lat = c.road === this.road[i] ? Math.max(-r.width / 2, Math.min(r.width / 2, this.offset[i] - roadC[i])) : lane(r);
+        // Keep a platform shift on the same road where that spot is clear; otherwise stay well inside
+        // the carriageway's walls (the tube's walls stand half a lane-width out from its edge).
+        const safe = Math.max(0, Math.max(3.2, r.width) / 2 + 0.9 - WALL_CLEAR);
+        let lat = c.road === this.road[i] ? this.offset[i] - roadC[i] : lane(r);
+        const ok = (l: number) => {
+          const qx = c.px - c.dy * l;
+          const qy = c.py + c.dx * l;
+          return TW.drivable(qx, qy, this.z[i]) && this.wallDist(W, G, qx, qy, this.z[i]) >= WALL_CLEAR - 0.6;
+        };
+        if (Math.abs(lat) > safe && !ok(lat)) lat = Math.max(-safe, Math.min(safe, lat));
         px[k] = c.px - c.dy * lat;
         py[k] = c.py + c.dx * lat;
       }
