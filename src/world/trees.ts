@@ -233,10 +233,16 @@ function crownBottom(tpl: number, rw: number): number {
   return b;
 }
 
-/** Height above a carriageway that crowns must clear (bus 3.4 m, pruned like real street trees). */
+/**
+ * The space crowns keep out of: up to 4.5 m over a carriageway (a 3.4 m bus and
+ * the pruning height of real street trees), then falling away 1:1 outside the
+ * kerb line, so a crown beside the road is no lower than 3 m at 1.5 m out (the
+ * bus's mirrors, and the driver's side window).
+ */
 const ROAD_CLEAR = 4.5;
-/** Crowns may hang this far over the kerb line at any height (the gutter is outside the bus). */
-const KERB_OVERHANG = 0.3;
+const CLEAR_SLOPE = 1;
+/** Busways run through cleared verges: the space falls away more gently (to the ground 7.5 m out). */
+const CLEAR_SLOPE_BUSWAY = 0.6;
 /** Trunks keep at least this far from the edge of a carriageway. */
 const TRUNK_CLEAR = 0.6;
 
@@ -537,15 +543,18 @@ export async function buildTrees(
     const liftNeeded = (x: number, y: number, base: number, tpl: number, w: number, h: number): number => {
       const reach = REACH[tpl] * w;
       let need = 0;
-      index.roadsNear(x, y, reach + index.maxHW, (ri, k, dist) => {
+      index.roadsNear(x, y, reach + ROAD_CLEAR / CLEAR_SLOPE_BUSWAY + index.maxHW, (ri, k, dist) => {
         if (kinds[ri] === RoadKind.Pedestrian) return;
+        const slope = kinds[ri] === RoadKind.Busway ? CLEAR_SLOPE_BUSWAY : CLEAR_SLOPE;
+        const out = ROAD_CLEAR / slope;
         const c = dist - segHW[k];
         if (c < TRUNK_CLEAR) {
           need = Infinity;
           return;
         }
-        const rr = c + KERB_OVERHANG;
-        if (rr >= reach) return;
+        // the crown from where the clear space starts (c - out from the trunk) to its rim
+        const r0 = Math.max(0, c - out);
+        if (r0 >= reach) return;
         // road height at the closest point
         const ax = seg[4 * k];
         const ay = seg[4 * k + 1];
@@ -556,7 +565,11 @@ export async function buildTrees(
         const z = segZ[2 * k] + (segZ[2 * k + 1] - segZ[2 * k]) * u;
         // a crown wholly below a deck is no trouble
         if (base + TOP[tpl] * h < z - 1.2) return;
-        need = Math.max(need, z + ROAD_CLEAR - (base + crownBottom(tpl, rr / w) * h));
+        for (let q = 0; q <= 8; q++) {
+          const r = r0 + ((reach - r0) * q) / 8.5;
+          const clear = ROAD_CLEAR - Math.max(0, c - r) * slope;
+          need = Math.max(need, z + clear - (base + crownBottom(tpl, r / w) * h));
+        }
       });
       return need;
     };
