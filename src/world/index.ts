@@ -199,8 +199,10 @@ export async function buildWorld(
   let sigClock = 0;
   let sigOffset = 0;
   const debug = location.search.includes('world=debug');
-  const dbgWin = window as unknown as { __worldCam?: number[]; __worldHours?: number; __worldInfo?: () => string; __worldRoot?: THREE.Group };
+  const dbgWin = window as unknown as { __worldCam?: number[]; __worldHours?: number; __worldInfo?: () => string; __worldRoot?: THREE.Group; __worldTicks?: Ctx['tick'] };
   if (debug) dbgWin.__worldRoot = root;
+  // the per-frame callbacks, so a harness can time each subsystem's CPU work without rendering
+  if (debug) dbgWin.__worldTicks = ctx.tick;
   if (debug) dbgWin.__worldInfo = () => `calls ${renderer.info.render.calls} tris ${renderer.info.render.triangles} geos ${renderer.info.memory.geometries} tex ${renderer.info.memory.textures}${underground ? ` underground (${hidden.length} hidden)` : ''}`;
   return {
     update(dt: number, camera: THREE.Camera, hours: number) {
