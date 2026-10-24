@@ -340,7 +340,7 @@ export interface BuildingIndex {
   big: Uint8Array;
 }
 
-export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: RoadIndex }, progress: (f: number) => void): Promise<BuildingIndex> {
+export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: RoadIndex; tunnels: RoadIndex }, progress: (f: number) => void): Promise<BuildingIndex> {
   const { data, R } = ctx;
   const traffic = (ri: number) => {
     const k = roads.infos[ri].r.kind;
@@ -349,12 +349,15 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
   /**
    * Height a building's walls must keep clear above a road that runs through
    * its outline in the open (a busway under a station building or hospital
-   * wing): road height + 5.2 m, or -Infinity when nothing passes. Walls only
-   * stand on the outline, so it is sampled along the outline's edges.
+   * wing): road height + 5.2 m, or -Infinity when nothing passes. A tunnel
+   * (open cut or tube, at any depth) keeps its tube's height + 0.3 m clear.
+   * Walls only stand on the outline, so it is sampled along the outline's edges.
    */
-  const clearanceOver = (ring: ArrayLike<number>, x0: number, y0: number, x1: number, y1: number, base: number): Float32Array | null => {
+  const clearanceOver = (ring: ArrayLike<number>, x0: number, y0: number, x1: number, y1: number, base: number, bottom: number): Float32Array | null => {
     const r = Math.hypot(x1 - x0, y1 - y0) / 2;
-    if (roads.index.clearance((x0 + x1) / 2, (y0 + y1) / 2, r, traffic) > r) return null;
+    const cx = (x0 + x1) / 2;
+    const cy = (y0 + y1) / 2;
+    if (roads.index.clearance(cx, cy, r, traffic) > r && roads.tunnels.clearance(cx, cy, r) > r) return null;
     const nv = ring.length >> 1;
     const need = new Float32Array(nv).fill(-Infinity);
     let any = false;
@@ -368,10 +371,17 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
         const x = ax + ((bx - ax) * (q + 0.5)) / n;
         const y = ay + ((by - ay) * (q + 0.5)) / n;
         const nr = roads.index.nearest(x, y, 10, traffic);
-        if (!nr || nr.dist > roads.infos[nr.road].hw + 0.3) continue;
-        if (nr.z > base + 2 || ctx.field.natAt(x, y) - nr.z > 4.6) continue;
-        need[v] = Math.max(need[v], nr.z + 5.2);
-        any = true;
+        if (nr && nr.dist <= roads.infos[nr.road].hw + 0.3 && nr.z <= base + 2 && ctx.field.natAt(x, y) - nr.z <= 4.6) {
+          need[v] = Math.max(need[v], nr.z + 5.2);
+          any = true;
+        }
+        // tunnels: the walls of the tube or cutting stand 0.9 m beyond the carriageway
+        const nt = roads.tunnels.nearest(x, y, 12);
+        const top = nt ? nt.z + (roads.infos[nt.road].r.kind === RoadKind.Motorway ? 6.4 : 5.8) + 0.3 : -Infinity;
+        if (nt && nt.dist <= roads.infos[nt.road].hw + 1.2 && nt.z <= base + 2 && top > bottom) {
+          need[v] = Math.max(need[v], top);
+          any = true;
+        }
       }
     }
     return any ? need : null;
@@ -416,7 +426,7 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
     const bottom = minG - 0.4;
     // ...but never down across a road that runs through underneath: those
     // edges stop above the road, with a soffit over the passage
-    const need = clearanceOver(ring, x0, y0, x1, y1, base);
+    const need = clearanceOver(ring, x0, y0, x1, y1, base, bottom);
     let foot: number | ((edge: number) => number) = bottom;
     let soffit = -Infinity;
     if (need) {
