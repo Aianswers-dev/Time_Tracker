@@ -28,8 +28,10 @@ export interface OverbridgeDef {
   /** Glass tint 0xRRGGBB and frame colour. */
   glass: number;
   frame: number;
-  /** Lift/stair towers at the two ends (beyond the platforms). */
+  /** Lift/stair towers at the two ends (centred 3.5 m in from each end of `len`). */
   towers: boolean;
+  /** Tower footprint (m square), default 6.5. */
+  towerW?: number;
   /** Flat white roof wider than the deck (CC's oval canopy). */
   roofW?: number;
   /** Roof only over this part of the deck, as a flat oval (CC); else the whole deck. */
@@ -295,8 +297,15 @@ export const STATIONS: StationDef[] = [
     roof: 'flat',
     median: 'fence',
     medianLights: true,
-    // Lift towers north (station side) and south (hospital side) joined by the teal overbridge.
-    overbridges: [{ x: 1051, y: -3108, ax: 0, ay: 1, len: [-22.5, 20.5], w: 4, glass: 0x3fa7a0, frame: 0x2b2f33, towers: true, clear: 6.4 }],
+    // Lift towers on the platforms' east-end landings joined by the teal overbridge, on the line
+    // of the OSM footbridge (building 36455, (1057,-3122)-(1061,-3096)).
+    overbridges: [{ x: 1059.2, y: -3108.9, ax: 0.164, ay: 0.987, len: [-16, 15.75], w: 4, glass: 0x3fa7a0, frame: 0x2b2f33, towers: true, clear: 6.4 }],
+    // OSM boxes the model replaces: the north station building, the footbridge and the south building.
+    ownBuildings: [
+      [1062, -3089],
+      [1059, -3109],
+      [1056, -3131],
+    ],
   },
   {
     key: 'boggo',
@@ -459,6 +468,13 @@ export const STATIONS: StationDef[] = [
     vault: { rib: 0x2b2f33, spacing: 3.2, paired: false, rise: 3.6, spring: 4.6 },
     median: 'fence',
     ownRoofs: 190,
+    // The two lift towers at the platforms' east ends (OSM 53118 / 53116, ~10 m square) joined by a
+    // glazed overbridge across the busway (photo: Herston_busway_station_and_Northern_Busway).
+    overbridges: [{ x: 185.05, y: 2120.2, ax: 0.15, ay: 0.989, len: [-17, 17], w: 3.6, glass: 0x8fb3ad, frame: 0x2b2f33, towers: true, towerW: 9, clear: 6.2 }],
+    ownBuildings: [
+      [187, 2132],
+      [183, 2108],
+    ],
   },
   {
     key: 'rbwh',

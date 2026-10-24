@@ -1296,10 +1296,11 @@ function buildOverbridge(c: Ctx, b: StationBuild, o: OverbridgeDef): void {
     geo.box(o.x + ax * rm, o.y + ay * rm, roofH + 0.35, roofH + 0.5, ax, ay, rl - 0.3, rw - 0.4);
   }
   // towers or piers at the ends, plus piers where the ground allows
-  const ends: number[] = o.towers ? [s0 + 3.5, s1 - 3.5] : [];
+  const tw = o.towerW ?? 6.5;
+  const ends: number[] = o.towers ? [s0 + tw / 2 + 0.25, s1 - tw / 2 - 0.25] : [];
   for (const s of ends) {
     const p = P(s, 0);
-    buildTower(c, b, { x: p[0], y: p[1], w: 6.5, d: 6.5, h: roofH - zb + 2.5, heading: Math.atan2(ax, ay), frame: o.frame, banner: 0xe8552b }, Math.min(c.heights.ground(p[0], p[1]), zb));
+    buildTower(c, b, { x: p[0], y: p[1], w: tw, d: tw, h: roofH - zb + 2.5, heading: Math.atan2(ax, ay), frame: o.frame, banner: 0xe8552b }, Math.min(c.heights.ground(p[0], p[1]), zb));
   }
   const pierStep = 12;
   for (let s = s0 + 2; s <= s1 - 2; s += pierStep) {
