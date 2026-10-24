@@ -772,6 +772,11 @@ export class CarTraffic {
                 const X = cx + dx * t;
                 const Y = cy + dy * t;
                 if (!crossesBoth(ri, X, Y, dx, dy, zw)) continue;
+                // At a signalised crossing the light decides (the busway is in the
+                // junction's box): a give-way line there held cars inside the box
+                // while the bus waited for the box to clear (Cultural Centre).
+                const nj = this.nearestJunction(X, Y, 14, zw);
+                if (nj >= 0 && this.nodes[nj].sig) continue;
                 const fwd = along - 5;
                 if (fwd > 0) {
                   e.xs[0].push(fwd);
