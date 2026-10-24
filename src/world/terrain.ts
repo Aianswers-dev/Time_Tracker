@@ -904,28 +904,71 @@ export function chunkGeometry(f: TerrainField, ci0: number, cj0: number, ci1: nu
   };
   const colOf = (i: number) => (i === ci1 ? w - 1 : (i - ci0) % s === 0 ? (i - ci0) / s : -1);
   const rowOf = (j: number) => (j === cj1 ? h - 1 : (j - cj0) % s === 0 ? (j - cj0) / s : -1);
-  const fine = new Map<number, number>();
-  /** Vertex (i, j) of a block [ia, ib] x [ja, jb] meshed at full resolution. */
-  const fineVert = (i: number, j: number, ia: number, ja: number, ib: number, jb: number): number => {
-    const a = colOf(i);
-    const b = rowOf(j);
-    if (a >= 0 && b >= 0) return grid[b * w + a];
-    const key = j * nx + i;
-    const got = fine.get(key);
-    if (got !== undefined) return got;
-    let z = H[key];
-    // on the block's edge: on the coarse neighbour's straight edge
-    if (i === ia || i === ib) z = H[ja * nx + i] + ((H[jb * nx + i] - H[ja * nx + i]) * (j - ja)) / (jb - ja);
-    else if (j === ja || j === jb) z = H[j * nx + ia] + ((H[j * nx + ib] - H[j * nx + ia]) * (i - ia)) / (ib - ia);
-    const v = put(X(i), z, Y(j), ...gradN(i, j, 1));
-    fine.set(key, v);
-    return v;
-  };
   // minor cuts (slivers over road surfaces) only in the near detail level
   const isCarved = (i: number, j: number) => {
     if (i < 0 || j < 0 || i >= hw || j >= ny - 1) return false;
     const v = f.hole[j * hw + i];
     return v === 1 || (v === 2 && s === 1);
+  };
+  // Blocks meshed at full resolution: those holding a carved cell, and at the middle LOD (700-2200 m, where
+  // roads still show several pixels wide) those whose coarse surface would rise through a road or other
+  // surface the ground is held under (a vertex with a clamp cap, which lies ~0.25 m under the surface):
+  // over a road on a cross-slope the coarse plane, spanning the lowered vertices, covers it with grass.
+  // (Not at the far LOD: it would cost the far ring ~0.9 M triangles for sub-pixel strips.)
+  const fineBlk = new Uint8Array(Math.max(0, (w - 1) * (h - 1)));
+  const cap = f.cap;
+  for (let b = 0; b + 1 < h; b++) {
+    for (let a = 0; a + 1 < w; a++) {
+      const ia = xsI[a];
+      const ib = xsI[a + 1];
+      const ja = ysJ[b];
+      const jb = ysJ[b + 1];
+      let fin = false;
+      for (let j = ja; j < jb && !fin; j++) for (let i = ia; i < ib; i++) if (isCarved(i, j)) fin = true;
+      if (!fin && s === 2) {
+        const h00 = H[ja * nx + ia];
+        const h10 = H[ja * nx + ib];
+        const h01 = H[jb * nx + ia];
+        const h11 = H[jb * nx + ib];
+        for (let j = ja; j <= jb && !fin; j++) {
+          for (let i = ia; i <= ib; i++) {
+            const c = cap[j * nx + i];
+            if (c === Infinity) continue;
+            const u = (i - ia) / (ib - ia);
+            const v = (j - ja) / (jb - ja);
+            // the coarse block's two triangles, diagonal p00-p11 (as meshed below)
+            const z = u >= v ? h00 + u * (h10 - h00) + v * (h11 - h10) : h00 + v * (h01 - h00) + u * (h11 - h01);
+            if (z > c + 0.25) {
+              fin = true;
+              break;
+            }
+          }
+        }
+      }
+      fineBlk[b * (w - 1) + a] = fin ? 1 : 0;
+    }
+  }
+  const blkFine = (a: number, b: number) => a >= 0 && b >= 0 && a + 1 < w && b + 1 < h && fineBlk[b * (w - 1) + a] === 1;
+  const fine = new Map<number, number>();
+  /** Vertex (i, j) of block (a, b), [ia, ib] x [ja, jb], meshed at full resolution. */
+  const fineVert = (i: number, j: number, a: number, b: number, ia: number, ja: number, ib: number, jb: number): number => {
+    const ca = colOf(i);
+    const rb = rowOf(j);
+    if (ca >= 0 && rb >= 0) return grid[rb * w + ca];
+    const key = j * nx + i;
+    const got = fine.get(key);
+    if (got !== undefined) return got;
+    let z = H[key];
+    // on the block's edge: on the coarse neighbour's straight edge (its own height when the block across
+    // is meshed at full resolution too)
+    if (i === ia || i === ib) {
+      if (!blkFine(i === ia ? a - 1 : a + 1, b)) z = H[ja * nx + i] + ((H[jb * nx + i] - H[ja * nx + i]) * (j - ja)) / (jb - ja);
+    } else if (j === ja || j === jb) {
+      if (!blkFine(a, j === ja ? b - 1 : b + 1)) z = H[j * nx + ia] + ((H[j * nx + ib] - H[j * nx + ia]) * (i - ia)) / (ib - ia);
+    }
+    const v = put(X(i), z, Y(j), ...gradN(i, j, 1));
+    fine.set(key, v);
+    return v;
   };
 
   /** Ground triangle a-b-c minus the cuts, with earth faces along the cut edges. */
@@ -1085,9 +1128,7 @@ export function chunkGeometry(f: TerrainField, ci0: number, cj0: number, ci1: nu
       const ib = xsI[a + 1];
       const ja = ysJ[b];
       const jb = ysJ[b + 1];
-      let carved = false;
-      for (let j = ja; j < jb && !carved; j++) for (let i = ia; i < ib; i++) if (isCarved(i, j)) carved = true;
-      if (!carved) {
+      if (!blkFine(a, b)) {
         // diagonal p00-p11 (matches renAt), counter-clockwise from above
         const p00 = grid[b * w + a];
         const p10 = grid[b * w + a + 1];
@@ -1098,10 +1139,10 @@ export function chunkGeometry(f: TerrainField, ci0: number, cj0: number, ci1: nu
       }
       for (let j = ja; j < jb; j++) {
         for (let i = ia; i < ib; i++) {
-          const v00 = fineVert(i, j, ia, ja, ib, jb);
-          const v10 = fineVert(i + 1, j, ia, ja, ib, jb);
-          const v11 = fineVert(i + 1, j + 1, ia, ja, ib, jb);
-          const v01 = fineVert(i, j + 1, ia, ja, ib, jb);
+          const v00 = fineVert(i, j, a, b, ia, ja, ib, jb);
+          const v10 = fineVert(i + 1, j, a, b, ia, ja, ib, jb);
+          const v11 = fineVert(i + 1, j + 1, a, b, ia, ja, ib, jb);
+          const v01 = fineVert(i, j + 1, a, b, ia, ja, ib, jb);
           if (!isCarved(i, j)) {
             idx.push(v00, v10, v11, v00, v11, v01);
             continue;
