@@ -304,10 +304,12 @@ ${NOISE_GLSL}
 vec3 srgb(vec3 c) { return pow(c, vec3(2.2)); }
 float w_aa(float v, float w, float fwv) { float f = max(fwv, 1e-3); return 1.0 - w_ss(w - f, w + f, v); }
 vec3 lawnCol(vec2 p, vec4 n1, vec4 n2, vec4 n3) {
-  vec3 green = vec3(0.38, 0.47, 0.25);
-  vec3 dry = vec3(0.56, 0.53, 0.36);
-  vec3 c = mix(green, dry, smoothstep(0.42, 0.78, n2.g + (n1.r - 0.5) * 0.35));
-  c = mix(c, vec3(0.30, 0.38, 0.20), smoothstep(0.6, 0.9, n2.b) * 0.6);
+  vec3 green = vec3(0.35, 0.43, 0.24);
+  vec3 dry = vec3(0.52, 0.50, 0.36);
+  vec3 c = mix(green, dry, smoothstep(0.48, 0.8, n2.g + (n1.r - 0.5) * 0.35));
+  // garden beds and shrubs
+  c = mix(c, vec3(0.20, 0.27, 0.14), smoothstep(0.62, 0.72, n1.g) * 0.75);
+  c = mix(c, vec3(0.28, 0.35, 0.19), smoothstep(0.6, 0.9, n2.b) * 0.6);
   return c * (0.86 + 0.28 * n3.r);
 }
 vec3 groundAlbedo(out float emis) {

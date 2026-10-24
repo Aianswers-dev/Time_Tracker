@@ -27,7 +27,7 @@ import {
   yieldFrame,
 } from './util';
 
-const TREE_CHUNK = 1000;
+const TREE_CHUNK = 1500;
 
 interface Species {
   tpl: 0 | 1 | 2; // broadleaf, palm, conifer
@@ -124,14 +124,14 @@ function trunk(g: MeshGeo, h: number, r0: number, r1: number, sides: number): vo
 
 function broadleaf(detail: number): THREE.BufferGeometry {
   const g = new MeshGeo(SPEC);
-  trunk(g, 0.55, 0.035, 0.022, detail > 0 ? 6 : 4);
+  trunk(g, 0.42, 0.035, 0.022, detail > 0 ? 6 : 4);
   if (detail > 0) {
-    lump(g, 0, 0.62, 0, 0.36, 0.26, 0.36, 1, 11);
-    lump(g, 0.17, 0.72, 0.1, 0.24, 0.2, 0.24, 0, 12);
-    lump(g, -0.15, 0.7, -0.12, 0.26, 0.2, 0.26, 0, 13);
-    lump(g, 0.02, 0.82, -0.02, 0.22, 0.16, 0.22, 0, 14);
+    lump(g, 0, 0.56, 0, 0.38, 0.3, 0.38, 1, 11);
+    lump(g, 0.17, 0.68, 0.1, 0.26, 0.24, 0.26, 0, 12);
+    lump(g, -0.15, 0.66, -0.12, 0.27, 0.24, 0.27, 0, 13);
+    lump(g, 0.02, 0.8, -0.02, 0.24, 0.2, 0.24, 0, 14);
   } else {
-    lump(g, 0, 0.66, 0, 0.46, 0.32, 0.46, 0, 15);
+    lump(g, 0, 0.62, 0, 0.47, 0.36, 0.47, 0, 15);
   }
   return g.build();
 }
@@ -277,7 +277,7 @@ export async function buildTrees(
     if (a.kind !== AreaKind.Park && a.kind !== AreaKind.Wood && a.kind !== AreaKind.Cemetery) continue;
     const area = Math.abs(signedArea(a.pts));
     if (area < 150) continue;
-    const per = a.kind === AreaKind.Wood ? 55 : a.kind === AreaKind.Cemetery ? 700 : 380;
+    const per = a.kind === AreaKind.Wood ? 80 : a.kind === AreaKind.Cemetery ? 900 : 520;
     const n = Math.min(4000, Math.floor(area / per));
     const [x0, y0, x1, y1] = ringBounds(a.pts);
     let placed = 0;
@@ -327,6 +327,7 @@ export async function buildTrees(
 
   // 4. backyard trees behind houses
   for (const p of extraYards) {
+    if (hash2(p.x, p.y, 16) > 0.7) continue;
     if (blocked(p.x, p.y, 2.5)) continue;
     list.push({ x: p.x, y: p.y, sp: pickSpecies(hash2(p.x, p.y, 9), T_YARD), s: hash2(p.x, p.y, 10) });
   }

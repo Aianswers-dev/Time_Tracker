@@ -9,7 +9,7 @@ import { F_HIGHSET, F_PITCHED, F_ROOF, F_SOFFIT, F_TILE, Style, makeBuildingMate
 import { triangulate } from './ground';
 import { IdGrid, centroid, f32, hash1, i8, obb, oriented, pointInRing, ringBounds, signedArea, smoothstep, u32, u8, yieldFrame } from './util';
 
-export const CHUNK = 600;
+export const CHUNK = 800;
 
 const GLASS = [0x5d7f99, 0x4f7f7a, 0x6a7884, 0x7a8a8f, 0x41617a, 0x6b6455, 0x56708a, 0x8a9aa4];
 const OFFICE = [0xc8c2b4, 0xa9a9a4, 0xd6d1c4, 0x8f9496, 0xbdb3a0, 0xe0dcd2];

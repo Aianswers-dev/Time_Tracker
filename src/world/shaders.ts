@@ -118,7 +118,11 @@ const FRAG_FOG = /* glsl */ `
 #ifdef USE_FOG
 {
   float wf = w_fogFactor();
+  #ifdef W_FOG_FADE
+  gl_FragColor.rgb *= 1.0 - wf;
+  #else
   gl_FragColor.rgb = mix(gl_FragColor.rgb, w_outputColor(w_fogColor(normalize(vWDir))), wf);
+  #endif
 }
 #endif
 `;
@@ -135,6 +139,10 @@ export interface PatchOptions {
   fragmentPars?: string;
   fragment?: [string, string][];
   defines?: Record<string, string | number>;
+  /** Anchor after which the compression code goes (default '#include <project_vertex>'). */
+  projectAnchor?: string;
+  /** Additive materials fade to black in fog instead of mixing toward the fog colour. */
+  fogFade?: boolean;
 }
 
 function replaceOnce(src: string, find: string, repl: string, key: string): string {
@@ -152,10 +160,12 @@ export function patch<T extends THREE.Material>(mat: T, o: PatchOptions): T {
     Object.assign(shader.uniforms, U, o.uniforms ?? {});
     shader.defines = { ...(shader.defines ?? {}), ...(o.defines ?? {}), W_FOGMUL: fogMul };
     if (o.compress !== false) shader.defines.W_COMPRESS = '';
+    if (o.fogFade) shader.defines.W_FOG_FADE = '';
     let vs = shader.vertexShader;
     vs = replaceOnce(vs, '#include <common>', `#include <common>\n${VERT_PARS}\n${o.vertexPars ?? ''}`, o.key);
     for (const [a, b] of o.vertex ?? []) vs = replaceOnce(vs, a, b, o.key);
-    vs = replaceOnce(vs, '#include <project_vertex>', `#include <project_vertex>\n${VERT_COMPRESS}`, o.key);
+    const anchor = o.projectAnchor ?? '#include <project_vertex>';
+    vs = replaceOnce(vs, anchor, `${anchor}\n${VERT_COMPRESS}`, o.key);
     let fs = shader.fragmentShader;
     fs = replaceOnce(fs, '#include <common>', `#include <common>\n${FRAG_PARS}\n${o.fragmentPars ?? ''}`, o.key);
     fs = replaceOnce(fs, '#include <fog_pars_fragment>', `#include <fog_pars_fragment>\n${FRAG_FOGFN}`, o.key);
@@ -168,7 +178,7 @@ export function patch<T extends THREE.Material>(mat: T, o: PatchOptions): T {
     shader.vertexShader = vs;
     shader.fragmentShader = fs;
   };
-  mat.customProgramCacheKey = () => `w-${o.key}-${fogMul}-${o.compress !== false}`;
+  mat.customProgramCacheKey = () => `w-${o.key}-${fogMul}-${o.compress !== false}-${!!o.fogFade}`;
   return mat;
 }
 

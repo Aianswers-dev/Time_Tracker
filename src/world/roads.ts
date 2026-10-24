@@ -185,7 +185,7 @@ function roadMaterial(ctx: Ctx): THREE.MeshLambertMaterial {
   });
 }
 
-function markMaterial(ctx: Ctx): THREE.MeshLambertMaterial {
+export function markMaterial(ctx: Ctx): THREE.MeshLambertMaterial {
   return patch(new THREE.MeshLambertMaterial({ color: 0xffffff }), {
     key: 'mark',
     uniforms: { uNoise: { value: ctx.tex.noise } },
