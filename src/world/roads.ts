@@ -17,7 +17,7 @@
  *   with portal headwalls where they meet the surface.
  */
 import * as THREE from 'three';
-import { RoadKind, type Road } from '../types';
+import { RoadKind, type EdgeWalls, type Road } from '../types';
 import { type Ctx, densityAt } from './ctx';
 import { MeshGeo } from './geo';
 import { RoadIndex, roadHeight } from './roadindex';
@@ -32,6 +32,8 @@ export const KERB_H = 0.15;
 const ROAD_CHUNK = 2500;
 /** Clear height inside tunnels. */
 const TUBE_H = 5.8;
+/** How high a tube wall is solid for the driving collider (above any bus; below a road crossing low over the tube). */
+const TUBE_WALL_H = 4.6;
 
 /** Prepared road: cumulative lengths, miter normals and heights. */
 export interface RI {
@@ -425,6 +427,57 @@ export interface RoadsResult {
   portals: { x: number; y: number; z: number }[];
   /** Every tunnel road's tube as built: road id, samples, and per side (+1, -1) which segments are open. */
   tubes: { road: number; tp: Tube; open: boolean[][] }[];
+  /** The solid edges drawn (walls, parapets, pilasters), for the driving collider. */
+  walls: EdgeWalls;
+}
+
+/** EdgeWalls kinds (the sim's WallKind). */
+const EW_TUNNEL = 0;
+const EW_PARAPET = 1;
+const EW_RETAINING = 2;
+
+/** Collects the solid edges as they are drawn (see EdgeWalls). */
+class WallLog {
+  private seg: number[] = [];
+  private lo: number[] = [];
+  private hi: number[] = [];
+  private kind: number[] = [];
+  private road: number[] = [];
+  private tunnel: number[] = [];
+  readonly ceilings: number[] = [];
+  add(ax: number, ay: number, bx: number, by: number, lo: number, hi: number, kind: number, road: number, tunnel: boolean): void {
+    if (Math.hypot(bx - ax, by - ay) < 0.02 || !(hi > lo)) return;
+    this.seg.push(ax, ay, bx, by);
+    this.lo.push(lo);
+    this.hi.push(hi);
+    this.kind.push(kind);
+    this.road.push(road < 0 ? -1 : road);
+    this.tunnel.push(tunnel ? 1 : 0);
+  }
+  /** The four sides of a box (as MeshGeo.box: centre, axis u with half-length hl, half-width hw across). */
+  box(x: number, y: number, lo: number, hi: number, ux: number, uy: number, hl: number, hw: number, kind: number, road: number, tunnel: boolean): void {
+    const vx = -uy;
+    const vy = ux;
+    const c = [
+      [-hl, -hw],
+      [hl, -hw],
+      [hl, hw],
+      [-hl, hw],
+    ].map(([a, b]) => [x + ux * a + vx * b, y + uy * a + vy * b]);
+    for (let i = 0; i < 4; i++) this.add(c[i][0], c[i][1], c[(i + 1) % 4][0], c[(i + 1) % 4][1], lo, hi, kind, road, tunnel);
+  }
+  result(): EdgeWalls {
+    return {
+      seg: Float32Array.from(this.seg),
+      lo: Float32Array.from(this.lo),
+      hi: Float32Array.from(this.hi),
+      kind: Uint8Array.from(this.kind),
+      road: Int32Array.from(this.road),
+      tunnel: Uint8Array.from(this.tunnel),
+      count: this.lo.length,
+      ceilings: Float32Array.from(this.ceilings),
+    };
+  }
 }
 
 interface Layer {
@@ -484,6 +537,21 @@ function rayRuns(ring: ArrayLike<number>, x: number, y: number, dx: number, dy: 
   return runs;
 }
 
+/** Where segment a-b crosses segment q0-q1: the fraction along a-b, or -1. */
+function segCross(ax: number, ay: number, bx: number, by: number, q0x: number, q0y: number, q1x: number, q1y: number): number {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const ex = q1x - q0x;
+  const ey = q1y - q0y;
+  const den = dx * ey - dy * ex;
+  if (Math.abs(den) < 1e-9) return -1;
+  const wx = q0x - ax;
+  const wy = q0y - ay;
+  const t = (wx * ey - wy * ex) / den;
+  const u = (wx * dy - wy * dx) / den;
+  return t >= 0 && t <= 1 && u >= 0 && u <= 1 ? t : -1;
+}
+
 export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.Material, progress: (f: number) => void): Promise<RoadsResult> {
   const { data, R } = ctx;
   const roads = data.roads;
@@ -521,6 +589,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       return { p, x0, y0, x1, y1 };
     });
   const portals: { x: number; y: number; z: number }[] = [];
+  const wallLog = new WallLog();
 
   // Node degrees for junction detection and portals.
   interface Node {
@@ -626,14 +695,49 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   // ... and the Green Bridge's cable-stayed span its own pylons
   const green = greenBridgeSpan(ctx);
   const otherAt = (x: number, y: number, z: number, self: number, dz = 2.5) => index.penetrationZ(x, y, z, dz, self);
-  /** Over another carriageway (or its cutting wall, 1 m beyond its edge) 1.5-8.5 m below, in the open: a busway ramp between the carriageways of a street. */
-  const overOpen = (x: number, y: number, z: number, self: number) => index.penetrationZ(x, y, z - 5, 3.5, self, (q) => !roads[q].tunnel) > -1.05;
+  /**
+   * Over another carriageway (or its cutting wall, 1 m beyond its edge) 1.5-8.5 m below, in the open: a
+   * busway ramp between the carriageways of a street, or a tunnel road's open approach cutting (over its
+   * box the ground, a fill wall or a footpath stands on the roof).
+   */
+  const overOpen = (x: number, y: number, z: number, self: number) =>
+    index.penetrationZ(x, y, z - 5, 3.5, self, (q) => !roads[q].tunnel) > -1.05 ||
+    (tunnels.penetrationZ(x, y, z - 5, 3.5, self) > -1.05 && field.roofAt(x, y) === -Infinity);
   // Mater Hill and Buranda busway stations stand between buff block cutting walls on a dark base
   const blockSites: [number, number][] = [];
   for (const pf of ctx.data.platforms) if (/Mater Hill|Buranda/i.test(pf.name) && pf.pts.length >= 2) blockSites.push([pf.pts[0], pf.pts[1]]);
   const blockWall = (x: number, y: number) => blockSites.some(([px, py]) => Math.hypot(px - x, py - y) < 170);
   /** Ground height for strips and wall tops that meet the terrain: the settled ground, never below the natural one. */
   const groundAt = (x: number, y: number) => Math.max(field.natAt(x, y), field.settledAt(x, y));
+  /**
+   * Underside of the lowest road deck passing more than 3 m over (x, y) at height z (within its width
+   * + 1 m), or Infinity: a cutting wall standing under it stops there.
+   */
+  const deckSoffit = (x: number, y: number, z: number) => {
+    const a = index.lowestAbove(x, y, z + 3, 1.0);
+    if (a.road < 0) return Infinity;
+    const q = roads[a.road];
+    return a.z - (q.kind <= RoadKind.Trunk || q.kind === RoadKind.Busway || q.bus ? 1.9 : 1.3);
+  };
+  /** Top of a cutting wall at offset `cut` beside road point c (road level z0): 0.9 m over the ground behind it, under any deck over it. */
+  const cutTop = (c: { x: number; y: number; nx: number; ny: number }, side: number, cut: number, z0: number) => {
+    const wx = c.x + c.nx * side * cut;
+    const wy = c.y + c.ny * side * cut;
+    const g = groundAt(c.x + c.nx * side * (cut + 0.5), c.y + c.ny * side * (cut + 0.5));
+    return Math.max(z0 + 1.0, Math.min(Math.max(g + 0.9, z0 + 1.2), deckSoffit(wx, wy, z0)));
+  };
+  // bus routes (GTFS shapes) with their heights: a cutting wall opens where one crosses it
+  const routeIdx = new RoadIndex(
+    data.routes.map((rt) => ({ pts: rt.pts, z: rt.z ?? new Float32Array(rt.pts.length / 2), width: 0, tunnel: false }) as unknown as Road),
+    data.bounds,
+    () => true,
+  );
+  // railways on the ground (track bed 4.2 m wide): one crossing low over a tunnel's cutting closes it into a box
+  const railIdx = new RoadIndex(
+    data.rail.filter((rl) => !rl.bridge && !rl.tunnel).map((rl) => ({ pts: rl.pts, z: rl.z, width: 4.2, tunnel: false }) as unknown as Road),
+    data.bounds,
+    () => true,
+  );
   /**
    * For a tube's open side: a street (not a tunnel) level with the tube road (at most 0.5 m above it,
    * 3 m below) that is itself under ground; a street above, or one in an open cutting, gets a wall.
@@ -1019,7 +1123,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     add(l.track, trackMat, 'track', { range: 5000 });
     add(l.plate, plateMat, 'plate', { order: 2, range: 900 });
   }
-  return { infos, index, tunnels, portals, tubes: tubesBuilt.map((b) => ({ road: b.ri.i, tp: b.tp, open: b.open })) };
+  return { infos, index, tunnels, portals, tubes: tubesBuilt.map((b) => ({ road: b.ri.i, tp: b.tp, open: b.open })), walls: wallLog.result() };
 
   // =========================================================================
   // helpers (hoisted function declarations close over the locals above)
@@ -1251,6 +1355,51 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const st = L.struct;
     const at = (c: (typeof P)[number], off: number) => [c.x + c.nx * side * off, c.y + c.ny * side * off] as const;
     const shoulderW = (k: number) => clamp(2.5 + 1.6 * Math.abs(field.natAt(...at(P[k], e0[k] + 3)) - zE[k]), 3, 9);
+    // a bus route crossing the line of a cutting wall at its level (a link the map's junctions miss): no
+    // wall there, nor a few metres either side (more where it crosses at a shallow angle), floor only
+    if (ri.i >= 0 && type.includes(2)) {
+      const span = (k: number) => {
+        const zk = zE[k] - (foot[k] > 0 ? KERB_H : 0.02);
+        const zk1 = zE[k + 1] - (foot[k + 1] > 0 ? KERB_H : 0.02);
+        return [Math.min(P[k].z, P[k + 1].z) - 0.4, Math.max(cutTop(P[k], side, e0[k] + 0.6, zk), cutTop(P[k + 1], side, e0[k + 1] + 0.6, zk1))];
+      };
+      const cross: number[] = [];
+      for (let k = 0; k + 1 < n; k++) {
+        if (type[k] !== 2) continue;
+        const [ax, ay] = at(P[k], e0[k] + 0.6);
+        const [bx, by] = at(P[k + 1], e0[k + 1] + 0.6);
+        const [lo, hi] = span(k);
+        routeIdx.roadsNear((ax + bx) / 2, (ay + by) / 2, Math.hypot(bx - ax, by - ay) / 2 + 0.5, (_q, sg) => {
+          const S = routeIdx.seg;
+          const qx0 = S[4 * sg];
+          const qy0 = S[4 * sg + 1];
+          const qx1 = S[4 * sg + 2];
+          const qy1 = S[4 * sg + 3];
+          const u = segCross(ax, ay, bx, by, qx0, qy0, qx1, qy1);
+          if (u < 0) return;
+          const cx = ax + (bx - ax) * u;
+          const cy = ay + (by - ay) * u;
+          const ql = Math.hypot(qx1 - qx0, qy1 - qy0) || 1;
+          const f = Math.min(1, Math.max(0, ((cx - qx0) * (qx1 - qx0) + (cy - qy0) * (qy1 - qy0)) / (ql * ql)));
+          const zq = routeIdx.segZ[2 * sg] + (routeIdx.segZ[2 * sg + 1] - routeIdx.segZ[2 * sg]) * f;
+          if (zq + 3.6 <= lo || zq >= hi) return;
+          const sin = Math.abs((bx - ax) * (qy1 - qy0) - (by - ay) * (qx1 - qx0)) / ((Math.hypot(bx - ax, by - ay) || 1) * ql);
+          cross.push(cx, cy, zq, Math.min(20, 4 + 3 / Math.max(0.15, sin)));
+        });
+      }
+      for (let k = 0; k + 1 < n && cross.length; k++) {
+        if (type[k] !== 2) continue;
+        const [ax, ay] = at(P[k], e0[k] + 0.6);
+        const [bx, by] = at(P[k + 1], e0[k + 1] + 0.6);
+        const [lo, hi] = span(k);
+        for (let q = 0; q < cross.length; q += 4) {
+          if (Math.hypot(cross[q] - (ax + bx) / 2, cross[q + 1] - (ay + by) / 2) < cross[q + 3] && cross[q + 2] + 3.6 > lo && cross[q + 2] < hi) {
+            type[k] = 4;
+            break;
+          }
+        }
+      }
+    }
     for (let k = 0; k + 1 < n; k++) {
       const t = type[k];
       if (t === 0) continue;
@@ -1320,17 +1469,18 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         k = kb - 1;
       } else if (t === 2 || t === 4) {
         const ends = t === 2 ? (k === 0 || type[k - 1] !== 2 ? 1 : 0) | (k + 2 >= n || type[k + 1] !== 2 ? 2 : 0) : 0;
-        cutSeg(L, A, B, side, ss[k], ss[k + 1], foot[k], foot[k + 1], e0[k], e0[k + 1], hw, t === 2, ends);
+        cutSeg(L, A, B, side, ss[k], ss[k + 1], foot[k], foot[k + 1], e0[k], e0[k + 1], hw, t === 2, ends, ri.i);
       } else if (t === 3) {
         // high fill: retaining wall from a parapet down to the ground
         const [w0x, w0y] = at(A, e0[k] + 0.1);
         const [w1x, w1y] = at(B, e0[k + 1] + 0.1);
         const [o0x, o0y] = at(A, e0[k] + 0.5);
         const [o1x, o1y] = at(B, e0[k + 1] + 0.5);
-        const ga = field.natAt(o0x, o0y) - 0.8;
-        const gb = field.natAt(o1x, o1y) - 0.8;
         const ta = zE[k] + 0.9;
         const tb = zE[k + 1] + 0.9;
+        // (over a tunnel's box the wall stands on its roof, never down through it)
+        const ga = Math.min(Math.max(field.natAt(o0x, o0y) - 0.8, field.roofAt(o0x, o0y) + 0.05), ta - 0.3);
+        const gb = Math.min(Math.max(field.natAt(o1x, o1y) - 0.8, field.roofAt(o1x, o1y) + 0.05), tb - 0.3);
         const v0 = st.vert(w0x, zE[k], w0y, ...CONC);
         const v1 = st.vert(w1x, zE[k + 1], w1y, ...CONC);
         const v2 = st.vert(w1x, tb, w1y, ...CONC);
@@ -1342,6 +1492,14 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const q0 = st.vert(o0x, ga, o0y, ...WALL);
         const q1 = st.vert(o1x, gb, o1y, ...WALL);
         st.quad(q0, q1, u1, u0, fx, 0, -fy);
+        wallLog.add(w0x, w0y, w1x, w1y, Math.min(zE[k], zE[k + 1]) - 0.4, Math.max(ta, tb), EW_PARAPET, ri.i, false);
+        // its outer face, down to the ground (in metre pieces: its foot may slope steeply onto a tunnel roof)
+        const np = Math.max(1, Math.ceil(Math.hypot(o1x - o0x, o1y - o0y)));
+        for (let q = 0; q < np; q++) {
+          const f0 = q / np;
+          const f1 = (q + 1) / np;
+          wallLog.add(o0x + (o1x - o0x) * f0, o0y + (o1y - o0y) * f0, o0x + (o1x - o0x) * f1, o0y + (o1y - o0y) * f1, ga + (gb - ga) * (gb > ga ? f0 : f1), Math.max(ta, tb), EW_PARAPET, ri.i, false);
+        }
         // keep the fill under the deck: clamp natural ground there
         field.clampQuad([...at(A, 0), ga, ...at(B, 0), gb, ...at(B, e0[k + 1]), gb, ...at(A, e0[k]), ga], 0.3);
       }
@@ -1368,6 +1526,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     hw: number,
     wall: boolean,
     ends = 0,
+    rid = -1,
   ): void {
     const g = L.strip;
     const st = L.struct;
@@ -1406,13 +1565,12 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       L.foot.quad(b0, b1, b2, b3, 0, 1, 0);
     }
     if (!wall) return;
-    const ga = groundAt(...at(A, cutA + 0.5));
-    const gb = groundAt(...at(B, cutB + 0.5));
     const T = 0.45;
     const [o0x, o0y] = at(A, cutA + T);
     const [o1x, o1y] = at(B, cutB + T);
-    const topA = Math.max(ga + 0.9, z0 + 1.2);
-    const topB = Math.max(gb + 0.9, z1 + 1.2);
+    const mid = deckSoffit((w0x + w1x) / 2, (w0y + w1y) / 2, (z0 + z1) / 2);
+    const topA = Math.min(cutTop(A, side, cutA, z0), mid);
+    const topB = Math.min(cutTop(B, side, cutB, z1), mid);
     if (blockWall(A.x, A.y)) {
       // station cutting: a dark base to 1 m, buff block above
       const b0 = st.vert(w0x, z0 - 0.2, w0y, ...BASE_DARK);
@@ -1453,6 +1611,11 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const uy = B.y - A.y;
     if (ends & 1) endFace(w0x, w0y, o0x, o0y, z0, topA, -ux, -uy);
     if (ends & 2) endFace(w1x, w1y, o1x, o1y, z1, topB, ux, uy);
+    const tun = rid >= 0 && roads[rid].tunnel;
+    const lo = Math.min(A.z, B.z) - 0.4;
+    wallLog.add(w0x, w0y, w1x, w1y, lo, Math.max(topA, topB), EW_RETAINING, rid, tun);
+    if (ends & 1) wallLog.add(w0x, w0y, o0x, o0y, lo, topA, EW_RETAINING, rid, tun);
+    if (ends & 2) wallLog.add(w1x, w1y, o1x, o1y, lo, topB, EW_RETAINING, rid, tun);
     const cols = [T, 6 + T, 16 + T];
     let prevA = -1;
     let prevB = -1;
@@ -1550,6 +1713,18 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         if (ss[e] - ss[k] > 2) {
           parapet(g, ri, ss[k], ss[e], side, hw + 0.05, edge, 0, 0.95, CONC);
           if (r.kind !== RoadKind.Motorway) parapet(g, ri, ss[k], ss[e], side, hw + 0.15, hw + 0.27, 1.05, 1.15, STEEL);
+          const top = r.kind !== RoadKind.Motorway ? 1.15 : 0.95;
+          let px = NaN;
+          let py = NaN;
+          let pz = 0;
+          walkRun(ri, ss[k], ss[e], (x, yy, z, nx2, ny2) => {
+            const qx = x + nx2 * side * (hw + 0.05);
+            const qy = yy + ny2 * side * (hw + 0.05);
+            if (px === px) wallLog.add(px, py, qx, qy, Math.min(pz, z) - 0.4, Math.max(pz, z) + top, EW_PARAPET, ri.i, false);
+            px = qx;
+            py = qy;
+            pz = z;
+          });
         }
         k = e + 1;
       }
@@ -1607,12 +1782,20 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const tx = c.ny;
         const ty = -c.nx;
         const base = Math.min(ground, ctx.data.terrain.waterLevel) - 1;
+        // no pier cap hanging over a road that passes under the deck with less than a bus's headroom
+        // under it (the columns run up to the deck instead)
+        const capOk = [-1, -0.5, 0, 0.5, 1].every((f) => index.penetrationZ(c.x + c.nx * f * (hw + 0.2), c.y + c.ny * f * (hw + 0.2), bottom - 3.1, 2.1, ri.i) < -0.5);
         for (const o of cols) {
           const px = c.x + c.nx * o;
           const py = c.y + c.ny * o;
-          g.cylinder(px, py, base, bottom - 0.9, heavy ? 0.85 : 0.6, 10, ...CONC);
+          const pr = heavy ? 0.85 : 0.6;
+          g.cylinder(px, py, base, capOk ? bottom - 0.9 : bottom, pr, 10, ...CONC);
+          wallLog.box(px, py, base, capOk ? bottom - 0.9 : bottom, tx, ty, pr * 0.95, pr * 0.95, EW_RETAINING, ri.i, false);
         }
-        g.box(c.x, c.y, bottom - 1.0, bottom, tx, ty, 0.9, hw + 0.2, ...CONC_DARK);
+        if (capOk) {
+          g.box(c.x, c.y, bottom - 1.0, bottom, tx, ty, 0.9, hw + 0.2, ...CONC_DARK);
+          wallLog.box(c.x, c.y, bottom - 1.0, bottom, tx, ty, 0.9, hw + 0.2, EW_RETAINING, ri.i, false);
+        }
         placed = true;
         break;
       }
@@ -1630,6 +1813,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       // none across a street that passes under the deck's end (Turbot Street over Roma Street)
       if ([-edge, 0, edge].some((o) => index.penetrationZ(c.x + c.nx * o, c.y + c.ny * o, ground, 1, ri.i) > -1)) continue;
       g.box(c.x, c.y, ground - 1, c.z - 0.05, c.ny, -c.nx, 0.7, edge + 0.4, ...WALL);
+      wallLog.box(c.x, c.y, ground - 1, c.z - 0.05, c.ny, -c.nx, 0.7, edge + 0.4, EW_RETAINING, ri.i, false);
     }
   }
 
@@ -1670,6 +1854,9 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       st.box(c.x - tx * 0.3, c.y - ty * 0.3, c.z + H, ground + 1.0, tx, ty, 0.6, half + 1, ...WALL);
       st.box(c.x + c.nx * half - tx * 0.3, c.y + c.ny * half - ty * 0.3, c.z - 0.2, c.z + H, tx, ty, 0.6, 0.6, ...WALL);
       st.box(c.x - c.nx * half - tx * 0.3, c.y - c.ny * half - ty * 0.3, c.z - 0.2, c.z + H, tx, ty, 0.6, 0.6, ...WALL);
+      wallLog.box(c.x - tx * 0.3, c.y - ty * 0.3, c.z + H, ground + 1.0, tx, ty, 0.6, half + 1, EW_RETAINING, -1, false);
+      wallLog.box(c.x + c.nx * half - tx * 0.3, c.y + c.ny * half - ty * 0.3, c.z - 0.2, c.z + H, tx, ty, 0.6, 0.6, EW_RETAINING, -1, false);
+      wallLog.box(c.x - c.nx * half - tx * 0.3, c.y - c.ny * half - ty * 0.3, c.z - 0.2, c.z + H, tx, ty, 0.6, 0.6, EW_RETAINING, -1, false);
       const d = 1.2;
       const m0 = st.vert(c.x + tx * d + c.nx * half, c.z, c.y + ty * d + c.ny * half, 8, 8, 9);
       const m1 = st.vert(c.x + tx * d - c.nx * half, c.z, c.y + ty * d - c.ny * half, 8, 8, 9);
@@ -1714,17 +1901,41 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
           z = a.z;
           road = a.road;
         }
+        // (and under another tunnel's tube passing over this one: the Northern Busway over Airport Link)
+        const b = tunnels.lowestAbove(c.x + c.nx * o, c.y + c.ny * o, c.z + 4.0, 0.3, ri.i);
+        if (b.z < z) {
+          z = b.z;
+          road = b.road;
+        }
       }
       return { dz: z - c.z, road };
     };
-    const ab = ss.map(aboveAt);
-    const abm = ss.slice(1).map((s1, k) => aboveAt((ss[k] + s1) / 2));
-    // the ceiling stays clear of the road's deck (a bridge's girders are deeper)
-    const lim = (a: { dz: number; road: number }) => (a.road < 0 ? Infinity : a.dz - (roads[a.road].bridge ? 2.2 : 0.65));
+    // a railway on the ground over the tube (the Cleveland line over the Eastern Busway at Buranda)
+    const railAt = (s: number) => {
+      const c = roadAt(ri, s);
+      let z = Infinity;
+      for (let q = -3; q <= 3; q++) {
+        const o = (q / 3) * span;
+        z = Math.min(z, railIdx.lowestAbove(c.x + c.nx * o, c.y + c.ny * o, c.z + 1.2, 0.3).z);
+      }
+      return { dz: z - c.z, road: z < Infinity ? -2 : -1 };
+    };
+    const ab = ss.map((s) => {
+      const a = aboveAt(s);
+      const b = railAt(s);
+      return b.dz < a.dz ? b : a;
+    });
+    const abm = ss.slice(1).map((s1, k) => {
+      const a = aboveAt((ss[k] + s1) / 2);
+      const b = railAt((ss[k] + s1) / 2);
+      return b.dz < a.dz ? b : a;
+    });
+    // the ceiling stays clear of the road's deck (a bridge's girders are deeper) or the track's ballast
+    const lim = (a: { dz: number; road: number }) => (a.road === -2 ? a.dz - 0.9 : a.road < 0 ? Infinity : a.dz - (roads[a.road].bridge ? 2.2 : 0.65));
     const hc = ss.map((_, k) => clamp(Math.min(lim(ab[k]), k > 0 ? lim(abm[k - 1]) : Infinity, k < n - 1 ? lim(abm[k]) : Infinity), 4.6, H));
-    // a street (not a bridge with its own deck) low over the cutting closes it into an underpass box,
-    // run on a sample past the street so the headwalls stand beside it, not in it
-    const street = (a: { dz: number; road: number }) => a.road >= 0 && !roads[a.road].bridge && a.dz < H + 3;
+    // a street (not a bridge with its own deck) or a railway low over the cutting closes it into an
+    // underpass box, run on a sample past it so the headwalls stand beside it, not in it
+    const street = (a: { dz: number; road: number }) => (a.road === -2 || (a.road >= 0 && !roads[a.road].bridge)) && a.dz < H + 3;
     const over = ss.map((_, k) => street(ab[k]) || (k > 0 && street(abm[k - 1])) || (k < n - 1 && street(abm[k])));
     const cov = P0.map((c, k) => covered(ri, c) || over[k] || (k > 0 && over[k - 1]) || (k < n - 1 && over[k + 1]));
     // no 4-8 m slivers of open cutting between two boxes, and no lone covered sample
@@ -1917,6 +2128,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const pal = pals[k];
         const q = (o: number, hh: number) => t.vert(c.x + c.nx * side * o, c.z + hh, c.y + c.ny * side * o, ...pal.wall, ss[k] + o, hh, 0, pd[k]);
         t.quad(q(wallOff, 0), q(end, 0), q(end, hc[k]), q(wallOff, hc[k]), c.ny, 0, c.nx);
+        wallLog.add(c.x + c.nx * side * wallOff, c.y + c.ny * side * wallOff, c.x + c.nx * side * end, c.y + c.ny * side * end, c.z - 0.4, c.z + Math.min(hc[k], TUBE_WALL_H), EW_TUNNEL, ri.i, true);
       };
       // underground platform beside the road: push the wall out past its far
       // edge, unless another carriageway lies just beyond it (an island
@@ -1983,7 +2195,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
           const m1 = k + 2 === ss.length ? endMiter(ri, true) : null;
           const Am = m0 ? { ...A, nx: m0[0], ny: m0[1] } : A;
           const Bm = m1 ? { ...B, nx: m1[0], ny: m1[1] } : B;
-          cutSeg(L, Am, Bm, side, ss[k], ss[k + 1], 0, 0, hw + 0.3, hw + 0.3, hw, !isOpen, ends);
+          cutSeg(L, Am, Bm, side, ss[k], ss[k + 1], 0, 0, hw + 0.3, hw + 0.3, hw, !isOpen, ends, ri.i);
           continue;
         }
         // where this tube meets another one, run on a little so the two overlap
@@ -2042,6 +2254,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
           // wall (the shader paints the dado, delineator line and panel joints, or the hall's tiles)
           const wp = hall && pal === TUBE_PAL.kgs ? 7 : 0;
           t.quad(V(A, woA, wz, pal.wall, sA, wp), V(B, woB, wz, pal.wall, sB, wp), V(B, woB, hB, pal.wall, sB, wp), V(A, woA, hA, pal.wall, sA, wp), -fx, 0, fy);
+          wallLog.add(A.x + A.nx * side * woA, A.y + A.ny * side * woA, B.x + B.nx * side * woB, B.y + B.ny * side * woB, Math.min(A.z, B.z) - 0.4, Math.max(A.z, B.z) + Math.min(hA, hB, TUBE_WALL_H), EW_TUNNEL, ri.i, true);
           if (!hall) {
             // cable tray under the ceiling edge
             const tr = [70, 72, 74];
@@ -2072,6 +2285,11 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
           }
         }
       }
+    }
+    // the ceiling's extent for the cameras (out to the walls, or across a platform hall)
+    for (let k = 0; k + 1 < ss.length; k++) {
+      if (!boxSeg(k)) continue;
+      wallLog.ceilings.push(P0[k].x, P0[k].y, P0[k + 1].x, P0[k + 1].y, P0[k].z, P0[k + 1].z, reach[0][k], reach[1][k], Math.min(hc[k], hc[k + 1]));
     }
     // light lines along the ceiling over the lanes (doubled in the 40 m inside each portal), and in a
     // long tube jet fans in pairs; on each walled side an exit sign and an emergency cabinet every 60 m
@@ -2156,35 +2374,47 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       for (const sd of [1, -1]) {
         if (!clear(sd * (half - 0.3), 0.6)) continue;
         st.boxF(c.x + c.nx * sd * (half - 0.3) - tx * 0.3, c.y + c.ny * sd * (half - 0.3) - ty * 0.3, c.z - 0.2, roof, tx, ty, 0.3, 0.3, ...CONC);
+        wallLog.box(c.x + c.nx * sd * (half - 0.3) - tx * 0.3, c.y + c.ny * sd * (half - 0.3) - ty * 0.3, c.z - 0.4, Math.min(roof, c.z + TUBE_WALL_H), tx, ty, 0.3, 0.3, EW_TUNNEL, ri.i, true);
       }
       const N = Math.max(4, Math.round((2 * half) / 1.2));
       const w = (2 * half) / N;
+      // another carriageway higher than this one but less than a bus's headroom under its roof (a twin
+      // tube whose road runs higher, Ivory Street): no headwall column over any of it
+      const zu0 = Math.max(c.z + 0.6, roof - 4.0);
+      const under = (x: number, y: number) =>
+        zu0 >= roof ? -Infinity : Math.max(index.penetrationZ(x, y, (zu0 + roof) / 2, (roof - zu0) / 2, ri.i), tunnels.penetrationZ(x, y, (zu0 + roof) / 2, (roof - zu0) / 2, ri.i));
       let lintelTop = Infinity;
       for (let j = 0; j < N; j++) {
         const o = -half + (j + 0.5) * w;
         const px = c.x + c.nx * o;
         const py = c.y + c.ny * o;
-        if (tubeNb(px, py, c.z) > 0) continue;
+        if (tubeNb(px, py, c.z) > 0 || under(px, py) > -w / 2) continue;
         const g = Math.max(groundAt(px + tx * 3, py + ty * 3), roof + 0.6);
         let top = g + 0.3;
+        // a street over the mouth, or a bus route passing over it (a street wider than mapped)
         const above = index.lowestAbove(px - tx * 0.4, py - ty * 0.4, roof - 0.5, 0.5);
-        const street = above.road >= 0 && above.z < top + 2.5;
+        const bus = routeIdx.lowestAbove(px - tx * 0.4, py - ty * 0.4, roof - 0.5, 2.5);
+        const zs = Math.min(above.road >= 0 ? above.z : Infinity, bus.road >= 0 ? bus.z : Infinity);
+        const street = zs < top + 2.5;
         if (street) {
-          top = Math.max(roof + 0.25, above.z - 0.05);
-          lintelTop = Math.min(lintelTop, above.z - 0.05);
+          top = Math.max(roof + 0.25, zs - 0.05);
+          lintelTop = Math.min(lintelTop, zs - 0.05);
         }
         st.boxF(px - tx * 0.3, py - ty * 0.3, roof, top, tx, ty, 0.3, w / 2 + 0.002, ...WALL);
         if (!street) {
           st.boxF(px - tx * 0.3, py - ty * 0.3, top, top + 0.12, tx, ty, 0.38, w / 2 + 0.002, ...CONC);
           st.boxF(px - tx * 0.5, py - ty * 0.5, top + 0.12, top + 1.0, tx, ty, 0.1, w / 2 + 0.002, ...CONC);
         }
+        // (solid for a bus on a street beside the mouth)
+        wallLog.add(px - tx * 0.3 - c.nx * (w / 2), py - ty * 0.3 - c.ny * (w / 2), px - tx * 0.3 + c.nx * (w / 2), py - ty * 0.3 + c.ny * (w / 2), roof, street ? top : top + 1.0, EW_TUNNEL, ri.i, true);
       }
       // lintel beam over the opening, standing 0.3 m proud of the headwall
       const lt = Math.min(roof + 1.0, lintelTop);
       if (lt > roof + 0.3) {
         // (only over this carriageway on a side where another one runs alongside)
-        const eL = clear(hw + 0.6, 0.3) ? wallOff + 0.6 : hw;
-        const eR = clear(-(hw + 0.6), 0.3) ? wallOff + 0.6 : hw;
+        const wide = (sd: number) => clear(sd * (hw + 0.6), 0.3) && under(c.x + c.nx * sd * (wallOff + 0.6), c.y + c.ny * sd * (wallOff + 0.6)) <= -0.3;
+        const eL = wide(1) ? wallOff + 0.6 : hw;
+        const eR = wide(-1) ? wallOff + 0.6 : hw;
         const mo = (eL - eR) / 2;
         st.boxF(c.x + c.nx * mo - tx * 0.45, c.y + c.ny * mo - ty * 0.45, roof - 0.2, lt, tx, ty, 0.45, (eL + eR) / 2, ...CONC);
         if (plate >= 0 && lt > roof + 0.75) namePlate(L, c.x - tx * 0.905, c.y - ty * 0.905, tx, ty, roof + (lt - roof - 0.2) / 2 - 0.1 + 0.0, Math.min(0.62, lt - roof - 0.1), wallOff * 2 - 0.4, plate);
@@ -2227,7 +2457,11 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       // ending on another's edge): only from the tube's walls in to where that carriageway begins
       const onRoad = (o: number) => tubeNb(c.x + c.nx * o + ox * 0.3, c.y + c.ny * o + oy * 0.3, c.z) > -0.15;
       const piece = (a: number, b: number) => {
-        if (b - a > 0.1) t.quad(e(a, -0.3), e(b, -0.3), e(b, hc[k]), e(a, hc[k]), -ox, 0, oy);
+        if (b - a <= 0.1) return;
+        t.quad(e(a, -0.3), e(b, -0.3), e(b, hc[k]), e(a, hc[k]), -ox, 0, oy);
+        const ex = c.x + ox * 0.05;
+        const ey = c.y + oy * 0.05;
+        wallLog.add(ex + c.nx * a, ey + c.ny * a, ex + c.nx * b, ey + c.ny * b, c.z - 0.4, c.z + Math.min(hc[k], TUBE_WALL_H), EW_TUNNEL, ri.i, true);
       };
       let l0 = oL;
       while (l0 - 0.25 > -oR && !onRoad(l0 - 0.25)) l0 -= 0.25;

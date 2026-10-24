@@ -203,6 +203,7 @@ export async function buildWorld(
   if (debug) dbgWin.__worldRoot = root;
   if (debug) dbgWin.__worldInfo = () => `calls ${renderer.info.render.calls} tris ${renderer.info.render.triangles} geos ${renderer.info.memory.geometries} tex ${renderer.info.memory.textures}${underground ? ` underground (${hidden.length} hidden)` : ''}`;
   return {
+    walls: roads.walls,
     update(dt: number, camera: THREE.Camera, hours: number) {
       if (debug && dbgWin.__worldCam) {
         // debug camera: [x, y, h, lookX, lookY, lookH] in map coordinates
