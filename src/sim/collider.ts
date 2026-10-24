@@ -953,6 +953,32 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     return hit;
   };
 
+  /**
+   * Height a retaining wall piece a-b, beside a road at level z, may reach: just under the deck of any
+   * road (a bridge, a busway viaduct) passing over it, else `hi`. The ground line's wall stops at the
+   * deck's soffit; left at the ground beside + 1 m it would stand on the deck above.
+   */
+  const capUnderDeck = (ax: number, ay: number, bx: number, by: number, z: number, hi: number): number => {
+    let cap = hi;
+    for (let k = 0; k <= 2; k++) {
+      const x = ax + ((bx - ax) * k) / 2;
+      const y = ay + ((by - ay) * k) / 2;
+      forEachRoadSegmentNear(x, y, 10, (sg) => {
+        const li = sLine[sg];
+        const l = lines[li];
+        if (l.kind === RoadKind.Pedestrian) return;
+        project(l, sIdx[sg], x, y);
+        // The deck, its parapets and a little beyond (the wall meets the abutment there).
+        const r = l.width / 2 + 1.0;
+        if (PROJ.d2 >= r * r || PROJ.z <= z + 3) return;
+        // Under the deck's soffit (src/world/roads.ts buildBridge: 1.9 m deep for main roads and busways).
+        const rd = data.roads[li];
+        const heavy = l.kind <= RoadKind.Trunk || l.kind === RoadKind.Busway || !!rd?.bus;
+        cap = Math.min(cap, PROJ.z - (heavy ? 1.9 : 1.3));
+      });
+    }
+    return cap;
+  };
   const pushWall = (ax: number, ay: number, bx: number, by: number, za: number, zb: number, onx: number, ony: number, ri: number) => {
     const r = data.roads[ri];
     const zm = (za + zb) / 2;
@@ -968,7 +994,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       const g = H.ground(mx + onx * 2.5, my + ony * 2.5);
       if (g - zm < 1.5) return;
       kind = WallKind.Retaining;
-      hi = g + 1.0;
+      hi = capUnderDeck(ax, ay, bx, by, zm, g + 1.0);
+      if (hi < zm + 1.0) return;
     }
     // Openings: junction mouths, and wherever the space beyond is another carriageway at this level.
     if (inMouth(mx, my, zm)) return;
@@ -1192,7 +1219,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
           const [gax, gay] = P(A, hw + 1.4);
           const [gbx, gby] = P(B, hw + 1.4);
           const top = Math.max(H.ground(gax, gay) + 0.9, A.z + 1.18, H.ground(gbx, gby) + 0.9, B.z + 1.18);
-          pushTube(ax, ay, bx, by, Math.min(A.z, B.z) - 0.4, top, WallKind.Retaining, ri);
+          const zm = (A.z + B.z) / 2;
+          pushTube(ax, ay, bx, by, Math.min(A.z, B.z) - 0.4, Math.max(zm + 1.18, capUnderDeck(ax, ay, bx, by, zm, top)), WallKind.Retaining, ri);
           continue;
         }
         if (k === 0 && joinStart) A = { ...A, x: A.x - dirS[0] * TUBE_EXT, y: A.y - dirS[1] * TUBE_EXT };

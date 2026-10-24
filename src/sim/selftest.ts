@@ -8,7 +8,7 @@
 import type { BusSpec, BusType, DriveInput, MapData } from '../types';
 import { BusPhysics } from './physics';
 import { BusControls } from './controls';
-import { buildCollider, type SimCollider } from './collider';
+import { buildCollider, WallKind, type SimCollider } from './collider';
 import { Heights } from '../data/height';
 
 const FALLBACK: Record<BusType, BusSpec> = {
@@ -648,6 +648,31 @@ function noDriveOffEdge(spec: BusSpec): void {
   check('placed in mid-air beside the deck: falls to the ground (z)', f.p.pose.z ?? 0, -0.1, 0.1, 'm');
 }
 
+function wallsUnderDeck(): void {
+  // A street at 2 m in a cutting (ground 8 m beside it), crossed by a busway viaduct at 10 m: the
+  // street's retaining walls stop under the deck (1.9 m deep) instead of standing up through it,
+  // and keep their height away from it.
+  const data = makeMap({
+    roads: [
+      { pts: [-300, 0, 300, 0], z: [2, 2], width: 7 },
+      { pts: [0, -300, 0, 300], z: [10, 10], bridge: true, width: 7.4, kind: 7 },
+    ],
+    ground: (_x, y) => (Math.abs(y) < 4 ? 2 : 8),
+  });
+  const col = world(data);
+  const w = col.walls;
+  let under = -Infinity;
+  let away = -Infinity;
+  for (let i = 0; i < w.count; i++) {
+    if (w.kind[i] !== WallKind.Retaining) continue;
+    const mx = (w.ax[i] + w.bx[i]) / 2;
+    if (Math.abs(mx) < 3) under = Math.max(under, w.hi[i]);
+    else if (Math.abs(mx) > 40 && Math.abs(mx) < 100) away = Math.max(away, w.hi[i]);
+  }
+  check('street cutting under a viaduct: retaining wall tops under the deck', under, 2.5, 8.15, 'm');
+  check('street cutting under a viaduct: retaining wall tops away from it', away, 8.9, 9.1, 'm');
+}
+
 function stationBays(spec: BusSpec): void {
   // A busway (7.4 m, at 10 m) with a platform whose kerb is 8.2 m from the centreline (PA Hospital on a
   // viaduct, Mater Hill in a cutting): along the bay, 1.6 m off the kerb (beyond the busway's own
@@ -748,6 +773,7 @@ async function main(): Promise<void> {
   river(S.rigid);
   levelsAfterReset(S.rigid);
   noDriveOffEdge(S.rigid);
+  wallsUnderDeck();
   stationBays(S.rigid);
   stepsAndGrades(S.rigid);
   console.log('--- glider ---');
