@@ -8,15 +8,16 @@ import * as THREE from 'three';
 import type { BusFactory, BusLights, BusMesh, BusPose, BusSpec, BusType, Collider, MapData, Route, WorldHandle } from '../types';
 import { wrapAngle } from '../data/coords';
 import { busTypeForRoute, stopUsage } from './routeMeta';
-import { TRACK_STEP, hasTrack, trackFor, type RouteTrack, type TrackSample, type TrackSignal } from './track';
+import { TRACK_STEP, hasTrack, trackFor, type RouteTrack, type TrackSample, type TrackSignal, type TrackStop } from './track';
 import type { MapMarker } from './minimap';
 import { brighten, rng } from './util';
-import { CarTraffic, Wait, type BusJunction } from './cars';
+import { CarTraffic, PLAYER_HOLD, STALL_HIDDEN, STALL_VISIBLE, Wait, type BusJunction } from './cars';
 import { TRAFFIC_CAPS, defaultTrafficLevel, type TrafficLevel } from './trafficLevel';
 import { makeBody, type Body } from './bodies';
 import { LEVEL_GAP, heightAt } from './height';
 import { session } from './session';
 import { buildPlatforms } from './platforms';
+import { signalsFor } from '../data/signals';
 
 const VIEW_DIST = 950;
 const LOOK_MAX = 40;
@@ -54,6 +55,10 @@ interface AiBus {
   sigCommit: boolean;
   /** Mid-block signals on the route (junction signals go through the reservations). */
   mids: TrackSignal[];
+  /** Per junction of `jl`: how its light is asked (the guide's way, from the route's own signal), else null. */
+  jAsk: (SignalAsk | null)[];
+  /** Per junction of `jl`: where the bus stops for its light (the route's own stop line where it has one). */
+  jLine: number[];
   /** Junctions on the route, the next one to commit to, and the ones we hold. */
   jl: BusJunction[];
   jNext: number;
@@ -64,6 +69,9 @@ interface AiBus {
   exempt: boolean;
   idle: number;
   dead: boolean;
+  /** Route distance at the last progress mark and seconds since it (jam breaker). */
+  progS: number;
+  stall: number;
   body: Body;
   pose: BusPose;
   lights: BusLights;
@@ -71,6 +79,15 @@ interface AiBus {
   marker: MapMarker;
   age: number;
   turnSign: number;
+}
+
+/** Where and how a light is asked: the approach point and direction into its junction, and the level. */
+interface SignalAsk {
+  x: number;
+  y: number;
+  dx: number;
+  dy: number;
+  z: number;
 }
 
 interface Candidate {
@@ -99,6 +116,11 @@ function idm(v: number, v0: number, gap: number, vLead: number, s0: number): num
   return A * (free - (sStar / Math.max(0.05, gap)) ** 2);
 }
 
+/** Time gap (s) at which the player's bus claims the main road through an unsignalised junction. */
+const MAJOR_GAP = 6;
+/** How far past a route's stop line a signalised junction's first node may lie and still be on that line's light (m). */
+const FAR_LINE = 70;
+
 export class Traffic {
   private active: AiBus[] = [];
   private pool = new Map<string, BusMesh[]>();
@@ -117,7 +139,17 @@ export class Traffic {
   private sphere = new THREE.Sphere();
   private tmp: TrackSample = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
   private tmp2: TrackSample = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
-  private playerBody = makeBody(12);
+  private playerBody = makeBody(32);
+  private playerLen = 12.5;
+  /** Film/test runs (?film): fixed AI caps and track building per sim step, so runs are reproducible. */
+  private film = false;
+  /** AI buses in contact with the player's bus (id -> deepest body segment), from the last resolve(). */
+  private touching = new Map<number, number>();
+  private cap = { ax: 0, ay: 0, bx: 0, by: 0, r: 0, v: 0, heading: 0, z: 0 };
+  private aheadHX = new Float32Array(LOOK_MAX);
+  /** The vehicle that made the last junctionOk() fail on its exit (bus id or car id), else 0. */
+  private jRef = 0;
+  private aheadHY = new Float32Array(LOOK_MAX);
   private lastPlayerZ: number | undefined;
   private aheadX = new Float32Array(LOOK_MAX);
   private aheadY = new Float32Array(LOOK_MAX);
@@ -130,7 +162,8 @@ export class Traffic {
   private maxActive = this.capBuses;
   private radius = 1100;
   private byId = new Map<number, AiBus>();
-  private mids = new WeakMap<RouteTrack, TrackSignal[]>();
+  private plans = new WeakMap<RouteTrack, { mids: TrackSignal[]; jAsk: (SignalAsk | null)[]; jLine: number[] }>();
+  private asks = new WeakMap<TrackSignal, SignalAsk>();
   private bodiesOut: Body[] = [];
   private exemptOut: boolean[] = [];
   /** Dev: simulate the traffic this many times per frame (?tff=N). */
@@ -139,7 +172,7 @@ export class Traffic {
   /** Dev: seconds to pre-simulate once the population is up (?twarm=S). */
   private warm = 0;
   /** Despawn counters (diagnostics). */
-  readonly stats = { overlapDespawns: 0, stuckDespawns: 0 };
+  readonly stats = { overlapDespawns: 0, stuckDespawns: 0, stallDespawns: 0, capDespawns: 0 };
   /** Recent safety-valve events (diagnostics). */
   readonly events: string[] = [];
   private costTimer = 0;
@@ -157,10 +190,18 @@ export class Traffic {
     readonly world: WorldHandle,
   ) {
     this.usage = stopUsage(data);
+    try {
+      this.film = new URLSearchParams(location.search).has('film');
+    } catch {
+      /* no location (tests) */
+    }
     // Build route tracks in the background, busiest routes first.
     this.buildQueue = [...data.routes].sort((a, b) => b.trips - a.trips);
     this.scheduleBuild();
     this.cars = new CarTraffic(scene, data, world);
+    this.cars.fixedCaps = this.film;
+    // Film/test runs: the traffic is inspectable from the page (window.__traffic.debugNear).
+    if (this.film) Object.assign(globalThis, { __traffic: this });
     buildPlatforms(scene, data);
     session.traffic = this;
     session.world = world;
@@ -176,7 +217,8 @@ export class Traffic {
   }
 
   private scheduleBuild(): void {
-    if (this.building || !this.buildQueue.length) return;
+    // (Film runs build a few tracks per sim step instead: see simulate.)
+    if (this.film || this.building || !this.buildQueue.length) return;
     this.building = true;
     setTimeout(() => {
       this.building = false;
@@ -310,6 +352,7 @@ export class Traffic {
     const d = Math.hypot(dx, dy);
     if (d > this.radius) return false;
     if (this.initial ? d < 45 : d < 120) return false;
+    if (this.shadowsPlayer(r, s)) return false;
     const zs = c.track.zAt(s);
     if (!this.initial && d < 500) {
       this.sphere.center.set(this.tmp.x, zs + 2, -this.tmp.y);
@@ -357,7 +400,9 @@ export class Traffic {
       sigState: null,
       sigTimer: 0,
       sigCommit: false,
-      mids: this.midSignals(c.track),
+      mids: this.signalPlan(c.track).mids,
+      jAsk: this.signalPlan(c.track).jAsk,
+      jLine: this.signalPlan(c.track).jLine,
       jl: this.cars.junctionsAlong(c.track),
       jNext: 0,
       holds: [],
@@ -366,6 +411,8 @@ export class Traffic {
       exempt: false,
       idle: 0,
       dead: false,
+      progS: s,
+      stall: 0,
       body: makeBody(nb),
       pose: {
         x: 0,
@@ -391,6 +438,17 @@ export class Traffic {
     this.updateBody(b);
     this.active.push(b);
     return true;
+  }
+
+  /**
+   * Would an AI bus of route r at s run just ahead of (or right behind) the
+   * player on its own route? Real headways are minutes apart; a twin a few
+   * hundred metres ahead would take every stop and every light first.
+   */
+  private shadowsPlayer(r: Route, s: number): boolean {
+    const g = session.guide;
+    if (!g?.route || !g.state || g.route.id !== r.id || g.route.dir !== r.dir) return false;
+    return s > g.state.s - 400 && s < g.state.s + 1500;
   }
 
   private decideServe(b: AiBus): boolean {
@@ -434,7 +492,8 @@ export class Traffic {
       const rear = ss.length - ss.axleFromFront;
       const sz = sec.z ?? z0;
       const tg = Math.tan(sec.pitch ?? 0);
-      const m = Math.min(5, Math.max(2, Math.ceil(ss.length / 3.5)));
+      // At most ~2 m apart (an AI path probe with the contact radius cannot pass between them).
+      const m = Math.min(10, Math.max(2, Math.ceil(ss.length / 2) + 1));
       for (let j = 0; j < m && k < body.x.length; j++) {
         const t = front - ((front + rear) * j) / (m - 1);
         body.x[k] = sec.x + hx * t;
@@ -446,6 +505,9 @@ export class Traffic {
     body.n = k;
     body.heading = p.heading;
     body.speed = p.speed;
+    let L = spec.sections[0].length;
+    for (let i = 1; i < spec.sections.length && i < n; i++) L += spec.sections[i].length - (spec.sections[i - 1].length - spec.sections[i - 1].rearHitchFromFront) - spec.sections[i].hitchFromFront;
+    this.playerLen = L;
     body.fx = body.x[0];
     body.fy = body.y[0];
     body.fz = body.z[0];
@@ -543,7 +605,8 @@ export class Traffic {
     this.lastCostMs = cost;
     this.costEma += (cost / this.ffSteps - this.costEma) * 0.05;
     this.costTimer -= dt;
-    if (this.costTimer <= 0) {
+    if (this.film) this.maxActive = this.capBuses;
+    else if (this.costTimer <= 0) {
       this.costTimer = 1;
       if (this.costEma > 1.4 && this.maxActive > 12) this.maxActive--;
       else if (this.costEma < 0.9 && this.maxActive < this.capBuses) this.maxActive++;
@@ -559,6 +622,8 @@ export class Traffic {
     this.updatePlayerBody(player);
 
     if (this.initial && !this.candidates.length) this.prioritise(px, py);
+    // Film runs: tracks are built per sim step (not per wall-clock slice), so what exists when is reproducible.
+    if (this.film) for (let k = 0; k < 3 && this.buildQueue.length; k++) trackFor(this.buildQueue.shift()!, this.data);
     this.candTimer -= dt;
     if (this.candCursor !== 0 || this.candTimer <= 0) {
       if (this.candCursor === 0) this.candTimer = this.candidates.length ? 2 : 0.5;
@@ -569,15 +634,41 @@ export class Traffic {
     for (let i = this.active.length - 1; i >= 0; i--) {
       const b = this.active[i];
       const d = Math.hypot(b.body.fx - px, b.body.fy - py);
-      const done = b.state === State.Terminus && b.dwell <= 0 && (!b.visible || b.dwell < -20);
+      // End of the trip: gone once out of view, or a few seconds after its last
+      // dwell (it never holds a terminal's front bay for long).
+      const done = b.state === State.Terminus && b.dwell <= 0 && (!b.visible || b.dwell < -6);
       const stuck = b.idle > (b.visible ? 45 : 25);
-      if (stuck) {
-        this.stats.stuckDespawns++;
+      // Jam breaker: no progress for minutes whatever the reason (exempt waits included).
+      const stalled = !stuck && b.stall > (b.visible ? STALL_VISIBLE : STALL_HIDDEN);
+      // The player's own route just ahead of or behind the player (e.g. spawned before the guide existed).
+      const twin = !b.visible && this.shadowsPlayer(b.route, b.s);
+      if (stuck || stalled) {
+        if (stuck) this.stats.stuckDespawns++;
+        else this.stats.stallDespawns++;
         const j = b.jl[b.jNext];
-        this.events.push(`bus ${b.route.id} stuck wait ${b.wait} obst ${b.obstacle} s ${b.s.toFixed(0)} next j ${j ? `${j.node} stop ${(j.stopS - b.s).toFixed(1)} sig ${j.sig} minor ${j.minor}` : '-'} holds ${b.holds.length}`);
+        this.events.push(`bus ${b.route.id} ${stuck ? 'stuck' : 'stalled'} wait ${b.wait} obst ${b.obstacle} s ${b.s.toFixed(0)} next j ${j ? `${j.node} stop ${(j.stopS - b.s).toFixed(1)} sig ${j.sig} minor ${j.minor}` : '-'} holds ${b.holds.length}`);
         if (this.events.length > 30) this.events.shift();
       }
-      if (b.dead || d > this.radius + 300 || done || stuck || i >= this.maxActive + 4) this.removeBus(i);
+      if (b.dead || d > this.radius + 300 || done || stuck || stalled || twin) this.removeBus(i);
+    }
+    // Over the cap (the level was lowered, or the CPU budget shrank): the
+    // farthest bus out of view goes first, never one in view within 300 m.
+    if (this.active.length > this.maxActive + 4) {
+      let pick = -1;
+      let score = -1;
+      this.active.forEach((b, i) => {
+        const d = Math.hypot(b.body.fx - px, b.body.fy - py);
+        if (b.visible && d < 300) return;
+        const sc = d + (b.visible ? 0 : 1e5);
+        if (sc > score) {
+          score = sc;
+          pick = i;
+        }
+      });
+      if (pick >= 0) {
+        this.removeBus(pick);
+        this.stats.capDespawns++;
+      }
     }
 
     // Spawn to keep the population up.
@@ -608,6 +699,7 @@ export class Traffic {
 
     this.byId.clear();
     for (const b of this.active) this.byId.set(b.id, b);
+    this.claimJunctions(time, player);
     for (const b of this.active) this.step(b, dt, time);
     for (const b of this.active) this.updateBody(b);
 
@@ -644,6 +736,44 @@ export class Traffic {
     this.cars.simulate(dt, time, player, this.playerBody, bodies, exempt, this.frustum);
   }
 
+  /**
+   * The player's bus takes part in the junction rules like an AI bus: on its
+   * route's main road it marks unsignalised junctions busy (side roads give
+   * way), and it holds a junction box while in it or too close to stop.
+   */
+  private claimJunctions(time: number, player: BusPose): void {
+    const g = session.guide;
+    if (!g?.track || !g.state || g.state.offRoute) return;
+    const jl = this.cars.junctionsAlong(g.track);
+    const s = g.state.s;
+    const v = Math.abs(player.speed);
+    const len = this.playerLen;
+    let lo = 0;
+    let hi = jl.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (jl[mid].s + jl[mid].boxR + len < s) lo = mid + 1;
+      else hi = mid;
+    }
+    // Side roads and merges give way to the player from MAJOR_GAP s away (a
+    // fixed 30 m was 1.5 s at busway speed: a bus merging from a station or a
+    // ramp had already committed and pulled out in front).
+    const ahead = Math.max(30, v * MAJOR_GAP);
+    for (let k = lo; k < jl.length && jl[k].s - s < ahead + 10; k++) {
+      const j = jl[k];
+      if (j.s + j.boxR + len < s) continue;
+      if (!j.sig && !j.minor && v > 1 && j.s - s < ahead) this.cars.markMajor(j.node, time, PLAYER_HOLD);
+      const inBox = s > j.s - j.boxR;
+      // (Cars in the next lane do not turn across ours in front of us, oncoming ones not across our path.)
+      if (inBox || (v > 1 && j.s - s < ahead)) {
+        g.track.sample(j.stopS, this.tmp);
+        this.cars.claimApproach(j.node, this.tmp.x, this.tmp.y, j.inX, j.inY, j.cls, inBox ? 0 : (j.s - s) / Math.max(v, 1), time + 0.5);
+      }
+      const committed = v > 1 && j.stopS - s < (v * v) / (2 * 3) + 2;
+      if (inBox || committed) this.cars.enter(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time + 0.5);
+    }
+  }
+
   private removeBus(i: number): void {
     const b = this.active[i];
     for (const q of b.holds) this.cars.leave(b.jl[q].node, -b.id);
@@ -652,15 +782,59 @@ export class Traffic {
     this.active.splice(i, 1);
   }
 
-  /** Mid-block signals of a route: the ones not at a managed junction. */
-  private midSignals(track: RouteTrack): TrackSignal[] {
-    let m = this.mids.get(track);
-    if (!m) {
-      const jl = this.cars.junctionsAlong(track);
-      m = track.signals.filter((sg) => !jl.some((j) => Math.abs(j.s - sg.s) < 30));
-      this.mids.set(track, m);
+  /** How a track signal is asked for: the approach point and direction into its junction, and the level. */
+  private signalAsk(tr: RouteTrack, sig: TrackSignal): SignalAsk {
+    let q = this.asks.get(sig);
+    if (!q) {
+      const z = tr.zAt(sig.s);
+      const ad = signalsFor(this.data).approachDir(sig.x, sig.y, z, (s, o) => Object.assign(o, tr.sample(s, this.tmp2)), sig.s);
+      tr.sample(sig.s, this.tmp2);
+      q = ad ? { x: ad.x, y: ad.y, dx: ad.dx, dy: ad.dy, z } : { x: sig.x, y: sig.y, dx: this.tmp2.hx, dy: this.tmp2.hy, z };
+      this.asks.set(sig, q);
     }
-    return m;
+    return q;
+  }
+
+  /**
+   * How a route's lights are obeyed. A track signal at a signalised junction
+   * the bus manages through the reservations is that junction's light, asked
+   * exactly as the player's guide asks it (so the AI and the HUD agree); every
+   * other track signal is a mid-block light obeyed at its own stop line.
+   */
+  private signalPlan(track: RouteTrack): { mids: TrackSignal[]; jAsk: (SignalAsk | null)[]; jLine: number[] } {
+    let p = this.plans.get(track);
+    if (!p) {
+      const jl = this.cars.junctionsAlong(track);
+      const model = signalsFor(this.data);
+      const jAsk: (SignalAsk | null)[] = jl.map(() => null);
+      // (A bus waits for the light where the player does, not at the node's own box edge 10-20 m on.)
+      const jLine = jl.map((j) => j.stopS);
+      const mids = track.signals.filter((sg, i) => {
+        const q = this.signalAsk(track, sg);
+        const ji = model.junctionAt(q.x, q.y, q.dx, q.dy, q.z);
+        if (ji < 0) return true;
+        let managed = false;
+        const nextS = track.signals[i + 1]?.s ?? Infinity;
+        jl.forEach((j, k) => {
+          // The junction's nodes by its stop line, and (where the line is drawn well back, as at the
+          // north end of Victoria Bridge) its first node further on, with no other node or light
+          // between: otherwise the bus would cross the line on this light and then wait inside the
+          // junction on another arm's light at that node.
+          const prev = k > 0 ? jl[k - 1].s + jl[k - 1].boxR : -Infinity;
+          const d = j.s - sg.s;
+          const near = Math.abs(d) < 30 || (d > 0 && d < FAR_LINE && !j.inside && prev <= sg.s && nextS > j.s + 30);
+          if (!j.sig || !near || this.cars.signalJunction(j.node, j.inX, j.inY) !== ji) return;
+          managed = true;
+          if (jAsk[k]) return;
+          jAsk[k] = q;
+          // (Not for a junction's second node, nor back inside the box of the junction before.)
+          if (!j.inside) jLine[k] = Math.min(j.stopS, Math.max(sg.s, prev));
+        });
+        return !managed;
+      });
+      this.plans.set(track, (p = { mids, jAsk, jLine }));
+    }
+    return p;
   }
 
   private step(b: AiBus, dt: number, time: number): void {
@@ -679,6 +853,8 @@ export class Traffic {
       b.wait = Wait.None;
       b.exempt = true;
       b.idle = 0;
+      b.progS = b.s;
+      b.stall = 0;
       const opening = b.dwellTotal - b.dwell > 0.8 && b.dwell > 2.4;
       b.door = Math.max(0, Math.min(1, b.door + (opening ? dt : -dt) / 1.4));
       lights.brake = true;
@@ -711,8 +887,10 @@ export class Traffic {
     if (st) {
       // At a busway platform the front bay is the target; queued behind
       // another bus inside the platform we serve the bay we are at.
-      const zone = tr.stops[b.nextStop]?.zone;
-      const gap = (zone ? zone.s1 - 1.5 : st.s) - b.s;
+      // (Tracks that give each stop its own front target and pull, src/game/track.ts, are used as given.)
+      const ts = tr.stops[b.nextStop] as (TrackStop & { target?: number; pull?: number }) | undefined;
+      const zone = ts?.zone;
+      const gap = (ts?.target ?? (zone ? zone.s1 - 1.5 : st.s)) - b.s;
       const atBay = !!zone && b.s > zone.s0 + 10 && b.s < zone.s1 + 1 && b.v < 0.3 && b.wait === Wait.Bus;
       if (b.serve) {
         if ((gap < 1.2 && b.v < 0.35) || atBay) {
@@ -722,7 +900,11 @@ export class Traffic {
           return;
         }
         if (gap < 140) acc = Math.min(acc, idm(b.v, v0, gap + 0.6, 0, 0.6));
-        b.pullTarget = gap < 45 ? Math.max(0, tr.kerbAt(st.s) - 1.75) : 0;
+        // Kerbside stops pull in to the kerb (where one was found near the lane);
+        // at platforms the lane already runs along the platform edge.
+        const kerb = tr.kerbAt(st.s);
+        const pull = ts?.pull !== undefined ? Math.max(0, Math.min(3, ts.pull)) : !zone && !ts?.station && kerb < 4.5 ? Math.max(0, Math.min(1.8, kerb - 1.75)) : 0;
+        b.pullTarget = gap < 45 ? pull : 0;
       } else if (gap < -2) {
         b.nextStop++;
         b.serve = this.decideServe(b);
@@ -730,7 +912,8 @@ export class Traffic {
     }
     if (b.s >= L - 3 && b.v < 0.6) {
       b.state = State.Terminus;
-      b.dwellTotal = b.dwell = 8;
+      // Passengers already got off at the last stop's dwell.
+      b.dwellTotal = b.dwell = time - b.departT < 30 ? 2 : 8;
       b.v = 0;
       return;
     }
@@ -745,18 +928,20 @@ export class Traffic {
     while (b.jNext < jl.length && jl[b.jNext].stopS < b.s - 2) b.jNext++;
     const j = jl[b.jNext];
     if (j) {
-      if (!j.sig && !j.minor && j.s - b.s < 30) this.cars.markMajor(j.node, time, -1);
-      const stopAt = j.stopS - b.s;
+      if (!j.sig && !j.minor && j.s - b.s < Math.max(30, b.v * 4)) this.cars.markMajor(j.node, time, -1);
+      // Its stop line (where the bus waits), unless it is already past that (spawned there): the box edge.
+      const line = (q: number) => (b.s <= b.jLine[q] + 1 ? b.jLine[q] : jl[q].stopS);
+      const stopAt = line(b.jNext) - b.s;
       const commitDist = Math.max(3, (b.v * b.v) / (2 * 2.2)) + 2;
       if (stopAt < commitDist + 35) {
         // Junctions closer together than our length are taken in one go.
-        let res = this.junctionOk(b, j, stopAt, time);
+        let res = this.junctionOk(b, b.jNext, stopAt, time);
         let k = b.jNext + 1;
         while (res === Wait.None && k < jl.length && jl[k].s - j.s < j.boxR + jl[k].boxR + b.len) {
-          res = this.junctionOk(b, jl[k], stopAt + (jl[k].stopS - j.stopS), time);
+          res = this.junctionOk(b, k, line(k) - b.s, time);
           k++;
         }
-        if (res !== Wait.None) lim(idm(b.v, v0, Math.max(0.05, stopAt), 0, 0.8), res);
+        if (res !== Wait.None) lim(idm(b.v, v0, Math.max(0.05, stopAt), 0, 0.8), res, this.jRef);
         else if (stopAt <= commitDist) {
           for (let q = b.jNext; q < k; q++) {
             const jq = jl[q];
@@ -783,8 +968,9 @@ export class Traffic {
         b.sigTimer -= dt;
         if (b.sigTimer <= 0 || b.sigState === null) {
           b.sigTimer = 0.25;
-          tr.sample(sig.s, this.tmp2);
-          b.sigState = signalAt.call(this.world, sig.x, sig.y, time, this.tmp2.hx, this.tmp2.hy);
+          // Asked the way the player's guide asks (same approach point, direction and level).
+          const q = this.signalAsk(tr, sig);
+          b.sigState = signalAt.call(this.world, q.x, q.y, time, q.dx, q.dy, q.z);
         }
         const stopDist = (b.v * b.v) / (2 * 2.6);
         if (b.sigState === 'red' || (b.sigState === 'amber' && !b.sigCommit && gap > stopDist + 1)) {
@@ -801,10 +987,14 @@ export class Traffic {
     const ax = this.aheadX;
     const ay = this.aheadY;
     const az = this.aheadZ;
+    const ahx = this.aheadHX;
+    const ahy = this.aheadHY;
     for (let k = 0; k < ns; k++) {
       tr.sample(b.s + 1.5 + k * 2.5, this.tmp2, b.pull);
       ax[k] = this.tmp2.x;
       ay[k] = this.tmp2.y;
+      ahx[k] = this.tmp2.hx;
+      ahy[k] = this.tmp2.hy;
       az[k] = tr.zAt(b.s + 1.5 + k * 2.5);
     }
     let bestGap = Infinity;
@@ -815,41 +1005,59 @@ export class Traffic {
     const consider = (o: Body, id: number, other: AiBus | null) => {
       if (Math.abs(o.fx - bodyF.fx) > reach || Math.abs(o.fy - bodyF.fy) > reach) return;
       const rel = wrapAngle(o.heading - bodyF.heading);
-      const crossing = Math.abs(rel) > 0.9 && Math.abs(rel) < 2.4;
-      // Two buses waiting on each other across a junction: the older id goes first.
-      if (other && crossing && other.obstacle === b.id && other.id < b.id) return;
+      // Two buses waiting on each other (across a junction, at a merge): one of them goes.
+      if (other && other.obstacle === b.id && other.id < b.id) return;
+      // Two 2.5 m wide bodies touch with their centrelines 2.5 m apart: look
+      // wider than that, except at oncoming traffic in the next lane.
+      const r2 = Math.abs(rel) > 2.4 ? 3.4 : 2.8 * 2.8;
       for (let k = 0; k < ns; k++) {
         const d = 1.5 + k * 2.5;
-        if (d > bestGap) return;
+        if (d - 2.5 > bestGap) return;
+        let found = false;
         for (let q = 0; q < o.n; q++) {
           const ex = o.x[q] - ax[k];
           const ey = o.y[q] - ay[k];
           // Only what is on our level (not the street under a viaduct).
-          if (ex * ex + ey * ey < 3.4 && Math.abs(o.z[q] - az[k]) <= LEVEL_GAP) {
-            bestGap = d;
-            bestV = Math.max(0, o.speed * Math.cos(rel));
-            bestId = id;
-            bestKind = other ? Wait.Bus : Wait.Player;
-            return;
+          if (ex * ex + ey * ey < r2 && Math.abs(o.z[q] - az[k]) <= LEVEL_GAP) {
+            // The gap to that point along our path (its points run bumper to bumper).
+            const g = d + Math.max(-2.5, Math.min(2.5, ex * ahx[k] + ey * ahy[k]));
+            if (g < bestGap) {
+              bestGap = g;
+              bestV = Math.max(0, o.speed * Math.cos(rel));
+              bestId = id;
+              bestKind = other ? Wait.Bus : Wait.Player;
+            }
+            found = true;
           }
         }
+        if (found) return;
       }
     };
     for (const o of this.active) if (o !== b && !o.dead) consider(o.body, o.id, o);
     consider(this.playerBody, -2, null);
+    const G = this.cars.grid;
     for (let k = 0; k < ns; k++) {
       const d = 1.5 + k * 2.5;
-      if (d >= bestGap) break;
-      const car = this.cars.carAt(ax[k], ay[k], 1.9, az[k]);
-      if (car >= 0) {
-        bestGap = d;
-        bestV = Math.max(0, this.cars.probe(ax[k], ay[k], 1.9, az[k]));
-        bestId = car;
-        bestKind = Wait.Car;
+      if (d - 2.5 >= bestGap) break;
+      // A car (0.92 m half width) touches us 2.2 m from our centreline.
+      const gi = G.nearest(ax[k], ay[k], 2.4, undefined, az[k]);
+      if (gi >= 0) {
+        // Its grid points sit ~1 m inside its bumpers.
+        const g = d + Math.max(-2.5, Math.min(2.5, (G.px[gi] - ax[k]) * ahx[k] + (G.py[gi] - ay[k]) * ahy[k])) - 1;
+        if (g < bestGap) {
+          bestGap = g;
+          bestV = Math.max(0, G.pv[gi]);
+          bestId = G.pid[gi];
+          bestKind = Wait.Car;
+        }
         break;
       }
     }
-    if (bestGap < Infinity) lim(idm(b.v, v0, Math.max(0.05, bestGap - 1.2), bestV, 2.2), bestKind, bestId);
+    if (bestGap < Infinity) lim(idm(b.v, v0, Math.max(0.05, bestGap - 0.5), bestV, 2.2), bestKind, bestId);
+    // Touching the player's bus with our front half: stop (the player is never bulldozed).
+    const tk = this.touching.get(b.id);
+    const touchFront = tk !== undefined && tk < (b.body.n - 1) / 2;
+    if (touchFront) lim(-6.5, Wait.Player);
     const why = wt.why;
     b.obstacle = why === Wait.Bus ? wt.ref : 0;
     b.wait = why;
@@ -861,11 +1069,15 @@ export class Traffic {
 
     acc = Math.max(-6.5, Math.min(1.2, acc));
     b.a = acc;
-    b.v = Math.max(0, b.v + acc * dt);
+    b.v = touchFront ? 0 : Math.max(0, b.v + acc * dt);
     // Convert lane speed to route distance (lanes are shorter on the inside of bends).
     const i = Math.max(0, Math.min(tr.n - 2, Math.floor(b.s / TRACK_STEP)));
     const segLen = Math.hypot(tr.x[i + 1] - tr.x[i], tr.y[i + 1] - tr.y[i]) / TRACK_STEP;
     b.s += (b.v * dt) / Math.max(0.4, Math.min(1.6, segLen || 1));
+    if (b.s - b.progS > 4) {
+      b.progS = b.s;
+      b.stall = 0;
+    } else b.stall += dt;
     // Safety valve: stationary for a long time without a good reason.
     if (b.v < 0.3 && !b.exempt) b.idle += dt;
     else b.idle = 0;
@@ -899,23 +1111,46 @@ export class Traffic {
   }
 
   /** May this bus go through junction `j` (stop line `stopAt` ahead) now? */
-  private junctionOk(b: AiBus, j: BusJunction, stopAt: number, time: number): Wait {
-    if (j.sig) {
-      const st = this.cars.signalFor(j.node, j.inX, j.inY, time);
+  private junctionOk(b: AiBus, k: number, stopAt: number, time: number): Wait {
+    const j = b.jl[k];
+    this.jRef = 0;
+    // (A second node of the junction we just entered keeps the first node's light.)
+    if (j.sig && !j.inside) {
+      const a = b.jAsk[k];
+      const st = a ? (this.world.signalStateAt?.(a.x, a.y, time, a.dx, a.dy, a.z) ?? null) : this.cars.signalFor(j.node, j.inX, j.inY, time);
       if (st === 'red') return Wait.Red;
       if (st === 'amber' && stopAt > (b.v * b.v) / (2 * 3)) return Wait.Red;
     } else if (this.cars.giveWayBusy(j.node, j.minor, time)) return Wait.Junction;
-    if (!this.cars.boxClear(j.node, -b.id, j.inX, j.inY, j.outX, j.outY, j.cls, time)) return Wait.Junction;
-    // Room on the far side for the bus to get out of the box.
-    b.track.sample(j.s + j.boxR + 4, this.tmp2, 0);
-    const x = this.tmp2.x;
-    const y = this.tmp2.y;
-    const z = b.track.zAt(j.s + j.boxR + 4);
-    if (this.cars.slowCarNear(x, y, 1.8, z)) return Wait.Junction;
-    for (const o of this.active) {
-      if (o === b || o.dead || o.v > 2) continue;
-      const body = o.body;
-      for (let q = 0; q < body.n; q++) if (Math.hypot(body.x[q] - x, body.y[q] - y) < 2.2 && Math.abs(body.z[q] - z) <= LEVEL_GAP) return Wait.Junction;
+    if (!this.cars.boxClear(j.node, -b.id, j.inX, j.inY, j.outX, j.outY, j.cls, time)) return this.cars.boxBlocker === PLAYER_HOLD ? Wait.Player : Wait.Junction;
+    // Room on the far side for the whole bus to get out of the box (it never
+    // stops with its tail across the junction). Waiting for a queue that is
+    // itself waiting legitimately is legitimate (jRef names the blocker).
+    const pb = this.playerBody;
+    const G = this.cars.grid;
+    for (let q = j.s + j.boxR + 2; q <= j.s + j.boxR + b.len + 1; q += 3) {
+      b.track.sample(q, this.tmp2, 0);
+      const x = this.tmp2.x;
+      const y = this.tmp2.y;
+      const z = b.track.zAt(q);
+      const gi = G.nearest(x, y, 1.8, undefined, z);
+      if (gi >= 0 && G.pv[gi] < 2) {
+        this.jRef = G.pid[gi];
+        return Wait.Car;
+      }
+      for (const o of this.active) {
+        if (o === b || o.dead || o.v > 2) continue;
+        const body = o.body;
+        if (Math.abs(body.fx - x) > o.len + 3 || Math.abs(body.fy - y) > o.len + 3) continue;
+        for (let k = 0; k < body.n; k++) {
+          if (Math.hypot(body.x[k] - x, body.y[k] - y) < 2.2 && Math.abs(body.z[k] - z) <= LEVEL_GAP) {
+            this.jRef = o.id;
+            return Wait.Bus;
+          }
+        }
+      }
+      if (Math.abs(pb.speed) < 2) {
+        for (let k = 0; k < pb.n; k++) if (Math.hypot(pb.x[k] - x, pb.y[k] - y) < 2.2 && Math.abs(pb.z[k] - z) <= LEVEL_GAP) return Wait.Player;
+      }
     }
     return Wait.None;
   }
@@ -976,74 +1211,131 @@ export class Traffic {
   /**
    * Push the player's bus out of AI buses and cars (same contract as
    * Collider.resolve: corrects pose in place, trims speed into the contact).
+   *
+   * Every body is a chain of capsules whose round ends stop at the bumpers
+   * (radius = half width), so contact means real overlap, not a 1-2 m
+   * envelope. The AI vehicles are kinematic: the one touching the player
+   * stops (see step and CarTraffic.simulate) and the player is moved at most
+   * 0.3 m per frame, so a stopped bus is never bulldozed. The other
+   * vehicle's own speed counts in the impact.
    */
   resolve(pose: BusPose, spec: BusSpec): { hit: boolean; impact: number } {
     const out = { hit: false, impact: 0 };
     const R = spec.width / 2;
     // Vehicles on another level (viaduct above, tunnel below) are not in the way.
     const z0 = this.playerZ(pose);
+    this.touching.clear();
+    const cap = this.cap;
+    const G = this.cars.grid;
+    let moved = 0;
     for (let iter = 0; iter < 3; iter++) {
       let best = 0;
       let bnx = 0;
       let bny = 0;
       let bsec = 0;
-      let otherV = 0;
-      let otherH = 0;
+      let ovx = 0;
+      let ovy = 0;
+      let bestBus: AiBus | null = null;
+      let bestK = 0;
+      // Deepest contact between the player sample point (px, py) and segment a-b of radius r.
+      let px = 0;
+      let py = 0;
+      const seg = (ax: number, ay: number, bx: number, by: number, r: number): boolean => {
+        const dx = bx - ax;
+        const dy = by - ay;
+        const l2 = dx * dx + dy * dy;
+        const t = l2 > 1e-6 ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / l2)) : 0;
+        const ex = px - ax - dx * t;
+        const ey = py - ay - dy * t;
+        const d = Math.hypot(ex, ey);
+        const pen = R + r - d;
+        if (pen > best && d > 1e-3) {
+          best = pen;
+          bnx = ex / d;
+          bny = ey / d;
+          return true;
+        }
+        return false;
+      };
       for (let si = 0; si < pose.sections.length && si < spec.sections.length; si++) {
         const sec = pose.sections[si];
         const ss = spec.sections[si];
         const hx = Math.sin(sec.heading);
         const hy = Math.cos(sec.heading);
-        const front = ss.axleFromFront - 0.2;
-        const rear = ss.length - ss.axleFromFront - 0.2;
+        // Our own capsule: sample points from R inside the front to R inside the rear.
+        const front = ss.axleFromFront - R;
+        const rear = ss.length - ss.axleFromFront - R;
         const sz = sec.z ?? z0;
         const tg = Math.tan(sec.pitch ?? 0);
-        const m = Math.max(2, Math.ceil((front + rear) / 2.2) + 1);
+        const m = Math.max(2, Math.ceil((front + rear) / 1.2) + 1);
         for (let j = 0; j < m; j++) {
           const t = front - ((front + rear) * j) / (m - 1);
-          const px = sec.x + hx * t;
-          const py = sec.y + hy * t;
+          px = sec.x + hx * t;
+          py = sec.y + hy * t;
           const pz = sz + tg * t;
           for (const b of this.active) {
+            if (b.dead) continue;
             const body = b.body;
             if (Math.abs(body.fx - px) > b.len + 4 || Math.abs(body.fy - py) > b.len + 4) continue;
-            for (let k = 0; k < body.n; k++) {
-              if (Math.abs(body.z[k] - pz) > LEVEL_GAP) continue;
-              const dx = px - body.x[k];
-              const dy = py - body.y[k];
-              const d = Math.hypot(dx, dy);
-              const pen = R + 1.25 - d;
-              if (pen > best && d > 1e-3) {
-                best = pen;
-                bnx = dx / d;
-                bny = dy / d;
+            const rB = b.spec.width / 2;
+            const n = body.n;
+            // The AI bus's end points move rB in from its bumpers.
+            const f = Math.min(0.45, rB / Math.max(0.1, b.len / (n - 1)));
+            for (let k = 0; k + 1 < n; k++) {
+              if (Math.abs(body.z[k] - pz) > LEVEL_GAP && Math.abs(body.z[k + 1] - pz) > LEVEL_GAP) continue;
+              let ax = body.x[k];
+              let ay = body.y[k];
+              let bx = body.x[k + 1];
+              let by = body.y[k + 1];
+              const dx = bx - ax;
+              const dy = by - ay;
+              if (k === 0) {
+                ax += dx * f;
+                ay += dy * f;
+              }
+              if (k + 2 === n) {
+                bx -= dx * f;
+                by -= dy * f;
+              }
+              if (seg(ax, ay, bx, by, rB)) {
                 bsec = si;
-                otherV = b.v;
-                otherH = body.heading;
+                // The AI bus moves front first: from point k+1 towards point k.
+                const l = Math.hypot(dx, dy) || 1;
+                ovx = (-dx / l) * b.v;
+                ovy = (-dy / l) * b.v;
+                bestBus = b;
+                bestK = k;
               }
             }
           }
-          const ci = this.cars.grid.nearest(px, py, R + 1.0, undefined, pz);
-          if (ci >= 0) {
-            const g = this.cars.grid;
-            const dx = px - g.px[ci];
-            const dy = py - g.py[ci];
-            const d = Math.hypot(dx, dy);
-            const pen = R + 1.0 - d;
-            if (pen > best && d > 1e-3) {
-              best = pen;
-              bnx = dx / d;
-              bny = dy / d;
+          G.query(px, py, R + 3.6, (i) => {
+            if (Math.abs(G.pz[i] - pz) > LEVEL_GAP || !this.cars.capsule(G.pid[i], cap)) return false;
+            if (seg(cap.ax, cap.ay, cap.bx, cap.by, cap.r)) {
               bsec = si;
-              otherV = 0;
-              otherH = 0;
+              ovx = Math.sin(cap.heading) * cap.v;
+              ovy = Math.cos(cap.heading) * cap.v;
+              bestBus = null;
             }
-          }
+            return false;
+          });
         }
       }
       if (best <= 0.01) break;
       out.hit = true;
-      const push = best + 0.002;
+      const hitBus = bestBus as AiBus | null;
+      if (hitBus) {
+        this.touching.set(hitBus.id, bestK);
+        // Deep inside the player's bus (a reset or rescue put it there): the AI bus goes, never the player.
+        if (best > R + hitBus.spec.width / 2 - 1 && !hitBus.dead) {
+          hitBus.dead = true;
+          this.stats.overlapDespawns++;
+          this.events.push(`bus ${hitBus.route.id} inside the player's bus: removed`);
+          if (this.events.length > 30) this.events.shift();
+        }
+      }
+      const push = Math.min(best + 0.002, 0.3 - moved);
+      if (push <= 0) break;
+      moved += push;
       pose.x += bnx * push;
       pose.y += bny * push;
       for (const sp of pose.sections) {
@@ -1052,12 +1344,16 @@ export class Traffic {
       }
       const sh = (pose.sections[bsec] ?? pose).heading;
       const fn = Math.sin(sh) * bnx + Math.cos(sh) * bny;
-      // Relative normal velocity (the other vehicle's motion counts too).
-      const vOther = otherV * (Math.sin(otherH) * bnx + Math.cos(otherH) * bny);
+      // Relative normal velocity (the other vehicle's motion counts too)...
+      const vOther = ovx * bnx + ovy * bny;
       const vn = pose.speed * fn - vOther;
       if (vn < 0) {
-        out.impact = Math.max(out.impact, -vn);
-        pose.speed -= vn * fn * 1.05;
+        // ...but the impact reported (and scored by the guide) is the player's own speed into the contact.
+        out.impact = Math.max(out.impact, Math.max(0, -pose.speed * fn));
+        // Our motion into the contact is taken away; the contact never adds speed
+        // (a stopped bus is not launched by the vehicle that touched it).
+        const ns = pose.speed - vn * fn * 1.05;
+        pose.speed = Math.sign(ns) === Math.sign(pose.speed) && Math.abs(ns) < Math.abs(pose.speed) ? ns : Math.sign(ns) === Math.sign(pose.speed) ? pose.speed : 0;
       }
     }
     return out;
@@ -1080,6 +1376,54 @@ export class Traffic {
     out.length = 0;
     for (const b of this.active) out.push(b.marker);
     return out;
+  }
+
+  /**
+   * The AI buses' bodies (centreline points front first, bending with an articulated bus) and half
+   * widths, for a driver looking along its lane for a bus ahead (the autopilot). Reused objects.
+   */
+  busBodies(): readonly { body: Body; half: number; len: number }[] {
+    const out = this.busBodiesOut;
+    let n = 0;
+    for (const b of this.active) {
+      if (b.dead) continue;
+      const r = (out[n] ??= { body: b.body, half: 0, len: 0 });
+      r.body = b.body;
+      r.half = b.spec.width / 2;
+      r.len = b.len;
+      n++;
+    }
+    out.length = n;
+    return out;
+  }
+  private readonly busBodiesOut: { body: Body; half: number; len: number }[] = [];
+
+  /** AI buses and cars within r of (x, y) with their state, and recent valve events (diagnostics). */
+  debugNear(x: number, y: number, r = 60): object {
+    const buses = this.active
+      .filter((b) => Math.hypot(b.body.fx - x, b.body.fy - y) < r + b.len)
+      .map((b) => {
+        const j = b.jl[b.jNext];
+        return {
+          id: b.id,
+          route: `${b.route.id}/${b.route.dir}`,
+          x: +b.body.fx.toFixed(1),
+          y: +b.body.fy.toFixed(1),
+          s: +b.s.toFixed(1),
+          v: +b.v.toFixed(1),
+          state: b.state,
+          wait: b.wait,
+          obstacle: b.obstacle,
+          exempt: b.exempt,
+          idle: +b.idle.toFixed(0),
+          stall: +b.stall.toFixed(0),
+          visible: b.visible,
+          next: j ? { node: j.node, stop: +(j.stopS - b.s).toFixed(1), line: +(b.jLine[b.jNext] - b.s).toFixed(1), sig: j.sig, minor: j.minor } : null,
+          holds: b.holds.map((q) => b.jl[q].node),
+          touching: this.touching.has(b.id),
+        };
+      });
+    return { buses, cars: this.cars.debugNear(x, y, r), events: [...this.events.slice(-8), ...this.cars.events.slice(-8)], stats: { ...this.stats, cars: { ...this.cars.stats } } };
   }
 
   /** Number of AI buses currently active (diagnostics). */
