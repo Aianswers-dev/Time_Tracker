@@ -245,9 +245,11 @@ export async function buildWorld(
       for (const o of hidden) o.visible = true;
       hidden.length = 0;
       for (const c of ctx.cull) {
-        const dx = c.x - camPos.x;
-        const dz = c.z - camPos.z;
-        c.obj.visible = dx * dx + dz * dz < c.range * c.range;
+        const b = c.box;
+        const dx = b ? Math.max(b[0] - camPos.x, 0, camPos.x - b[2]) : c.x - camPos.x;
+        const dz = b ? Math.max(b[1] - camPos.z, 0, camPos.z - b[3]) : c.z - camPos.z;
+        const d2 = dx * dx + dz * dz;
+        c.obj.visible = d2 < c.range * c.range && !(c.min && d2 < c.min * c.min);
       }
       for (const t of ctx.tick) t(dt, camera);
       // underground culling (last frame's hidden meshes were restored above)
