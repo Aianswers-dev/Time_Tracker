@@ -42,13 +42,20 @@ export interface AutopilotInputs {
   doorsOpen: boolean;
   /** Door interlock holding the bus. */
   interlock: boolean;
+  /** Kneel 0..1 (to kneel for a passenger who needs it). */
+  kneel?: number;
   /** Collider result this frame (base collider details pass through). */
   hit?: { hit: boolean; impact: number; wall?: boolean; wallIndex?: number; water?: boolean };
   /** Road surface height under the rear axle as the physics sees it. */
   z?: number;
 }
 
-const DWELL = 4;
+/** Doors open with no passenger dwell from the guide: close after this (s). */
+const MIN_DWELL = 4;
+/** Give up waiting for the passengers after this (s); the guide caps passenger time at ~40 s. */
+const MAX_DWELL = 75;
+/** A look in the mirrors once everyone is aboard, before closing the doors (s). */
+const MIRRORS = 1.2;
 const DECEL = 1.1;
 const SIGNAL_DECEL = 1.6;
 
@@ -56,9 +63,24 @@ function clamp(v: number, a: number, b: number): number {
   return v < a ? a : v > b ? b : v;
 }
 
+/** One stop's dwell, for the logs. */
+export interface AutopilotDwell {
+  /** Route stop index. */
+  stop: number;
+  /** Doors open to doors closing (s). */
+  secs: number;
+  off: number;
+  on: number;
+  /** Left at the stop because the bus was full. */
+  full: number;
+  /** On board when the doors closed. */
+  load: number;
+}
+
 export class Autopilot {
   phase: AutopilotPhase = 'drive';
   readonly problems: AutopilotProblem[] = [];
+  readonly dwells: AutopilotDwell[] = [];
   readonly frame: AutopilotFrame = { phase: 'drive', lateral: 0, target: 0, limitDist: Infinity, limitWhy: '' };
   /** Time spent in each phase (s). */
   readonly phaseTime: Record<string, number> = {};
@@ -70,9 +92,15 @@ export class Autopilot {
 
   private sRear = 0;
   private dwellT = 0;
+  /** Time since the guide said everyone is aboard. */
+  private doneT = 0;
   private stuckT = 0;
   private servedIdx = -1;
   private lastIdx = -1;
+  /** Opened the doors at the departure stop. */
+  private boardedStart = false;
+  /** Knelt for a passenger at this stop. */
+  private knelt = false;
   private holdT = 0;
   private lastZ = NaN;
   private queueT = 0;
@@ -246,16 +274,35 @@ export class Autopilot {
     if (this.phase === 'dwell') {
       target = 0;
       this.dwellT += dt;
-      if (this.dwellT > DWELL) {
+      const d = g.dwell;
+      // Kneel for a passenger with a pram or wheelchair (driving off raises the bus again).
+      if (d?.kneelFor && !this.knelt && (a.kneel ?? 0) < 0.05) {
+        out.pressed.add('kneel' as InputAction);
+        this.knelt = true;
+      }
+      // Wait for everyone to get off and on, as a driver would.
+      this.doneT = d?.done ? this.doneT + dt : 0;
+      const ready = d ? this.doneT > MIRRORS : this.dwellT > MIN_DWELL;
+      if (ready || this.dwellT > MAX_DWELL) {
+        if (!ready) this.problem('dwell-timeout', `passengers still moving after ${MAX_DWELL} s at stop #${d?.stop ?? ns} (${d ? `${d.alighting} to get off, ${d.boardTotal - d.boarding} to board` : 'no dwell'})`, at, 1);
+        if (d) this.dwells.push({ stop: d.stop, secs: +this.dwellT.toFixed(1), off: d.alightTotal, on: d.boarding, full: d.full, load: g.load });
         out.pressed.add('doors' as InputAction);
         this.phase = 'closing';
       }
     } else if (this.phase === 'closing') {
       target = 0;
       if (!a.doorsOpen && !a.interlock) this.phase = 'drive';
+    } else if (stopped && g.canBoard && !a.doorsOpen && !this.boardedStart) {
+      // Passengers waiting at the departure stop.
+      out.pressed.add('doors' as InputAction);
+      this.boardedStart = true;
+      this.knelt = false;
+      this.phase = 'dwell';
+      this.dwellT = 0;
     } else if (stopped && g.canServe && !a.doorsOpen && ns !== this.servedIdx && why === 'stop') {
       out.pressed.add('doors' as InputAction);
       this.servedIdx = ns;
+      this.knelt = false;
       this.phase = 'dwell';
       this.dwellT = 0;
     } else if (stopped && why === 'stop' && !g.canServe && stop && sFront > stopTarget - 3) {
@@ -372,7 +419,7 @@ export class Autopilot {
   }
 
   /** Summary for logs. */
-  report(): { time: number; rescues: number; phaseTime: Record<string, number>; problems: AutopilotProblem[] } {
-    return { time: +this.time.toFixed(1), rescues: this.rescues, phaseTime: Object.fromEntries(Object.entries(this.phaseTime).map(([k, v]) => [k, +v.toFixed(1)])), problems: this.problems };
+  report(): { time: number; rescues: number; phaseTime: Record<string, number>; problems: AutopilotProblem[]; dwells: AutopilotDwell[] } {
+    return { time: +this.time.toFixed(1), rescues: this.rescues, phaseTime: Object.fromEntries(Object.entries(this.phaseTime).map(([k, v]) => [k, +v.toFixed(1)])), problems: this.problems, dwells: this.dwells };
   }
 }

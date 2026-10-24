@@ -38,8 +38,10 @@ pnpm build      # static site in dist/
   collisions with buildings and traffic, and synthesised engine, air-brake,
   door and tunnel-echo sounds.
 - **The shift**: pull into each stop (any lettered bay at a busway platform)
-  and open the doors to serve it, keep to the timetable, follow turn-by-turn
-  hints, and get a summary at the end. AI buses run their own real routes
+  and open the doors to serve it, wait while passengers get off and on (busier
+  at busway stations, in the CBD and at peak hour; kneel for prams and
+  wheelchairs; close early and you leave people behind), keep to the
+  timetable, follow turn-by-turn hints, and get a summary at the end. AI buses run their own real routes
   around you, plus car traffic (Off / Light / Normal in the menu).
 
 ## Controls

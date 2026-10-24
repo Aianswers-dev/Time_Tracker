@@ -403,6 +403,49 @@
   color: var(--muted);
   font-weight: 600;
 }
+/* Passengers on board, with a little occupancy meter */
+.bbh-load {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: 9px;
+  border-left: 1px solid var(--line);
+}
+.bbh-clock .bbh-load svg {
+  width: 17px;
+  height: 17px;
+  color: var(--teal-2);
+}
+.bbh-load small {
+  margin-left: -3px;
+  font-size: 11.5px;
+  font-weight: 650;
+  color: var(--muted);
+}
+.bbh-load::after {
+  content: '';
+  position: absolute;
+  left: 9px;
+  right: 0;
+  bottom: -3px;
+  height: 2px;
+  border-radius: 1px;
+  background: linear-gradient(90deg, var(--teal-2) var(--p, 0%), rgba(255, 255, 255, 0.14) 0);
+}
+.bbh-clock .bbh-load.busy svg {
+  color: var(--amber);
+}
+.bbh-load.busy::after {
+  background: linear-gradient(90deg, var(--amber) var(--p, 0%), rgba(255, 255, 255, 0.14) 0);
+}
+.bbh-clock .bbh-load.full svg,
+.bbh-load.full b {
+  color: #ff8d8f;
+}
+.bbh-load.full::after {
+  background: var(--red);
+}
 .bbh-clock .bbh-shift:not(:empty)::before {
   content: 'Shift ';
   font-size: 10px;
@@ -643,6 +686,145 @@
   color: var(--navy);
   margin: 0 2px;
   text-shadow: none;
+}
+
+/* Passengers at a stop (above the prompt): alighting empties, boarding fills */
+.bbh-dwell {
+  position: absolute;
+  left: 50%;
+  bottom: calc(max(26vh, 150px) + 48px);
+  width: min(360px, 92vw);
+  padding: 9px 14px 11px;
+  display: grid;
+  gap: 7px;
+  opacity: 0;
+  transform: translate(-50%, 10px);
+  transition: opacity 0.2s, transform 0.2s;
+}
+.bbh-dwell.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+.bbh-dhead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.bbh-dname {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 750;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bbh-dstat {
+  flex: none;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 850;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-shadow: none;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--muted);
+}
+.bbh-dstat.off {
+  background: rgba(255, 176, 32, 0.18);
+  color: #ffc861;
+}
+.bbh-dstat.on {
+  background: rgba(0, 165, 181, 0.24);
+  color: #74e4ef;
+}
+.bbh-dstat.ok {
+  background: rgba(141, 198, 63, 0.22);
+  color: #b9ec77;
+}
+.bbh-dstat.bad {
+  background: rgba(255, 77, 79, 0.22);
+  color: #ff8d8f;
+}
+.bbh-drow {
+  display: grid;
+  grid-template-columns: 96px 1fr 64px;
+  align-items: center;
+  gap: 10px;
+  transition: opacity 0.2s;
+}
+.bbh-drow.none {
+  opacity: 0.4;
+}
+.bbh-dlbl {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.bbh-dlbl svg {
+  flex: none;
+  width: 17px;
+  height: 17px;
+}
+.bbh-drow.off .bbh-dlbl svg {
+  color: var(--amber);
+}
+.bbh-drow.on .bbh-dlbl svg {
+  color: var(--teal-2);
+}
+.bbh-dbar {
+  position: relative;
+  height: 10px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+.bbh-dbar > b {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-radius: 5px;
+  transition: width 0.35s ease-out, background 0.3s;
+}
+/* One notch per passenger when there are few enough to count. */
+.bbh-dbar.ticks::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(90deg, transparent 0 calc(100% / var(--n) - 2px), rgba(7, 18, 35, 0.85) calc(100% / var(--n) - 2px) calc(100% / var(--n)));
+}
+.bbh-drow.off .bbh-dbar > b {
+  background: linear-gradient(90deg, #ff9a1f, #ffc24a);
+}
+.bbh-drow.on .bbh-dbar > b {
+  background: linear-gradient(90deg, var(--teal), var(--teal-2));
+}
+.bbh-dwell.done .bbh-drow.on .bbh-dbar > b {
+  background: linear-gradient(90deg, #6fb02c, var(--green));
+}
+.bbh-dwell.full .bbh-drow.on .bbh-dbar > b {
+  background: linear-gradient(90deg, #d93a3c, #ff7a52);
+}
+.bbh-dnum {
+  text-align: right;
+  white-space: nowrap;
+  font-size: 19px;
+  font-weight: 850;
+  line-height: 1;
+}
+.bbh-dnum small {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--muted);
 }
 
 /* Toasts */
@@ -1140,5 +1322,53 @@
   }
   .bbh-limit {
     grid-row: auto;
+  }
+}
+
+/* Passenger panel on small screens: tighter. */
+@media (max-height: 560px), (max-width: 760px) {
+  .bbh-dwell {
+    bottom: calc(max(26vh, 150px) + 42px);
+    width: min(300px, 64vw);
+    padding: 7px 10px 8px;
+    gap: 5px;
+  }
+  .bbh-dname {
+    font-size: 12.5px;
+  }
+  .bbh-drow {
+    grid-template-columns: 78px 1fr 52px;
+    gap: 8px;
+  }
+  .bbh-dlbl {
+    font-size: 9.5px;
+  }
+  .bbh-dlbl svg {
+    width: 14px;
+    height: 14px;
+  }
+  .bbh-dbar {
+    height: 8px;
+  }
+  .bbh-dnum {
+    font-size: 15px;
+  }
+  .bbh-dnum small {
+    font-size: 10px;
+  }
+}
+/* Touch: the bottom belongs to the driving controls, so the panel sits under the top cards. */
+@media (pointer: coarse) {
+  .bbh-dwell {
+    top: calc(var(--top) + 72px);
+    bottom: auto;
+    width: min(250px, 30vw);
+    transform: translate(-50%, -8px);
+  }
+  .bbh-drow {
+    grid-template-columns: 16px 1fr 46px;
+  }
+  .bbh-dlbl span {
+    display: none;
   }
 }
