@@ -161,10 +161,10 @@ interface Car {
   dead: boolean;
 }
 
-/** A junction on an AI bus route (for the shared reservations). */
 /** Links between two nodes of one signalised junction shorter than this are inside it. */
 const INSIDE_LINK = 40;
 
+/** A junction on an AI bus route (for the shared reservations). */
 export interface BusJunction {
   node: number;
   x: number;
