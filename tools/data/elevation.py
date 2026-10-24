@@ -101,7 +101,8 @@ RIVER_BRIDGE_RADIUS = 260.0
 BRIDGE_BUMP = 35.0  # m: how much radar surface a bridge footprint may remove from the DEM
 STRUCT_ANCHOR = 0.02  # anchor weight of bridge / tunnel interiors relative to at-grade roads
 ZTOL = 0.2  # m: height tolerance when simplifying output polylines (roads, rail)
-ROUTE_ZTOL = 0.5  # m: the same for bus routes (the drivable surface is the road z)
+ROUTE_ZTOL = 0.1  # m: the same for bus routes (AI buses and the guide ride the route z: 61 review #13)
+ONEWAY_AGAINST = 4.0  # route matching: per-sample cost of a one-way road driven backwards (twin tubes: the right tube within ~14 m wins; below FREE, so a lone tube the shape runs along still beats off-road)
 KIND_GROUPS = (
     ("motorway", (0,)),
     ("trunk", (1,)),
@@ -136,6 +137,7 @@ class Line:
     emit: bool
     meta: dict = field(default_factory=dict)  # the output record (roads.json road / rail entry)
     name: str = ""  # for reports only
+    reversed: bool = False  # oneway=-1: xy/nodes run against the OSM way
     # filled by solve(): dense polyline and heights
     dxy: np.ndarray | None = None
     dz: np.ndarray | None = None
@@ -983,11 +985,16 @@ def flat(xy: np.ndarray) -> list[int]:
 # The build stage called by build_osm
 
 
-def build(lines: list[Line], water_out: list[dict], buildings: list[dict], areas: list[dict], box) -> tuple[list[dict], list[dict]]:
-    """Solve heights and write terrain.bin; returns (roads, rail) output records.
+def build(lines: list[Line], water_out: list[dict], buildings: list[dict], areas: list[dict], box,
+          platforms: list[dict] | None = None):
+    """Solve heights and write terrain.bin; returns (roads, rail, platforms, buildings).
 
-    Adds "z" (decimetres AHD) to every building record in place.
+    Station platforms are normalised and the station bay carriageways added to
+    the roads (stations.py) before the terrain burn. Every building gets "z"
+    (decimetres AHD); each road record carries its Line as "_ln" (dropped by
+    the caller before writing).
     """
+    import stations
     import build_terrain as BT
 
     t0 = time.time()
@@ -1038,6 +1045,7 @@ def build(lines: list[Line], water_out: list[dict], buildings: list[dict], areas
                 if k == "p":
                     rec["p"] = flat(xy)
                     rec["z"] = [q(v) for v in z]
+            rec["_ln"] = ln
             (rail if ln.kind == RAIL else roads).append(rec)
             runs.append((ln, xy, np.rint(z * 10) / 10))
     check = check_output(lines, stats, runs)
@@ -1048,14 +1056,18 @@ def build(lines: list[Line], water_out: list[dict], buildings: list[dict], areas
         if ln.bridge or ln.tunnel:
             continue
         segs.append((xy, z, 2.0 if ln.kind == RAIL else 0.5 * float(ln.meta.get("w", 6.0)) + 0.5))
+    platforms, buildings, bays, bay_segs = stations.build(roads, platforms or [], buildings)
+    roads.extend(bays)
+    segs.extend(bay_segs)
     burned = BT.Grid(burn(ground, segs, np.isfinite(level_grid)), ground.x0, ground.y0, ground.cell)
     log(f"burned {len(segs)} at-grade polylines into the terrain in {time.time() - t:.1f}s")
     BT.write(burned, BT.outer_grid(coarse, burned),
              {"roads": "inner grid has the at-grade roads and rail burned in (cuttings, embankments); ground under bridges and over tunnels is natural"})
     building_bases(buildings, burned)
+    buildings = stations.roof_bases(buildings, roads, platforms)
     report(stats, check)
     log(f"elevation stage done in {time.time() - t0:.1f}s")
-    return roads, rail
+    return roads, rail, platforms, buildings
 
 
 def building_bases(buildings: list[dict], grid) -> None:
@@ -1168,10 +1180,11 @@ class RoadHeights:
     """The road segments of roads.json with their heights, for map matching."""
 
     def __init__(self, roads: list[dict]):
-        ax, ay, bx, by, za, zb, rid = [], [], [], [], [], [], []
+        ax, ay, bx, by, za, zb, rid, ow = [], [], [], [], [], [], [], []
         for k, r in enumerate(roads):
             if "z" not in r:
                 continue
+            ow.append(np.full(len(r["p"]) // 2 - 1, bool(r.get("o"))))
             p = np.asarray(r["p"], dtype=np.float64).reshape(-1, 2) * 0.1
             z = np.asarray(r["z"], dtype=np.float64) * 0.1
             ax.append(p[:-1, 0])
@@ -1184,6 +1197,7 @@ class RoadHeights:
         self.ax, self.ay, self.bx, self.by = (np.concatenate(v) for v in (ax, ay, bx, by))
         self.za, self.zb = np.concatenate(za), np.concatenate(zb)
         self.rid = np.concatenate(rid)
+        self.oneway = np.concatenate(ow)
         segs = shapely.linestrings(np.stack([np.stack([self.ax, self.ay], -1), np.stack([self.bx, self.by], -1)], 1))
         self.tree = shapely.STRtree(segs)
 
@@ -1215,8 +1229,11 @@ class RoadHeights:
         t = np.clip(((px - self.ax[si]) * dx + (py - self.ay[si]) * dy) / l2, 0, 1)
         d = np.hypot(px - (self.ax[si] + t * dx), py - (self.ay[si] + t * dy))
         zc = self.za[si] + (self.zb[si] - self.za[si]) * t
-        cosang = np.abs(dx * tang[pi, 0] + dy * tang[pi, 1]) / np.sqrt(l2)
-        emis = (d / 7.0) ** 2 + 3.0 * (1.0 - cosang)
+        sdot = (dx * tang[pi, 0] + dy * tang[pi, 1]) / np.sqrt(l2)
+        cosang = np.abs(sdot)
+        # driving a one-way road backwards is not a match (twin tunnel tubes,
+        # one-way pairs at different heights: 199 review #1)
+        emis = (d / 7.0) ** 2 + 3.0 * (1.0 - cosang) + ONEWAY_AGAINST * (self.oneway[si] & (sdot < -0.3))
         rc = self.rid[si]
         starts = np.searchsorted(pi, np.arange(n + 1))
 
