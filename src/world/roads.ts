@@ -816,16 +816,50 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const m1 = endMiter(ri, true);
     if (m0 && ss[0] === 0) P[0] = { ...P[0], nx: m0[0], ny: m0[1] };
     if (m1 && ss[n - 1] === ri.len) P[n - 1] = { ...P[n - 1], nx: m1[0], ny: m1[1] };
+    // depth of the natural ground beside the road, and the profile per sample with hysteresis (a walled
+    // cutting starts deeper than 1.6 m and runs on while deeper than 0.9 m; a fill wall likewise), short
+    // runs merged into their neighbours, so walls never break up into a row of short pieces
+    const depth = new Float32Array(n);
     for (let k = 0; k < n; k++) {
       const c = P[k];
       const fw = foot[k];
       e0[k] = hw + (fw > 0 ? fw : 0.15);
       zE[k] = c.z + (fw > 0 ? KERB_H : 0);
+      depth[k] = field.natAt(c.x + c.nx * side * (e0[k] + 2.5), c.y + c.ny * side * (e0[k] + 2.5)) - zE[k];
+    }
+    const raw = new Uint8Array(n);
+    for (let k = 0; k < n; k++) {
+      const d = depth[k];
+      const prev = k > 0 ? raw[k - 1] : 1;
+      raw[k] = d > 1.6 || (prev === 2 && d > 0.9) ? 2 : d < -2.6 || (prev === 3 && d < -1.6) ? 3 : 1;
+    }
+    for (let k = n - 2; k >= 0; k--) {
+      // and backwards, so a run also starts early
+      if (raw[k] === 1 && raw[k + 1] === 2 && depth[k] > 0.9) raw[k] = 2;
+      if (raw[k] === 1 && raw[k + 1] === 3 && depth[k] < -1.6) raw[k] = 3;
+    }
+    {
+      let a = 0;
+      while (a < n) {
+        let b = a;
+        while (b + 1 < n && raw[b + 1] === raw[a]) b++;
+        const len = b - a + 1;
+        const before = a > 0 ? raw[a - 1] : 0;
+        const after = b + 1 < n ? raw[b + 1] : 0;
+        let deep = 0;
+        for (let q = a; q <= b; q++) deep = Math.max(deep, Math.abs(depth[q]));
+        // a short gap between two walled stretches of the same kind joins them
+        if (raw[a] === 1 && len <= 2 && before > 1 && before === after) raw.fill(before, a, b + 1);
+        // a short wall piece that is not deep becomes part of the batter
+        else if (raw[a] !== 1 && len <= 2 && deep < 2.5 && before !== raw[a] && after !== raw[a]) raw.fill(1, a, b + 1);
+        a = b + 1;
+      }
+    }
+    for (let k = 0; k < n; k++) {
+      const c = P[k];
       const ox = (off: number) => c.x + c.nx * side * off;
       const oy = (off: number) => c.y + c.ny * side * off;
-      const hn = field.natAt(ox(e0[k] + 2.5), oy(e0[k] + 2.5));
-      const d = hn - zE[k];
-      const t = d > 1.3 ? 2 : d < -2.2 ? 3 : 1;
+      const t = raw[k];
       // in a junction, or another carriageway right beside us: leave it to the neighbour
       const inJ = skips.some(([a, b]) => ss[k] > a && ss[k] < b);
       const probe = t === 2 ? e0[k] + 0.3 : e0[k] + 1.5;
