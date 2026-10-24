@@ -178,7 +178,13 @@ vec3 roadAlbedo() {
   c *= mix(0.88, 1.12, n.g) * mix(0.95, 1.05, n2.b);
   c = mix(c, c * 0.78, smoothstep(0.66, 0.7, n.b) * 0.7);
   if (surf > 0.5 && surf < 1.5) c *= vec3(1.12, 1.06, 1.02);
-  else if (surf > 1.5 && surf < 2.5) {
+  else if (surf > 2.5 && surf < 3.5) {
+    // station bay: light-grey concrete slabs
+    vec2 q = p / vec2(4.5, 3.6);
+    vec2 f = abs(fract(q) - 0.5);
+    float j = smoothstep(0.485, 0.5, max(f.x, f.y));
+    c = vec3(0.62, 0.61, 0.58) * mix(0.9, 1.06, n.g) * mix(0.96, 1.04, n2.b) * (1.0 - j * 0.35);
+  } else if (surf > 1.5 && surf < 2.5) {
     vec2 q = p / vec2(0.6, 0.3);
     q.x += step(0.5, fract(q.y * 0.5)) * 0.5;
     vec2 f = abs(fract(q) - 0.5);
@@ -704,7 +710,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const hw = ri.hw;
     const lift = ri.lift;
     const tp = tubePreps.get(ri.i) ?? null;
-    const surf = r.kind === RoadKind.Pedestrian ? 2 : r.bus ? 1 : r.kind === RoadKind.Motorway ? 6 : r.kind === RoadKind.Service ? 5 : 0;
+    const surf = r.bay ? 3 : r.kind === RoadKind.Pedestrian ? 2 : r.bus ? 1 : r.kind === RoadKind.Motorway ? 6 : r.kind === RoadKind.Service ? 5 : 0;
 
     // ---- asphalt ribbon (and terrain clamp under at-grade roads)
     {
@@ -784,7 +790,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       const lines: { off: number; w: number; pat: number }[] = [];
       const lanes = Math.max(1, r.lanes);
       const major = r.kind <= RoadKind.Tertiary || r.kind === RoadKind.Busway || r.bus;
-      if (r.kind !== RoadKind.Pedestrian && r.kind !== RoadKind.Residential && (r.kind !== RoadKind.Service || r.bus)) {
+      // station bays: no lines of their own (the busway's edge line separates the stopping lane)
+      if (!r.bay && r.kind !== RoadKind.Pedestrian && r.kind !== RoadKind.Residential && (r.kind !== RoadKind.Service || r.bus)) {
         if (r.oneway) {
           const lw = r.width / lanes;
           for (let k = 1; k < lanes; k++) lines.push({ off: -hw + k * lw, w: 0.12, pat: 1 });
@@ -833,7 +840,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         }
       }
       // BUS ONLY words on busways
-      if ((r.kind === RoadKind.Busway || r.bus) && ri.len > 40) {
+      if ((r.kind === RoadKind.Busway || r.bus) && !r.bay && ri.len > 40) {
         const g = L.words;
         const lanesDir: { off: number; dir: number }[] = r.oneway
           ? [{ off: 0, dir: 1 }]
@@ -871,7 +878,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       buildTube(ri, L, tp);
     } else if (r.bridge) {
       buildBridge(ri, L);
-    } else {
+    } else if (!r.bay) {
+      // (a station bay's platform side is the platform; its busway side is the busway)
       buildAtGrade(ri, L, skips);
     }
 
@@ -1489,7 +1497,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const depth = heavy ? 1.9 : 1.3;
     const edge = hw + 0.45;
     // parapets, open where another carriageway at the same level runs alongside
-    for (const side of [1, -1]) {
+    // (and never on a station bay's platform side, its left)
+    for (const side of r.bay ? [-1] : [1, -1]) {
       const step = 3;
       const ss: number[] = [];
       const ok: boolean[] = [];

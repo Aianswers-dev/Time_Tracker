@@ -48,6 +48,16 @@ export interface Road {
   link: boolean;
   /** Bus-only road (busway / bus-designated service road). */
   bus: boolean;
+  /**
+   * Station stopping bay: a synthetic one-way bus carriageway (pipeline,
+   * tools/data/stations.py) that fills the space between a busway and a
+   * platform kerb, at the busway's height, tapering into the busway beyond
+   * the platform ends. The platform is on its left (direction of travel);
+   * its left edge runs 0.3 m under the platform slab. Draw it as station
+   * pavement (concrete), with no parapet, wall or footpath on its left and
+   * no gap to the busway on its right.
+   */
+  bay?: boolean;
   name?: string;
   /** Posted speed limit in km/h when tagged in OSM. */
   maxspeed?: number;
@@ -178,6 +188,20 @@ export interface MapData {
   rail: Rail[];
   /** Traffic signal node positions, flat [x, y, ...]. */
   signals: Float32Array;
+  /**
+   * Per signal: index into `roads` of the road the signal stands on, or -1 for
+   * signals mapped on paths and cycleways only (bike and pedestrian crossings
+   * of a street, e.g. over a busway tunnel), which control no road traffic.
+   */
+  signalRoad?: Int32Array;
+  /**
+   * Per signal: the traffic it faces along its road's polyline (OSM
+   * traffic_signals:direction): 1 forward (vertex order), -1 backward, 0 both
+   * or not tagged.
+   */
+  signalDir?: Int8Array;
+  /** Per signal: height (m AHD) of its road at the signal (ground for road -1). */
+  signalZ?: Float32Array;
   /** Marked pedestrian crossings, flat [x, y, ...]. */
   crossings: Float32Array;
   buildings: Building[];
