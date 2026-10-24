@@ -203,7 +203,8 @@ export class SkySystem {
     const hr = ((hours % 24) + 24) % 24;
     const evening = smoothstep(17, 19.5, hr) * (1 - smoothstep(22.5, 25.5, hr));
     const late = hr < 6 ? 1 - smoothstep(4.5, 6.5, hr) : 0;
-    U.uLit.value = 0.06 + night * (0.12 + 0.26 * evening + 0.06 * late) + evening * 0.04;
+    // about 35-40% of windows lit at dusk, a quarter at midnight, ~15-20% in the small hours
+    U.uLit.value = 0.04 + night * (0.1 + 0.22 * evening + 0.04 * late);
 
     // Lights: the sun by day, the moon by night.
     const sunI = a.sunI + (b.sunI - a.sunI) * t;

@@ -451,7 +451,25 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
   // From every ~2 m of platform edge facing a road, a 5 m wide strip back to that road (at its level)
   // counts as carriageway.
   const bayLines: Line[] = [];
-  const addBay = (px: number, py: number, underground: boolean, poly: Float32Array | null, levelZ: number | null): void => {
+  /** Height of the nearest busway within `r` of (x, y), or null. */
+  const buswayZNear = (x: number, y: number, r: number): number | null => {
+    let best = r * r;
+    let z: number | null = null;
+    forEachRoadSegmentNear(x, y, r, (sg) => {
+      const l = lines[sLine[sg]];
+      if (l.kind !== RoadKind.Busway) return;
+      project(l, sIdx[sg], x, y);
+      if (PROJ.d2 < best) {
+        best = PROJ.d2;
+        z = PROJ.z;
+      }
+    });
+    return z;
+  };
+  const addBay = (px: number, py: number, underground: boolean, poly: Float32Array | null, platformZ: number | null): void => {
+    // Long platforms sit on a grade (Roma Street climbs 6 m along its platforms), so the level comes from
+    // the busway beside this sample when there is one, else the platform's overall level.
+    const levelZ = platformZ === null ? null : (buswayZNear(px, py, 20) ?? platformZ);
     let bestD = 16 * 16;
     let bestScore = Infinity;
     let qx = 0;
@@ -495,24 +513,15 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     });
   };
   /**
-   * Height of a platform: the nearest busway within 20 m (platforms serve busways; PA Hospital's sit on
-   * the busway viaduct with a street stop below), else the road height at the nearest stop within 40 m.
+   * Height of a platform: a busway within 20 m of one of its corners (platforms serve busways; PA
+   * Hospital's sit on the busway viaduct with a street stop below), else the road height at the nearest
+   * stop within 40 m. Bays refine it per sample from the busway beside them.
    */
   const platformLevel = (p: Float32Array): number | null => {
-    let bestB = 20 * 20;
-    let zb: number | null = null;
     for (let i = 0; i < p.length; i += 2) {
-      forEachRoadSegmentNear(p[i], p[i + 1], 20, (sg) => {
-        const l = lines[sLine[sg]];
-        if (l.kind !== RoadKind.Busway) return;
-        project(l, sIdx[sg], p[i], p[i + 1]);
-        if (PROJ.d2 < bestB) {
-          bestB = PROJ.d2;
-          zb = PROJ.z;
-        }
-      });
+      const zb = buswayZNear(p[i], p[i + 1], 20);
+      if (zb !== null) return zb;
     }
-    if (zb !== null) return zb;
     let best = 40 * 40;
     let z: number | null = null;
     for (const st of data.stops ?? []) {

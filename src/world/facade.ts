@@ -118,8 +118,9 @@ void facade(inout vec3 albedo, inout float rough, inout float metal, inout vec3 
     glassCol = tint * (0.6 + 0.08 * w_hash(vec2(floor(c.x / 6.0), floor(c.y)) + seed * 31.0));
     wall = mix(tint * 0.7, vec3(0.55, 0.57, 0.6), 0.5);
     vec2 cell = floor(vec2(uv.x / 4.5, c.y));
-    float h = w_hash(cell + seed * 17.0);
-    lit = step(h, uLit * 1.15) * g;
+    // offices light up floor by floor, so mix a per-floor term into the per-bay one
+    float h = mix(w_hash(cell + seed * 17.0), w_hash(vec2(cell.y, seed * 29.0)), 0.5);
+    lit = step(h, uLit * 1.05) * g;
     litCol = mix(vec3(0.82, 0.9, 1.0), vec3(1.0, 0.9, 0.7), step(0.7, w_hash(cell * 1.7 + 3.0)));
   } else if (style < 1.5) {
     // office: concrete frame, punched glazing
@@ -131,7 +132,7 @@ void facade(inout vec3 albedo, inout float rough, inout float metal, inout vec3 
     g = mix(g, 0.58, f_far(fw));
     glassMask = g;
     glassCol = mix(vec3(0.08, 0.12, 0.16), base * 0.3, 0.3);
-    float h = w_hash(floor(c) + seed * 17.0);
+    float h = mix(w_hash(floor(c) + seed * 17.0), w_hash(vec2(floor(c.y), seed * 37.0)), 0.45);
     lit = step(h, uLit) * g;
     litCol = vec3(0.9, 0.95, 1.0);
   } else if (style < 2.5) {
@@ -253,9 +254,19 @@ void facade(inout vec3 albedo, inout float rough, inout float metal, inout vec3 
   albedo = mix(wall, glassCol, glassMask);
   rough = mix(wallRough, 0.07, glassMask);
   metal = mix(metal, style < 0.5 ? 0.85 : 0.55, glassMask);
-  float on = lit * uNight;
-  float vary = 0.55 + 0.45 * w_hash(floor(uv / vec2(2.0, storey)) + seed * 41.0);
-  emis += litCol * on * vary * 0.85;
+  // Night windows. Up close each window is on or off, with its own colour
+  // (warm home, cool office, dim) and brightness; once windows shrink below a
+  // pixel the pattern turns into a soft glow in bands of floors, so distant
+  // towers read as buildings rather than pixel noise.
+  float farW = w_ss(0.3, 1.4, max(FW.x, FW.y));
+  float band = w_hash(vec2(floor(uv.y / (storey * 2.0)), seed * 57.0));
+  float farOn = clamp(uLit * (0.35 + 1.1 * band), 0.0, 1.0) * glassMask;
+  float on = mix(lit, farOn, farW) * uNight;
+  float hv = w_hash(floor(uv / vec2(1.7, storey)) + seed * 41.0);
+  vec3 tint = hv < 0.42 ? vec3(1.0, 0.78, 0.52) : (hv < 0.78 ? vec3(0.82, 0.9, 1.0) : vec3(0.55, 0.5, 0.42));
+  vec3 wc = mix(litCol, tint, 0.55);
+  float vary = 0.5 + 0.5 * fract(hv * 7.31);
+  emis += wc * on * vary * mix(0.62, 0.38, farW);
   albedo = mix(albedo, albedo * 0.4, on);
 }
 `;

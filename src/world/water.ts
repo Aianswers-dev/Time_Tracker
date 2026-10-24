@@ -39,6 +39,9 @@ export function buildWater(ctx: Ctx): void {
         {
           vec2 wp = vec2(vGPos.x, -vGPos.z);
           diffuseColor.rgb *= 0.85 + 0.3 * texture2D(uWaterN, wp / 400.0).b;
+          // at night: moonlit sky and city glow on the water, a touch brighter at grazing angles
+          float graze = 1.0 - abs(dot(normalize(vViewPosition), normal));
+          totalEmissiveRadiance += uNight * (vec3(0.018, 0.024, 0.034) + vec3(0.05, 0.04, 0.03) * graze * graze);
         }`,
       ],
     ],
