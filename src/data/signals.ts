@@ -18,7 +18,7 @@
  *
  * Pure data (no three.js): the world, the game and node checks use it alike.
  */
-import { RoadKind, type MapData, type Road } from '../types';
+import { RoadKind, type MapData, type Road, type Route } from '../types';
 import { heightsFor } from './height';
 
 export const SIGNAL_AMBER = 3.5;
@@ -27,9 +27,12 @@ export const SIGNAL_ALL_RED = 2;
 export type Light = 'green' | 'amber' | 'red';
 
 export interface SignalArm {
-  /** Unit vector pointing out of the junction (map coords). */
+  /** Unit vector pointing out of the junction (map coords): the road's own direction. */
   ux: number;
   uy: number;
+  /** Where the arm's road passes closest to the junction centre; the stop line is `stop` m from here along u. */
+  ox: number;
+  oy: number;
   /** Widest road on this arm (index into MapData.roads). */
   road: number;
   /** Road height near the junction (m AHD). */
@@ -42,7 +45,7 @@ export interface SignalArm {
   incoming: boolean;
   /** Phase index (into SignalJunction.phases) of incoming arms, -1 for exits. */
   phase: number;
-  /** Stop line distance from the junction centre. */
+  /** Stop line distance from (ox, oy) along the arm. */
   stop: number;
   /** Distance from the centre to where the arm goes into a tunnel (Infinity if it doesn't). */
   open: number;
@@ -330,7 +333,7 @@ export class SignalModel {
       if (!l) this.grid.set(key, (l = []));
       l.push(ji);
     }
-    this.coordinate();
+    this.coordinate(data.routes);
   }
 
   private buildJunction(roads: Road[], geo: RoadGeo[], segs: SegGrid, cx: number, cy: number, cz: number): SignalJunction {
@@ -369,7 +372,7 @@ export class SignalModel {
         ux /= l;
         uy /= l;
         const incoming = !r.oneway || dir === -1;
-        found.push({ ux, uy, road: ri, z: q.z, hw: r.width / 2, lanes: r.lanes, oneway: r.oneway, kind: r.kind, incoming, open, name: r.name });
+        found.push({ ux, uy, ox: p0.x, oy: p0.y, road: ri, z: q.z, hw: r.width / 2, lanes: r.lanes, oneway: r.oneway, kind: r.kind, incoming, open, name: r.name });
       }
     });
     // Merge arms pointing the same way (the widest road names the arm).
@@ -378,6 +381,8 @@ export class SignalModel {
       // (within ~30°: the two carriageways of a divided road, a slip lane beside its road)
       const m = arms.find((b) => a.ux * b.ux + a.uy * b.uy > 0.86);
       if (m) {
+        // (the stop line and heads go on the incoming carriageway)
+        if (!m.incoming && a.incoming) Object.assign(m, { ox: a.ox, oy: a.oy, road: a.road, z: a.z, hw: a.hw, lanes: a.lanes, oneway: a.oneway });
         m.incoming = m.incoming || a.incoming;
         m.open = Math.min(m.open, a.open);
       } else arms.push({ ...a, phase: -1, stop: 6 });
@@ -457,88 +462,204 @@ export class SignalModel {
   }
 
   /**
-   * Junctions within COORD_R of each other along a road run one cycle, the
-   * green for the road between them starting at the far one as traffic from
-   * the near one gets there: a short link is not held full by a red at its
-   * far end while its near end is green (busway junction pairs at Buranda,
-   * the two halves of a dual-carriageway crossing, offset T junctions).
+   * Junctions within COORD_R of each other run one cycle, the green for the
+   * link between them starting at the far one as traffic released at the near
+   * one gets there: a short link is not held full by a red at its far end
+   * while its near end is green (busway junction pairs at Buranda, the two
+   * halves of a dual-carriageway crossing, offset T junctions). The flow a
+   * pair is set for is the bus routes' through it (by trips), else the
+   * heaviest road feeding the link; a group is a maximum spanning tree.
    */
-  private coordinate(): void {
+  private coordinate(routes: readonly Route[]): void {
     const J = this.junctions;
     const ok = (j: SignalJunction) => j.phases.length >= 2;
-    // The phase at a feeding the road towards b, and the phase at b taking it from a.
-    const flow = (a: SignalJunction, b: SignalJunction): { pa: number; pb: number } | null => {
-      const d = Math.hypot(b.x - a.x, b.y - a.y);
-      const ux = (b.x - a.x) / d;
-      const uy = (b.y - a.y) / d;
-      let pa = -1;
-      let best = 0.8;
-      // (straight on from the arm opposite the one towards b)
-      for (const r of a.arms) {
-        const c = -(r.ux * ux + r.uy * uy);
-        if (r.incoming && r.phase >= 0 && c > best) {
-          best = c;
-          pa = r.phase;
-        }
-      }
-      let pb = -1;
-      best = 0.8;
-      for (const r of b.arms) {
-        const c = -(r.ux * ux + r.uy * uy);
-        if (r.incoming && r.phase >= 0 && c > best) {
-          best = c;
-          pb = r.phase;
-        }
-      }
-      if (pa < 0) {
-        // No straight-on feeder: the road's own arm at a.
-        best = 0.8;
-        for (const r of a.arms) {
-          const c = r.ux * ux + r.uy * uy;
-          if (r.incoming && r.phase >= 0 && c > best) {
-            best = c;
-            pa = r.phase;
-          }
-        }
-      }
-      return pa >= 0 && pb >= 0 ? { pa, pb } : null;
+    interface Link {
+      a: number;
+      b: number;
+      pa: number;
+      pb: number;
+      w: number;
+    }
+    const best = new Map<number, Link>();
+    const offer = (l: Link) => {
+      const key = Math.min(l.a, l.b) * 65536 + Math.max(l.a, l.b);
+      const cur = best.get(key);
+      if (!cur || l.w > cur.w) best.set(key, l);
     };
-    const near = (i: number): number[] => {
-      const j = J[i];
-      const out: number[] = [];
-      const gx = Math.floor(j.x / 60);
-      const gy = Math.floor(j.y / 60);
+    const near = (x: number, y: number, z: number, r: number): number => {
+      let bi = -1;
+      let bd = r;
+      const gx = Math.floor(x / 60);
+      const gy = Math.floor(y / 60);
       for (let oy = -1; oy <= 1; oy++) {
         for (let ox = -1; ox <= 1; ox++) {
           for (const k of this.grid.get((gx + ox) * 65536 + gy + oy) ?? []) {
-            const o = J[k];
-            if (k === i || !ok(o) || Math.abs(o.z - j.z) > LEVEL) continue;
-            if (Math.hypot(o.x - j.x, o.y - j.y) < COORD_R) out.push(k);
+            const j = J[k];
+            if (!ok(j) || Math.abs(j.z - z) > LEVEL) continue;
+            const d = Math.hypot(j.x - x, j.y - y);
+            if (d < bd) {
+              bd = d;
+              bi = k;
+            }
           }
         }
       }
-      return out;
+      return bi;
     };
-    const clear = SIGNAL_AMBER + SIGNAL_ALL_RED;
-    const seen = new Uint8Array(J.length);
-    for (let root = 0; root < J.length; root++) {
-      if (seen[root] || !ok(J[root])) continue;
-      // The group: junctions chained within COORD_R that share a road.
-      const order = [root];
-      const parent = new Map<number, { p: number; pa: number; pb: number }>();
-      seen[root] = 1;
-      for (let q = 0; q < order.length; q++) {
-        const a = order[q];
-        for (const b of near(a)) {
-          if (seen[b]) continue;
-          const f = flow(J[a], J[b]);
-          if (!f) continue;
-          seen[b] = 1;
-          parent.set(b, { p: a, ...f });
-          order.push(b);
+
+    // ---- the bus routes' flows: consecutive controlled junctions along each route
+    const at = (r: Route, s: number, o: { x: number; y: number; z: number }) => {
+      const cum = r.cum;
+      let lo = 0;
+      let hi = cum.length - 1;
+      while (hi - lo > 1) {
+        const m = (lo + hi) >> 1;
+        if (cum[m] <= s) lo = m;
+        else hi = m;
+      }
+      const t = Math.max(0, Math.min(1, (s - cum[lo]) / (cum[hi] - cum[lo] || 1)));
+      o.x = r.pts[2 * lo] + (r.pts[2 * hi] - r.pts[2 * lo]) * t;
+      o.y = r.pts[2 * lo + 1] + (r.pts[2 * hi + 1] - r.pts[2 * lo + 1]) * t;
+      o.z = r.z[lo] + (r.z[hi] - r.z[lo]) * t;
+      return o;
+    };
+    const p = { x: 0, y: 0, z: 0 };
+    const q = { x: 0, y: 0, z: 0 };
+    const flows = new Map<string, Link>();
+    for (const r of routes) {
+      if (r.cum.length < 2) continue;
+      // Visits: junction, and the route distance nearest its centre.
+      const visits: { j: number; s: number; d: number }[] = [];
+      for (let s = 0; s <= r.length; s += 4) {
+        at(r, s, p);
+        const k = near(p.x, p.y, p.z, 14);
+        if (k < 0) continue;
+        const d = Math.hypot(J[k].x - p.x, J[k].y - p.y);
+        const last = visits[visits.length - 1];
+        if (last && last.j === k) {
+          if (d < last.d) {
+            last.d = d;
+            last.s = s;
+          }
+        } else visits.push({ j: k, s, d });
+      }
+      // (asked as the guide and the AI buses ask: approachDir, then stateAt's junction and arm)
+      const sampler = (s2: number, o: { x: number; y: number }) => {
+        at(r, s2, q);
+        o.x = q.x;
+        o.y = q.y;
+      };
+      const phaseOf = (v: { j: number; s: number }) => {
+        const j = J[v.j];
+        const ad = this.approachDir(j.x, j.y, j.z, sampler, v.s);
+        if (!ad || this.junctionAt(ad.x, ad.y, ad.dx, ad.dy, j.z) !== v.j) return -1;
+        const arm = this.approachArm(v.j, ad.x, ad.y, ad.dx, ad.dy);
+        return arm >= 0 ? j.arms[arm].phase : -1;
+      };
+      for (let i = 1; i < visits.length; i++) {
+        const a = visits[i - 1];
+        const b = visits[i];
+        if (b.s - a.s > COORD_R + 30 || Math.hypot(J[a.j].x - J[b.j].x, J[a.j].y - J[b.j].y) >= COORD_R) continue;
+        const pa = phaseOf(a);
+        const pb = phaseOf(b);
+        if (pa < 0 || pb < 0) continue;
+        // (routes add up per direction and phase pair)
+        const fk = `${a.j},${b.j},${pa},${pb}`;
+        const f = flows.get(fk);
+        if (f) f.w += 100 + r.trips;
+        else flows.set(fk, { a: a.j, b: b.j, pa, pb, w: 100 + r.trips });
+      }
+    }
+    for (const f of flows.values()) offer(f);
+
+    // ---- elsewhere: the heaviest road feeding the link (straight on preferred)
+    const armW = (r: SignalArm) => (CLASS_W[r.kind] ?? 0.8) * (r.oneway ? r.lanes : r.lanes / 2 + 0.5);
+    const flow = (ai: number, bi: number): Link | null => {
+      const a = J[ai];
+      const b = J[bi];
+      const d = Math.hypot(b.x - a.x, b.y - a.y);
+      const ux = (b.x - a.x) / d;
+      const uy = (b.y - a.y) / d;
+      let fa: SignalArm | null = null;
+      let fw = 0;
+      for (const r of a.arms) {
+        const c = r.ux * ux + r.uy * uy;
+        // (not the link's own arm: its traffic comes from b)
+        if (!r.incoming || r.phase < 0 || c > 0.5) continue;
+        const w = armW(r) * (1 + Math.max(0, -c));
+        if (w > fw) {
+          fw = w;
+          fa = r;
         }
       }
-      if (order.length < 2) continue;
+      let pb = -1;
+      let bc = 0.8;
+      for (const r of b.arms) {
+        const c = -(r.ux * ux + r.uy * uy);
+        if (r.incoming && r.phase >= 0 && c > bc) {
+          bc = c;
+          pb = r.phase;
+        }
+      }
+      return fa && pb >= 0 ? { a: ai, b: bi, pa: fa.phase, pb, w: armW(fa) } : null;
+    };
+    J.forEach((ja, a) => {
+      if (!ok(ja)) return;
+      const gx = Math.floor(ja.x / 60);
+      const gy = Math.floor(ja.y / 60);
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          for (const b of this.grid.get((gx + ox) * 65536 + gy + oy) ?? []) {
+            const jb = J[b];
+            if (b <= a || !ok(jb) || Math.abs(jb.z - ja.z) > LEVEL || Math.hypot(jb.x - ja.x, jb.y - ja.y) >= COORD_R) continue;
+            if (best.has(a * 65536 + b)) continue;
+            const f = flow(a, b);
+            const r = flow(b, a);
+            if (f && (!r || f.w >= r.w)) offer(f);
+            else if (r) offer(r);
+          }
+        }
+      }
+    });
+
+    // ---- maximum spanning forest
+    const links = [...best.values()].sort((x, y) => y.w - x.w);
+    const root = new Int32Array(J.length).map((_, i) => i);
+    const find = (i: number): number => {
+      while (root[i] !== i) {
+        root[i] = root[root[i]];
+        i = root[i];
+      }
+      return i;
+    };
+    const adj = new Map<number, Link[]>();
+    for (const l of links) {
+      const ra = find(l.a);
+      const rb = find(l.b);
+      if (ra === rb) continue;
+      root[ra] = rb;
+      for (const k of [l.a, l.b]) {
+        let v = adj.get(k);
+        if (!v) adj.set(k, (v = []));
+        v.push(l);
+      }
+    }
+    const clear = SIGNAL_AMBER + SIGNAL_ALL_RED;
+    const seen = new Uint8Array(J.length);
+    for (const first of adj.keys()) {
+      if (seen[first]) continue;
+      const order = [first];
+      seen[first] = 1;
+      const via = new Map<number, Link>();
+      for (let i = 0; i < order.length; i++) {
+        for (const l of adj.get(order[i]) ?? []) {
+          const o = l.a === order[i] ? l.b : l.a;
+          if (seen[o]) continue;
+          seen[o] = 1;
+          via.set(o, l);
+          order.push(o);
+        }
+      }
       // One cycle (the longest), every phase's green stretched in proportion.
       const C = Math.max(...order.map((k) => J[k].cycle));
       for (const k of order) {
@@ -547,22 +668,24 @@ export class SignalModel {
         const P = j.phases.length;
         const sum = j.phases.reduce((t, ph) => t + ph.green, 0);
         const f = (C - P * clear) / sum;
-        let start = 0;
+        let st = 0;
         for (const ph of j.phases) {
-          ph.start = start;
+          ph.start = st;
           ph.green *= f;
-          start += ph.green + clear;
+          st += ph.green + clear;
         }
         j.cycle = C;
       }
-      // Offsets down the tree: the far end's green starts as traffic from the near end arrives.
+      // Offsets down the tree: b's green for the link starts as traffic released at a arrives.
+      const mod = (v: number) => ((v % C) + C) % C;
       for (const k of order) {
-        const e = parent.get(k);
-        if (!e) continue;
-        const a = J[e.p];
-        const b = J[k];
+        const l = via.get(k);
+        if (!l) continue;
+        const a = J[l.a];
+        const b = J[l.b];
         const delay = Math.hypot(b.x - a.x, b.y - a.y) / 12;
-        b.offset = (((b.phases[e.pb].start - a.phases[e.pa].start + a.offset - delay) % C) + C) % C;
+        if (k === l.b) b.offset = mod(b.phases[l.pb].start - a.phases[l.pa].start + a.offset - delay);
+        else a.offset = mod(a.phases[l.pa].start - b.phases[l.pb].start + b.offset + delay);
       }
     }
   }

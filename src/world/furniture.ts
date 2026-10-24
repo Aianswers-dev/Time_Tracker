@@ -163,16 +163,14 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
 
   junctions.forEach((jn, ji) => {
     if (!jn.phases.length) return;
-    const cx = jn.x;
-    const cy = jn.y;
     for (const a of jn.arms) {
       if (!a.incoming) continue;
       // Stop line clear of the widest other road, in the open (not inside a tunnel portal).
       const ds = Math.min(a.stop, a.open - 1);
       if (ds < 4) continue;
       const lift = infos[a.road].lift;
-      const sx = cx + a.ux * ds;
-      const sy = cy + a.uy * ds;
+      const sx = a.ox + a.ux * ds;
+      const sy = a.oy + a.uy * ds;
       const tx = -a.ux;
       const ty = -a.uy;
       const lx = -ty;
@@ -196,8 +194,8 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       }
       // far-side right pole (across the junction) for major roads
       if (a.kind <= RoadKind.Secondary) {
-        const fx = cx - a.ux * ds - lx * (a.oneway ? a.hw + 0.9 : 1.5);
-        const fy = cy - a.uy * ds - ly * (a.oneway ? a.hw + 0.9 : 1.5);
+        const fx = a.ox - a.ux * ds - lx * (a.oneway ? a.hw + 0.9 : 1.5);
+        const fy = a.oy - a.uy * ds - ly * (a.oneway ? a.hw + 0.9 : 1.5);
         if (index.penetrationZ(fx, fy, a.z, 3) < -0.3) {
           poles.push({ x: fx, y: fy, z: base, h: 4.6 });
           heads.push({ x: fx, y: fy, h: base + 3.4, fx: a.ux, fy: a.uy, j: ji, group });

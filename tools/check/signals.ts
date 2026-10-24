@@ -40,6 +40,7 @@ let arms = 0;
 let dead = 0;
 let conflicts = 0;
 let controlled = 0;
+let elsewhere = 0;
 const phaseCount = new Map<number, number>();
 for (const j of model.junctions) {
   phaseCount.set(j.phases.length, (phaseCount.get(j.phases.length) ?? 0) + 1);
@@ -47,11 +48,23 @@ for (const j of model.junctions) {
   controlled++;
   const inc = j.arms.filter((a) => a.incoming);
   const green = new Array(inc.length).fill(0);
+  // Sample each arm on its own road short of the stop line; where that point
+  // is another junction's (a road passing a wide junction's centre on its way
+  // to a neighbour), from the centre out along the arm instead.
+  const ji = model.junctions.indexOf(j);
+  const at = inc.map((a) => {
+    const d = Math.min(a.stop + 3, 20);
+    const x = a.ox + a.ux * d;
+    const y = a.oy + a.uy * d;
+    const k = model.junctionAt(x, y, -a.ux, -a.uy, a.z);
+    if (k === ji && j.arms[model.approachArm(k, x, y, -a.ux, -a.uy)] === a) return { x, y };
+    elsewhere++;
+    return { x: j.x + a.ux * d, y: j.y + a.uy * d };
+  });
   for (let t = 0; t < j.cycle; t += STEP) {
     const on: number[] = [];
     inc.forEach((a, i) => {
-      const d = Math.min(a.stop + 3, 20);
-      const st = model.stateAt(j.x + a.ux * d, j.y + a.uy * d, t, -a.ux, -a.uy, a.z);
+      const st = model.stateAt(at[i].x, at[i].y, t, -a.ux, -a.uy, a.z);
       if (st === 'green') {
         green[i]++;
         on.push(i);
@@ -76,7 +89,7 @@ for (const j of model.junctions) {
     }
   });
 }
-console.log(`junctions: ${controlled} controlled (phases: ${[...phaseCount].sort().map(([k, v]) => `${k}:${v}`).join(' ')}), ${arms} incoming arms, ${dead} never green, ${conflicts} conflicting-green samples`);
+console.log(`junctions: ${controlled} controlled (phases: ${[...phaseCount].sort().map(([k, v]) => `${k}:${v}`).join(' ')}), ${arms} incoming arms (${elsewhere} sampled from the centre), ${dead} never green, ${conflicts} conflicting-green samples`);
 if (dead || conflicts) fail++;
 
 // ---- 2. AI car graph
