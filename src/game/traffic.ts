@@ -114,6 +114,9 @@ function idm(v: number, v0: number, gap: number, vLead: number, s0: number): num
   return A * (free - (sStar / Math.max(0.05, gap)) ** 2);
 }
 
+/** Time gap (s) at which the player's bus claims the main road through an unsignalised junction. */
+const MAJOR_GAP = 6;
+
 export class Traffic {
   private active: AiBus[] = [];
   private pool = new Map<string, BusMesh[]>();
@@ -747,10 +750,14 @@ export class Traffic {
       if (jl[mid].s + jl[mid].boxR + len < s) lo = mid + 1;
       else hi = mid;
     }
-    for (let k = lo; k < jl.length && jl[k].s - s < 40; k++) {
+    // Side roads and merges give way to the player from MAJOR_GAP s away (a
+    // fixed 30 m was 1.5 s at busway speed: a bus merging from a station or a
+    // ramp had already committed and pulled out in front).
+    const ahead = Math.max(30, v * MAJOR_GAP);
+    for (let k = lo; k < jl.length && jl[k].s - s < ahead + 10; k++) {
       const j = jl[k];
       if (j.s + j.boxR + len < s) continue;
-      if (!j.sig && !j.minor && v > 1 && j.s - s < 30) this.cars.markMajor(j.node, time, PLAYER_HOLD);
+      if (!j.sig && !j.minor && v > 1 && j.s - s < ahead) this.cars.markMajor(j.node, time, PLAYER_HOLD);
       const inBox = s > j.s - j.boxR;
       const committed = v > 1 && j.stopS - s < (v * v) / (2 * 3) + 2;
       if (inBox || committed) this.cars.enter(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time + 0.5);
@@ -898,7 +905,7 @@ export class Traffic {
     while (b.jNext < jl.length && jl[b.jNext].stopS < b.s - 2) b.jNext++;
     const j = jl[b.jNext];
     if (j) {
-      if (!j.sig && !j.minor && j.s - b.s < 30) this.cars.markMajor(j.node, time, -1);
+      if (!j.sig && !j.minor && j.s - b.s < Math.max(30, b.v * 4)) this.cars.markMajor(j.node, time, -1);
       const stopAt = j.stopS - b.s;
       const commitDist = Math.max(3, (b.v * b.v) / (2 * 2.2)) + 2;
       if (stopAt < commitDist + 35) {
