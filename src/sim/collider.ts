@@ -960,7 +960,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
   // Tunnel tubes, exactly where src/world/roads.ts (buildTube) draws them: walls hw + 0.9 out, between
   // samples every 4 m; open toward any other carriageway at this level (shared halls with a flush
   // floor), with a short nose wall where an open side closes again; pushed out past the far edge of
-  // an underground platform beside the road; and where there is no ground over the tube (portal
+  // an underground platform beside the road (none at all at an island platform with another
+  // carriageway just beyond it: one shared hall); and where there is no ground over the tube (portal
   // approaches) an open cutting whose wall stands at the same line, up to just above the ground.
   // The world's tubes are 5.8 m high inside (6.4 m for motorways); the walls only need to reach above a
   // bus, and must stay below roads that cross a shallow tube closer than that.
@@ -1105,20 +1106,30 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       };
       const open = P0.map(nbAt);
       const segOpen = ss.slice(1).map((s1, k) => open[k] || open[k + 1] || nbAt(at((ss[k] + s1) / 2)));
-      const wo = P0.map((c) => {
+      // Underground platform beside the road: the wall stands past its far edge, unless another
+      // carriageway lies just beyond it (an island platform), where the two share one hall.
+      const platEdge = P0.map((c) => {
         let last = -1;
         for (let o = hw + 0.3; o < hw + 26; o += 0.5) {
           if (inTubePlatform(c.x + c.nx * side * o, c.y + c.ny * side * o)) last = o;
           else if (last >= 0 || o > hw + 8) break;
         }
-        return last >= 0 ? Math.max(wallOff, last + 1.2) : wallOff;
+        return last;
       });
+      const shared = P0.map((c, k) => {
+        const last = platEdge[k];
+        if (last < 0) return false;
+        for (let o = last + 0.5; o <= last + 8; o += 0.5) if (tubeNb(c.x + c.nx * side * o, c.y + c.ny * side * o, c.z, ri) > -0.5) return true;
+        return false;
+      });
+      const wo = platEdge.map((last, k) => (last >= 0 && !shared[k] ? Math.max(wallOff, last + 1.2) : wallOff));
       const P = (c: TubeAt, o: number): [number, number] => [c.x + c.nx * side * o, c.y + c.ny * side * o];
       for (let k = 0; k + 1 < ss.length; k++) {
         let A = P0[k];
         let B = P0[k + 1];
-        const isOpen = segOpen[k];
-        if (k > 0 && segOpen[k - 1] !== isOpen && cov[k]) {
+        // Shared segments are open like those toward a neighbouring carriageway.
+        const isOpen = segOpen[k] || shared[k] || shared[k + 1];
+        if (k > 0 && (segOpen[k - 1] || shared[k - 1] || shared[k]) !== isOpen && cov[k]) {
           // Nose wall sealing the wedge between two tubes where an open side closes.
           for (let o = wallOff + 0.5; o <= wallOff + 12; o += 0.5) {
             const [qx, qy] = P(A, o);

@@ -469,8 +469,13 @@ function tubeRules(): void {
       { pts: [0, -200, 0, -40, 0, 200], z: [10, 10, 10], width: 7.4, tunnel: true, kind: 7 },
       { pts: [0, -40, 200 * s10, -40 + 200 * c10], z: [10, 10], width: 7.4, tunnel: true, kind: 7 },
       { pts: [300, -200, 300, 200], z: [10, 10], width: 7.4, tunnel: true, kind: 7 },
+      { pts: [-300, -200, -300, 200], z: [10, 10], width: 7.4, tunnel: true, kind: 7 },
+      { pts: [-288, -200, -288, 200], z: [10, 10], width: 7.4, tunnel: true, kind: 7 },
     ],
-    platforms: [{ pts: [303.9, -30, 309, -30, 309, 30, 303.9, 30], underground: true }],
+    platforms: [
+      { pts: [303.9, -30, 309, -30, 309, 30, 303.9, 30], underground: true },
+      { pts: [-295.9, -30, -292.1, -30, -292.1, 30, -295.9, 30], underground: true },
+    ],
     ground: () => 30,
     bounds: [-400, -400, 400, 400],
   });
@@ -502,6 +507,9 @@ function tubeRules(): void {
   for (let i = 0; i < W.count; i++) if (W.road[i] === 2 && W.ax[i] > 300 && Math.abs(W.ay[i]) < 10) px = W.ax[i];
   check('tube: wall beside an underground platform stands past its far edge', px - 309, 0.4, 1.5, 'm');
   check('tube: wall away from the platform at the usual line', wallsAcross(2, 304.5, 304.7, 101), 1, 1, '');
+  // An island platform between two tubes 12 m apart: one shared hall, no wall either side of it.
+  check('tube: no wall beside an island platform (shared hall)', wallsAcross(3, -299, -289, 1) + wallsAcross(4, -299, -289, 1), 0, 0, '');
+  check('tube: walls between the two tubes again past the island platform', wallsAcross(3, -299, -289, 101) + wallsAcross(4, -299, -289, 101), 2, 2, '');
 }
 
 function grade(spec: BusSpec): void {

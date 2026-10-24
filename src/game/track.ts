@@ -782,7 +782,9 @@ export class RouteTrack {
           }
           const P = cands[k - 1];
           for (let q = 0; q < P.length; q++) {
-            const tr = P[q].road === L[j].road ? 0 : connected(P[q].road, L[j].road) ? 3 : 40;
+            // Staying on a road is free, carrying straight on to a connected one cheap, turning off costs.
+            const turn = 1 - (P[q].dx * L[j].dx + P[q].dy * L[j].dy);
+            const tr = P[q].road === L[j].road ? 0 : connected(P[q].road, L[j].road) ? 1 + turn * 15 : 40;
             const v = score[k - 1][q] + tr + L[j].cost;
             if (v < score[k][j]) {
               score[k][j] = v;
@@ -805,6 +807,10 @@ export class RouteTrack {
         pick[k] = cands[k][j] ?? null;
         j = back[k][j];
       }
+      const DBG = (globalThis as { TRACK_DEBUG?: string }).TRACK_DEBUG;
+      if (DBG === `${this.route.id}/${this.route.dir}`)
+        for (let k = 0; k < m; k++)
+          console.log(`run ${a}-${b} s ${(a + k) * TRACK_STEP} bad ${bad[a + k]} pick ${pick[k]?.road} cands ${cands[k].map((c) => `${c.road}:${c.cost.toFixed(1)}`).join(' ')}`);
       // Lane points on the matched carriageways (keeping a platform shift on the same road), eased in
       // and out over the run's margins.
       const px = new Float32Array(m);
