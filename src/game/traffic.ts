@@ -8,17 +8,16 @@ import * as THREE from 'three';
 import type { BusFactory, BusLights, BusMesh, BusPose, BusSpec, BusType, Collider, MapData, Route, WorldHandle } from '../types';
 import { wrapAngle } from '../data/coords';
 import { busTypeForRoute, stopUsage } from './routeMeta';
-import { TRACK_STEP, hasTrack, trackFor, type RouteTrack, type TrackSample } from './track';
+import { TRACK_STEP, hasTrack, trackFor, type RouteTrack, type TrackSample, type TrackSignal } from './track';
 import type { MapMarker } from './minimap';
 import { brighten, rng } from './util';
-import { CarTraffic } from './cars';
+import { CarTraffic, Wait, type BusJunction } from './cars';
+import { TRAFFIC_CAPS, defaultTrafficLevel, type TrafficLevel } from './trafficLevel';
 import { makeBody, type Body } from './bodies';
 import { session } from './session';
+import { buildPlatforms } from './platforms';
 
-const RADIUS = 1500;
-const DESPAWN = 1800;
 const VIEW_DIST = 950;
-const MAX_BUSES = 48;
 const LOOK_MAX = 40;
 
 const enum State {
@@ -52,9 +51,18 @@ interface AiBus {
   sigState: 'green' | 'amber' | 'red' | null;
   sigTimer: number;
   sigCommit: boolean;
-  stuck: number;
-  ghost: number;
+  /** Mid-block signals on the route (junction signals go through the reservations). */
+  mids: TrackSignal[];
+  /** Junctions on the route, the next one to commit to, and the ones we hold. */
+  jl: BusJunction[];
+  jNext: number;
+  holds: number[];
+  /** Bus id we are waiting behind (for the crossing tie-break), else 0. */
   obstacle: number;
+  wait: Wait;
+  exempt: boolean;
+  idle: number;
+  dead: boolean;
   body: Body;
   pose: BusPose;
   lights: BusLights;
@@ -114,7 +122,23 @@ export class Traffic {
   private playerSpec: BusSpec | null = null;
   private markersOut: MapMarker[] = [];
   private costEma = 0.5;
-  private maxActive = MAX_BUSES;
+  private level: TrafficLevel = defaultTrafficLevel();
+  private capBuses = TRAFFIC_CAPS[this.level].buses;
+  private maxActive = this.capBuses;
+  private radius = 1100;
+  private byId = new Map<number, AiBus>();
+  private mids = new WeakMap<RouteTrack, TrackSignal[]>();
+  private bodiesOut: Body[] = [];
+  private exemptOut: boolean[] = [];
+  /** Dev: simulate the traffic this many times per frame (?tff=N). */
+  private ffSteps = 1;
+  private ffExtra = 0;
+  /** Dev: seconds to pre-simulate once the population is up (?twarm=S). */
+  private warm = 0;
+  /** Despawn counters (diagnostics). */
+  readonly stats = { overlapDespawns: 0, stuckDespawns: 0 };
+  /** Recent safety-valve events (diagnostics). */
+  readonly events: string[] = [];
   private costTimer = 0;
   private hours = 12;
   private created = 0;
@@ -134,8 +158,17 @@ export class Traffic {
     this.buildQueue = [...data.routes].sort((a, b) => b.trips - a.trips);
     this.scheduleBuild();
     this.cars = new CarTraffic(scene, data, world);
+    buildPlatforms(scene, data);
     session.traffic = this;
     session.world = world;
+    try {
+      const q = new URLSearchParams(location.search);
+      this.ffSteps = Math.max(1, Math.min(40, Math.round(Number(q.get('tff') ?? 1)) || 1));
+      this.warm = Math.max(0, Math.min(600, Number(q.get('twarm') ?? 0) || 0));
+    } catch {
+      /* no location (tests) */
+    }
+    this.setLevel(this.level);
     this.prewarm();
   }
 
@@ -154,7 +187,7 @@ export class Traffic {
   private prioritise(x: number, y: number): void {
     const near: Route[] = [];
     const far: Route[] = [];
-    for (const r of this.buildQueue) (this.routeNear(r, x, y, RADIUS + 300) ? near : far).push(r);
+    for (const r of this.buildQueue) (this.routeNear(r, x, y, this.radius + 300) ? near : far).push(r);
     this.buildQueue = [...near, ...far];
   }
 
@@ -171,7 +204,7 @@ export class Traffic {
 
   /** Rebuild the spawn candidates incrementally (a slice of routes per call). */
   private refreshCandidates(px: number, py: number, all: boolean): void {
-    const R2 = RADIUS * RADIUS;
+    const R2 = this.radius * this.radius;
     const routes = this.data.routes;
     if (this.candCursor === 0) this.candNext = [];
     const end = all ? routes.length : Math.min(routes.length, this.candCursor + 60);
@@ -264,7 +297,7 @@ export class Traffic {
     list.push(b.mesh);
   }
 
-  private spawn(c: Candidate, px: number, py: number, camera: THREE.Camera | null): boolean {
+  private spawn(c: Candidate, px: number, py: number): boolean {
     const r = c.route;
     const s = c.inside[Math.floor(this.rand() * c.inside.length)] + (this.rand() - 0.5) * 36;
     if (s < 30 || s > r.length - 60) return false;
@@ -272,13 +305,15 @@ export class Traffic {
     const dx = this.tmp.x - px;
     const dy = this.tmp.y - py;
     const d = Math.hypot(dx, dy);
-    if (d > RADIUS) return false;
+    if (d > this.radius) return false;
     if (this.initial ? d < 45 : d < 120) return false;
-    if (!this.initial && camera && d < 500) {
+    if (!this.initial && d < 500) {
       this.sphere.center.set(this.tmp.x, 2, -this.tmp.y);
       this.sphere.radius = 14;
       if (this.frustum.intersectsSphere(this.sphere)) return false;
     }
+    // Never spawn in or right before a junction box.
+    for (const j of this.cars.junctionsAlong(c.track)) if (Math.abs(j.s - s) < j.boxR + 22) return false;
     // Keep clear of other buses on the same stretch.
     for (const o of this.active) {
       const b = o.body;
@@ -318,9 +353,15 @@ export class Traffic {
       sigState: null,
       sigTimer: 0,
       sigCommit: false,
-      stuck: 0,
-      ghost: 0,
+      mids: this.midSignals(c.track),
+      jl: this.cars.junctionsAlong(c.track),
+      jNext: 0,
+      holds: [],
       obstacle: 0,
+      wait: Wait.None,
+      exempt: false,
+      idle: 0,
+      dead: false,
       body: makeBody(nb),
       pose: {
         x: 0,
@@ -340,7 +381,8 @@ export class Traffic {
       turnSign: 0,
     };
     b.serve = this.decideServe(b);
-    while (b.sigIdx < c.track.signals.length && c.track.signals[b.sigIdx].s < s) b.sigIdx++;
+    while (b.sigIdx < b.mids.length && b.mids[b.sigIdx].s < s) b.sigIdx++;
+    while (b.jNext < b.jl.length && b.jl[b.jNext].stopS < s + 2) b.jNext++;
     this.updateBody(b);
     this.active.push(b);
     return true;
@@ -401,67 +443,51 @@ export class Traffic {
    * Advance the AI. `hours` (optional) switches headlights on at night.
    * Call after the player's physics so the player's pose is current.
    */
+  /** Traffic density: 'off', 'light' (default) or 'normal'. */
+  setLevel(level: TrafficLevel): void {
+    this.level = level;
+    const caps = TRAFFIC_CAPS[level];
+    this.capBuses = caps.buses;
+    this.maxActive = Math.min(Math.max(this.maxActive, 1), caps.buses);
+    if (level !== 'off' && this.maxActive < Math.min(18, caps.buses)) this.maxActive = Math.min(18, caps.buses);
+    this.radius = level === 'normal' ? 1400 : 1100;
+    this.cars.setCaps(caps.cars, caps.carRadius);
+    this.cars.enabled = caps.cars > 0;
+    this.candTimer = 0;
+  }
+
+  get trafficLevel(): TrafficLevel {
+    return this.level;
+  }
+
+  /**
+   * Advance the AI. `hours` (optional) switches headlights on at night.
+   * Call after the player's physics so the player's pose is current.
+   */
   update(dt: number, timeSeconds: number, player: BusPose, camera: THREE.Camera, hours?: number): void {
     const t0 = performance.now();
     if (hours !== undefined) this.hours = hours;
     else if (session.hours !== null) this.hours = session.hours;
-    const px = player.x;
-    const py = player.y;
-    this.updatePlayerBody(player);
+    if (session.trafficLevel && session.trafficLevel !== this.level) this.setLevel(session.trafficLevel);
     camera.updateMatrixWorld();
     this.projScreen.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     this.frustum.setFromProjectionMatrix(this.projScreen);
     const cam = camera.position;
 
-    if (this.initial && !this.candidates.length) {
-      this.prioritise(px, py);
+    for (let k = 0; k < this.ffSteps; k++) {
+      if (k > 0) this.ffExtra += dt;
+      this.simulate(dt, timeSeconds + this.ffExtra, player);
     }
-    this.candTimer -= dt;
-    if (this.candCursor !== 0 || this.candTimer <= 0) {
-      if (this.candCursor === 0) this.candTimer = this.candidates.length ? 2 : 0.5;
-      this.refreshCandidates(px, py, !this.candidates.length);
-    }
-
-    // Despawn far away / finished buses.
-    for (let i = this.active.length - 1; i >= 0; i--) {
-      const b = this.active[i];
-      const d = Math.hypot(b.body.fx - px, b.body.fy - py);
-      const done = b.state === State.Terminus && b.dwell <= 0 && (!b.visible || b.dwell < -20);
-      if (d > DESPAWN || done || i >= this.maxActive + 4) {
-        this.release(b);
-        this.active.splice(i, 1);
+    if (this.warm > 0 && !this.initial) {
+      // Dev fast-forward: run the traffic for a while without drawing it.
+      const steps = Math.round(this.warm * 20);
+      this.warm = 0;
+      for (let k = 0; k < steps; k++) {
+        this.ffExtra += 0.05;
+        this.simulate(0.05, timeSeconds + this.ffExtra, player);
       }
     }
-
-    // Spawn to keep the population up.
-    this.spawnTimer -= dt;
-    if (this.spawnTimer <= 0 && this.candidates.length) {
-      this.spawnTimer = this.initial ? 0 : 0.35;
-      let sumW = 0;
-      for (const c of this.candidates) sumW += c.weight;
-      const desired = Math.min(this.maxActive, Math.max(6, Math.round(sumW / 300)));
-      let tries = this.initial ? 60 : 6;
-      let made = 0;
-      const maxMade = this.initial ? 10 : 2;
-      while (this.active.length < desired && tries-- > 0 && made < maxMade) {
-        let pick = this.rand() * sumW;
-        let c = this.candidates[0];
-        for (const cc of this.candidates) {
-          pick -= cc.weight;
-          if (pick <= 0) {
-            c = cc;
-            break;
-          }
-        }
-        if (this.spawn(c, px, py, camera)) made++;
-      }
-      // Populate freely (even in view) until the background track builder has caught up.
-      if (this.initial && !this.buildQueue.length && (this.active.length >= desired || tries <= 0)) this.initial = false;
-    }
-
-    // Simulate.
-    for (const b of this.active) this.step(b, dt, timeSeconds);
-    for (const b of this.active) this.updateBody(b);
+    const time = timeSeconds + this.ffExtra;
 
     // Visuals (frustum + distance culled).
     for (const b of this.active) {
@@ -484,23 +510,133 @@ export class Traffic {
       if (!vis) continue;
       this.pose(b, dt);
       b.mesh.setPose(b.pose);
-      b.mesh.setLights(b.lights, timeSeconds);
+      b.mesh.setLights(b.lights, time);
       b.mesh.setDoors(b.door);
     }
-
-    this.cars.update(dt, timeSeconds, player, this.playerBody, this.active.map((b) => b.body), this.frustum, cam, this.hours);
+    this.cars.render(this.frustum, cam, this.hours);
 
     // Adaptive cap keeps the AI inside its frame budget.
     const cost = performance.now() - t0;
     this.lastCostMs = cost;
-    this.costEma += (cost - this.costEma) * 0.05;
+    this.costEma += (cost / this.ffSteps - this.costEma) * 0.05;
     this.costTimer -= dt;
     if (this.costTimer <= 0) {
       this.costTimer = 1;
-      if (this.costEma > 1.6 && this.maxActive > 18) this.maxActive--;
-      else if (this.costEma < 1.0 && this.maxActive < MAX_BUSES) this.maxActive++;
+      if (this.costEma > 1.4 && this.maxActive > 12) this.maxActive--;
+      else if (this.costEma < 0.9 && this.maxActive < this.capBuses) this.maxActive++;
+      if (this.maxActive > this.capBuses) this.maxActive = this.capBuses;
     }
     if (this.buildQueue.length) this.scheduleBuild();
+  }
+
+  /** One simulation step of the buses and cars (no drawing). */
+  private simulate(dt: number, time: number, player: BusPose): void {
+    const px = player.x;
+    const py = player.y;
+    this.updatePlayerBody(player);
+
+    if (this.initial && !this.candidates.length) this.prioritise(px, py);
+    this.candTimer -= dt;
+    if (this.candCursor !== 0 || this.candTimer <= 0) {
+      if (this.candCursor === 0) this.candTimer = this.candidates.length ? 2 : 0.5;
+      this.refreshCandidates(px, py, !this.candidates.length);
+    }
+
+    // Despawn far away / finished / stuck buses.
+    for (let i = this.active.length - 1; i >= 0; i--) {
+      const b = this.active[i];
+      const d = Math.hypot(b.body.fx - px, b.body.fy - py);
+      const done = b.state === State.Terminus && b.dwell <= 0 && (!b.visible || b.dwell < -20);
+      const stuck = b.idle > (b.visible ? 45 : 25);
+      if (stuck) {
+        this.stats.stuckDespawns++;
+        const j = b.jl[b.jNext];
+        this.events.push(`bus ${b.route.id} stuck wait ${b.wait} obst ${b.obstacle} s ${b.s.toFixed(0)} next j ${j ? `${j.node} stop ${(j.stopS - b.s).toFixed(1)} sig ${j.sig} minor ${j.minor}` : '-'} holds ${b.holds.length}`);
+        if (this.events.length > 30) this.events.shift();
+      }
+      if (b.dead || d > this.radius + 300 || done || stuck || i >= this.maxActive + 4) this.removeBus(i);
+    }
+
+    // Spawn to keep the population up.
+    this.spawnTimer -= dt;
+    if (this.spawnTimer <= 0 && this.candidates.length && this.capBuses > 0) {
+      this.spawnTimer = this.initial ? 0 : 0.35;
+      let sumW = 0;
+      for (const c of this.candidates) sumW += c.weight;
+      const desired = Math.min(this.maxActive, Math.max(6, Math.round(sumW / 300)));
+      let tries = this.initial ? 60 : 6;
+      let made = 0;
+      const maxMade = this.initial ? 10 : 2;
+      while (this.active.length < desired && tries-- > 0 && made < maxMade) {
+        let pick = this.rand() * sumW;
+        let c = this.candidates[0];
+        for (const cc of this.candidates) {
+          pick -= cc.weight;
+          if (pick <= 0) {
+            c = cc;
+            break;
+          }
+        }
+        if (this.spawn(c, px, py)) made++;
+      }
+      // Populate freely (even in view) until the background track builder has caught up.
+      if (this.initial && !this.buildQueue.length && (this.active.length >= desired || tries <= 0)) this.initial = false;
+    } else if (this.capBuses === 0 && this.initial && !this.buildQueue.length) this.initial = false;
+
+    this.byId.clear();
+    for (const b of this.active) this.byId.set(b.id, b);
+    for (const b of this.active) this.step(b, dt, time);
+    for (const b of this.active) this.updateBody(b);
+
+    // Safety valve: a bus that has driven into another bus is removed (the one behind).
+    for (const a of this.active) {
+      if (a.dead) continue;
+      const fx = a.body.fx;
+      const fy = a.body.fy;
+      for (const o of this.active) {
+        if (o === a || o.dead) continue;
+        if (Math.abs(o.body.fx - fx) > o.len + 6 || Math.abs(o.body.fy - fy) > o.len + 6) continue;
+        const body = o.body;
+        let hit = false;
+        for (let q = 0; q < body.n && !hit; q++) hit = Math.hypot(body.x[q] - fx, body.y[q] - fy) < 1.6;
+        if (hit) {
+          a.dead = true;
+          this.stats.overlapDespawns++;
+          this.events.push(`bus overlap ${a.route.id} into ${o.route.id} v ${a.v.toFixed(1)}/${o.v.toFixed(1)}`);
+          break;
+        }
+      }
+    }
+
+    const bodies = this.bodiesOut;
+    const exempt = this.exemptOut;
+    bodies.length = 0;
+    exempt.length = 0;
+    for (const b of this.active) {
+      if (b.dead) continue;
+      bodies.push(b.body);
+      exempt.push(b.exempt);
+    }
+    this.cars.simulate(dt, time, player, this.playerBody, bodies, exempt, this.frustum);
+  }
+
+  private removeBus(i: number): void {
+    const b = this.active[i];
+    for (const q of b.holds) this.cars.leave(b.jl[q].node, -b.id);
+    b.holds.length = 0;
+    this.release(b);
+    this.active.splice(i, 1);
+  }
+
+  /** Mid-block signals of a route: the ones not at a managed junction. */
+  private midSignals(track: RouteTrack): TrackSignal[] {
+    let m = this.mids.get(track);
+    if (!m) {
+      const jl = this.cars.junctionsAlong(track);
+      m = track.signals.filter((sg) => !jl.some((j) => Math.abs(j.s - sg.s) < 30));
+      this.mids.set(track, m);
+    }
+    return m;
   }
 
   private step(b: AiBus, dt: number, time: number): void {
@@ -510,11 +646,15 @@ export class Traffic {
     const stops = b.route.stops;
     const lights = b.lights;
     lights.headlights = this.hours < 6.6 || this.hours > 17.9;
+    this.refreshHolds(b, time);
 
     if (b.state === State.Dwell || b.state === State.Terminus) {
       b.v = 0;
       b.a = 0;
       b.dwell -= dt;
+      b.wait = Wait.None;
+      b.exempt = true;
+      b.idle = 0;
       const opening = b.dwellTotal - b.dwell > 0.8 && b.dwell > 2.4;
       b.door = Math.max(0, Math.min(1, b.door + (opening ? dt : -dt) / 1.4));
       lights.brake = true;
@@ -533,14 +673,25 @@ export class Traffic {
     // Free-road speed from the track profile.
     const v0 = tr.vmaxAt(b.s + Math.min(10, b.v * 0.8));
     let acc = idm(b.v, v0, Infinity, 0, 2);
-    let obstacle = 0;
+    const wt: { why: Wait; ref: number } = { why: Wait.None, ref: 0 };
+    const lim = (a: number, w: Wait, ref = 0) => {
+      if (a < acc) {
+        acc = a;
+        wt.why = w;
+        wt.ref = ref;
+      }
+    };
 
     // Next stop.
     const st = stops[b.nextStop];
     if (st) {
-      const gap = st.s - b.s;
+      // At a busway platform the front bay is the target; queued behind
+      // another bus inside the platform we serve the bay we are at.
+      const zone = tr.stops[b.nextStop]?.zone;
+      const gap = (zone ? zone.s1 - 1.5 : st.s) - b.s;
+      const atBay = !!zone && b.s > zone.s0 + 10 && b.s < zone.s1 + 1 && b.v < 0.3 && b.wait === Wait.Bus;
       if (b.serve) {
-        if (gap < 1.2 && b.v < 0.35) {
+        if ((gap < 1.2 && b.v < 0.35) || atBay) {
           b.state = State.Dwell;
           b.dwellTotal = b.dwell = 9 + this.rand() * 11;
           b.v = 0;
@@ -553,7 +704,7 @@ export class Traffic {
         b.serve = this.decideServe(b);
       }
     }
-    if (b.s >= L - 1.5) {
+    if (b.s >= L - 3 && b.v < 0.6) {
       b.state = State.Terminus;
       b.dwellTotal = b.dwell = 8;
       b.v = 0;
@@ -565,27 +716,55 @@ export class Traffic {
     if (time - b.departT < 6 && (!st || st.s - b.s > 45 || !b.serve)) b.pullTarget = 0;
     b.pull += Math.max(-dt * 0.45, Math.min(dt * 0.45, b.pullTarget - b.pull));
 
-    // Signals.
-    const sig = tr.signals[b.sigIdx];
+    // Junctions: same reservations as the cars (signal, box, exit room).
+    const jl = b.jl;
+    while (b.jNext < jl.length && jl[b.jNext].stopS < b.s - 2) b.jNext++;
+    const j = jl[b.jNext];
+    if (j) {
+      if (!j.sig && !j.minor && j.s - b.s < 30) this.cars.markMajor(j.node, time, -1);
+      const stopAt = j.stopS - b.s;
+      const commitDist = Math.max(3, (b.v * b.v) / (2 * 2.2)) + 2;
+      if (stopAt < commitDist + 35) {
+        // Junctions closer together than our length are taken in one go.
+        let res = this.junctionOk(b, j, stopAt, time);
+        let k = b.jNext + 1;
+        while (res === Wait.None && k < jl.length && jl[k].s - j.s < j.boxR + jl[k].boxR + b.len) {
+          res = this.junctionOk(b, jl[k], stopAt + (jl[k].stopS - j.stopS), time);
+          k++;
+        }
+        if (res !== Wait.None) lim(idm(b.v, v0, Math.max(0.05, stopAt), 0, 0.8), res);
+        else if (stopAt <= commitDist) {
+          for (let q = b.jNext; q < k; q++) {
+            const jq = jl[q];
+            this.cars.enter(jq.node, -b.id, jq.inX, jq.inY, jq.outX, jq.outY, jq.cls, time + 4);
+            b.holds.push(q);
+          }
+          b.jNext = k;
+        }
+      }
+    }
+
+    // Mid-block signals (pedestrian lights).
     const signalAt = this.world.signalStateAt;
-    if (sig) {
+    const mids = b.mids;
+    while (b.sigIdx < mids.length && mids[b.sigIdx].s < b.s - 1) {
+      b.sigIdx++;
+      b.sigState = null;
+      b.sigCommit = false;
+    }
+    const sig = mids[b.sigIdx];
+    if (sig && signalAt) {
       const gap = sig.s - b.s;
-      if (gap < -1) {
-        b.sigIdx++;
-        b.sigState = null;
-        b.sigCommit = false;
-      } else if (signalAt && gap < 80) {
+      if (gap < 80) {
         b.sigTimer -= dt;
         if (b.sigTimer <= 0 || b.sigState === null) {
           b.sigTimer = 0.25;
-          b.sigState = signalAt.call(this.world, sig.x, sig.y, time);
+          tr.sample(sig.s, this.tmp2);
+          b.sigState = signalAt.call(this.world, sig.x, sig.y, time, this.tmp2.hx, this.tmp2.hy);
         }
         const stopDist = (b.v * b.v) / (2 * 2.6);
         if (b.sigState === 'red' || (b.sigState === 'amber' && !b.sigCommit && gap > stopDist + 1)) {
-          if (!b.sigCommit) {
-            acc = Math.min(acc, idm(b.v, v0, gap, 0, 1.0));
-            obstacle = -1;
-          }
+          if (!b.sigCommit) lim(idm(b.v, v0, gap, 0, 1.0), Wait.Red);
         } else if (gap < 6) b.sigCommit = true;
       }
     }
@@ -605,58 +784,53 @@ export class Traffic {
     let bestGap = Infinity;
     let bestV = 0;
     let bestId = 0;
+    let bestKind: Wait = Wait.None;
     const reach = look + 30;
     const consider = (o: Body, id: number, other: AiBus | null) => {
       if (Math.abs(o.fx - bodyF.fx) > reach || Math.abs(o.fy - bodyF.fy) > reach) return;
       const rel = wrapAngle(o.heading - bodyF.heading);
       const crossing = Math.abs(rel) > 0.9 && Math.abs(rel) < 2.4;
-      if (other && crossing) {
-        if (b.ghost > 0) return;
-        // Two buses waiting on each other: the older id goes first.
-        if (other.obstacle === b.id && other.id < b.id) return;
-      }
+      // Two buses waiting on each other across a junction: the older id goes first.
+      if (other && crossing && other.obstacle === b.id && other.id < b.id) return;
       for (let k = 0; k < ns; k++) {
         const d = 1.5 + k * 2.5;
         if (d > bestGap) return;
-        for (let j = 0; j < o.n; j++) {
-          const ex = o.x[j] - ax[k];
-          const ey = o.y[j] - ay[k];
+        for (let q = 0; q < o.n; q++) {
+          const ex = o.x[q] - ax[k];
+          const ey = o.y[q] - ay[k];
           if (ex * ex + ey * ey < 3.4) {
             bestGap = d;
             bestV = Math.max(0, o.speed * Math.cos(rel));
             bestId = id;
+            bestKind = other ? Wait.Bus : Wait.Player;
             return;
           }
         }
       }
     };
-    for (const o of this.active) if (o !== b) consider(o.body, o.id, o);
-    consider(this.playerBody, -1, null);
+    for (const o of this.active) if (o !== b && !o.dead) consider(o.body, o.id, o);
+    consider(this.playerBody, -2, null);
     for (let k = 0; k < ns; k++) {
       const d = 1.5 + k * 2.5;
       if (d >= bestGap) break;
-      const cv = this.cars.probe(ax[k], ay[k], 1.9);
-      if (cv >= 0) {
+      const car = this.cars.carAt(ax[k], ay[k], 1.9);
+      if (car >= 0) {
         bestGap = d;
-        bestV = cv;
-        bestId = 0;
+        bestV = Math.max(0, this.cars.probe(ax[k], ay[k], 1.9));
+        bestId = car;
+        bestKind = Wait.Car;
         break;
       }
     }
-    if (bestGap < Infinity) {
-      acc = Math.min(acc, idm(b.v, v0, Math.max(0.05, bestGap - 1.2), bestV, 2.2));
-      obstacle = bestId;
-    }
-    b.obstacle = obstacle;
-
-    // Deadlock watchdog: if stuck behind another AI for a long time, squeeze past.
-    if (b.v < 0.2 && obstacle > 0) b.stuck += dt;
-    else b.stuck = Math.max(0, b.stuck - dt * 2);
-    if (b.stuck > 10) {
-      b.ghost = 4;
-      b.stuck = 0;
-    }
-    if (b.ghost > 0) b.ghost -= dt;
+    if (bestGap < Infinity) lim(idm(b.v, v0, Math.max(0.05, bestGap - 1.2), bestV, 2.2), bestKind, bestId);
+    const why = wt.why;
+    b.obstacle = why === Wait.Bus ? wt.ref : 0;
+    b.wait = why;
+    b.exempt =
+      why === Wait.Red ||
+      why === Wait.Player ||
+      (why === Wait.Bus && (this.byId.get(wt.ref)?.exempt ?? false)) ||
+      (why === Wait.Car && this.cars.isExempt(wt.ref));
 
     acc = Math.max(-6.5, Math.min(1.2, acc));
     b.a = acc;
@@ -665,6 +839,9 @@ export class Traffic {
     const i = Math.max(0, Math.min(tr.n - 2, Math.floor(b.s / TRACK_STEP)));
     const segLen = Math.hypot(tr.x[i + 1] - tr.x[i], tr.y[i + 1] - tr.y[i]) / TRACK_STEP;
     b.s += (b.v * dt) / Math.max(0.4, Math.min(1.6, segLen || 1));
+    // Safety valve: stationary for a long time without a good reason.
+    if (b.v < 0.3 && !b.exempt) b.idle += dt;
+    else b.idle = 0;
 
     // Lights and indicators.
     lights.brake = acc < -0.45 || b.v < 0.1;
@@ -681,6 +858,38 @@ export class Traffic {
     b.turnSign = Math.abs(turn) > 0.6 ? Math.sign(turn) : 0;
     lights.indicatorLeft = !!pullingIn || b.turnSign < 0;
     lights.indicatorRight = (!pullingIn && pullingOut) || (b.turnSign > 0 && !pullingIn);
+  }
+
+  /** Keep reservations alive while the bus is in a box; release ones its tail has cleared. */
+  private refreshHolds(b: AiBus, time: number): void {
+    for (let k = b.holds.length - 1; k >= 0; k--) {
+      const j = b.jl[b.holds[k]];
+      if (b.s - b.len > j.s + j.boxR) {
+        this.cars.leave(j.node, -b.id);
+        b.holds.splice(k, 1);
+      } else this.cars.enter(j.node, -b.id, j.inX, j.inY, j.outX, j.outY, j.cls, time + 4);
+    }
+  }
+
+  /** May this bus go through junction `j` (stop line `stopAt` ahead) now? */
+  private junctionOk(b: AiBus, j: BusJunction, stopAt: number, time: number): Wait {
+    if (j.sig) {
+      const st = this.cars.signalFor(j.node, j.inX, j.inY, time);
+      if (st === 'red') return Wait.Red;
+      if (st === 'amber' && stopAt > (b.v * b.v) / (2 * 3)) return Wait.Red;
+    } else if (this.cars.giveWayBusy(j.node, j.minor, time)) return Wait.Junction;
+    if (!this.cars.boxClear(j.node, -b.id, j.inX, j.inY, j.outX, j.outY, j.cls, time)) return Wait.Junction;
+    // Room on the far side for the bus to get out of the box.
+    b.track.sample(j.s + j.boxR + 4, this.tmp2, 0);
+    const x = this.tmp2.x;
+    const y = this.tmp2.y;
+    if (this.cars.slowCarNear(x, y, 1.8)) return Wait.Junction;
+    for (const o of this.active) {
+      if (o === b || o.dead || o.v > 2) continue;
+      const body = o.body;
+      for (let q = 0; q < body.n; q++) if (Math.hypot(body.x[q] - x, body.y[q] - y) < 2.2) return Wait.Junction;
+    }
+    return Wait.None;
   }
 
   private pose(b: AiBus, dt: number): void {

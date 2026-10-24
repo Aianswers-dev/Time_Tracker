@@ -5,6 +5,7 @@ import { RoadKind, type MapData, type Route } from '../types';
 import { pointAlong, wrapAngle } from '../data/coords';
 import { drivable, roadIndexFor, speedLimitOf } from './roadIndex';
 import { isStationStop } from './routeMeta';
+import { matchStopPlatform, type PlatformZone } from './platforms';
 
 export const TRACK_STEP = 4;
 
@@ -24,13 +25,23 @@ export interface TrackStop {
   station: boolean;
   /** Distance from the lane centre to the kerb at the stop (left, metres). */
   kerb: number;
+  /** Busway platform the stop is served from: any bay along [s0, s1] will do. */
+  zone: PlatformZone | null;
 }
+
+/** Lane centre this far from a platform edge puts the bus side ~0.35 m off it. */
+const PLATFORM_LANE = 1.6;
 
 export interface TrackSignal {
   /** Stop line distance along the route. */
   s: number;
   x: number;
   y: number;
+}
+
+function smooth01(t: number): number {
+  const c = Math.max(0, Math.min(1, t));
+  return c * c * (3 - 2 * c);
 }
 
 function median7(src: Float32Array): Float32Array {
@@ -180,9 +191,33 @@ export class RouteTrack {
     for (let i = 0; i < n; i++) {
       const off = Math.max(-3, Math.min(8, tS[i]));
       this.offset[i] = off;
-      this.x[i] = bx[i] + nx[i] * off;
-      this.y[i] = by[i] + ny[i] * off;
       this.kerb[i] = Math.max(1.3, Math.min(6, kS[i] - off));
+    }
+    // Busway platforms: the lane hugs the platform edge so buses pull right alongside.
+    const zones = route.stops.map((_, k) => matchStopPlatform(data, route, k));
+    for (const z of zones) {
+      if (!z) continue;
+      const edgeAt = (s: number) => z.edge[Math.max(0, Math.min(z.edge.length - 1, Math.round((s - z.s0) / z.step)))];
+      // Ease in and out over a distance that keeps the swerve gentle (~1 m sideways per 5 m).
+      const shift = Math.abs(edgeAt(z.s0) - PLATFORM_LANE - this.offset[Math.max(0, Math.min(n - 1, Math.round(z.s0 / TRACK_STEP)))]);
+      const lead = Math.max(30, shift * 5);
+      const tail = Math.max(25, shift * 4);
+      const i0 = Math.max(0, Math.floor((z.s0 - lead - 5) / TRACK_STEP));
+      const i1 = Math.min(n - 1, Math.ceil((z.s1 + tail) / TRACK_STEP));
+      for (let i = i0; i <= i1; i++) {
+        const s = i * TRACK_STEP;
+        const w = s < z.s0 ? smooth01((s - (z.s0 - lead - 5)) / lead) : s > z.s1 ? 1 - smooth01((s - z.s1) / tail) : 1;
+        if (w <= 0) continue;
+        const want = edgeAt(s) - PLATFORM_LANE;
+        const kerbNow = this.kerb[i] + this.offset[i];
+        this.offset[i] += (want - this.offset[i]) * w;
+        this.kerb[i] += (Math.max(PLATFORM_LANE, kerbNow - this.offset[i]) - this.kerb[i]) * w;
+        if (s >= z.s0 && s <= z.s1) this.kerb[i] = PLATFORM_LANE;
+      }
+    }
+    for (let i = 0; i < n; i++) {
+      this.x[i] = bx[i] + nx[i] * this.offset[i];
+      this.y[i] = by[i] + ny[i] * this.offset[i];
     }
     // Tangents from the lane itself.
     this.tx = new Float32Array(n);
@@ -233,7 +268,8 @@ export class RouteTrack {
     // Stops.
     this.stops = route.stops.map((st, index) => {
       const i = Math.max(0, Math.min(n - 1, Math.round(st.s / TRACK_STEP)));
-      return { index, s: st.s, station: isStationStop(data.stops[st.stop].name), kerb: this.kerb[i] };
+      const zone = zones[index];
+      return { index, s: st.s, station: !!zone || isStationStop(data.stops[st.stop].name), kerb: this.kerb[i], zone };
     });
     // Signals near the GTFS line, deduped per intersection.
     const grid = signalGrid(data);

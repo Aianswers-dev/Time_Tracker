@@ -1,10 +1,15 @@
 """Extract TransLink bus routes that run through the inner city.
 
-Input:  tools/data/raw/SEQ_GTFS.zip (TransLink SEQ GTFS, unpacked to raw/gtfs)
+Input:  tools/data/raw/SEQ_GTFS.zip (TransLink SEQ GTFS, unpacked to raw/gtfs),
+        public/data/roads.json + terrain.bin from build_osm.py
 Output: public/data/routes.json
 
 For each route and direction we keep the most common shape, clip it to the
-longest stretch inside the map, and attach the stops served along it.
+longest stretch inside the map, and attach the stops served along it. Each
+route vertex gets a height "z" (decimetres AHD) by matching the route onto the
+solved roads at a continuous height (elevation.RoadHeights), so a route
+through the busway tunnels stays underground and one on a viaduct stays up;
+each stop gets the route height at its position.
 """
 
 import collections
@@ -14,7 +19,11 @@ import os
 import sys
 import zipfile
 
+import numpy as np
 from shapely.geometry import LineString, Point
+
+import build_terrain
+import elevation
 
 from common import OUT, RAW, in_bbox, project, q
 
@@ -119,6 +128,13 @@ def main():
             stops_out.append({"n": s["stop_name"].strip(), "c": s["stop_code"], "x": q(x), "y": q(y)})
         return stop_index[sid]
 
+    with open(os.path.join(OUT, "roads.json")) as f:
+        heights = elevation.RoadHeights(json.load(f)["roads"])
+    inner, outer, _ = build_terrain.read_terrain()
+    ground = build_terrain.ground_sampler(inner, outer)
+    stop_z: dict[int, list[float]] = collections.defaultdict(list)
+    off_road = []
+
     out = []
     for (short, direction), (sid, freq) in sorted(chosen.items(), key=lambda kv: (kv[0][0].zfill(6), kv[0][1])):
         line = clipped.get(sid)
@@ -148,10 +164,15 @@ def main():
             t0 = stops[0][2]
             for st in stops:
                 st[2] -= t0
-        coords = list(line.simplify(0.4).coords)
-        flat: list[int] = []
-        for x, y in coords:
-            flat += [q(x), q(y)]
+        dense = elevation.densify(np.asarray(line.coords), 4.0)
+        z, off = heights.match(dense, ground)
+        off_road.append(off)
+        cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(dense, axis=0).T))])
+        for st in stops:
+            stop_z[st[0]].append(float(np.interp(st[1] * 0.1, cum, z)))
+        keep = elevation.simplify3d(dense, z, 0.4, elevation.ROUTE_ZTOL)
+        flat = elevation.flat(dense[keep])
+        zq = [q(v) for v in z[keep]]
         out.append(
             {
                 "id": short,
@@ -164,9 +185,14 @@ def main():
                 "trips": freq,
                 "len": round(line.length),
                 "p": flat,
+                "z": zq,
                 "stops": stops,
             }
         )
+
+    for k, zs in stop_z.items():
+        stops_out[k]["z"] = q(float(np.median(zs)))
+    print(f"route heights: {100 * float(np.mean(off_road)):.1f}% of samples off the mapped roads", file=sys.stderr)
 
     os.makedirs(OUT, exist_ok=True)
     path = os.path.join(OUT, "routes.json")

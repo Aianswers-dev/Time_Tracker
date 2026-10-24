@@ -7,11 +7,13 @@ import { pointAlong, projectOnto } from '../data/coords';
 import { drivable, roadIndexFor, speedLimitOf } from './roadIndex';
 import { trackFor, type RouteTrack, type TrackSample } from './track';
 import { computeTurns, shortStreet, type TurnHint } from './turns';
-import { isStationStop, stopDisplayName, stopNumber, stopUsage } from './routeMeta';
-import { flagAtlas, partsGroup, plateGeometry, poleParts, shelterParts, signMaterial, stationGroup, SIGN_H, SIGN_W, type Part } from './stops3d';
+import { isStationStop, stopDisplayName, stopNumber } from './routeMeta';
+import { flagAtlas, partsGroup, plateGeometry, poleParts, signMaterial, SIGN_H, SIGN_W } from './stops3d';
+import { buildPlatforms, type PlatformZone } from './platforms';
 import { NextStopMarker, Ribbon } from './ribbon';
-import { brighten, hashString } from './util';
+import { brighten } from './util';
 import { session } from './session';
+import { heightAt } from './height';
 
 export const enum StopStatus {
   Pending = 0,
@@ -117,10 +119,12 @@ interface StopPlace {
   heading: number;
   kerb: number;
   station: boolean;
+  /** Busway platform zone (serve at any bay along it), or null for a kerbside stop. */
+  zone: PlatformZone | null;
 }
 
 function frame(x: number, y: number, heading: number, out: THREE.Object3D): void {
-  out.position.set(x, 0, -y);
+  out.position.set(x, heightAt(x, y), -y);
   out.rotation.set(0, -heading, 0);
 }
 
@@ -207,21 +211,24 @@ export class RouteGuide {
       ribbonVisible: true,
       signal: null,
     };
+    // The flag stands a few metres ahead of the stop (the world puts a shelter at the stop itself).
     this.places = this.track.stops.map((ts) => {
-      this.track.sample(ts.s, this.tmp);
+      const z = ts.zone;
+      this.track.sample(z ? (z.s0 + z.s1) / 2 : ts.s + 3, this.tmp);
       const lx = -this.tmp.hy;
       const ly = this.tmp.hx;
-      const off = ts.kerb + (ts.station ? 0.05 : 0.6);
-      return { x: this.tmp.x + lx * off, y: this.tmp.y + ly * off, heading: this.tmp.heading, kerb: ts.kerb, station: ts.station };
+      const kerb = z ? this.track.kerbAt((z.s0 + z.s1) / 2) : ts.kerb;
+      const off = kerb + (z ? 1.4 : 0.6);
+      return { x: this.tmp.x + lx * off, y: this.tmp.y + ly * off, heading: this.tmp.heading, kerb, station: ts.station, zone: z };
     });
     // Seed the projection window at the start stop (loop routes start where they end).
-    const s0 = Math.max(route.stops[0] ? route.stops[0].s : 0, this.busLength + 2);
+    const s0 = this.startS();
     this.state.s = s0;
     this.segI = pointAlong(route.pts, route.cum, s0).i;
     this.group.name = 'route-guide';
     scene.add(this.group);
+    buildPlatforms(scene, data);
     this.buildRouteStops();
-    this.buildCityStops();
     this.ribbon = new Ribbon(scene, this.track, this.color);
     this.marker = new NextStopMarker(scene, this.track, this.color);
     this.onKey = (e: KeyboardEvent) => {
@@ -236,109 +243,53 @@ export class RouteGuide {
 
   private buildRouteStops(): void {
     const data = this.data;
-    const usage = stopUsage(data);
     const stopIdx = this.route.stops.map((s) => s.stop);
     const atlas = flagAtlas(data, stopIdx, false);
     const signMat = signMaterial(atlas.tex);
     const pole = poleParts();
-    this.route.stops.forEach((rs, i) => {
+    this.route.stops.forEach((_rs, i) => {
       const p = this.places[i];
-      const name = data.stops[rs.stop].name;
-      if (p.station) {
-        const g = stationGroup(name);
-        // Platform centred a little behind the stopping point.
-        this.track.sample(rs.s - 9, this.tmp);
-        const lx = -this.tmp.hy;
-        const ly = this.tmp.hx;
-        frame(this.tmp.x + lx * (p.kerb + 0.05), this.tmp.y + ly * (p.kerb + 0.05), this.tmp.heading, g);
-        this.group.add(g);
-        return;
-      }
+      // Busway platforms carry their own bay flags (see platforms.ts).
+      if (p.zone) return;
       const g = partsGroup(pole);
       const plate = new THREE.Mesh(plateGeometry(atlas.uv[i]), signMat);
       plate.position.set(SIGN_W / 2 + 0.03, 3.15 - SIGN_H / 2 - 0.05, 0);
       g.add(plate);
       frame(p.x, p.y, p.heading, g);
       this.group.add(g);
-      if (usage[rs.stop] > 220) {
-        const sh = partsGroup(shelterParts(hashString(name)));
-        this.track.sample(rs.s - 6, this.tmp);
-        const lx = -this.tmp.hy;
-        const ly = this.tmp.hx;
-        const off = p.kerb + 0.9 + 0.95;
-        frame(this.tmp.x + lx * off, this.tmp.y + ly * off, this.tmp.heading, sh);
-        this.group.add(sh);
-      }
     });
-  }
-
-  /** Cheap instanced poles (and shelters at busy stops) for every other stop in the city. */
-  private buildCityStops(): void {
-    const data = this.data;
-    const idx = roadIndexFor(data);
-    const usage = stopUsage(data);
-    const own = this.route.stops.map((s) => data.stops[s.stop]);
-    const seen = new Set<string>();
-    const poles: THREE.Matrix4[] = [];
-    const shelters: THREE.Matrix4[] = [];
-    const o = new THREE.Object3D();
-    data.stops.forEach((st, si) => {
-      const key = `${Math.round(st.x / 3)},${Math.round(st.y / 3)}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      if (isStationStop(st.name)) return;
-      for (const s of own) if (Math.abs(s.x - st.x) < 8 && Math.abs(s.y - st.y) < 8) return;
-      const hit = idx.nearest(st.x, st.y, 25, undefined, 0, drivable);
-      let x = st.x;
-      let y = st.y;
-      let heading = 0;
-      if (hit) {
-        const road = data.roads[hit.road];
-        const tx = hit.side > 0 ? hit.dx : -hit.dx;
-        const ty = hit.side > 0 ? hit.dy : -hit.dy;
-        const half = road.oneway ? road.width / 2 : Math.max(3.2, road.width / 2);
-        const off = half + 0.6;
-        x = hit.px - ty * off;
-        y = hit.py + tx * off;
-        heading = Math.atan2(tx, ty);
-      }
-      frame(x, y, heading, o);
-      o.updateMatrix();
-      poles.push(o.matrix.clone());
-      if (usage[si] > 300 && hit) {
-        const [hx, hy] = [Math.sin(heading), Math.cos(heading)];
-        const off = 0.9 + 0.95;
-        frame(x - hy * off + hx * 6, y + hx * off + hy * 6, heading, o);
-        o.updateMatrix();
-        shelters.push(o.matrix.clone());
-      }
-    });
-    const generic = flagAtlas(data, [0], true);
-    const parts: Part[] = [...poleParts(), { geo: plateGeometry(generic.uv[0]).translate(SIGN_W / 2 + 0.03, 3.15 - SIGN_H / 2 - 0.05, 0), mat: signMaterial(generic.tex) }];
-    const addInstanced = (ps: Part[], ms: THREE.Matrix4[]) => {
-      if (!ms.length) return;
-      for (const p of ps) {
-        const im = new THREE.InstancedMesh(p.geo, p.mat, ms.length);
-        ms.forEach((m, i) => im.setMatrixAt(i, m));
-        im.instanceMatrix.needsUpdate = true;
-        im.computeBoundingSphere();
-        this.group.add(im);
-      }
-    };
-    addInstanced(parts, poles);
-    addInstanced(shelterParts(1), shelters);
   }
 
   // -------------------------------------------------------------------------
 
   /** Where the player's bus should start: map x/y of the FRONT of the bus and heading. */
   startPose(): { x: number; y: number; heading: number } {
-    const first = this.route.stops[0];
-    const s = Math.min(this.route.length - 1, Math.max(first ? first.s : 0, this.busLength + 2));
+    const s = this.startS();
     const kerb = this.track.kerbAt(s);
     const pull = Math.max(0, kerb - 1.7);
     this.track.sample(s, this.tmp, pull);
     return { x: this.tmp.x, y: this.tmp.y, heading: this.tmp.heading };
+  }
+
+  /** Start of the stretch where the front of the bus counts as being at stop i. */
+  private zoneFrom(i: number): number {
+    const z = this.places[i]?.zone;
+    const s = this.route.stops[i].s;
+    return z ? Math.min(z.s0, s) - 2 : s - 15;
+  }
+
+  /** End of the stretch where the front of the bus counts as being at stop i. */
+  private zoneTo(i: number): number {
+    const z = this.places[i]?.zone;
+    const s = this.route.stops[i].s;
+    return z ? Math.max(z.s1, s) + 4 : s + 18;
+  }
+
+  /** Route distance of the front of the bus at the start (first stop; front bay of a platform). */
+  private startS(): number {
+    const first = this.track.stops[0];
+    const want = first ? (first.zone ? first.zone.s1 - 1 : first.s) : 0;
+    return Math.min(this.route.length - 1, Math.max(want, this.busLength + 2));
   }
 
   toggleRibbon(on?: boolean): void {
@@ -464,7 +415,7 @@ export class RouteGuide {
       this.initialised = true;
       // Stops behind the start are skipped; the stop we start at is the departure stop.
       for (let i = 0; i < stops.length; i++) {
-        if (Math.abs(stops[i].s - st.s) < 20 && this.departIndex < 0) {
+        if ((Math.abs(stops[i].s - st.s) < 20 || (st.s >= this.zoneFrom(i) && st.s <= this.zoneTo(i))) && this.departIndex < 0) {
           this.departIndex = i;
           break;
         }
@@ -508,7 +459,7 @@ export class RouteGuide {
       break;
     }
     // Missed: we are well past the stop without serving it.
-    if (next >= 0 && st.s > stops[next].s + 22 && !st.offRoute) {
+    if (next >= 0 && st.s > this.zoneTo(next) + 18 && !st.offRoute) {
       st.stopStatus[next] = StopStatus.Missed;
       st.stopsMissed++;
       this.emit('missed', `Missed stop: ${stopDisplayName(this.data.stops[stops[next].stop].name)}`);
@@ -521,7 +472,7 @@ export class RouteGuide {
     // Departure delta for the stop we just served, measured as we leave it.
     if (this.dwellIndex >= 0) {
       const ds = stops[this.dwellIndex];
-      if (st.s > ds.s + 16 || (Math.abs(speed) > 2 && !doorsOpen)) {
+      if (st.s > this.zoneTo(this.dwellIndex) || (Math.abs(speed) > 2 && !doorsOpen)) {
         const delta = st.shiftTime - (ds.t - this.departT);
         this.servedDeltas.push(delta);
         this.dwellIndex = -1;
@@ -531,8 +482,8 @@ export class RouteGuide {
     st.canServe = false;
     if (next >= 0) {
       const ns = stops[next];
-      const along = st.s - ns.s;
-      st.atStop = along > -15 && along < 18 && pr.dist < 14;
+      // Kerbside: front within ~15 m of the flag. Platform: alongside any bay.
+      st.atStop = st.s >= this.zoneFrom(next) && st.s <= this.zoneTo(next) && pr.dist < 14;
       st.canServe = st.atStop && Math.abs(speed) < 0.5;
       if (st.canServe && doorsOpen && st.shiftStarted) {
         st.stopStatus[next] = StopStatus.Served;
@@ -554,7 +505,8 @@ export class RouteGuide {
         st.nextStopStation = isStationStop(s.name);
         st.nextStopDue = stops[next].t - this.departT;
         const p = this.places[next];
-        this.marker.setStop(stops[next].s, p.x, p.y);
+        if (p.zone) this.marker.setStop(p.zone.s1 + 1, p.x, p.y, p.zone.s0 - 1);
+        else this.marker.setStop(stops[next].s, p.x, p.y);
       } else {
         st.nextStopName = '';
         st.nextStopNumber = '';
@@ -563,7 +515,7 @@ export class RouteGuide {
         this.marker.setStop(null, 0, 0);
       }
     }
-    st.nextStopDistance = next >= 0 ? stops[next].s - st.s : Infinity;
+    st.nextStopDistance = next < 0 ? Infinity : this.places[next].zone ? Math.max(0, this.places[next].zone!.s0 - st.s) : stops[next].s - st.s;
 
     // Timetable delta.
     if (st.shiftStarted) {
@@ -609,7 +561,8 @@ export class RouteGuide {
       this.sigTimer -= dt;
       if (this.sigTimer <= 0 || this.sigState === null) {
         this.sigTimer = 0.2;
-        this.sigState = world.signalStateAt(sg.x, sg.y, this.time);
+        this.track.sample(sg.s, this.tmp);
+        this.sigState = world.signalStateAt(sg.x, sg.y, this.time, this.tmp.hx, this.tmp.hy);
       }
       st.signal = this.sigState ? { distance: Math.max(0, sg.s - st.s), state: this.sigState } : null;
     } else st.signal = null;

@@ -1,10 +1,14 @@
 """Extract the Brisbane inner-city map from the BBBike OSM extract.
 
-Input:  tools/data/raw/Brisbane.osm.pbf
-Output: public/data/roads.json, buildings.json, areas.json
+Input:  tools/data/raw/Brisbane.osm.pbf, the terrain tiles (build_terrain.py)
+Output: public/data/roads.json, buildings.json, areas.json, terrain.bin,
+        terrain.json
 
 All coordinates are decimetre integers in world space (see common.py), stored
-as flat [x0, y0, x1, y1, ...] arrays.
+as flat [x0, y0, x1, y1, ...] arrays. Roads and rail are collected at full
+resolution with their OSM node ids; elevation.build() solves their heights
+(adding the per-vertex "z" arrays, decimetres AHD) before they are clipped to
+the map and simplified, and writes the terrain.
 """
 
 import json
@@ -13,10 +17,11 @@ import re
 import sys
 
 import osmium
-from shapely.geometry import LineString, Polygon, MultiPolygon, box
+from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
 from shapely.validation import make_valid
 
+import elevation
 from common import OUT, RAW, bounds_xy, in_bbox, project, q
 
 PBF = os.path.join(RAW, "Brisbane.osm.pbf")
@@ -65,6 +70,18 @@ BUILDING_KIND = {
     "museum": 5, "parking": 7, "roof": 8,
 }
 
+# Corrections to OSM tags, by way id, applied before anything else reads the
+# tags (keys set to None are removed). Use this when a bridge, tunnel or
+# layer tag on a busway/motorway corridor is wrong or missing and the height
+# solve therefore puts a structure at the wrong level; give the reason. The
+# busway corridors (M1, M2, 222) and the motorways were audited with
+# elevation_preview.py and needed none; mis-shared nodes where a street
+# passes through a tunnel or bridge are handled generally by
+# elevation._split_nodes().
+TAG_OVERRIDES: dict[int, dict[str, str | None]] = {
+    # 123456789: {"tunnel": "yes", "layer": "-2"},  # example: reason
+}
+
 NUM = re.compile(r"[-+]?\d*\.?\d+")
 
 
@@ -110,8 +127,7 @@ def simplify_ring(coords, tol=0.3):
 class Handler(osmium.SimpleHandler):
     def __init__(self):
         super().__init__()
-        self.roads: list[dict] = []
-        self.rail: list[dict] = []
+        self.lines: list[elevation.Line] = []  # roads and rail, full resolution
         self.buildings: list[dict] = []
         self.areas: list[dict] = []
         self.signals: list[int] = []
@@ -151,6 +167,13 @@ class Handler(osmium.SimpleHandler):
     # Ways (roads, rail) ----------------------------------------------------
     def way(self, w):
         tags = w.tags
+        if w.id in TAG_OVERRIDES:
+            tags = {k: v for k, v in tags}
+            for k, v in TAG_OVERRIDES[w.id].items():
+                if v is None:
+                    tags.pop(k, None)
+                else:
+                    tags[k] = v
         if is_bus_platform(tags) and not w.is_closed():
             try:
                 pts = [(nd.lon, nd.lat) for nd in w.nodes]
@@ -170,6 +193,8 @@ class Handler(osmium.SimpleHandler):
         if len(pts) < 2 or not any(in_bbox(lon, lat, 0.002) for lon, lat in pts):
             return
         xy = [project(lon, lat) for lon, lat in pts]
+        nodes = [nd.ref for nd in w.nodes]
+        layer_tag = num(tags.get("layer"))
 
         if hw in ROAD_KIND:
             if hw == "service" and tags.get("service") in ("driveway", "parking_aisle", "drive-through", "emergency_access"):
@@ -188,6 +213,7 @@ class Handler(osmium.SimpleHandler):
             elif oneway == "-1":
                 ow = 1
                 xy.reverse()
+                nodes.reverse()
             if not ow and kind in (5, 6) and tags.get("lanes") is None:
                 lanes = 2 if kind == 5 else 1
             width = num(tags.get("width"))
@@ -198,48 +224,55 @@ class Handler(osmium.SimpleHandler):
             bridge = 1 if tags.get("bridge") not in (None, "no") else 0
             tunnel = tags.get("tunnel")
             tun = 1 if tunnel in ("yes", "culvert", "covered") else 0
-            layer = num(tags.get("layer")) or 0
-            geom = LineString(xy).intersection(CLIP_PAD)
-            for part in getattr(geom, "geoms", [geom]):
-                if part.is_empty or not isinstance(part, LineString) or part.length < 1:
-                    continue
-                coords = list(part.simplify(0.25).coords)
-                road = {
-                    "k": kind,
-                    "w": round(width, 1),
-                    "l": lanes,
-                    "p": flat(coords),
-                }
-                nm = self.name(tags.get("name") or tags.get("ref"))
-                if nm >= 0:
-                    road["n"] = nm
-                if ow:
-                    road["o"] = 1
-                if bridge:
-                    road["b"] = 1
-                if tun:
-                    road["t"] = 1
-                if layer:
-                    road["y"] = int(layer)
-                ms = num(tags.get("maxspeed"))
-                if ms and 5 <= ms <= 130:
-                    road["ms"] = int(ms)
-                if hw.endswith("_link"):
-                    road["lk"] = 1
-                if hw == "busway" or kind == 7:
-                    road["bus"] = 1
-                self.roads.append(road)
+            layer = layer_tag or 0
+            # "p" (and "z") are filled in by elevation.build() after the height solve
+            road = {
+                "k": kind,
+                "w": round(width, 1),
+                "l": lanes,
+                "p": None,
+            }
+            label = tags.get("name") or tags.get("ref")
+            nm = self.name(label)
+            if nm >= 0:
+                road["n"] = nm
+            if ow:
+                road["o"] = 1
+            if bridge:
+                road["b"] = 1
+            if tun:
+                road["t"] = 1
+            if layer:
+                road["y"] = int(layer)
+            ms = num(tags.get("maxspeed"))
+            if ms and 5 <= ms <= 130:
+                road["ms"] = int(ms)
+            if hw.endswith("_link"):
+                road["lk"] = 1
+            if hw == "busway" or kind == 7:
+                road["bus"] = 1
+            self.lines.append(
+                elevation.Line(
+                    id=w.id, nodes=nodes, xy=xy, kind=kind, bridge=bool(bridge),
+                    # covered roads and building passages stay at grade
+                    tunnel=tunnel == "yes", layer=int(layer), has_layer=layer_tag is not None,
+                    link=hw.endswith("_link"), emit=True, meta=road,
+                    name=tags.get("bridge:name") or label or "",
+                )
+            )
         elif rw in ("rail", "light_rail", "subway", "narrow_gauge") and tags.get("service") not in ("yard", "siding", "spur"):
-            geom = LineString(xy).intersection(CLIP_PAD)
-            for part in getattr(geom, "geoms", [geom]):
-                if part.is_empty or not isinstance(part, LineString) or part.length < 1:
-                    continue
-                r = {"p": flat(part.simplify(0.5).coords)}
-                if tags.get("bridge") not in (None, "no"):
-                    r["b"] = 1
-                if tags.get("tunnel") not in (None, "no"):
-                    r["t"] = 1
-                self.rail.append(r)
+            r = {"p": None}
+            if tags.get("bridge") not in (None, "no"):
+                r["b"] = 1
+            if tags.get("tunnel") not in (None, "no"):
+                r["t"] = 1
+            self.lines.append(
+                elevation.Line(
+                    id=w.id, nodes=nodes, xy=xy, kind=elevation.RAIL, bridge="b" in r,
+                    tunnel=tags.get("tunnel") == "yes", layer=int(layer_tag or 0), has_layer=layer_tag is not None,
+                    link=False, emit=True, meta=r, name=tags.get("bridge:name") or tags.get("name") or "",
+                )
+            )
 
     # Areas (buildings, water, parks) --------------------------------------
     def area(self, a):
@@ -376,7 +409,7 @@ def main():
     print("reading", PBF, file=sys.stderr)
     h.apply_file(PBF, locations=True, idx="flex_mem")
 
-    print(f"roads {len(h.roads)} rail {len(h.rail)} buildings {len(h.buildings)} areas {len(h.areas)} water {len(h.water_polys)}", file=sys.stderr)
+    print(f"road and rail ways {len(h.lines)} buildings {len(h.buildings)} areas {len(h.areas)} water {len(h.water_polys)}", file=sys.stderr)
 
     water = unary_union(h.water_polys).intersection(CLIP_PAD) if h.water_polys else None
     water_out = []
@@ -389,6 +422,19 @@ def main():
                     entry["h"] = [flat(r.coords[:-1]) for r in p.interiors if Polygon(r).area > 20]
                 water_out.append(entry)
 
+    # Heights: terrain cleaning, the road/rail solve, terrain.bin, building bases.
+    roads, rail = elevation.build(h.lines, water_out, h.buildings, h.areas, CLIP_PAD.bounds)
+    print(f"roads {len(roads)} rail {len(rail)}", file=sys.stderr)
+    # keep only the names of roads that survived clipping, in order of first use
+    remap: dict[int, int] = {}
+    names: list[str] = []
+    for r in roads:
+        if "n" in r:
+            if r["n"] not in remap:
+                remap[r["n"]] = len(names)
+                names.append(h.names[r["n"]])
+            r["n"] = remap[r["n"]]
+
     os.makedirs(OUT, exist_ok=True)
     bx0, by0, bx1, by1 = bounds_xy()
     meta = {
@@ -396,7 +442,7 @@ def main():
         "scale": 0.1,
     }
     with open(os.path.join(OUT, "roads.json"), "w") as f:
-        json.dump({**meta, "names": h.names, "roads": h.roads, "rail": h.rail, "signals": h.signals, "crossings": h.crossings}, f, separators=(",", ":"))
+        json.dump({**meta, "names": names, "roads": roads, "rail": rail, "signals": h.signals, "crossings": h.crossings}, f, separators=(",", ":"))
     with open(os.path.join(OUT, "buildings.json"), "w") as f:
         json.dump({**meta, "buildings": h.buildings}, f, separators=(",", ":"))
     with open(os.path.join(OUT, "areas.json"), "w") as f:

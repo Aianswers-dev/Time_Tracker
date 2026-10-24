@@ -29,6 +29,8 @@ export interface Junction {
   gA: number;
   gB: number;
   offset: number;
+  /** Arms (unit vectors pointing out of the junction) and their phase group. */
+  arms?: { ux: number; uy: number; g: number }[];
 }
 
 export type Light = 'green' | 'amber' | 'red';
@@ -161,7 +163,13 @@ interface Arm {
 export interface Signals {
   junctions: Junction[];
   grid: IdGrid;
-  stateAt(x: number, y: number, t: number): Light | null;
+  /**
+   * State for the junction nearest (x, y). With a travel direction (dirX, dirY)
+   * the approach group comes from the direction of travel, which is exact;
+   * otherwise it is guessed from the bearing of (x, y) from the junction centre
+   * (ambiguous for points at the centre or on a corner).
+   */
+  stateAt(x: number, y: number, t: number, dirX?: number, dirY?: number): Light | null;
 }
 
 export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: RoadIndex }, progress: (f: number) => void): Promise<Signals> {
@@ -294,7 +302,17 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
     const usable = cycle - 2 * (AMBER + ALL_RED);
     const gA = hasB ? usable * (main.kind <= RoadKind.Primary ? 0.62 : 0.55) : cycle - 20;
     const gB = hasB ? usable - gA : 0;
-    const jn: Junction = { x: cx, y: cy, ax: main.ux, ay: main.uy, cycle, gA, gB, offset: hash2(cx, cy, 71) * cycle };
+    const jn: Junction = {
+      x: cx,
+      y: cy,
+      ax: main.ux,
+      ay: main.uy,
+      cycle,
+      gA,
+      gB,
+      offset: hash2(cx, cy, 71) * cycle,
+      arms: armsJ.map((a) => ({ ux: a.ux, uy: a.uy, g: groupOf(a) })),
+    };
     const ji = junctions.length;
     junctions.push(jn);
 
@@ -710,7 +728,7 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
   return {
     junctions,
     grid,
-    stateAt(x: number, y: number, t: number): Light | null {
+    stateAt(x: number, y: number, t: number, dirX?: number, dirY?: number): Light | null {
       let best = -1;
       let bd = 40;
       grid.query(x - 40, y - 40, x + 40, y + 40, (i) => {
@@ -722,9 +740,26 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       });
       if (best < 0) return null;
       const j = junctions[best];
-      const dx = x - j.x;
-      const dy = y - j.y;
+      let dx = x - j.x;
+      let dy = y - j.y;
+      if (dirX !== undefined && dirY !== undefined && (dirX !== 0 || dirY !== 0)) {
+        // The approach arm is the one pointing back along the travel direction:
+        // use that arm's group so the answer matches its signal heads exactly.
+        let bestDot = 0.5;
+        let g = -1;
+        for (const a of j.arms ?? []) {
+          const d = -(a.ux * dirX + a.uy * dirY);
+          if (d > bestDot) {
+            bestDot = d;
+            g = a.g;
+          }
+        }
+        if (g >= 0) return phaseState(j, g, t);
+        dx = -dirX;
+        dy = -dirY;
+      }
       const l = Math.hypot(dx, dy) || 1;
+      // Same rule as the heads: arms within ~45° of the main axis are group 0.
       const group = Math.abs((dx * j.ax + dy * j.ay) / l) > 0.7 ? 0 : 1;
       return phaseState(j, group, t);
     },

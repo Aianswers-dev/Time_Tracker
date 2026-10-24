@@ -83,6 +83,40 @@
 .bbs-top .bbs-spacer {
   flex: 1;
 }
+.bbs-traffic {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(8, 20, 38, 0.7);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.bbs-traffic span {
+  padding: 0 8px 0 10px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.bbs-traffic button {
+  min-height: 38px;
+  min-width: 56px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--muted);
+}
+.bbs-traffic button.on {
+  background: var(--fg);
+  color: var(--navy);
+}
 .bbs-ghost {
   min-height: 44px;
   padding: 0 16px;
@@ -735,6 +769,15 @@
   }
   .bbs-ghost {
     min-height: 38px;
+  }
+  .bbs-traffic button {
+    min-height: 32px;
+    min-width: 0;
+    padding: 0 9px;
+    font-size: 12px;
+  }
+  .bbs-traffic span {
+    display: none;
   }
   .bbs-body {
     gap: 10px;

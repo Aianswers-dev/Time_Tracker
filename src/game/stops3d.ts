@@ -1,13 +1,11 @@
-// Brisbane-style bus stop furniture.
+// Brisbane-style bus stop flags for the player's route (the world draws the
+// shelters at every stop; busway platforms live in platforms.ts).
 //
 // Kerbside stops use the TransLink "flag" sign: a double-sided plate on a
 // galvanised pole, mounted at right angles to the kerb so approaching buses
 // see it face-on. White head with the TransLink mark, a blue panel with the
 // bus pictogram and the stop number, then zone / stop ID and the routes that
-// call there. A timetable case sits lower on the pole. Busier stops get an
-// Adshel-style glass shelter with a back-lit advertising panel; busway stops
-// (Cultural Centre, King George Square, ...) are raised platforms with a
-// canopy and a station name board.
+// call there. A timetable case sits lower on the pole.
 import * as THREE from 'three';
 import { routesServing, stopNumber } from './routeMeta';
 import type { MapData } from '../types';
@@ -174,77 +172,10 @@ export function plateGeometry(uv: [number, number, number, number]): THREE.Buffe
 // ---------------------------------------------------------------------------
 // Shared materials (created lazily, reused by every stop)
 
-let mats: {
-  pole: THREE.MeshLambertMaterial;
-  frame: THREE.MeshLambertMaterial;
-  roof: THREE.MeshLambertMaterial;
-  glass: THREE.MeshLambertMaterial;
-  bench: THREE.MeshLambertMaterial;
-  concrete: THREE.MeshLambertMaterial;
-  tactile: THREE.MeshLambertMaterial;
-  canopy: THREE.MeshLambertMaterial;
-  caseMat: THREE.MeshLambertMaterial;
-  lamp: THREE.MeshBasicMaterial;
-  ads: THREE.MeshBasicMaterial[];
-} | null = null;
-
-function posterTexture(): THREE.CanvasTexture {
-  const c = document.createElement('canvas');
-  c.width = 512;
-  c.height = 256;
-  const ctx = c.getContext('2d')!;
-  const posters: [string, string, string, string][] = [
-    ['#ff8a3d', '#ffd166', 'SOUTH BANK', 'Summer nights by the river'],
-    ['#1aa39a', '#9be15d', 'GO CARD', 'Tap on. Tap off.'],
-    ['#6a3ef0', '#ff5fa2', 'THE VALLEY', 'Live music, every night'],
-    ['#0b5ed7', '#5bc0eb', 'XXXX', 'Brewed in Milton since 1878'],
-  ];
-  posters.forEach(([a, b, title, sub], i) => {
-    const x = i * 128;
-    const gr = ctx.createLinearGradient(x, 0, x + 128, 256);
-    gr.addColorStop(0, a);
-    gr.addColorStop(1, b);
-    ctx.fillStyle = gr;
-    ctx.fillRect(x, 0, 128, 256);
-    ctx.fillStyle = 'rgba(255,255,255,0.18)';
-    ctx.beginPath();
-    ctx.arc(x + 96, 70, 46, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.font = '900 21px system-ui, -apple-system, Segoe UI, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(title, x + 64, 170);
-    ctx.font = '600 11px system-ui, -apple-system, Segoe UI, sans-serif';
-    ctx.fillText(sub, x + 64, 192);
-  });
-  const t = new THREE.CanvasTexture(c);
-  t.colorSpace = THREE.SRGBColorSpace;
-  return t;
-}
+let mats: { pole: THREE.MeshLambertMaterial; caseMat: THREE.MeshLambertMaterial } | null = null;
 
 function materials(): NonNullable<typeof mats> {
-  if (mats) return mats;
-  const poster = posterTexture();
-  const ads = [0, 1, 2, 3].map((i) => {
-    const t = poster.clone();
-    t.repeat.set(0.25, 1);
-    t.offset.set(i * 0.25, 0);
-    t.needsUpdate = true;
-    return new THREE.MeshBasicMaterial({ map: t, color: 0xdddddd });
-  });
-  mats = {
-    pole: new THREE.MeshLambertMaterial({ color: 0xa9b1b8 }),
-    frame: new THREE.MeshLambertMaterial({ color: 0x3a4148 }),
-    roof: new THREE.MeshLambertMaterial({ color: 0x2b3036 }),
-    glass: new THREE.MeshLambertMaterial({ color: 0xbfe3f2, transparent: true, opacity: 0.28, depthWrite: false, side: THREE.DoubleSide }),
-    bench: new THREE.MeshLambertMaterial({ color: 0x8a6a4a }),
-    concrete: new THREE.MeshLambertMaterial({ color: 0xb9b6ae }),
-    tactile: new THREE.MeshLambertMaterial({ color: 0xf2c200, emissive: 0x332700 }),
-    canopy: new THREE.MeshLambertMaterial({ color: 0xeef1f4, emissive: 0x3c4248, side: THREE.DoubleSide }),
-    caseMat: new THREE.MeshLambertMaterial({ color: 0x1b2a44 }),
-    lamp: new THREE.MeshBasicMaterial({ color: 0xfff1d6 }),
-    ads,
-  };
+  if (!mats) mats = { pole: new THREE.MeshLambertMaterial({ color: 0xa9b1b8 }), caseMat: new THREE.MeshLambertMaterial({ color: 0x1b2a44 }) };
   return mats;
 }
 
@@ -267,128 +198,6 @@ export function poleParts(): Part[] {
     { geo: new THREE.CylinderGeometry(0.04, 0.045, 3.15, 8).translate(0, 1.575, 0), mat: m.pole },
     { geo: box(0.32, 0.5, 0.06, 0.1, 1.45, 0), mat: m.caseMat },
   ];
-}
-
-/** Adshel-style shelter parts. Local frame as above; centred on origin. */
-export function shelterParts(adVariant: number): Part[] {
-  const m = materials();
-  const L = 4.6;
-  const D = 1.7;
-  const H = 2.55;
-  const parts: Part[] = [
-    // Roof slab, cantilevered towards the road.
-    { geo: box(D + 0.35, 0.12, L + 0.3, 0.2, H, 0), mat: m.roof },
-    // LED strip under the roof.
-    { geo: box(0.12, 0.02, L - 0.6, -0.1, H - 0.07, 0), mat: m.lamp },
-    // Back posts.
-    { geo: box(0.08, H, 0.08, -D / 2, H / 2, -L / 2 + 0.1), mat: m.frame },
-    { geo: box(0.08, H, 0.08, -D / 2, H / 2, L / 2 - 0.1), mat: m.frame },
-    { geo: box(0.08, H, 0.08, -D / 2, H / 2, 0), mat: m.frame },
-    // Glass back wall and one glass end.
-    { geo: box(0.02, H - 0.35, L - 0.2, -D / 2 + 0.03, (H - 0.35) / 2 + 0.15, 0), mat: m.glass },
-    { geo: box(D - 0.25, H - 0.35, 0.02, -0.1, (H - 0.35) / 2 + 0.15, -L / 2 + 0.1), mat: m.glass },
-    // Bench.
-    { geo: box(0.42, 0.05, 2.1, -D / 2 + 0.3, 0.46, 0.4), mat: m.bench },
-    { geo: box(0.05, 0.46, 0.05, -D / 2 + 0.3, 0.23, -0.5), mat: m.frame },
-    { geo: box(0.05, 0.46, 0.05, -D / 2 + 0.3, 0.23, 1.3), mat: m.frame },
-    // Advertising light box at the downstream end.
-    { geo: box(D - 0.25, 1.85, 0.16, -0.1, 1.15, L / 2 - 0.12), mat: m.frame },
-    { geo: new THREE.PlaneGeometry(D - 0.4, 1.7).translate(0, 0, 0.085).translate(-0.1, 1.15, L / 2 - 0.12), mat: m.ads[adVariant % 4] },
-    { geo: new THREE.PlaneGeometry(D - 0.4, 1.7).rotateY(Math.PI).translate(0, 0, -0.085).translate(-0.1, 1.15, L / 2 - 0.12), mat: m.ads[(adVariant + 1) % 4] },
-  ];
-  return parts;
-}
-
-function stationSignTexture(name: string): THREE.CanvasTexture {
-  const c = document.createElement('canvas');
-  c.width = 1024;
-  c.height = 128;
-  const ctx = c.getContext('2d')!;
-  ctx.fillStyle = '#0b1f3a';
-  ctx.fillRect(0, 0, 1024, 128);
-  ctx.fillStyle = '#e463a4';
-  ctx.fillRect(0, 118, 1024, 10);
-  ctx.save();
-  ctx.fillStyle = '#fff';
-  ctx.beginPath();
-  ctx.roundRect(18, 18, 92, 92, 18);
-  ctx.fill();
-  ctx.restore();
-  ctx.save();
-  ctx.translate(26, 30);
-  ctx.strokeStyle = '#e463a4';
-  ctx.lineCap = 'round';
-  ctx.lineWidth = 15;
-  ctx.beginPath();
-  ctx.arc(38, 40, 26, Math.PI * 0.95, Math.PI * 2.15);
-  ctx.stroke();
-  ctx.lineWidth = 11;
-  ctx.beginPath();
-  ctx.moveTo(38, 4);
-  ctx.lineTo(38, 56);
-  ctx.stroke();
-  ctx.restore();
-  const label = name.replace(/,?\s*(platform\s*\d+[a-z]?|\d+[a-z])$/i, '').replace(/\s+busway station$/i, ' station');
-  const plat = /platform\s*(\d+[a-z]?)$/i.exec(name)?.[1] ?? /,\s*(\d+[a-z])$/i.exec(name)?.[1];
-  ctx.fillStyle = '#fff';
-  ctx.font = '800 58px system-ui, -apple-system, Segoe UI, sans-serif';
-  ctx.textBaseline = 'middle';
-  let size = 58;
-  while (ctx.measureText(label).width > (plat ? 700 : 860) && size > 30) {
-    size -= 2;
-    ctx.font = `800 ${size}px system-ui, -apple-system, Segoe UI, sans-serif`;
-  }
-  ctx.fillText(label, 134, 64);
-  if (plat) {
-    ctx.fillStyle = '#00a5b5';
-    ctx.beginPath();
-    ctx.roundRect(1024 - 150, 20, 130, 88, 14);
-    ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.textAlign = 'center';
-    ctx.font = '800 22px system-ui, -apple-system, Segoe UI, sans-serif';
-    ctx.fillText('PLATFORM', 1024 - 85, 42);
-    ctx.font = '900 46px system-ui, -apple-system, Segoe UI, sans-serif';
-    ctx.fillText(plat.toUpperCase(), 1024 - 85, 82);
-  }
-  const t = new THREE.CanvasTexture(c);
-  t.colorSpace = THREE.SRGBColorSpace;
-  t.anisotropy = 4;
-  return t;
-}
-
-/** Busway platform with canopy; local frame as above, origin at the platform's road edge centre. */
-export function stationGroup(name: string): THREE.Group {
-  const m = materials();
-  const g = new THREE.Group();
-  const L = 34;
-  const W = 4.2;
-  const add = (geo: THREE.BufferGeometry, mat: THREE.Material) => {
-    const mesh = new THREE.Mesh(geo, mat);
-    g.add(mesh);
-    return mesh;
-  };
-  add(box(W, 0.32, L, -W / 2, 0.16, 0), m.concrete);
-  add(box(0.6, 0.01, L, -0.35, 0.325, 0), m.tactile);
-  // Canopy on a row of columns at the back.
-  for (let z = -L / 2 + 2; z <= L / 2 - 2; z += 6) add(box(0.22, 4.2, 0.22, -W + 0.4, 2.42, z), m.frame);
-  add(box(W + 1.0, 0.18, L - 1, -W / 2 + 0.3, 4.55, 0), m.canopy);
-  for (const x of [-W + 1.0, -1.0]) add(box(0.14, 0.03, L - 3, x, 4.44, 0), m.lamp);
-  add(box(0.12, 0.35, L - 1, 0.75, 4.4, 0), m.roof);
-  // Back glass balustrade.
-  add(box(0.03, 1.1, L - 2, -W + 0.15, 0.32 + 0.55, 0), m.glass);
-  // Benches.
-  for (const z of [-8, 0, 8]) add(box(0.45, 0.06, 2.2, -W + 0.8, 0.8, z), m.bench);
-  // Name boards hanging from the canopy, facing both directions of travel.
-  const tex = stationSignTexture(name);
-  const signMat = new THREE.MeshBasicMaterial({ map: tex });
-  for (const z of [-L / 2 + 4, L / 2 - 4]) {
-    const board = add(box(3.6, 0.45, 0.06, -W / 2, 3.85, z), m.frame);
-    void board;
-    add(new THREE.PlaneGeometry(3.5, 0.44).translate(-W / 2, 3.85, z + 0.035), signMat);
-    add(new THREE.PlaneGeometry(3.5, 0.44).rotateY(Math.PI).translate(-W / 2, 3.85, z - 0.035), signMat);
-  }
-  return g;
 }
 
 /** Group made of parts (one mesh per part). */

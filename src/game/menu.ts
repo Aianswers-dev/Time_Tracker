@@ -15,12 +15,16 @@ import {
   type RouteGroup,
 } from './routeMeta';
 import { brighten, el, escapeHtml, fmtDistance, safeStorageGet, safeStorageSet } from './util';
+import { TRAFFIC_LABELS, defaultTrafficLevel, saveTrafficLevel, type TrafficLevel } from './trafficLevel';
+import { session } from './session';
 
 export interface MenuChoice {
   route: Route;
   type: BusType;
   /** Local time of day to start at, 0..24. */
   hours: number;
+  /** AI traffic density (already applied to the running Traffic via the session). */
+  traffic: TrafficLevel;
 }
 
 export const TIME_CHOICES = [
@@ -206,6 +210,8 @@ export function showMenu(data: MapData): Promise<MenuChoice> {
     let typeOverride: BusType | null = prefs.route === sel.id && prefs.type ? prefs.type : null;
     let timeKey: string = prefs.time ?? 'day';
     let group: RouteGroup | 'all' = 'all';
+    let traffic: TrafficLevel = defaultTrafficLevel();
+    let trafficTouched = false;
     let query = '';
     let visible: RouteEntry[] = [];
 
@@ -218,6 +224,9 @@ export function showMenu(data: MapData): Promise<MenuChoice> {
         <div class="bbs-brand">${LOGO}<div><h1>Brisbane <span>Bus</span> Simulator</h1>
         <p>Drive real TransLink routes through the CBD and inner suburbs · ${entries.length} routes · ${nStops.toLocaleString()} stops</p></div></div>
         <div class="bbs-spacer"></div>
+        <div class="bbs-traffic" role="radiogroup" aria-label="AI traffic" title="AI traffic"><span>Traffic</span>${(['off', 'light', 'normal'] as TrafficLevel[])
+          .map((l) => `<button role="radio" data-traffic="${l}">${TRAFFIC_LABELS[l]}</button>`)
+          .join('')}</div>
         <button class="bbs-ghost" data-act="controls" aria-haspopup="dialog">Controls <kbd>?</kbd></button>
       </header>
       <main class="bbs-body">
@@ -254,6 +263,21 @@ export function showMenu(data: MapData): Promise<MenuChoice> {
       if (e.target === modal || (e.target as HTMLElement).closest('[data-act="close"]')) openModal(false);
     });
     root.querySelector('[data-act="controls"]')!.addEventListener('click', () => openModal(true));
+    const trafficBox = root.querySelector<HTMLDivElement>('.bbs-traffic')!;
+    const syncTraffic = () =>
+      trafficBox.querySelectorAll<HTMLButtonElement>('[data-traffic]').forEach((b) => {
+        const on = b.dataset.traffic === traffic;
+        b.classList.toggle('on', on);
+        b.setAttribute('aria-checked', String(on));
+      });
+    trafficBox.addEventListener('click', (e) => {
+      const b = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-traffic]');
+      if (!b) return;
+      traffic = b.dataset.traffic as TrafficLevel;
+      trafficTouched = true;
+      syncTraffic();
+    });
+    syncTraffic();
 
     // Category chips (only groups that exist).
     const present = new Set(entries.map((e) => e.group));
@@ -468,9 +492,11 @@ export function showMenu(data: MapData): Promise<MenuChoice> {
       safeStorageSet(PREF_KEY, JSON.stringify({ route: sel.id, dir: route.dir, type: typeOverride ?? undefined, time: timeKey } satisfies Prefs));
       removeEventListener('keydown', onKey, true);
       removeEventListener('resize', onResize);
+      if (trafficTouched) saveTrafficLevel(traffic);
+      session.trafficLevel = traffic;
       root.classList.add('leaving');
       setTimeout(() => root.remove(), 480);
-      resolve({ route, type: currentType(), hours: time.hours });
+      resolve({ route, type: currentType(), hours: time.hours, traffic });
     };
 
     syncChips();

@@ -348,6 +348,11 @@ export interface Collider {
 export interface WorldHandle {
   /** Call every frame. `hours` is local time of day 0..24. */
   update(dt: number, camera: THREE.Camera, hours: number): void;
-  /** Current state of the traffic signal nearest to a point, for AI and HUD. */
-  signalStateAt?(x: number, y: number, timeSeconds: number): 'green' | 'amber' | 'red' | null;
+  /**
+   * Current state of the traffic signal nearest to a point, for AI and HUD.
+   * Pass the approaching vehicle's travel direction (dirX, dirY, unit, map
+   * coords) to get the phase for that approach; without it the approach is
+   * guessed from the point's bearing from the junction centre.
+   */
+  signalStateAt?(x: number, y: number, timeSeconds: number, dirX?: number, dirY?: number): 'green' | 'amber' | 'red' | null;
 }

@@ -76,6 +76,24 @@ export class PointGrid {
     this.head[k] = i;
   }
 
+  /** Visit points within r of (x, y) until `fn` returns true. */
+  query(x: number, y: number, r: number, fn: (i: number) => boolean): void {
+    const c0x = Math.floor((x - r) / this.cell);
+    const c1x = Math.floor((x + r) / this.cell);
+    const c0y = Math.floor((y - r) / this.cell);
+    const c1y = Math.floor((y + r) / this.cell);
+    const r2 = r * r;
+    for (let cy = c0y; cy <= c1y; cy++) {
+      for (let cx = c0x; cx <= c1x; cx++) {
+        for (let i = this.head[this.key(cx, cy)]; i >= 0; i = this.next[i]) {
+          const dx = this.px[i] - x;
+          const dy = this.py[i] - y;
+          if (dx * dx + dy * dy <= r2 && fn(i)) return;
+        }
+      }
+    }
+  }
+
   /** Index of the nearest point within r of (x, y) whose id != skip, or -1. */
   nearest(x: number, y: number, r: number, skip = -2147483648): number {
     const c0x = Math.floor((x - r) / this.cell);
