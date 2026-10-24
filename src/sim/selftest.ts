@@ -616,6 +616,29 @@ function levelsAfterReset(spec: BusSpec): void {
   check('Backspace on a deck edge: every section on the deck (min z)', minOf(sectionZs(p)), 9.4, 10.1, 'm');
 }
 
+function resetOnBend(spec: BusSpec): void {
+  // Backspace on a 40 m radius bend: every section's axle is put back on the lane, not laid out
+  // straight off the road.
+  const pts: number[] = [];
+  const zs: number[] = [];
+  for (let a = -10; a <= 100; a += 5) {
+    pts.push(-40 + 40 * Math.cos((a * Math.PI) / 180), 40 * Math.sin((a * Math.PI) / 180));
+    zs.push(0);
+  }
+  const col = world(makeMap({ roads: [{ pts, z: zs, width: 7 }] }));
+  const p = new BusPhysics(spec);
+  const c = new BusControls();
+  // Rear axle of the front section at 60 degrees round, heading along the bend, 2 m off it.
+  const a = (60 * Math.PI) / 180;
+  p.reset(-40 + 42 * Math.cos(a), 42 * Math.sin(a), -a, 0);
+  p.update(DT, input(), c, col);
+  p.reset(p.pose.x, p.pose.y, p.pose.heading);
+  p.update(DT, input(), c, col);
+  let worst = 0;
+  for (const sp of p.pose.sections) worst = Math.max(worst, Math.abs(Math.hypot(sp.x + 40, sp.y) - (40 - 1.75)));
+  check(`Backspace on a bend: every axle on the lane (${spec.sections.length} sections, worst off)`, worst, 0, 0.8, 'm');
+}
+
 function noDriveOffEdge(spec: BusSpec): void {
   // A viaduct deck at 10 m with a gap in its east parapet (a bus route's GTFS line runs off the deck
   // there, which opens the wall): driving through the gap, the bus stops at the deck's edge instead of
@@ -719,6 +742,31 @@ function stationBays(spec: BusSpec): void {
     check(`station bay (${kind}): drove along the bay`, r.p.pose.y + 55, 8, 100, 'm');
     check(`station bay (${kind}): the bay is drivable and has a surface`, col.surface(6.6, 0, 10, 2.2).z, 9.95, 10.05, 'm');
   }
+  // The same station with its stopping bay in the map data (a one-way bay road between the busway and
+  // the kerb, southbound with the platform on its left): no walls along it and no bay strips, and the
+  // bus pulls in and out at the busway's level.
+  {
+    const data = makeMap({
+      roads: [
+        { pts: [0, -300, 0, 300], z: [10, 10], bridge: true, width: 7.4, kind: 7 },
+        { pts: [5.9, 70, 5.9, -70], z: [10, 10], bridge: true, width: 4.6, kind: 7, oneway: true },
+      ],
+      platforms: [{ pts: [7.9, -40, 12, -40, 12, 40, 7.9, 40], underground: false }],
+      ground: () => 3,
+    });
+    (data.roads[1] as { bay?: boolean }).bay = true;
+    const col = world(data);
+    let bayWalls = 0;
+    for (let i = 0; i < col.walls.count; i++) if (col.walls.road[i] === 1) bayWalls++;
+    check('station bay road (map data): no walls along it', bayWalls, 0, 0, '');
+    // Strips only at the platform's ends then, none along its kerb (41 samples there).
+    const without = world(makeMap({ roads: [data.roads[0] as never], platforms: [{ pts: [7.9, -40, 12, -40, 12, 40, 7.9, 40], underground: false }], ground: () => 3 })).stats.bays;
+    check(`station bay road (map data): no bay strips along the kerb (${without} without the bay road)`, without - col.stats.bays, 40, 200, '');
+    const r = drive(spec, col, [5.9, 60, Math.PI, 10], 8, () => ({ throttle: 0.3 }));
+    const zs = r.out.map((s) => s.z).concat(sectionZs(r.p));
+    check("station bay road (map data): stays at the busway's level", minOf(zs), 9.9, 10.1, 'm');
+    check('station bay road (map data): drove along the bay', 60 - r.p.pose.y, 8, 100, 'm');
+  }
 }
 
 function stepsAndGrades(spec: BusSpec): void {
@@ -801,6 +849,7 @@ async function main(): Promise<void> {
   river(S.rigid);
   levelsAfterReset(S.rigid);
   noDriveOffEdge(S.rigid);
+  resetOnBend(S.rigid);
   wallsUnderDeck();
   cameraQueries();
   stationBays(S.rigid);
@@ -825,6 +874,7 @@ async function main(): Promise<void> {
   grade(S.metro);
   levelsAfterReset(S.metro);
   noDriveOffEdge(S.metro);
+  resetOnBend(S.metro);
   stationBays(S.metro);
   stepsAndGrades(S.metro);
   console.log(failures ? `\n${failures} check(s) FAILED` : '\nall checks passed');

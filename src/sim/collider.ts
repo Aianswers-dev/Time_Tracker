@@ -1306,6 +1306,9 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       continue;
     }
     if (r.kind === RoadKind.Pedestrian) continue;
+    // A station stopping bay (map data, see Road.bay) runs between the busway and the platform kerb:
+    // no wall on either side (the deck edge beyond the platform still stops a bus, see BusPhysics).
+    if ((r as { bay?: boolean }).bay) continue;
     const p = r.pts;
     const zs = lines[ri].z;
     const n = p.length / 2;
@@ -1778,6 +1781,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
         const score =
           d +
           (l.kind === RoadKind.Service ? 4 : 0) +
+          ((data.roads[sLine[s]] as { bay?: boolean } | undefined)?.bay ? 3 : 0) +
           (z === undefined && l.tunnel ? 25 : 0) +
           (l.kind === RoadKind.Motorway && !l.link ? 6 : 0) +
           dh * 3 +

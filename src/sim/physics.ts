@@ -243,6 +243,7 @@ export class BusPhysics {
     const fxp = snap.x + lx * lateral;
     const fyp = snap.y + ly * lateral;
     this.place(fxp - nx * wb, fyp - ny * wb, snap.heading, snap.z);
+    this.laySections(c, snap.z, lateral);
     void this.updateVertical(0, 0);
     for (let i = 0; i < 4; i++) {
       const r = c.resolve(this.pose, this.spec);
@@ -669,6 +670,37 @@ export class BusPhysics {
       cur.heading = hd;
       cur.x = hx - Math.sin(hd) * d;
       cur.y = hy - Math.cos(hd) * d;
+      this.joints[i - 1] = rel;
+    }
+  }
+
+  /**
+   * After a snap onto a road: each trailer's axle onto the same lane of the road at that level (on a
+   * bend, sections laid out straight would stand off the road, into its walls).
+   */
+  private laySections(c: SimCollider, z: number, lateral: number): void {
+    const secs = this.pose.sections;
+    for (let i = 1; i < secs.length; i++) {
+      const prev = secs[i - 1];
+      const sp = this.spec.sections[i - 1];
+      const si = this.spec.sections[i];
+      const back = sp.rearHitchFromFront - sp.axleFromFront;
+      const d = Math.max(0.5, si.axleFromFront - si.hitchFromFront);
+      const [px, py] = headingDir(prev.heading);
+      const hx = prev.x - px * back;
+      const hy = prev.y - py * back;
+      const snap = c.nearestRoad(hx - px * d, hy - py * d, prev.heading, 12, z);
+      if (!snap || Math.abs(snap.z - z) > 1.5) continue;
+      const [nx, ny] = headingDir(snap.heading);
+      const tx = snap.x - ny * lateral;
+      const ty = snap.y + nx * lateral;
+      let hd = Math.atan2(hx - tx, hy - ty);
+      const rel = clamp(wrapAngle(prev.heading - hd), -JOINT_LIMIT * 0.5, JOINT_LIMIT * 0.5);
+      hd = wrapAngle(prev.heading - rel);
+      const [fx, fy] = headingDir(hd);
+      secs[i].x = hx - fx * d;
+      secs[i].y = hy - fy * d;
+      secs[i].heading = hd;
       this.joints[i - 1] = rel;
     }
   }
