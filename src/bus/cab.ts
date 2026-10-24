@@ -449,7 +449,7 @@ function buildCab(B: BodyLayout, sec: SectionLayout, d: Dims, eyeL: THREE.Vector
     // matches the exterior sticker (paint.ts): kerb side of centre, just under the top frit
     const y0 = 2.348, y1 = 2.432;
     const x0 = -0.72, x1 = 0.28;
-    pan.quad(P(x0, y0, inner(x0, y0) - 0.004), P(x1, y0, inner(x1, y0) - 0.004), P(x1, y1, inner(x1, y1) - 0.004), P(x0, y1, inner(x0, y1) - 0.004), [0.9, 0.9, 0.9], uvRect(R_HAIL, STA.w, STA.h));
+    pan.quad(P(x0, y0, inner(x0, y0) - 0.004), P(x1, y0, inner(x1, y0) - 0.004), P(x1, y1, inner(x1, y1) - 0.004), P(x0, y1, inner(x0, y1) - 0.004), [0.72, 0.72, 0.72], uvRect(R_HAIL, STA.w, STA.h));
   }
   // --- passenger display hanging behind the driver, facing the saloon
   panel(dyn, P(-0.25, metro ? 2.6 : 2.52, 2.06), V(1, 0, 0), V(0, 1, 0), 0.8, 0.15, uvRect(R_STOP, DYN.w, DYN.h));
@@ -484,7 +484,8 @@ function buildCab(B: BodyLayout, sec: SectionLayout, d: Dims, eyeL: THREE.Vector
       }
     // driver's smoked roller blind, partly down
     const by1 = d.g1 - 0.045, by0 = d.g1 - d.blindDrop;
-    const bx = xs(metro ? 0.02 : 0.1, xi - 0.08, 8);
+    // stops short of the A-pillar so it never wraps behind it
+    const bx = xs(metro ? 0.02 : 0.1, Math.min(xi - 0.08, glassEdge(1, by0) - 0.06, glassEdge(1, by1) - 0.06), 8);
     const tint: RGB = metro ? [0.025, 0.028, 0.035] : [0.03, 0.035, 0.045];
     for (let i = 0; i < bx.length - 1; i++) {
       const xa2 = bx[i], xb2 = bx[i + 1];

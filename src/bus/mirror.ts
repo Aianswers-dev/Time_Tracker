@@ -66,6 +66,8 @@ function flankFor(type: BusType, id: LiveryId): Flank {
 }
 
 let shared: { ctx: Ctx; tex: THREE.CanvasTexture } | null = null;
+type Layer = ReturnType<typeof makeCanvas>;
+const layers: { key: string; back: Layer | null; front: Layer | null } = { key: '', back: null, front: null };
 
 /** The shared reflection texture (module-level, never dispose). */
 export function mirrorTexture(): THREE.CanvasTexture {
@@ -92,10 +94,28 @@ export function paintMirrors(v: MirrorView): void {
   }
   const c = shared.ctx;
   const id = liveryFor(v.type, v.route ? ({ id: v.route } as Route) : undefined);
-  const fl = flankFor(v.type, id);
-  wing(c, M_LEFT, -1, fl, v);
-  wing(c, M_RIGHT, 1, fl, v);
-  saloon(c, M_INT, v);
+  const key = `${v.type}|${id}|${v.night ? 1 : 0}`;
+  if (key !== layers.key) {
+    // Everything but the lane dashes is static for a given bus and light:
+    // paint the kerb-side view and the saloon once, and the driver's-side
+    // view as a background and a bus layer to composite the dashes between.
+    layers.key = key;
+    const fl = flankFor(v.type, id);
+    wing(c, M_LEFT, -1, fl, v, 'back');
+    wing(c, M_LEFT, -1, fl, v, 'front');
+    saloon(c, M_INT, v);
+    const r0: Reg = { x: 0, y: 0, w: M_RIGHT.w, h: M_RIGHT.h };
+    layers.back ??= makeCanvas(r0.w, r0.h);
+    layers.front ??= makeCanvas(r0.w, r0.h);
+    layers.back.ctx.clearRect(0, 0, r0.w, r0.h);
+    layers.front.ctx.clearRect(0, 0, r0.w, r0.h);
+    wing(layers.back.ctx, r0, 1, fl, v, 'back');
+    wing(layers.front.ctx, r0, 1, fl, v, 'front');
+  }
+  if (!layers.back || !layers.front) return;
+  c.drawImage(layers.back.canvas, M_RIGHT.x, M_RIGHT.y);
+  wing(c, M_RIGHT, 1, flankFor(v.type, id), v, 'dashes');
+  c.drawImage(layers.front.canvas, M_RIGHT.x, M_RIGHT.y);
   shared.tex.needsUpdate = true;
 }
 
@@ -112,7 +132,7 @@ function poly(c: Ctx, pts: [number, number][], fill: string | CanvasGradient): v
  * (bus side toward the middle of the windscreen). X: metres from the mirror
  * toward the bus, y: height above the road, z: metres behind the mirror.
  */
-function wing(c: Ctx, r: Reg, side: 1 | -1, fl: Flank, v: MirrorView): void {
+function wing(c: Ctx, r: Reg, side: 1 | -1, fl: Flank, v: MirrorView, part: 'back' | 'dashes' | 'front'): void {
   const W = r.w, H = r.h;
   const inner = side < 0 ? 1 : -1;
   const camH = v.type === 'metro' ? 2.8 : side < 0 ? 2.22 : 1.62;
@@ -126,38 +146,44 @@ function wing(c: Ctx, r: Reg, side: 1 | -1, fl: Flank, v: MirrorView): void {
   c.beginPath();
   c.rect(0, 0, W, H);
   c.clip();
-  // sky
-  const sky = c.createLinearGradient(0, 0, 0, vy);
-  sky.addColorStop(0, night ? '#04060b' : '#5d8fcf');
-  sky.addColorStop(1, night ? '#161b27' : '#c9dcec');
-  c.fillStyle = sky;
-  c.fillRect(0, 0, W, vy + 1);
-  // skyline / trees on the outer side
-  let k = side < 0 ? 11 : 29;
-  for (let x = 0; x < W; ) {
-    k = (k * 9301 + 49297) % 233280;
-    const w = 4 + (k % 9);
-    const h = 3 + ((k >> 4) % 14);
-    const tree = k % 3 === 0;
-    c.fillStyle = night ? (k % 5 === 0 ? '#5a5030' : '#0d1018') : tree ? '#5f7650' : `rgb(${150 + (k % 40)},${158 + (k % 30)},${168 + (k % 24)})`;
-    c.fillRect(x, vy - h, w, h + 1);
-    x += w;
-  }
-  // road and verge
-  const road = c.createLinearGradient(0, vy, 0, H);
-  road.addColorStop(0, night ? '#15161a' : '#7a7d82');
-  road.addColorStop(1, night ? '#0b0c0e' : '#46494e');
-  c.fillStyle = road;
-  c.fillRect(0, vy, W, H - vy);
   const zs = [1.2, 120];
-  if (side < 0) {
-    // kerb, then footpath and grass beyond
-    const kerb = -0.5;
-    poly(c, [P(kerb, 0, zs[0]), P(kerb, 0, zs[1]), P(-30, 0, zs[1]), P(-30, 0, zs[0])], night ? '#1a1b1c' : '#a5a198');
-    poly(c, [P(kerb - 2.4, 0, zs[0]), P(kerb - 2.4, 0, zs[1]), P(-40, 0, zs[1]), P(-40, 0, zs[0])], night ? '#0f130e' : '#6f8a4e');
-    poly(c, [P(kerb, 0, zs[0]), P(kerb, 0, zs[1]), P(kerb - 0.15, 0.15, zs[1]), P(kerb - 0.15, 0.15, zs[0])], night ? '#2a2b2c' : '#d2cec4');
-  } else {
-    // dashed lane line streaming past, then the next lane's edge line
+  if (part === 'back') {
+    // sky
+    const sky = c.createLinearGradient(0, 0, 0, vy);
+    sky.addColorStop(0, night ? '#04060b' : '#5d8fcf');
+    sky.addColorStop(1, night ? '#161b27' : '#c9dcec');
+    c.fillStyle = sky;
+    c.fillRect(0, 0, W, vy + 1);
+    // skyline / trees on the outer side
+    let k = side < 0 ? 11 : 29;
+    for (let x = 0; x < W; ) {
+      k = (k * 9301 + 49297) % 233280;
+      const w = 4 + (k % 9);
+      const h = 3 + ((k >> 4) % 14);
+      const tree = k % 3 === 0;
+      c.fillStyle = night ? (k % 5 === 0 ? '#5a5030' : '#0d1018') : tree ? '#5f7650' : `rgb(${150 + (k % 40)},${158 + (k % 30)},${168 + (k % 24)})`;
+      c.fillRect(x, vy - h, w, h + 1);
+      x += w;
+    }
+    // road and verge
+    const road = c.createLinearGradient(0, vy, 0, H);
+    road.addColorStop(0, night ? '#15161a' : '#7a7d82');
+    road.addColorStop(1, night ? '#0b0c0e' : '#46494e');
+    c.fillStyle = road;
+    c.fillRect(0, vy, W, H - vy);
+    if (side < 0) {
+      // kerb, then footpath and grass beyond
+      const kerb = -0.5;
+      poly(c, [P(kerb, 0, zs[0]), P(kerb, 0, zs[1]), P(-30, 0, zs[1]), P(-30, 0, zs[0])], night ? '#1a1b1c' : '#a5a198');
+      poly(c, [P(kerb - 2.4, 0, zs[0]), P(kerb - 2.4, 0, zs[1]), P(-40, 0, zs[1]), P(-40, 0, zs[0])], night ? '#0f130e' : '#6f8a4e');
+      poly(c, [P(kerb, 0, zs[0]), P(kerb, 0, zs[1]), P(kerb - 0.15, 0.15, zs[1]), P(kerb - 0.15, 0.15, zs[0])], night ? '#2a2b2c' : '#d2cec4');
+    } else {
+      // the next lane's edge line
+      const lx = -0.85;
+      poly(c, [P(lx - 3.4, 0, zs[0]), P(lx - 3.4, 0, zs[1]), P(lx - 3.55, 0, zs[1]), P(lx - 3.55, 0, zs[0])], night ? '#55585c' : '#e8eaec');
+    }
+  } else if (part === 'dashes') {
+    // dashed lane line streaming past (3 m line, 9 m gap)
     const lx = -0.85;
     const ph = ((v.dist % 12) + 12) % 12;
     const paint = night ? '#6b6e72' : '#eceef0';
@@ -166,95 +192,95 @@ function wing(c: Ctx, r: Reg, side: 1 | -1, fl: Flank, v: MirrorView): void {
       if (b <= a) continue;
       poly(c, [P(lx + 0.06, 0, a), P(lx + 0.06, 0, b), P(lx - 0.06, 0, b), P(lx - 0.06, 0, a)], paint);
     }
-    poly(c, [P(lx - 3.4, 0, zs[0]), P(lx - 3.4, 0, zs[1]), P(lx - 3.55, 0, zs[1]), P(lx - 3.55, 0, zs[0])], night ? '#55585c' : '#e8eaec');
-  }
-  // our own bus: flank, windows, bellows, wheels
-  const X = 0.19;
-  const z0 = 0.35, z1 = fl.length + 0.1;
-  let y0 = 0.3;
-  for (const [y1, col] of fl.bands) {
-    poly(c, [P(X, y0, z0), P(X, y0, z1), P(X, y1, z1), P(X, y1, z0)], night ? shade(col, 0.22) : col);
-    y0 = y1;
-  }
-  const [ws, wt] = fl.win;
-  const glass = c.createLinearGradient(0, 0, 0, H);
-  glass.addColorStop(0, night ? '#c7b98f' : '#3d4a5a');
-  glass.addColorStop(1, night ? '#8f8466' : '#0d1219');
-  poly(c, [P(X + 0.004, ws, z0 + 1.2), P(X + 0.004, ws, z1 - 0.4), P(X + 0.004, wt, z1 - 0.4), P(X + 0.004, wt, z0 + 1.2)], glass);
-  c.strokeStyle = night ? '#2a2620' : '#0b0d10';
-  for (let z = z0 + 1.2; z < z1 - 0.4; z += 1.9) {
-    const [ax, ay] = P(X + 0.006, ws, z);
-    const [bx, by] = P(X + 0.006, wt, z);
-    c.lineWidth = Math.max(0.6, (f * 0.07) / z);
-    c.beginPath();
-    c.moveTo(ax, ay);
-    c.lineTo(bx, by);
-    c.stroke();
-  }
-  if (fl.dots) {
-    c.fillStyle = fl.dots;
-    for (let z = z0 + 0.6; z < z1; z += 0.18) {
-      const [px, py] = P(X + 0.008, 1.78 + 0.42 * Math.sin((z / 2.7) * Math.PI * 2), z);
-      const rr = Math.max(0.35, (f * 0.022) / z);
-      c.fillRect(px - rr, py - rr, rr * 2, rr * 2);
+  } else {
+    // our own bus: flank, windows, bellows, wheels
+    const X = 0.19;
+    const z0 = 0.35, z1 = fl.length + 0.1;
+    let y0 = 0.3;
+    for (const [y1, col] of fl.bands) {
+      poly(c, [P(X, y0, z0), P(X, y0, z1), P(X, y1, z1), P(X, y1, z0)], night ? shade(col, 0.22) : col);
+      y0 = y1;
     }
-  }
-  for (const [a, b] of fl.joints) {
-    poly(c, [P(X - 0.05, 0.34, a), P(X - 0.05, 0.34, b), P(X - 0.05, 3.0, b), P(X - 0.05, 3.0, a)], night ? '#2b2c2e' : '#a8adb3');
-    c.strokeStyle = night ? '#18191b' : '#6c7178';
-    c.lineWidth = 0.7;
-    for (let z = a; z < b; z += 0.1) {
-      const [ax, ay] = P(X - 0.04, 0.4, z);
-      const [bx, by] = P(X - 0.04, 2.95, z);
+    const [ws, wt] = fl.win;
+    const glass = c.createLinearGradient(0, 0, 0, H);
+    glass.addColorStop(0, night ? '#c7b98f' : '#3d4a5a');
+    glass.addColorStop(1, night ? '#8f8466' : '#0d1219');
+    poly(c, [P(X + 0.004, ws, z0 + 1.2), P(X + 0.004, ws, z1 - 0.4), P(X + 0.004, wt, z1 - 0.4), P(X + 0.004, wt, z0 + 1.2)], glass);
+    c.strokeStyle = night ? '#2a2620' : '#0b0d10';
+    for (let z = z0 + 1.2; z < z1 - 0.4; z += 1.9) {
+      const [ax, ay] = P(X + 0.006, ws, z);
+      const [bx, by] = P(X + 0.006, wt, z);
+      c.lineWidth = Math.max(0.6, (f * 0.07) / z);
       c.beginPath();
       c.moveTo(ax, ay);
       c.lineTo(bx, by);
       c.stroke();
     }
-  }
-  for (const az of fl.axles) {
-    const arch: [number, number][] = [];
-    for (let i = 0; i <= 10; i++) {
-      const t = (i / 10) * Math.PI;
-      arch.push(P(X + 0.002, 0.5 + 0.62 * Math.sin(t), az + 0.66 * Math.cos(t)));
+    if (fl.dots) {
+      c.fillStyle = fl.dots;
+      for (let z = z0 + 0.6; z < z1; z += 0.18) {
+        const [px, py] = P(X + 0.008, 1.78 + 0.42 * Math.sin((z / 2.7) * Math.PI * 2), z);
+        const rr = Math.max(0.35, (f * 0.022) / z);
+        c.fillRect(px - rr, py - rr, rr * 2, rr * 2);
+      }
     }
-    poly(c, arch, night ? '#050506' : '#121315');
-    const tyre: [number, number][] = [];
-    const hub: [number, number][] = [];
-    for (let i = 0; i < 14; i++) {
-      const t = (i / 14) * Math.PI * 2;
-      tyre.push(P(X - 0.02, 0.5 + 0.5 * Math.sin(t), az + 0.5 * Math.cos(t)));
-      hub.push(P(X - 0.03, 0.5 + 0.27 * Math.sin(t), az + 0.27 * Math.cos(t)));
+    for (const [a, b] of fl.joints) {
+      poly(c, [P(X - 0.05, 0.34, a), P(X - 0.05, 0.34, b), P(X - 0.05, 3.0, b), P(X - 0.05, 3.0, a)], night ? '#2b2c2e' : '#a8adb3');
+      c.strokeStyle = night ? '#18191b' : '#6c7178';
+      c.lineWidth = 0.7;
+      for (let z = a; z < b; z += 0.1) {
+        const [ax, ay] = P(X - 0.04, 0.4, z);
+        const [bx, by] = P(X - 0.04, 2.95, z);
+        c.beginPath();
+        c.moveTo(ax, ay);
+        c.lineTo(bx, by);
+        c.stroke();
+      }
     }
-    poly(c, tyre, '#0c0c0d');
-    poly(c, hub, night ? '#2a2c30' : '#8d939a');
-  }
-  // glass sheen, dark edge
-  const sheen = c.createLinearGradient(0, 0, W, H);
-  sheen.addColorStop(0, 'rgba(255,255,255,0.10)');
-  sheen.addColorStop(0.5, 'rgba(255,255,255,0)');
-  sheen.addColorStop(1, 'rgba(0,0,0,0.12)');
-  c.fillStyle = sheen;
-  c.fillRect(0, 0, W, H);
-  if (v.type === 'metro') {
-    // camera monitor overlay: distance guide marks on the bus side, side tag
-    const gx = (z: number) => P(X - 0.25, 0, z);
-    for (const [z, col] of [[4, '#e0362b'], [9, '#f2c200'], [16, '#3cc35a']] as [number, string][]) {
-      const [x, y] = gx(z);
-      c.fillStyle = col;
-      c.fillRect(Math.min(x, x - inner * 18), y - 1, 18, 2);
+    for (const az of fl.axles) {
+      const arch: [number, number][] = [];
+      for (let i = 0; i <= 10; i++) {
+        const t = (i / 10) * Math.PI;
+        arch.push(P(X + 0.002, 0.5 + 0.62 * Math.sin(t), az + 0.66 * Math.cos(t)));
+      }
+      poly(c, arch, night ? '#050506' : '#121315');
+      const tyre: [number, number][] = [];
+      const hub: [number, number][] = [];
+      for (let i = 0; i < 14; i++) {
+        const t = (i / 14) * Math.PI * 2;
+        tyre.push(P(X - 0.02, 0.5 + 0.5 * Math.sin(t), az + 0.5 * Math.cos(t)));
+        hub.push(P(X - 0.03, 0.5 + 0.27 * Math.sin(t), az + 0.27 * Math.cos(t)));
+      }
+      poly(c, tyre, '#0c0c0d');
+      poly(c, hub, night ? '#2a2c30' : '#8d939a');
     }
-    c.fillStyle = 'rgba(0,0,0,0.55)';
-    c.fillRect(side < 0 ? 4 : W - 22, 4, 18, 13);
-    c.fillStyle = '#e8edf3';
-    c.font = 'bold 10px sans-serif';
-    c.textAlign = 'center';
-    c.textBaseline = 'middle';
-    c.fillText(side < 0 ? 'L' : 'R', side < 0 ? 13 : W - 13, 11);
-  } else {
-    c.strokeStyle = 'rgba(0,0,0,0.6)';
-    c.lineWidth = 3;
-    c.strokeRect(0, 0, W, H);
+    // glass sheen, dark edge
+    const sheen = c.createLinearGradient(0, 0, W, H);
+    sheen.addColorStop(0, 'rgba(255,255,255,0.10)');
+    sheen.addColorStop(0.5, 'rgba(255,255,255,0)');
+    sheen.addColorStop(1, 'rgba(0,0,0,0.12)');
+    c.fillStyle = sheen;
+    c.fillRect(0, 0, W, H);
+    if (v.type === 'metro') {
+      // camera monitor overlay: distance guide marks on the bus side, side tag
+      const gx = (z: number) => P(X - 0.25, 0, z);
+      for (const [z, col] of [[4, '#e0362b'], [9, '#f2c200'], [16, '#3cc35a']] as [number, string][]) {
+        const [x, y] = gx(z);
+        c.fillStyle = col;
+        c.fillRect(Math.min(x, x - inner * 18), y - 1, 18, 2);
+      }
+      c.fillStyle = 'rgba(0,0,0,0.55)';
+      c.fillRect(side < 0 ? 4 : W - 22, 4, 18, 13);
+      c.fillStyle = '#e8edf3';
+      c.font = 'bold 10px sans-serif';
+      c.textAlign = 'center';
+      c.textBaseline = 'middle';
+      c.fillText(side < 0 ? 'L' : 'R', side < 0 ? 13 : W - 13, 11);
+    } else {
+      c.strokeStyle = 'rgba(0,0,0,0.6)';
+      c.lineWidth = 3;
+      c.strokeRect(0, 0, W, H);
+    }
   }
   c.restore();
 }
