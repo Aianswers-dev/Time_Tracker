@@ -149,12 +149,15 @@ if (args.includes('--routes')) {
       }
       // The AI cars' light for the same junction (when its stop line is near this one).
       const gj = model.junctionAt(qx, qy, hx, hy, zq);
-      const bj = jl.find((j) => {
+      let bk = jl.findIndex((j) => {
         if (!j.sig || Math.abs(j.stopS - sg.s) > 25) return false;
         const nd = C.nodes[j.node];
         return model.junctionAt(nd.x - j.inX * 10, nd.y - j.inY * 10, j.inX, j.inY, nd.z) === gj;
       });
-      if (!bj) continue;
+      if (bk < 0) continue;
+      // Inside the junction the AI keeps the light of its first node (cars.ts canGo): compare that one.
+      while (bk > 0 && jl[bk].inside) bk--;
+      const bj = jl[bk];
       // The car lane into that node that arrives the way the route does, asked as canGo asks.
       let lane = -1;
       let bd = 0.7;

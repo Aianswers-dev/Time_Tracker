@@ -90,6 +90,10 @@ const ARM_PROBE = 16;
 const LEVEL = 3.5;
 /** stateAt looks for junctions within this radius. */
 const PICK_R = 40;
+/** An approach chord ends where the path comes this close to the junction centre. */
+const IN_R = 12;
+/** Arms whose direction scores are this close (cos; ~40 degrees apart) are told apart by where we stand. */
+const TIE = 0.25;
 
 const CLASS_W: Partial<Record<RoadKind, number>> = {
   [RoadKind.Motorway]: 3,
@@ -346,15 +350,19 @@ export class SignalModel {
         const b = pointAt(r, g, g.len);
         open = Math.min(Math.hypot(a.x - cx, a.y - cy), Math.hypot(b.x - cx, b.y - cy));
       }
+      const p0 = pointAt(r, g, q.s);
       for (const dir of [1, -1]) {
         // Probe 16 m along the road, or as far as it goes (short links, pieces before a portal).
         const s = Math.max(0, Math.min(g.len, q.s + dir * ARM_PROBE));
         if (Math.abs(s - q.s) < 2.5) continue;
         const pt = pointAt(r, g, s);
-        let ux = pt.x - cx;
-        let uy = pt.y - cy;
+        if (Math.hypot(pt.x - cx, pt.y - cy) < 4) continue;
+        // The road's own direction from where it passes the centre (the centre of a
+        // wide or multi-node junction can lie well off a road).
+        let ux = pt.x - p0.x;
+        let uy = pt.y - p0.y;
         const l = Math.hypot(ux, uy);
-        if (l < 4) continue;
+        if (l < 2) continue;
         ux /= l;
         uy /= l;
         const incoming = !r.oneway || dir === -1;
@@ -491,13 +499,19 @@ export class SignalModel {
       bx /= bl;
       by /= bl;
     }
-    // Where we stand counts too once we are clearly out on an arm (it breaks
-    // ties between arms at a skewed junction; ask from a point on the approach).
+    // Where we stand counts too once we are clearly out on an arm, but only to
+    // break ties between arms that point about the way we came (a skewed
+    // junction): the centre of a wide or multi-node junction can lie well off
+    // the road, and then where we stand says little.
     const w = hasDir ? Math.max(0, Math.min(1, (bl - 4) / 8)) * 0.6 : 1;
+    let top = -Infinity;
+    if (hasDir) for (const a of j.arms) if (a.incoming) top = Math.max(top, -(a.ux * dirX! + a.uy * dirY!));
     j.arms.forEach((a, i) => {
       if (!a.incoming) return;
       // The arm pointing back along our travel, and the arm we stand on.
-      const d = (hasDir ? -(a.ux * dirX! + a.uy * dirY!) : 0) + (bl > 1e-3 ? w * (a.ux * bx + a.uy * by) : -i * 1e-3);
+      const h = hasDir ? -(a.ux * dirX! + a.uy * dirY!) : 0;
+      if (h < top - TIE) return;
+      const d = h + (bl > 1e-3 ? w * (a.ux * bx + a.uy * by) : -i * 1e-3);
       if (d > bd) {
         bd = d;
         best = i;
@@ -529,15 +543,26 @@ export class SignalModel {
         sc = q;
       }
     }
-    at(sc - 18, p);
+    // The chord ends where the path comes within IN_R of the centre, before
+    // any turn it makes inside the junction (the nearest point can be well
+    // into a turn when the centre lies off the road).
+    let se = sc;
+    for (let q = sc; q >= sc - 40; q -= 1) {
+      at(q, p);
+      if (Math.hypot(p.x - j.x, p.y - j.y) >= IN_R) {
+        se = q;
+        break;
+      }
+    }
+    at(se - 15, p);
     const ax = p.x;
     const ay = p.y;
-    at(sc - 3, p);
+    at(se, p);
     const l = Math.hypot(p.x - ax, p.y - ay);
     if (l < 1) return null;
     const dx = (p.x - ax) / l;
     const dy = (p.y - ay) / l;
-    at(sc - 12, p);
+    at(se - 2, p);
     return { dx, dy, x: p.x, y: p.y };
   }
 

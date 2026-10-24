@@ -1082,10 +1082,8 @@ export class Traffic {
   private junctionOk(b: AiBus, k: number, stopAt: number, time: number): Wait {
     const j = b.jl[k];
     this.jRef = 0;
-    // A second node of the junction we just entered: its light was the first node's.
-    const p = b.jl[k - 1];
-    const inside = !!p && p.sig && j.s - p.s < 40 && this.cars.sameSignalJunction(p.node, j.node);
-    if (j.sig && !inside) {
+    // (A second node of the junction we just entered keeps the first node's light.)
+    if (j.sig && !j.inside) {
       const a = b.jAsk[k];
       const st = a ? (this.world.signalStateAt?.(a.x, a.y, time, a.dx, a.dy, a.z) ?? null) : this.cars.signalFor(j.node, j.inX, j.inY, time);
       if (st === 'red') return Wait.Red;

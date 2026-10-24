@@ -162,6 +162,9 @@ interface Car {
 }
 
 /** A junction on an AI bus route (for the shared reservations). */
+/** Links between two nodes of one signalised junction shorter than this are inside it. */
+const INSIDE_LINK = 40;
+
 export interface BusJunction {
   node: number;
   x: number;
@@ -178,6 +181,8 @@ export interface BusJunction {
   sig: boolean;
   /** The bus arrives from a side road and must give way. */
   minor: boolean;
+  /** A second node of the signalised junction entered at the previous one: that node's light holds. */
+  inside: boolean;
 }
 
 export interface CarStats {
@@ -344,8 +349,11 @@ export class CarTraffic {
   readonly grid = new PointGrid(8, 1024);
   private buckets = new Map<number, Car[]>();
   private byId = new Map<number, Car>();
-  /** Signal-model junction of each signalised node (-1 elsewhere): nodes of one junction share one light per approach. */
-  private nodeSigJ: Int32Array = new Int32Array(0);
+  /**
+   * Directed lanes that are short links from one node of a signalised junction
+   * to another node of the same junction: the light asked at the first node holds.
+   */
+  private insideLane: Uint8Array = new Uint8Array(0);
   /** Stop-line distance from the end node for each directed lane (0 = uncontrolled). */
   private stopD: Float32Array = new Float32Array(0);
   /** Junction nodes (3+ arms) on a coarse grid, for mapping bus routes onto them. */
@@ -650,17 +658,19 @@ export class CarTraffic {
       }
     }
     this.buildBuswayCrossings(edgeGrid);
-    const model = signalsFor(this.data);
-    this.nodeSigJ = new Int32Array(this.nodes.length).fill(-1);
-    this.nodes.forEach((nd, n) => {
-      if (nd.sig) this.nodeSigJ[n] = model.junctionAt(nd.x, nd.y, undefined, undefined, nd.z);
-    });
-  }
-
-  /** Are graph nodes a and b parts of one signalised junction? */
-  sameSignalJunction(a: number, b: number): boolean {
-    const j = this.nodeSigJ[a];
-    return j >= 0 && j === this.nodeSigJ[b];
+    // (The junction each end asks its light of, as signalFor asks it.)
+    this.insideLane = new Uint8Array(this.edges.length * 2);
+    for (let lane = 0; lane < this.edges.length * 2; lane++) {
+      const e = this.edges[lane >> 1];
+      if (e.len >= INSIDE_LINK || (e.oneway && lane & 1)) continue;
+      const a = lane & 1 ? e.b : e.a;
+      const n = this.endNode(lane);
+      if (!this.nodes[a].sig || !this.nodes[n].sig) continue;
+      const [sx, sy] = this.laneStartDir(lane);
+      const [ex, ey] = this.laneEndDir(lane);
+      const ja = this.signalJunction(a, sx, sy);
+      if (ja >= 0 && ja === this.signalJunction(n, ex, ey)) this.insideLane[lane] = 1;
+    }
   }
 
   /**
@@ -1127,9 +1137,16 @@ export class CarTraffic {
         boxR: nd.boxR,
         sig: nd.sig,
         minor: rank + 0.01 < nd.rank,
+        inside: false,
       });
     }
     out.sort((a, b) => a.s - b.s);
+    out.forEach((j, k) => {
+      const p = out[k - 1];
+      if (!p?.sig || !j.sig || j.s - p.s >= INSIDE_LINK) return;
+      const jp = this.signalJunction(p.node, p.inX, p.inY);
+      j.inside = jp >= 0 && jp === this.signalJunction(j.node, j.inX, j.inY);
+    });
     this.busJunctions.set(track, out);
     return out;
   }
@@ -1356,8 +1373,7 @@ export class CarTraffic {
       // On a short link between two nodes of one junction we are already in it:
       // its light was ours at the first node (asked again here with the link's
       // direction it would be some other arm's).
-      const inside = e0.len < 40 && this.sameSignalJunction(lane & 1 ? e0.b : e0.a, N);
-      const st = inside ? null : this.signalFor(N, inX, inY, time);
+      const st = this.insideLane[lane] ? null : this.signalFor(N, inX, inY, time);
       if (st === 'red') return Wait.Red;
       if (st === 'amber' && stopAt > (c.v * c.v) / (2 * 3.5)) return Wait.Red;
     } else {
