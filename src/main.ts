@@ -302,6 +302,17 @@ async function main() {
         for (let i = 0; i < g.count; i++) if (near(g.px[i], g.py[i])) cars.push({ id: g.pid[i], x: +g.px[i].toFixed(1), y: +g.py[i].toFixed(1), z: +g.pz[i].toFixed(1), v: +g.pv[i].toFixed(1) });
         return { buses, cars };
       },
+      /** Guide lane samples from s0 to s1 (lane geometry and speed plan, for diagnosing a stretch). */
+      lane(s0: number, s1: number, step = 2) {
+        const T = auto!.track;
+        const o = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
+        const out: { s: number; x: number; y: number; z: number; heading: number; vmax: number; limit: number }[] = [];
+        for (let s = s0; s <= s1; s += step) {
+          T.sample(s, o);
+          out.push({ s, x: +o.x.toFixed(2), y: +o.y.toFixed(2), z: +T.zAt(s).toFixed(2), heading: +((o.heading * 180) / Math.PI).toFixed(1), vmax: +(T.vmaxAt(s) * 3.6).toFixed(0), limit: T.limitAt(s) });
+        }
+        return out;
+      },
       report() {
         return { ...auto!.report(), summary: guide.state.summary, served: guide.state.stopsServed, missed: guide.state.stopsMissed, total: guide.state.stopsTotal, events: guide.state.events.map((e) => `${e.kind}: ${e.text}`) };
       },

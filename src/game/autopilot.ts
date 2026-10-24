@@ -1,5 +1,5 @@
 // Autopilot: drives the player's bus along its route through the real physics
-// and collider (pure pursuit on the guide lane, curve/limit/stop/signal speed
+// and collider (Stanley steering on the guide lane, curve/limit/stop/signal speed
 // planning, door cycles at stops) and logs whatever goes wrong on the way.
 // Used by `?autopilot=1` (demo drive) and the route film/test tools.
 import type { BusPose, BusSpec, DriveInput, InputAction } from '../types';
@@ -8,6 +8,7 @@ import type { GuideState } from './guide';
 import type { Traffic } from './traffic';
 import { TRACK_STEP } from './track';
 import { LEVEL_GAP } from './height';
+import { wrapAngle } from '../data/coords';
 
 export type AutopilotPhase = 'drive' | 'stopping' | 'dwell' | 'closing' | 'signal' | 'queue' | 'stuck' | 'done';
 
@@ -58,6 +59,9 @@ const MAX_DWELL = 75;
 const MIRRORS = 1.2;
 const DECEL = 1.1;
 const SIGNAL_DECEL = 1.6;
+/** Stanley cross-track gain (1/s) and how far ahead the lane heading is read (s per m/s). */
+const STANLEY_K = 1.4;
+const PREVIEW = 0.35;
 
 function clamp(v: number, a: number, b: number): number {
   return v < a ? a : v > b ? b : v;
@@ -197,28 +201,27 @@ export class Autopilot {
     const z = a.z ?? pose.z ?? 0;
     const at = { s: sFront, x: pose.x + hx * sec0.axleFromFront, y: pose.y + hy * sec0.axleFromFront, z };
 
-    // --- Steering: pure pursuit from the rear axle --------------------------------
-    const Ld = clamp(7 + Math.abs(v) * 0.9, 8, 26);
-    T.sample(this.sRear + Ld, this.tmp, this.pull);
-    const tx = this.tmp.x - pose.x;
-    const ty = this.tmp.y - pose.y;
-    // Target in the bus frame: forward = h, right = (hy, -hx).
-    const fwd = tx * hx + ty * hy;
-    const right = tx * hy - ty * hx;
-    const d2 = fwd * fwd + right * right;
-    const delta = Math.atan((2 * L * right) / Math.max(1, d2));
+    // --- Steering: Stanley on the front axle -------------------------------------
+    // Keeping the front axle on the lane centres a long bus's swept path on the lane in a bend
+    // (the rear wheels track inside, the front overhang swings out). Steering the rear axle
+    // along the lane instead puts the front corner ~2 m wide on a 20 m radius, into the wall.
     const av = Math.abs(v);
-    const ratio = 1 / (1 + Math.pow(Math.max(0, av - 1.5) / 6.5, 2));
-    out.steer = clamp(delta / (spec.maxSteer * ratio), -1, 1);
-    // Lateral error at the front axle.
-    T.sample(sFront - spec.frontOverhang, this.tmp, this.pull);
     const fx = pose.x + hx * L;
     const fy = pose.y + hy * L;
+    const sAxle = this.project(fx, fy, this.sRear + L - 4, this.sRear + L + 4);
+    T.sample(sAxle, this.tmp, this.pull);
+    // Front axle left (+) / right (−) of the lane.
     const lat = (fx - this.tmp.x) * -this.tmp.hy + (fy - this.tmp.y) * this.tmp.hx;
     this.frame.lateral = -lat;
+    // The lane's heading a little ahead covers the steering rate and the yaw lag.
+    T.sample(sAxle + 1 + av * PREVIEW, this.tmp, this.pull);
+    const delta = wrapAngle(this.tmp.heading - pose.heading) + Math.atan2(STANLEY_K * lat, 1 + av);
+    const ratio = 1 / (1 + Math.pow(Math.max(0, av - 1.5) / 6.5, 2));
+    out.steer = clamp(delta / (spec.maxSteer * ratio), -1, 1);
 
     // --- Speed planning --------------------------------------------------------------
-    let target = Math.min(T.vmaxAt(sFront), (T.limitAt(sFront) / 3.6) * 0.97);
+    // Not faster than the bend the rest of the bus is still in.
+    let target = Math.min(T.vmaxAt(sFront), T.vmaxAt(sAxle), T.vmaxAt(this.sRear), (T.limitAt(sFront) / 3.6) * 0.97);
     let why = 'cruise';
     let limitDist = Infinity;
     // Curves and limits ahead (vmax already brakes for curves; limits we brake for here).
