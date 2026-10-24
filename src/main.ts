@@ -30,7 +30,7 @@ function loadingScreen() {
 async function main() {
   const loading = loadingScreen();
   const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', logarithmicDepthBuffer: true });
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
   renderer.setSize(innerWidth, innerHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -165,6 +165,7 @@ async function main() {
       doorsOpen: controls.doorsOpen,
       stopRequested: g.nextStopDistance < 250 && !g.finished,
       timeSeconds: simTime,
+      gear: inp.gear,
     });
     rig.update(dt, bus, cab, pose, inp);
     audio.update({ rpm: physics.rpm, throttle: inp.throttle, speed: pose.speed, brake: inp.brake });

@@ -263,6 +263,8 @@ export interface CabState {
   doorsOpen: boolean;
   stopRequested: boolean;
   timeSeconds: number;
+  /** Selected gear for the dash display ('R', 'N', 'D'), when known. */
+  gear?: string;
 }
 
 export interface Cab {

@@ -200,7 +200,7 @@ function drawCluster(c: CanvasRenderingContext2D, s: ClusterState): void {
   c.fillText('km/h', 256, 110);
   c.font = `bold 22px ${FONT}`;
   c.fillStyle = L.reverse ? '#ffb020' : '#7fffa0';
-  c.fillText(L.reverse ? 'R' : s.speed < 0.5 && s.rpm < 760 ? 'N' : 'D', 206, 84);
+  c.fillText(st.gear ?? (L.reverse ? 'R' : s.speed < 0.5 && s.rpm < 760 ? 'N' : 'D'), 206, 84);
   c.font = `11px ${FONT}`;
   c.fillStyle = '#9fb4d0';
   const t = Math.floor(st.timeSeconds);
@@ -593,6 +593,7 @@ export function createCab(type: BusType): Cab {
         st.stopRequested ? 1 : 0,
         Math.floor(st.timeSeconds),
         playerSign.route,
+        st.gear ?? '',
       ].join(',');
       if (key !== lastKey && (st.timeSeconds - lastDraw > 0.05 || st.timeSeconds < lastDraw)) {
         lastKey = key;
