@@ -61,6 +61,28 @@ function streetAt(data: MapData, route: Route, s: number, offsets: number[]): st
   return best;
 }
 
+/** The road the route runs on at s (null off the road network). */
+function roadAt(data: MapData, route: Route, s: number) {
+  const ss = Math.max(0, Math.min(route.length, s));
+  const p = pointAlong(route.pts, route.cum, ss);
+  const hit = roadIndexFor(data).nearest(p.x, p.y, 12, p.heading, 0.85, drivable, heightsOf(data).routeZ(route, ss));
+  return hit ? data.roads[hit.road] : null;
+}
+
+/** A traffic signal node within r of the route at s, at street level (not on a bridge or in a tunnel). */
+function signalAt(data: MapData, route: Route, s: number, r: number): boolean {
+  const road = roadAt(data, route, s);
+  if (road && (road.bridge || road.tunnel)) return false;
+  const p = pointAlong(route.pts, route.cum, Math.max(0, Math.min(route.length, s)));
+  const g = data.signals;
+  for (let k = 0; k + 1 < g.length; k += 2) {
+    const dx = g[k] - p.x;
+    const dy = g[k + 1] - p.y;
+    if (Math.abs(dx) < r && Math.abs(dy) < r && dx * dx + dy * dy < r * r) return true;
+  }
+  return false;
+}
+
 function chordHeading(route: Route, s0: number, s1: number): number {
   const a = pointAlong(route.pts, route.cum, s0);
   const b = pointAlong(route.pts, route.cum, s1);
@@ -124,6 +146,9 @@ export function computeTurns(data: MapData, route: Route): TurnHint[] {
     if (abs > 150 * DEG) kind = 'uturn';
     else if (abs > 115 * DEG) kind = right ? 'sharp-right' : 'sharp-left';
     else if (abs > 52 * DEG) kind = right ? 'right' : 'left';
+    // A gentle angle is still a turn at the lights, or turning right off a two-way road across the
+    // oncoming lanes; "keep" is for forks and slip lanes.
+    else if (signalAt(data, route, t.s, 25) || (right && roadAt(data, route, t.s - 30)?.oneway === false)) kind = right ? 'right' : 'left';
     else kind = right ? 'slight-right' : 'slight-left';
     const verb =
       kind === 'uturn'

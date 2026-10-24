@@ -1,463 +1,548 @@
-// First-person driver's cab: right-hand drive dash with canvas instruments,
-// a big flat bus steering wheel, ticketing console, go card readers, driver's
-// safety screen, destination box backside, sun visor and the full saloon.
+// First-person driver's cab, modelled on photos of the Brisbane fleet:
+//  - Volgren Optimus (Volvo B8RLE, Transport for Brisbane / CityGlider):
+//    Volvo wrap-around dark-grey dash with the instrument binnacle on the
+//    column, door controls on the left wing, switches on the right wing and a
+//    console along the right wall, the go card driver console on a stalk to
+//    the left of the wheel, a light-grey overhead console (destination sign
+//    housing) across the top of the windscreen with a smoked roller blind,
+//    an interior convex mirror and the "PLEASE HAIL DRIVER" sticker.
+//  - Brisbane Metro (HESS lighTram 25): taller wrap-around windscreen, light
+//    overhead console, big roller blind, digital cluster and camera-monitor
+//    screens on the A-pillars instead of wing mirrors.
+// The windscreen wraps round the corners to slim A-pillars. Everything is
+// unlit (baked shading), ~11 draw calls including the saloon.
 import * as THREE from 'three';
 import type { BusType, Cab, CabState } from '../types';
 import { layoutFor, type BodyLayout, type SectionLayout } from './spec';
-import { frontZ } from './shell';
-import { buildSaloon } from './saloon';
+import { ringAt } from './shell';
+import { buildSaloon, DRIVER_PLATFORM } from './saloon';
 import { playerSign } from './state';
-import { FONT, GeoBuilder, canvasTexture, makeCanvas, mat4, rgb, roundRect, type RGB } from './util';
+import { M_INT, M_LEFT, M_RIGHT, mirrorTexture, mirrorUV, paintMirrors } from './mirror';
+import {
+  DYN, R_CCTV, R_CLUSTER, R_CONSOLE, R_DESTCTL, R_HAIL, R_OVERHEAD, R_RCONSOLE, R_READER, R_STICKER, R_STOP, R_SWITCH_L, R_SWITCH_R, R_TICKET, STA,
+  drawCluster, drawStatic, drawStop, drawTicket, uvRect,
+} from './cabtex';
+import { GeoBuilder, canvasTexture, makeCanvas, mat4, rgb, type RGB } from './util';
 
 const V = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z);
+const D2R = Math.PI / 180;
 
-// dynamic canvas regions (512 x 256)
-const DYN = { w: 512, h: 256 };
-const R_CLUSTER = { x: 0, y: 0, w: 512, h: 184 };
-const R_STOP = { x: 0, y: 184, w: 384, h: 72 };
-const R_TICKET = { x: 384, y: 184, w: 128, h: 72 };
-// static canvas regions (512 x 256)
-const STA = { w: 512, h: 256 };
-const R_SWITCH_R = { x: 0, y: 0, w: 256, h: 128 };
-const R_SWITCH_L = { x: 256, y: 0, w: 256, h: 128 };
-const R_READER = { x: 0, y: 128, w: 96, h: 128 };
-const R_STICKER = { x: 96, y: 128, w: 208, h: 64 };
-const R_CCTV = { x: 96, y: 192, w: 208, h: 64 };
-const R_DESTCTL = { x: 304, y: 128, w: 208, h: 128 };
-
-type Reg = { x: number; y: number; w: number; h: number };
-
-function uvRect(r: Reg, W: number, H: number): [number, number, number, number] {
-  return [r.x / W, 1 - (r.y + r.h) / H, (r.x + r.w) / W, 1 - r.y / H];
+interface Dims {
+  metro: boolean;
+  /** Windscreen glass bottom / top (the top is the overhead console's underside). */
+  g0: number;
+  g1: number;
+  /** Dash top where it meets the glass, its crest, and its depth from the glass. */
+  dashGlass: number;
+  crest: number;
+  depth: number;
+  /** Cluster face centre and steering wheel centre (x, y, z' behind the nose). */
+  cluster: THREE.Vector3;
+  wheel: THREE.Vector3;
+  /** Wheel plane tilt from horizontal. */
+  tilt: number;
+  /** z' of the overhead console's rear face. */
+  ohRear: number;
+  /** How far the driver's roller blind is pulled down. */
+  blindDrop: number;
+  col: { dash: RGB; top: RGB; binn: RGB; trim: RGB; over: RGB; pillar: RGB; cowl: RGB; lower: RGB };
 }
 
-/** Quad centred at c, spanning `w` along `right` and `h` along `up`. */
-function panel(gb: GeoBuilder, c: THREE.Vector3, right: THREE.Vector3, up: THREE.Vector3, w: number, h: number, uv: [number, number, number, number]): void {
+function dimsFor(B: BodyLayout): Dims {
+  if (B.type === 'metro')
+    return {
+      metro: true,
+      g0: 0.98,
+      g1: 2.62,
+      dashGlass: 1.1,
+      crest: 1.18,
+      depth: 0.56,
+      cluster: V(0.62, 1.4, 0.64),
+      wheel: V(0.62, 1.3, 1.02),
+      tilt: 22 * D2R,
+      ohRear: 0.82,
+      blindDrop: 0.26,
+      col: { dash: rgb('#3a3d42'), top: rgb('#2c2f33'), binn: rgb('#26282c'), trim: rgb('#8e949b'), over: rgb('#d3d6d9'), pillar: rgb('#2b2e33'), cowl: rgb('#3a3d42'), lower: rgb('#a4aab1') },
+    };
+  return {
+    metro: false,
+    g0: 1.12,
+    g1: 2.5,
+    dashGlass: 1.19,
+    crest: 1.25,
+    depth: 0.5,
+    cluster: V(0.62, 1.42, 0.6),
+    wheel: V(0.62, 1.3, 1.0),
+    tilt: 22 * D2R,
+    ohRear: 0.66,
+    blindDrop: 0.2,
+    col: { dash: rgb('#3b3e43'), top: rgb('#2e3034'), binn: rgb('#2a2c30'), trim: rgb('#62676e'), over: rgb('#c3c7cb'), pillar: rgb('#34373c'), cowl: rgb('#45484d'), lower: rgb('#8f959c') },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Geometry helpers (x, y, z' -> section-local via Z)
+
+/** Smooth grid surface; normals from finite differences, flipped to face `toward`. */
+function surface(gb: GeoBuilder, P: THREE.Vector3[][], c: RGB, toward: THREE.Vector3, uv?: [number, number]): void {
+  const ni = P.length, nj = P[0].length;
+  const idx: number[][] = [];
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), n = new THREE.Vector3(), t = new THREE.Vector3();
+  for (let i = 0; i < ni; i++) {
+    idx.push([]);
+    for (let j = 0; j < nj; j++) {
+      a.subVectors(P[Math.min(i + 1, ni - 1)][j], P[Math.max(i - 1, 0)][j]);
+      b.subVectors(P[i][Math.min(j + 1, nj - 1)], P[i][Math.max(j - 1, 0)]);
+      n.crossVectors(a, b);
+      if (n.lengthSq() < 1e-12) n.set(0, 1, 0);
+      n.normalize();
+      if (n.dot(t.subVectors(toward, P[i][j])) < 0) n.negate();
+      const p = P[i][j];
+      idx[i].push(gb.vertex(p.x, p.y, p.z, n.x, n.y, n.z, uv ? uv[0] : 0, uv ? uv[1] : 0, c));
+    }
+  }
+  for (let i = 0; i < ni - 1; i++)
+    for (let j = 0; j < nj - 1; j++) {
+      gb.tri(idx[i][j], idx[i + 1][j], idx[i + 1][j + 1]);
+      gb.tri(idx[i][j], idx[i + 1][j + 1], idx[i][j + 1]);
+    }
+}
+
+/** Flat polygon (any shape) in the plane x = const, from (z, y) points. */
+function capX(gb: GeoBuilder, x: number, pts: [number, number][], c: RGB, nx: number): void {
+  const contour = pts.map(([z, y]) => new THREE.Vector2(z, y));
+  const tris = THREE.ShapeUtils.triangulateShape(contour, []);
+  const base = gb.count;
+  for (const [z, y] of pts) gb.vertex(x, y, z, nx, 0, 0, 0, 0, c);
+  for (const [i, j, k] of tris) gb.tri(base + i, base + j, base + k);
+}
+
+/** Quad centred at c spanning w along `right` and h along `up`. */
+function panel(gb: GeoBuilder, c: THREE.Vector3, right: THREE.Vector3, up: THREE.Vector3, w: number, h: number, uv: [number, number, number, number], col: RGB = [1, 1, 1]): void {
   const r = right.clone().multiplyScalar(w / 2);
   const u = up.clone().multiplyScalar(h / 2);
-  gb.quad(c.clone().sub(r).sub(u), c.clone().add(r).sub(u), c.clone().add(r).add(u), c.clone().sub(r).add(u), [1, 1, 1], uv);
+  gb.quad(c.clone().sub(r).sub(u), c.clone().add(r).sub(u), c.clone().add(r).add(u), c.clone().sub(r).add(u), col, uv);
 }
 
-/** Up/right vectors for a panel whose normal points toward `target` from `c` (roll-free). */
-function facing(c: THREE.Vector3, target: THREE.Vector3): { right: THREE.Vector3; up: THREE.Vector3 } {
-  const n = target.clone().sub(c).normalize();
-  const right = new THREE.Vector3(0, 1, 0).cross(n).normalize();
-  const up = n.clone().cross(right).normalize();
-  return { right, up };
+/** Right/up vectors for a roll-free panel whose normal points along n. */
+function basis(n: THREE.Vector3): { right: THREE.Vector3; up: THREE.Vector3; n: THREE.Vector3 } {
+  const nn = n.clone().normalize();
+  const right = new THREE.Vector3(0, 1, 0).cross(nn).normalize();
+  const up = nn.clone().cross(right).normalize();
+  return { right, up, n: nn };
 }
 
-// ---------------------------------------------------------------------------
-// Instruments
-
-function dial(c: CanvasRenderingContext2D, cx: number, cy: number, r: number, value: number, max: number, major: number, minor: number, label: string, scale: number, bands: [number, number, string][]): void {
-  const a0 = (135 * Math.PI) / 180;
-  const sweep = (270 * Math.PI) / 180;
-  const ang = (v: number) => a0 + sweep * Math.max(0, Math.min(1, v / max));
-  const face = c.createRadialGradient(cx, cy - r * 0.3, r * 0.1, cx, cy, r);
-  face.addColorStop(0, '#1d2026');
-  face.addColorStop(1, '#090a0c');
-  c.fillStyle = face;
-  c.beginPath();
-  c.arc(cx, cy, r, 0, Math.PI * 2);
-  c.fill();
-  c.strokeStyle = '#6f757d';
-  c.lineWidth = 3;
-  c.stroke();
-  for (const [v0, v1, col] of bands) {
-    c.strokeStyle = col;
-    c.lineWidth = 5;
-    c.beginPath();
-    c.arc(cx, cy, r - 9, ang(v0), ang(v1));
-    c.stroke();
-  }
-  c.strokeStyle = '#e8ecf2';
-  c.fillStyle = '#e8ecf2';
-  c.textAlign = 'center';
-  c.textBaseline = 'middle';
-  c.font = `bold ${Math.round(r * 0.2)}px ${FONT}`;
-  for (let v = 0; v <= max + 1e-6; v += minor) {
-    const a = ang(v);
-    const isMajor = Math.abs(v / major - Math.round(v / major)) < 1e-6;
-    const r0 = r - (isMajor ? 16 : 11);
-    c.lineWidth = isMajor ? 2.5 : 1.3;
-    c.beginPath();
-    c.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
-    c.lineTo(cx + Math.cos(a) * (r - 5), cy + Math.sin(a) * (r - 5));
-    c.stroke();
-    if (isMajor) c.fillText(String(Math.round(v * scale)), cx + Math.cos(a) * (r - 29), cy + Math.sin(a) * (r - 29));
-  }
-  c.font = `${Math.round(r * 0.13)}px ${FONT}`;
-  c.fillStyle = '#9aa2ad';
-  c.fillText(label, cx, cy + r * 0.42);
-  // needle
-  const a = ang(value);
-  c.strokeStyle = '#ff3b1f';
-  c.lineWidth = 3.5;
-  c.lineCap = 'round';
-  c.beginPath();
-  c.moveTo(cx - Math.cos(a) * 12, cy - Math.sin(a) * 12);
-  c.lineTo(cx + Math.cos(a) * (r - 12), cy + Math.sin(a) * (r - 12));
-  c.stroke();
-  c.lineCap = 'butt';
-  c.fillStyle = '#2a2e35';
-  c.beginPath();
-  c.arc(cx, cy, 9, 0, Math.PI * 2);
-  c.fill();
+function facing(c: THREE.Vector3, target: THREE.Vector3) {
+  return basis(target.clone().sub(c));
 }
 
-function arrow(c: CanvasRenderingContext2D, x: number, y: number, dir: 1 | -1, on: boolean): void {
-  c.fillStyle = on ? '#2cff4a' : '#0f2a14';
-  c.beginPath();
-  c.moveTo(x + dir * 14, y);
-  c.lineTo(x, y - 11);
-  c.lineTo(x, y - 5);
-  c.lineTo(x - dir * 12, y - 5);
-  c.lineTo(x - dir * 12, y + 5);
-  c.lineTo(x, y + 5);
-  c.lineTo(x, y + 11);
-  c.closePath();
-  c.fill();
-}
-
-function lamp(c: CanvasRenderingContext2D, x: number, y: number, text: string, on: boolean, col: string): void {
-  c.fillStyle = on ? col : '#1a1c20';
-  roundRect(c, x - 19, y - 9, 38, 18, 4);
-  c.fill();
-  c.fillStyle = on ? '#000' : '#3a3e45';
-  c.font = `bold 10px ${FONT}`;
-  c.textAlign = 'center';
-  c.textBaseline = 'middle';
-  c.fillText(text, x, y + 1);
-}
-
-function headlampIcon(c: CanvasRenderingContext2D, x: number, y: number, on: boolean): void {
-  c.strokeStyle = on ? '#2cff4a' : '#183020';
-  c.fillStyle = c.strokeStyle;
-  c.lineWidth = 2;
-  c.beginPath();
-  c.ellipse(x - 3, y, 6, 8, 0, Math.PI / 2, Math.PI * 1.5, true);
-  c.closePath();
-  c.fill();
-  for (const dy of [-6, -2, 2, 6]) {
-    c.beginPath();
-    c.moveTo(x + 5, y + dy);
-    c.lineTo(x + 14, y + dy + 2);
-    c.stroke();
-  }
-}
-
-interface ClusterState {
-  speed: number;
-  rpm: number;
-  flash: boolean;
-  st: CabState;
-  trip: number;
-  metro: boolean;
-}
-
-function drawCluster(c: CanvasRenderingContext2D, s: ClusterState): void {
-  const { x, y, w, h } = R_CLUSTER;
-  c.save();
-  c.translate(x, y);
-  c.fillStyle = '#050607';
-  c.fillRect(0, 0, w, h);
-  const bez = c.createLinearGradient(0, 0, 0, h);
-  bez.addColorStop(0, '#2a2d33');
-  bez.addColorStop(1, '#121316');
-  c.fillStyle = bez;
-  roundRect(c, 2, 2, w - 4, h - 4, 22);
-  c.fill();
-  const st = s.st;
-  const L = st.lights;
-  if (!s.metro) {
-    dial(c, 98, 96, 80, s.speed, 120, 20, 10, 'km/h', 1, [[60, 120, '#7a1c1c']]);
-    dial(c, 414, 96, 80, s.rpm / 100, 30, 5, 2.5, 'x1000 r/min', 0.1, [[10, 18, '#1f7a3a'], [26, 30, '#a01818']]);
-  } else {
-    // Metro: power meter instead of a tachometer
-    dial(c, 98, 96, 80, s.speed, 100, 20, 10, 'km/h', 1, [[70, 100, '#7a1c1c']]);
-    const p = Math.max(0, Math.min(100, ((s.rpm - 700) / 2300) * 100));
-    dial(c, 414, 96, 80, p, 100, 25, 12.5, 'POWER %', 1, [[0, 25, '#1f5f9a'], [75, 100, '#a01818']]);
-  }
-  // centre LCD
-  c.fillStyle = '#0d1621';
-  roundRect(c, 184, 22, 144, 144, 10);
-  c.fill();
-  c.strokeStyle = '#3c4552';
-  c.lineWidth = 2;
-  c.stroke();
-  const left = L.indicatorLeft || L.hazards;
-  const right = L.indicatorRight || L.hazards;
-  arrow(c, 206, 38, -1, left && s.flash);
-  arrow(c, 306, 38, 1, right && s.flash);
-  headlampIcon(c, 250, 38, L.headlights);
-  c.fillStyle = '#d6e6ff';
-  c.textAlign = 'center';
-  c.textBaseline = 'middle';
-  c.font = `bold 46px ${FONT}`;
-  c.fillText(String(Math.round(s.speed)), 256, 84);
-  c.font = `bold 11px ${FONT}`;
-  c.fillStyle = '#7f93ad';
-  c.fillText('km/h', 256, 110);
-  c.font = `bold 22px ${FONT}`;
-  c.fillStyle = L.reverse ? '#ffb020' : '#7fffa0';
-  c.fillText(st.gear ?? (L.reverse ? 'R' : s.speed < 0.5 && s.rpm < 760 ? 'N' : 'D'), 206, 84);
-  c.font = `11px ${FONT}`;
-  c.fillStyle = '#9fb4d0';
-  const t = Math.floor(st.timeSeconds);
-  c.fillText(`TRIP ${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`, 256, 128);
-  c.fillText(`${s.trip.toFixed(2)} km   27°C`, 256, 143);
-  const msg = st.doorsOpen ? 'DOORS OPEN' : st.stopRequested ? 'STOP REQUESTED' : s.metro ? 'SOC 78%' : 'FUEL ▮▮▮▮▯';
-  c.fillStyle = st.doorsOpen || st.stopRequested ? '#ffb020' : '#6f8aa8';
-  c.font = `bold 11px ${FONT}`;
-  c.fillText(msg, 256, 158);
-  // tell-tale row along the bottom
-  lamp(c, 40, 170, 'DOOR', st.doorsOpen, '#ff8a00');
-  lamp(c, 84, 170, 'STOP', st.stopRequested, '#ff2a1a');
-  lamp(c, 128, 170, 'BRAKE', L.brake && s.speed < 1, '#ff2a1a');
-  lamp(c, 384, 170, 'HAZ', L.hazards && s.flash, '#ff2a1a');
-  lamp(c, 428, 170, 'ABS', false, '#ffb000');
-  lamp(c, 472, 170, s.metro ? 'READY' : 'ECAS', true, '#2cff4a');
-  c.restore();
-}
-
-function drawStop(c: CanvasRenderingContext2D, st: CabState): void {
-  const { x, y, w, h } = R_STOP;
-  c.save();
-  c.translate(x, y);
-  c.fillStyle = '#060404';
-  c.fillRect(0, 0, w, h);
-  c.textAlign = 'center';
-  c.textBaseline = 'middle';
-  if (st.stopRequested) {
-    c.fillStyle = '#ff2b14';
-    c.font = `bold 40px ${FONT}`;
-    c.fillText('BUS STOPPING', w / 2, h / 2 + 2);
-  } else {
-    c.fillStyle = '#ff7a1a';
-    c.font = `bold 26px ${FONT}`;
-    const t = playerSign.route ? `${playerSign.route}  ${playerSign.headsign}` : 'translink.com.au';
-    c.fillText(t.slice(0, 26), w / 2, h / 2 + 2, w - 12);
-  }
-  // LED grid mask
-  c.fillStyle = 'rgba(0,0,0,0.55)';
-  for (let i = 0; i < w; i += 4) c.fillRect(i, 0, 1.4, h);
-  for (let j = 0; j < h; j += 4) c.fillRect(0, j, w, 1.4);
-  c.restore();
-}
-
-function drawTicket(c: CanvasRenderingContext2D, st: CabState): void {
-  const { x, y, w, h } = R_TICKET;
-  c.save();
-  c.translate(x, y);
-  c.fillStyle = '#0c2a5a';
-  c.fillRect(0, 0, w, h);
-  c.fillStyle = '#ffffff';
-  c.font = `bold 12px ${FONT}`;
-  c.textAlign = 'left';
-  c.textBaseline = 'top';
-  c.fillText(`Route ${playerSign.route || '--'}`, 5, 4);
-  c.font = `10px ${FONT}`;
-  c.fillText((playerSign.headsign || 'Not in service').slice(0, 20), 5, 19);
-  c.fillStyle = '#f6c400';
-  c.font = `bold 13px ${FONT}`;
-  c.fillText('50c FARES', 5, 34);
-  c.fillStyle = '#9ec5ff';
-  c.font = `10px ${FONT}`;
-  const t = Math.floor(st.timeSeconds);
-  c.fillText(`go card  ✔   ${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`, 5, 52);
-  c.restore();
-}
-
-function drawStatic(c: CanvasRenderingContext2D): void {
-  c.fillStyle = '#16181c';
-  c.fillRect(0, 0, STA.w, STA.h);
-  const sw = (r: Reg, labels: [string, string][]) => {
-    c.save();
-    c.translate(r.x, r.y);
-    c.fillStyle = '#1e2025';
-    c.fillRect(0, 0, r.w, r.h);
-    const cols = 4;
-    labels.forEach(([lab, col], i) => {
-      const cx = 12 + (i % cols) * 60;
-      const cy = 10 + Math.floor(i / cols) * 58;
-      c.fillStyle = '#0c0d0f';
-      roundRect(c, cx, cy, 50, 46, 6);
-      c.fill();
-      c.fillStyle = col;
-      roundRect(c, cx + 6, cy + 5, 38, 24, 4);
-      c.fill();
-      c.fillStyle = '#d8dce2';
-      c.font = `bold 9px ${FONT}`;
-      c.textAlign = 'center';
-      c.textBaseline = 'middle';
-      c.fillText(lab, cx + 25, cy + 38);
-    });
-    c.restore();
-  };
-  sw(R_SWITCH_R, [['HAZARD', '#a3201b'], ['LIGHTS', '#30343a'], ['WIPER', '#30343a'], ['DEMIST', '#30343a'], ['INT LT', '#30343a'], ['KNEEL', '#b8860b'], ['RAMP', '#1f4f9a'], ['A/C', '#30343a']]);
-  sw(R_SWITCH_L, [['DOOR 1', '#1e7a35'], ['DOOR 2', '#1e7a35'], ['PRAM', '#30343a'], ['P BRAKE', '#a3201b'], ['HORN', '#30343a'], ['RADIO', '#30343a'], ['CCTV', '#30343a'], ['DEST', '#1f4f9a']]);
-  // go card reader face
-  c.save();
-  c.translate(R_READER.x, R_READER.y);
-  c.fillStyle = '#d9dcdf';
-  c.fillRect(0, 0, R_READER.w, R_READER.h);
-  c.fillStyle = '#1c2c3a';
-  c.fillRect(10, 10, 76, 26);
-  c.fillStyle = '#9cf0a0';
-  c.font = `bold 8px ${FONT}`;
-  c.textAlign = 'center';
-  c.fillText('PLEASE TOUCH', 48, 21);
-  c.fillText('YOUR go CARD', 48, 31);
-  c.strokeStyle = '#f2c400';
-  c.lineWidth = 7;
-  c.beginPath();
-  c.arc(48, 84, 28, 0, Math.PI * 2);
-  c.stroke();
-  c.fillStyle = '#eef0f2';
-  c.beginPath();
-  c.arc(48, 84, 24, 0, Math.PI * 2);
-  c.fill();
-  c.restore();
-  // stickers
-  const sticker = (r: Reg, bg: string, fg: string, lines: string[]) => {
-    c.save();
-    c.translate(r.x, r.y);
-    c.fillStyle = bg;
-    c.fillRect(0, 0, r.w, r.h);
-    c.fillStyle = fg;
-    c.font = `bold 13px ${FONT}`;
-    c.textAlign = 'center';
-    c.textBaseline = 'middle';
-    lines.forEach((l, i) => c.fillText(l, r.w / 2, r.h / 2 + (i - (lines.length - 1) / 2) * 16));
-    c.restore();
-  };
-  sticker(R_STICKER, '#f6c400', '#111', ['Please do not distract', 'the driver while the', 'bus is in motion']);
-  sticker(R_CCTV, '#1d4fbf', '#fff', ['WARNING', 'CCTV IN OPERATION']);
-  // destination controller keypad
-  c.save();
-  c.translate(R_DESTCTL.x, R_DESTCTL.y);
-  c.fillStyle = '#26292e';
-  c.fillRect(0, 0, R_DESTCTL.w, R_DESTCTL.h);
-  c.fillStyle = '#1a2a12';
-  c.fillRect(12, 10, 184, 34);
-  c.fillStyle = '#b6f27a';
-  c.font = `bold 14px ${FONT}`;
-  c.textAlign = 'left';
-  c.fillText('DEST 061  RTE', 20, 32);
-  for (let i = 0; i < 12; i++) {
-    c.fillStyle = '#4a4f57';
-    roundRect(c, 14 + (i % 6) * 31, 54 + Math.floor(i / 6) * 34, 26, 26, 4);
-    c.fill();
-    c.fillStyle = '#e8ebef';
-    c.font = `bold 11px ${FONT}`;
-    c.textAlign = 'center';
-    c.fillText('1234567890*#'[i], 27 + (i % 6) * 31, 71 + Math.floor(i / 6) * 34);
-  }
-  c.restore();
+/** Box with a frame given by its centre and basis (for tilted housings). */
+function orientedBox(gb: GeoBuilder, c: THREE.Vector3, f: { right: THREE.Vector3; up: THREE.Vector3; n: THREE.Vector3 }, w: number, h: number, d: number, col: RGB): void {
+  const g = new THREE.BoxGeometry(w, h, d);
+  const m = new THREE.Matrix4().makeBasis(f.right, f.up, f.n).setPosition(c.clone().addScaledVector(f.n, -d / 2));
+  gb.add(g, m, col);
+  g.dispose();
 }
 
 // ---------------------------------------------------------------------------
 
-function buildFurniture(B: BodyLayout, sec: SectionLayout, dz: number): { geo: THREE.BufferGeometry; wheelCenter: THREE.Vector3 } {
-  const zo = -sec.axleFromFront + dz;
+interface Built {
+  furniture: THREE.BufferGeometry;
+  panels: THREE.BufferGeometry;
+  dynamic: THREE.BufferGeometry;
+  mirrors: THREE.BufferGeometry;
+  clear: THREE.BufferGeometry;
+  wheelCenter: THREE.Vector3;
+}
+
+function buildCab(B: BodyLayout, sec: SectionLayout, d: Dims, eyeL: THREE.Vector3): Built {
+  const zo = -sec.axleFromFront;
   const Z = (z: number) => z + zo;
-  const gb = new GeoBuilder();
-  gb.shade = true;
-  const dash: RGB = rgb('#26282c');
-  const dashTop: RGB = rgb('#1b1c1f');
-  const grey: RGB = rgb('#4b5058');
-  const fz = (y: number) => frontZ(B, sec, y) + 0.07 - dz;
-  // left shelf in front of the entrance
-  const zl = fz(1.22);
-  gb.box(-B.hw + 0.09, 0.34, Z(zl), 0.06, 1.2, Z(0.5), dash, 1 | 2 | 4 | 16);
-  gb.box(-B.hw + 0.09, 1.2, Z(zl), 0.06, 1.23, Z(0.52), dashTop, 4 | 16);
-  // driver's dash
-  const zd = fz(1.4);
-  gb.box(0.06, 0.8, Z(zd), B.hw - 0.09, 1.38, Z(0.72), dash, 2 | 16 | 1);
-  gb.quad(V(0.06, 1.38, Z(0.72)), V(B.hw - 0.09, 1.38, Z(0.72)), V(B.hw - 0.09, 1.47, Z(zd)), V(0.06, 1.47, Z(zd)), dashTop);
-  // slim instrument binnacle: sloped cover, short hood lip, side cheeks
-  const hx0 = 0.31, hx1 = 0.93;
-  gb.quad(V(hx0, 1.86, Z(0.44)), V(hx1, 1.86, Z(0.44)), V(hx1, 1.46, Z(0.16)), V(hx0, 1.46, Z(0.16)), dashTop);
-  gb.box(hx0, 1.855, Z(0.44), hx1, 1.875, Z(0.555), dashTop);
-  for (const x of [hx0, hx1]) {
-    const dir = x === hx0 ? -1 : 1;
-    gb.quad(V(x, 1.44, Z(0.16)), V(x, 1.44, Z(0.6)), V(x, 1.875, Z(0.555)), V(x, 1.875, Z(0.44)), dir < 0 ? dash : dash);
+  const P = (x: number, y: number, z: number) => V(x, y, Z(z));
+  const xi = B.hw - 0.08;
+  const metro = d.metro;
+  const eye = eyeL.clone();
+  /** z' of the inside of the front (windscreen) at (x, y), following the rounded corners. */
+  const inner = (x: number, y: number): number => {
+    const r = ringAt(B, sec, y);
+    const hwI = r.hw - 0.06;
+    const rf = Math.max(0.02, r.rf - 0.02);
+    const cx = hwI - rf;
+    let z = r.zf + 0.06;
+    const ax = Math.abs(x);
+    if (ax > cx) {
+      const q = Math.min(rf, ax - cx);
+      z += rf - Math.sqrt(Math.max(0, rf * rf - q * q));
+    }
+    return z;
+  };
+  /** Point on the inside of the glass at plan arc length t from the centre line: [|x|, z']. */
+  const glassPt = (t: number, y: number): [number, number] => {
+    const r = ringAt(B, sec, y);
+    const hwI = r.hw - 0.06, rf = Math.max(0.02, r.rf - 0.02), cx = hwI - rf, z0 = r.zf + 0.06;
+    if (t <= cx) return [t, z0];
+    const arc = (rf * Math.PI) / 2;
+    if (t <= cx + arc) {
+      const th = (t - cx) / rf;
+      return [cx + rf * Math.sin(th), z0 + rf * (1 - Math.cos(th))];
+    }
+    return [hwI, z0 + rf + (t - cx - arc)];
+  };
+  /** Arc length where the glass reaches z' = zt at height y. */
+  const tAtZ = (zt: number, y: number): number => {
+    let lo = 0, hi = 4;
+    for (let k = 0; k < 28; k++) {
+      const m = (lo + hi) / 2;
+      if (glassPt(m, y)[1] < zt) lo = m;
+      else hi = m;
+    }
+    return (lo + hi) / 2;
+  };
+  const fur = new GeoBuilder();
+  fur.shade = true;
+  const pan = new GeoBuilder();
+  const dyn = new GeoBuilder();
+  const mir = new GeoBuilder();
+  const clr = new GeoBuilder();
+  clr.alpha = [];
+  const C = d.col;
+  const xs = (a: number, b: number, n: number) => Array.from({ length: n + 1 }, (_, i) => a + ((b - a) * i) / n);
+
+  // --- driver's dash: moulded top that tucks under the glass, crest, rounded rear edge, knee panel
+  const xa = 0.06;
+  const prof: [number, number][] = [
+    [-0.03, d.g0],
+    [0, d.dashGlass],
+    [0.08, d.dashGlass + 0.03],
+    [0.22, d.crest - 0.006],
+    [0.34, d.crest],
+    [d.depth - 0.07, d.crest - 0.014],
+    [d.depth - 0.02, d.crest - 0.05],
+    [d.depth, d.crest - 0.1],
+    [d.depth, d.crest - 0.2],
+    [d.depth - 0.03, 0.95],
+    [d.depth - 0.07, DRIVER_PLATFORM + 0.06],
+  ];
+  const dashRows = xs(xa, xi, 14).map((x) => {
+    const zg = inner(x, d.dashGlass);
+    return prof.map(([dz, y]) => P(x, y, zg + dz));
+  });
+  surface(fur, dashRows, C.dash, eye);
+  // darker anti-glare top: re-colour the first four profile rows
+  {
+    const rows = xs(xa, xi, 14).map((x) => {
+      const zg = inner(x, d.dashGlass);
+      return prof.slice(0, 5).map(([dz, y]) => P(x, y + 0.002, zg + dz));
+    });
+    surface(fur, rows, C.top, eye);
   }
-  gb.box(hx0, 1.4, Z(0.52), hx1, 1.64, Z(0.6), dash, 16 | 4);
-  // right wing (switches) and left wing (console pedestal)
-  gb.box(0.95, 0.8, Z(0.5), B.hw - 0.09, 1.34, Z(1.0), dash, 2 | 4 | 16);
-  gb.box(0.04, 0.8, Z(0.5), 0.3, 1.4, Z(0.78), dash, 1 | 4 | 16 | 2);
-  // ticketing console on a pedestal left of the wheel
-  gb.rod(V(0.17, 1.4, Z(0.66)), V(0.17, 1.55, Z(0.66)), 0.025, grey, 6);
-  gb.box(0.04, 1.52, Z(0.56), 0.3, 1.7, Z(0.72), rgb('#2e3238'));
-  // steering column
-  const wheelCenter = V(0.62, 1.6, Z(0.85));
-  gb.rod(V(0.62, 1.12, Z(0.6)), wheelCenter.clone().add(V(0, -0.03, -0.04)), 0.05, rgb('#1c1d20'), 8);
-  gb.box(0.5, 1.0, Z(0.58), 0.74, 1.2, Z(0.74), rgb('#1c1d20'));
-  // pedals
-  gb.box(0.48, 0.8, Z(0.35), 0.58, 0.86, Z(0.5), rgb('#3a3d42'));
-  gb.box(0.7, 0.8, Z(0.38), 0.78, 0.86, Z(0.5), rgb('#3a3d42'));
-  // driver's seat (no headrest so the saloon stays visible when looking back)
-  const seat: RGB = rgb('#2c3038');
-  gb.box(0.52, 0.8, Z(1.42), 0.74, 1.2, Z(1.62), rgb('#1c1d20'));
-  gb.box(0.38, 1.2, Z(1.22), 0.86, 1.34, Z(1.72), seat);
-  const back = new THREE.BoxGeometry(0.48, 0.66, 0.1);
-  gb.add(back, mat4(0.62, 1.7, Z(1.8), -0.12), seat);
-  const stripe = new THREE.BoxGeometry(0.1, 0.62, 0.005);
-  gb.add(stripe, mat4(0.62, 1.7, Z(1.745), -0.12), rgb('#1f50c8'));
-  back.dispose();
-  stripe.dispose();
-  // destination sign cabinet behind the front display
-  const metro = B.type === 'metro';
-  const [hb0, hb1] = metro ? [2.6, 2.86] : [2.73, 2.99];
-  const zh = fz(metro ? 2.73 : 2.86) - 0.02;
-  const depth = metro ? 0.1 : 0.22;
-  gb.box(-B.hw + (metro ? 0.36 : 0.12), hb0, Z(zh), B.hw - (metro ? 0.36 : 0.12), hb1, Z(zh + depth), rgb(metro ? '#1c1e22' : '#464a51'), 2 | 1 | 8 | 16);
-  if (!metro) for (const x of [-0.7, 0.0, 0.7]) gb.box(x - 0.03, hb0 + 0.08, Z(zh + depth), x + 0.03, hb0 + 0.14, Z(zh + depth + 0.02), rgb('#9aa0a7'));
-  // black rubber seal around the inside of the windscreen
-  const g0 = metro ? 0.98 : 1.12, g1 = metro ? 2.6 : 2.72, xg = B.hw - (metro ? 0.22 : 0.15);
-  const seal = rgb('#08090a');
-  gb.quad(V(xg, g1 - 0.03, Z(fz(g1) - 0.015)), V(-xg, g1 - 0.03, Z(fz(g1) - 0.015)), V(-xg, g1, Z(fz(g1) - 0.015)), V(xg, g1, Z(fz(g1) - 0.015)), seal);
-  for (const sx of [1, -1]) {
-    const xa = sx * xg, xb = sx * (xg - 0.03);
-    gb.quad(V(xa, g0, Z(fz(g0) - 0.015)), V(xb, g0, Z(fz(g0) - 0.015)), V(xb, g1, Z(fz(g1) - 0.015)), V(xa, g1, Z(fz(g1) - 0.015)), seal);
+  {
+    const zg = inner(xa, d.dashGlass);
+    capX(fur, xa, [...prof.map(([dz, y]) => [Z(zg + dz), y] as [number, number]), [Z(zg - 0.03), DRIVER_PLATFORM + 0.06]], C.dash, -1);
   }
-  // convex saloon mirror at the top of the windscreen
-  gb.rod(V(0.05, g1 - 0.01, Z(fz(g1) + 0.01)), V(0.05, g1 - 0.08, Z(fz(g1) + 0.12)), 0.01, rgb('#202226'), 5);
-  gb.box(-0.12, g1 - 0.2, Z(fz(g1) + 0.12), 0.22, g1 - 0.06, Z(fz(g1) + 0.15), rgb('#202226'));
-  gb.quad(V(-0.105, g1 - 0.19, Z(fz(g1) + 0.152)), V(0.205, g1 - 0.19, Z(fz(g1) + 0.152)), V(0.205, g1 - 0.07, Z(fz(g1) + 0.152)), V(-0.105, g1 - 0.07, Z(fz(g1) + 0.152)), rgb('#7d8ea0'));
-  // go card readers on the door poles
-  for (const d of sec.doors.slice(0, 2)) {
-    const zr = d.z1 + 0.06 - dz;
-    gb.box(-(B.hw - 0.08 - 0.25) + 0.02, 1.08, Z(zr - 0.1), -(B.hw - 0.08 - 0.25) + 0.1, 1.32, Z(zr + 0.1), rgb('#d4d7db'));
+  // --- kerb-side cowl in front of the entrance (lower, so the doorway view stays open)
+  const cowl: [number, number][] = [
+    [-0.03, d.g0],
+    [0, d.g0 + 0.04],
+    [0.1, d.g0 + 0.065],
+    [0.24, d.g0 + 0.065],
+    [0.3, d.g0 + 0.03],
+    [0.32, d.g0 - 0.03],
+    [0.31, 0.5],
+  ];
+  surface(
+    fur,
+    xs(-xi, xa, 14).map((x) => {
+      const zg = inner(x, d.g0);
+      return cowl.map(([dz, y]) => P(x, y, zg + dz));
+    }),
+    C.cowl,
+    eye,
+  );
+  // --- instrument binnacle on the column: hood over a recessed cluster face
+  const cc = P(d.cluster.x, d.cluster.y, d.cluster.z);
+  const cf = facing(cc, eye);
+  const faceW = 0.5, faceH = 0.17;
+  const FT = cc.clone().addScaledVector(cf.up, faceH / 2); // face top edge (centre)
+  const FB = cc.clone().addScaledVector(cf.up, -faceH / 2);
+  const zgc = Z(inner(d.cluster.x, d.dashGlass));
+  const crestY = d.crest;
+  const binn: [number, number][] = [
+    [zgc + 0.17, crestY - 0.01],
+    [FT.z - 0.13, FT.y - 0.06],
+    [FT.z - 0.09, FT.y + 0.025],
+    [FT.z - 0.03, FT.y + 0.055],
+    [FT.z + 0.06, FT.y + 0.065],
+    [FT.z + 0.13, FT.y + 0.05],
+    [FT.z + 0.15, FT.y + 0.03],
+    [FT.z + 0.12, FT.y + 0.018],
+    [FT.z + 0.01, FT.y + 0.006],
+    [FT.z, FT.y],
+    [FB.z, FB.y],
+    [FB.z + 0.03, FB.y - 0.012],
+    [FB.z + 0.04, Math.max(crestY - 0.02, FB.y - 0.07)],
+    [FB.z + 0.02, crestY - 0.08],
+  ];
+  const hx0 = d.cluster.x - 0.3, hx1 = d.cluster.x + 0.3;
+  // hood shell (profile swept across, ends rounded by pulling the outer rows in)
+  const hoodIdx = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+  const hoodRows: THREE.Vector3[][] = [];
+  for (const [i, x] of xs(hx0, hx1, 12).entries()) {
+    const e = Math.abs(i / 12 - 0.5) * 2; // 0 centre .. 1 ends
+    const k = e > 0.8 ? 1 - ((e - 0.8) / 0.2) ** 2 * 0.35 : 1;
+    hoodRows.push(hoodIdx.map((j) => {
+      const [z, y] = binn[j];
+      return V(x, crestY + (y - crestY) * k, z);
+    }));
   }
-  return { geo: gb.build(), wheelCenter };
+  surface(fur, hoodRows, C.binn, eye);
+  const lower = [10, 11, 12, 13];
+  surface(fur, xs(hx0, hx1, 2).map((x) => lower.map((j) => V(x, binn[j][1], binn[j][0]))), C.binn, eye);
+  for (const [x, nx] of [[hx0, -1], [hx1, 1]] as [number, number][]) {
+    const outline = binn.map(([z, y]) => [z, crestY + (y - crestY) * 0.65] as [number, number]);
+    capX(fur, x, outline, C.binn, nx);
+  }
+  // cluster face
+  panel(dyn, cc, cf.right, cf.up, faceW, faceH, uvRect(R_CLUSTER, DYN.w, DYN.h));
+  // --- switch panels on the dash wings (door controls left, lights right)
+  {
+    const zl = inner(0.18, d.crest) + 0.3;
+    const c1 = P(0.18, d.crest + 0.003, zl);
+    const n1 = basis(V(0, 1, 0).lerp(eye.clone().sub(c1).normalize(), 0.35));
+    panel(pan, c1, n1.right, n1.up, 0.2, 0.1, uvRect(R_SWITCH_L, STA.w, STA.h));
+    const zr = inner(1.03, d.crest) + 0.3;
+    const c2 = P(1.03, d.crest + 0.003, zr);
+    const n2 = basis(V(0, 1, 0).lerp(eye.clone().sub(c2).normalize(), 0.35));
+    panel(pan, c2, n2.right, n2.up, 0.2, 0.1, uvRect(R_SWITCH_R, STA.w, STA.h));
+    // destination keypad on the kerb-side cowl
+    const zk = inner(-0.42, d.g0) + 0.17;
+    const c3 = P(-0.42, d.g0 + 0.068, zk);
+    const n3 = basis(V(0, 1, 0).lerp(eye.clone().sub(c3).normalize(), 0.5));
+    panel(pan, c3, n3.right, n3.up, 0.24, 0.15, uvRect(R_DESTCTL, STA.w, STA.h));
+  }
+  // --- right-hand console along the side wall (park brake, emergency buttons)
+  {
+    const z0 = 0.62, z1 = 1.5, x0 = xi - 0.2, y1 = DRIVER_PLATFORM + 0.42;
+    fur.box(x0, DRIVER_PLATFORM, Z(z1), xi, y1, Z(z0), C.dash, 2 | 4 | 16);
+    // decal runs front to back, top edge toward the wall (read by turning to the right)
+    pan.quad(P(x0 + 0.01, y1 + 0.002, z0 + 0.05), P(x0 + 0.01, y1 + 0.002, z1 - 0.05), P(xi - 0.01, y1 + 0.002, z1 - 0.05), P(xi - 0.01, y1 + 0.002, z0 + 0.05), [1, 1, 1], uvRect(R_RCONSOLE, STA.w, STA.h));
+  }
+  // --- steering column and shroud
+  const wc = P(d.wheel.x, d.wheel.y, d.wheel.z);
+  const wn = V(0, Math.cos(d.tilt), Math.sin(d.tilt));
+  const colEnd = wc.clone().addScaledVector(wn, -0.5);
+  fur.rod(wc.clone().addScaledVector(wn, -0.04), colEnd, 0.045, rgb('#1c1d20'), 10);
+  {
+    const sc = wc.clone().addScaledVector(wn, -0.2);
+    orientedBox(fur, sc, basis(wn.clone().negate().applyAxisAngle(V(1, 0, 0), -Math.PI / 2)), 0.16, 0.12, 0.26, rgb('#222428'));
+  }
+  fur.box(d.wheel.x - 0.12, DRIVER_PLATFORM, Z(d.wheel.z - 0.32), d.wheel.x + 0.12, colEnd.y + 0.05, Z(d.wheel.z - 0.1), rgb('#1f2024'));
+  // --- go card driver console on a stalk, angled to the driver
+  {
+    const tc = P(0.16, metro ? 1.5 : 1.52, metro ? 0.92 : 0.9);
+    const tf = facing(tc, eye);
+    orientedBox(fur, tc.clone().addScaledVector(tf.n, -0.002), tf, 0.23, 0.23, 0.065, rgb('#2f3237'));
+    panel(pan, tc.clone().addScaledVector(tf.n, 0.001), tf.right, tf.up, 0.22, 0.22, uvRect(R_CONSOLE, STA.w, STA.h));
+    panel(dyn, tc.clone().addScaledVector(tf.n, 0.003).addScaledVector(tf.up, 0.039), tf.right, tf.up, 0.188, 0.106, uvRect(R_TICKET, DYN.w, DYN.h));
+    const base = P(0.16, d.crest, inner(0.16, d.crest) + d.depth - 0.12);
+    fur.rod(base, tc.clone().addScaledVector(tf.up, -0.1).addScaledVector(tf.n, -0.04), 0.022, rgb('#25272b'), 8);
+  }
+  // --- overhead console: the destination sign housing seen from inside
+  {
+    const rows = xs(-xi, xi, 20).map((x) => [P(x, d.g1, inner(x, d.g1) - 0.02), P(x, d.g1, d.ohRear)]);
+    surface(fur, rows, C.over, eye);
+    fur.quad(P(-xi, d.g1, d.ohRear), P(xi, d.g1, d.ohRear), P(xi, B.ceiling + 0.01, d.ohRear), P(-xi, B.ceiling + 0.01, d.ohRear), C.over);
+    // shadow line where the console meets the glass, access-panel seam
+    fur.quad(P(-xi, d.g1 - 0.002, d.ohRear - 0.16), P(xi, d.g1 - 0.002, d.ohRear - 0.16), P(xi, d.g1 - 0.002, d.ohRear - 0.15), P(-xi, d.g1 - 0.002, d.ohRear - 0.15), rgb('#8a8f95'));
+    const ow = 1.0, oh = Math.min(0.17, B.ceiling - d.g1 - 0.02);
+    pan.quad(P(-0.95, d.g1 + 0.01, d.ohRear + 0.004), P(-0.95 + ow, d.g1 + 0.01, d.ohRear + 0.004), P(-0.95 + ow, d.g1 + 0.01 + oh, d.ohRear + 0.004), P(-0.95, d.g1 + 0.01 + oh, d.ohRear + 0.004), [1, 1, 1], uvRect(R_OVERHEAD, STA.w, STA.h));
+    // CCTV dome
+    const dome = new THREE.SphereGeometry(0.05, 12, 6, 0, Math.PI * 2, Math.PI / 2, Math.PI / 2);
+    fur.add(dome, mat4(-0.62, d.g1, Z(d.ohRear - 0.2)), rgb('#15171a'));
+    dome.dispose();
+    // roller-blind cassettes
+    const cas: RGB = [C.over[0] * 0.8, C.over[1] * 0.8, C.over[2] * 0.8];
+    for (const [a, b] of [[0.08, xi - 0.06], [-xi + 0.06, -0.08]]) {
+      for (const [x0, x1] of xs(a, b, 6).slice(0, -1).map((x, i, arr) => [x, i + 1 < arr.length ? arr[i + 1] : b])) {
+        const za = inner(x0, d.g1) + 0.01, zb = inner(x1, d.g1) + 0.01;
+        fur.quad(P(x0, d.g1 - 0.045, za + 0.07), P(x1, d.g1 - 0.045, zb + 0.07), P(x1, d.g1, zb + 0.07), P(x0, d.g1, za + 0.07), cas);
+        fur.quad(P(x0, d.g1 - 0.045, za), P(x1, d.g1 - 0.045, zb), P(x1, d.g1 - 0.045, zb + 0.07), P(x0, d.g1 - 0.045, za + 0.07), cas);
+      }
+    }
+  }
+  // --- A-pillars: slim moulded trim along the line where the wrapped windscreen
+  // meets the first side window / the door, leaning back with the glass
+  const firstOpen = (side: 1 | -1): number => {
+    const zs = side > 0 ? sec.windowsR.map((w) => w.z0) : [...sec.windowsL.map((w) => w.z0), ...sec.doors.map((dd) => dd.z0)];
+    return Math.min(...zs);
+  };
+  const pillarZ = { 1: firstOpen(1), [-1]: firstOpen(-1) } as Record<1 | -1, number>;
+  /** |x| of the windscreen's side edge (the pillar line) at height y. */
+  const glassEdge = (s: 1 | -1, y: number): number => glassPt(tAtZ(pillarZ[s], y) - 0.03, y)[0];
+  const pillarYs = xs(d.g0 - 0.1, d.g1 + 0.01, 10);
+  for (const s of [1, -1] as const) {
+    const zA = pillarZ[s];
+    const rows = pillarYs.map((y) => {
+      const te = tAtZ(zA, y);
+      const [xf, zf] = glassPt(te - 0.075, y);
+      const [xr, zr] = glassPt(te + 0.012, y);
+      const f = P(s * (xf - 0.01), y, zf + 0.006);
+      const r = P(s * (xr - 0.012), y, zr);
+      const m = f.clone().lerp(r, 0.5);
+      // bulge inward (toward the cab centre / rearward)
+      m.x -= s * 0.028;
+      m.z += 0.022;
+      const f2 = f.clone().lerp(m, 0.35);
+      f2.x -= s * 0.012;
+      const r2 = r.clone().lerp(m, 0.35);
+      r2.x -= s * 0.012;
+      return [f, f2, m, r2, r];
+    });
+    surface(fur, rows, C.pillar, eye);
+  }
+  // --- interior convex mirror on a stalk (shows the saloon)
+  {
+    const mc = P(-0.12, d.g1 - 0.1, d.ohRear - 0.3);
+    const toEye = eye.clone().sub(mc).normalize();
+    const mf = basis(toEye.add(V(0, 0, 1)).normalize());
+    orientedBox(fur, mc.clone().addScaledVector(mf.n, -0.004), mf, 0.3, 0.12, 0.035, rgb('#1d1f23'));
+    panel(mir, mc.clone().addScaledVector(mf.n, 0.001), mf.right, mf.up, 0.276, 0.1, mirrorUV(M_INT));
+    fur.rod(P(-0.12, d.g1, d.ohRear - 0.34), mc.clone().addScaledVector(mf.up, 0.04).addScaledVector(mf.n, -0.025), 0.01, rgb('#1d1f23'), 6);
+  }
+  // --- Metro: camera-monitor screens on the A-pillars
+  if (metro) {
+    for (const s of [1, -1] as const) {
+      const ym = d.g1 - 0.42;
+      const xe = glassEdge(s, ym);
+      const mc = P(s * (xe - 0.12), ym, pillarZ[s] + 0.04);
+      const mf = facing(mc, eye);
+      orientedBox(fur, mc.clone().addScaledVector(mf.n, -0.003), mf, 0.16, 0.27, 0.05, rgb('#17191c'));
+      panel(mir, mc.clone().addScaledVector(mf.n, 0.001), mf.right, mf.up, 0.13, 0.24, mirrorUV(s > 0 ? M_RIGHT : M_LEFT));
+      fur.rod(mc.clone().addScaledVector(mf.n, -0.03), P(s * (xe - 0.02), ym, pillarZ[s] - 0.02), 0.015, rgb('#17191c'), 6);
+    }
+  }
+  // --- go card readers on the door poles
+  for (const dd of sec.doors.slice(0, 2)) {
+    const zr = dd.z1 + 0.06;
+    const xr = -(xi - 0.25);
+    fur.box(xr + 0.02, 1.08, Z(zr - 0.1), xr + 0.1, 1.32, Z(zr + 0.1), rgb('#d4d7db'));
+    pan.quad(P(xr + 0.105, 1.09, zr + 0.09), P(xr + 0.105, 1.09, zr - 0.09), P(xr + 0.105, 1.31, zr - 0.09), P(xr + 0.105, 1.31, zr + 0.09), [1, 1, 1], uvRect(R_READER, STA.w, STA.h));
+  }
+  // --- driver's seat (no headrest, so looking back shows the saloon)
+  {
+    const sp = DRIVER_PLATFORM;
+    const seat = rgb('#2c3038');
+    fur.box(0.52, sp, Z(1.38), 0.72, sp + 0.36, Z(1.62), rgb('#1c1d20'));
+    fur.box(0.38, sp + 0.36, Z(1.2), 0.86, sp + 0.5, Z(1.72), seat);
+    const back = new THREE.BoxGeometry(0.48, 0.66, 0.1);
+    fur.add(back, mat4(0.62, sp + 0.86, Z(1.8), -0.12), seat);
+    back.dispose();
+  }
+  // --- stickers on the back of the driver's partition
+  {
+    const zp = 1.925;
+    pan.quad(P(0.3, 1.0, zp), P(0.75, 1.0, zp), P(0.75, 1.14, zp), P(0.3, 1.14, zp), [1, 1, 1], uvRect(R_STICKER, STA.w, STA.h));
+    pan.quad(P(0.8, 1.0, zp), P(1.1, 1.0, zp), P(1.1, 1.09, zp), P(0.8, 1.09, zp), [1, 1, 1], uvRect(R_CCTV, STA.w, STA.h));
+  }
+  // --- "PLEASE HAIL DRIVER" on the top of the glass (Optimus), reversed from inside
+  if (!metro) {
+    // matches the exterior sticker (paint.ts): kerb side of centre, just under the top frit
+    const y0 = 2.348, y1 = 2.432;
+    const x0 = -0.72, x1 = 0.28;
+    pan.quad(P(x0, y0, inner(x0, y0) - 0.004), P(x1, y0, inner(x1, y0) - 0.004), P(x1, y1, inner(x1, y1) - 0.004), P(x0, y1, inner(x0, y1) - 0.004), [0.72, 0.72, 0.72], uvRect(R_HAIL, STA.w, STA.h));
+  }
+  // --- passenger display hanging behind the driver, facing the saloon
+  panel(dyn, P(-0.25, metro ? 2.6 : 2.52, 2.06), V(1, 0, 0), V(0, 1, 0), 0.8, 0.15, uvRect(R_STOP, DYN.w, DYN.h));
+
+  // --- clear parts: windscreen (a hint of glass, black frit along the top), roller blinds
+  {
+    const ysG = [d.g0 + 0.02, d.g1 - 0.06, d.g1 - 0.035, d.g1 - 0.015, d.g1];
+    const us = xs(0, 1, 32);
+    const xsG = us;
+    const idx: number[][] = [];
+    for (const u of us) {
+      const row: number[] = [];
+      for (const y of ysG) {
+        const xl = glassEdge(-1, y), xr = glassEdge(1, y);
+        // denser towards the wrapped corners
+        const uu = 0.5 - 0.5 * Math.cos(Math.PI * u);
+        const x = -xl + (xl + xr) * (0.35 * u + 0.65 * uu);
+        const edge = Math.min(x + xl, xr - x);
+        const top = Math.max(0, Math.min(1, (y - (d.g1 - 0.055)) / 0.04));
+        const side = Math.max(0, Math.min(1, (0.05 - edge) / 0.05));
+        const frit = Math.max(top, side);
+        const a = 0.04 + 0.9 * frit;
+        const k = (1 - frit) ** 3;
+        row.push(clr.vertex(x, y, Z(inner(x, y) - 0.008), 0, 0, 1, 0, 0, [0.22 * k + 0.012, 0.27 * k + 0.014, 0.28 * k + 0.016], a));
+      }
+      idx.push(row);
+    }
+    for (let i = 0; i < xsG.length - 1; i++)
+      for (let j = 0; j < ysG.length - 1; j++) {
+        clr.tri(idx[i][j], idx[i + 1][j], idx[i + 1][j + 1]);
+        clr.tri(idx[i][j], idx[i + 1][j + 1], idx[i][j + 1]);
+      }
+    // driver's smoked roller blind, partly down
+    const by1 = d.g1 - 0.045, by0 = d.g1 - d.blindDrop;
+    // stops short of the A-pillar so it never wraps behind it
+    const bx = xs(metro ? 0.02 : 0.1, Math.min(xi - 0.08, glassEdge(1, by0) - 0.06, glassEdge(1, by1) - 0.06), 8);
+    const tint: RGB = metro ? [0.025, 0.028, 0.035] : [0.03, 0.035, 0.045];
+    for (let i = 0; i < bx.length - 1; i++) {
+      const xa2 = bx[i], xb2 = bx[i + 1];
+      const za = inner(xa2, by0) + 0.05, zb = inner(xb2, by0) + 0.05;
+      const ta = inner(xa2, by1) + 0.06, tb = inner(xb2, by1) + 0.06;
+      clr.quad(P(xb2, by0, zb), P(xa2, by0, za), P(xa2, by1, ta), P(xb2, by1, tb), tint, undefined, metro ? 0.68 : 0.62);
+      fur.quad(P(xb2, by0 - 0.022, zb), P(xa2, by0 - 0.022, za), P(xa2, by0, za), P(xb2, by0, zb), rgb('#25272b'));
+    }
+    // pull tab
+    const tx = (bx[0] + bx[bx.length - 1]) / 2;
+    const tz = inner(tx, by0) + 0.05;
+    fur.box(tx - 0.03, by0 - 0.06, Z(tz - 0.005), tx + 0.03, by0 - 0.02, Z(tz + 0.005), rgb('#25272b'));
+  }
+
+  return {
+    furniture: fur.build(),
+    panels: pan.build(),
+    dynamic: dyn.build(),
+    mirrors: mir.build(),
+    clear: clr.build(),
+    wheelCenter: wc,
+  };
 }
 
+/** Volvo-style bus wheel: thick rim, two low spokes and a big centre pad. */
 function steeringWheelGeometry(): THREE.BufferGeometry {
   const gb = new GeoBuilder();
   gb.shade = true;
-  const black: RGB = rgb('#202125');
-  const rim = new THREE.TorusGeometry(0.255, 0.021, 8, 36);
+  const black: RGB = rgb('#2a2c31');
+  const rim = new THREE.TorusGeometry(0.25, 0.022, 8, 40);
   gb.add(rim, mat4(0, 0, 0, Math.PI / 2, 0, 0), black);
-  for (const a of [Math.PI / 2 + 0.25, Math.PI / 2 - 0.25, -Math.PI / 2]) {
-    const spoke = new THREE.BoxGeometry(0.21, 0.022, 0.05);
-    gb.add(spoke, mat4(Math.cos(a) * 0.13, -0.012, Math.sin(a) * -0.13, 0, a, 0), rgb('#2a2c31'));
+  rim.dispose();
+  // spokes at about 4 and 8 o'clock (local -z is 12 o'clock, toward the windscreen)
+  for (const a of [-0.38, Math.PI + 0.38]) {
+    const dir = V(Math.cos(a), 0, -Math.sin(a));
+    const len = 0.19;
+    const spoke = new THREE.BoxGeometry(len, 0.024, 0.06);
+    gb.add(spoke, mat4(dir.x * (0.07 + len / 2), -0.012, dir.z * (0.07 + len / 2), 0, a, 0), rgb('#33363c'));
     spoke.dispose();
   }
-  const hub = new THREE.CylinderGeometry(0.085, 0.095, 0.06, 18);
-  gb.add(hub, mat4(0, -0.02, 0), rgb('#2c2f35'));
-  const badge = new THREE.CircleGeometry(0.035, 16);
-  gb.add(badge, mat4(0, 0.0115, 0, -Math.PI / 2), rgb('#8f969e'));
-  // rim grip marks at 10 and 2 o'clock
-  for (const a of [Math.PI * 0.8, Math.PI * 0.2]) {
-    const g = new THREE.TorusGeometry(0.255, 0.024, 6, 6, 0.35);
-    gb.add(g, mat4(0, 0, 0, Math.PI / 2, 0, a - 0.17), rgb('#33363c'));
+  {
+    const spoke = new THREE.BoxGeometry(0.05, 0.022, 0.17);
+    gb.add(spoke, mat4(0, -0.014, 0.15), rgb('#33363c'));
+    spoke.dispose();
+  }
+  const pad = new THREE.CylinderGeometry(0.09, 0.1, 0.07, 20);
+  gb.add(pad, mat4(0, -0.012, 0.012, 0, 0, 0, 1.25, 1, 1), rgb('#3a3d43'));
+  pad.dispose();
+  const badge = new THREE.CircleGeometry(0.025, 16);
+  gb.add(badge, mat4(0, 0.0235, 0.0, -Math.PI / 2), rgb('#9aa1a9'));
+  badge.dispose();
+  // grip sections at 10 and 2 o'clock
+  for (const a of [Math.PI * 0.75, Math.PI * 0.25]) {
+    const g = new THREE.TorusGeometry(0.25, 0.025, 6, 8, 0.45);
+    gb.add(g, mat4(0, 0, 0, Math.PI / 2, 0, a - 0.225), rgb('#34373d'));
     g.dispose();
   }
-  rim.dispose();
-  hub.dispose();
-  badge.dispose();
   return gb.build();
 }
 
@@ -465,9 +550,8 @@ export function createCab(type: BusType): Cab {
   const B = layoutFor(type);
   const sec = B.sections[0];
   const metro = type === 'metro';
-  const dz = B.eye.z - 1.4; // furniture laid out for an eye 1.4 m behind the nose
-  const zo = -sec.axleFromFront;
-  const Z = (z: number) => z + zo;
+  const d = dimsFor(B);
+  const Z = (z: number) => z - sec.axleFromFront;
   const group = new THREE.Group();
   group.name = 'cab';
   group.userData.busCab = true;
@@ -476,99 +560,54 @@ export function createCab(type: BusType): Cab {
   const saloon = buildSaloon(B, sec, true);
   group.add(saloon.group);
 
-  const furn = buildFurniture(B, sec, dz);
+  const built = buildCab(B, sec, d, eye);
   const furnMat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
-  const furniture = new THREE.Mesh(furn.geo, furnMat);
+  const furniture = new THREE.Mesh(built.furniture, furnMat);
   furniture.name = 'cabFurniture';
   group.add(furniture);
 
-  // steering wheel: pivot tilted 35 degrees from horizontal
+  // steering wheel: built flat (local -z = 12 o'clock), tilted back toward the driver
   const wheelPivot = new THREE.Group();
-  wheelPivot.position.copy(furn.wheelCenter);
-  wheelPivot.rotation.x = (35 * Math.PI) / 180;
+  wheelPivot.position.copy(built.wheelCenter);
+  wheelPivot.rotation.x = d.tilt;
   const wheelMat = new THREE.MeshBasicMaterial({ vertexColors: true });
   const wheel = new THREE.Mesh(steeringWheelGeometry(), wheelMat);
   wheel.name = 'steeringWheel';
   wheelPivot.add(wheel);
   group.add(wheelPivot);
 
-  // canvas textures
-  const dyn = makeCanvas(DYN.w, DYN.h);
-  const dynTex = canvasTexture(dyn.canvas, true, false);
-  const sta = makeCanvas(STA.w, STA.h);
-  drawStatic(sta.ctx);
-  const staTex = canvasTexture(sta.canvas);
+  // canvases
+  const dynC = makeCanvas(DYN.w, DYN.h);
+  const dynTex = canvasTexture(dynC.canvas, true, false);
+  const staC = makeCanvas(STA.w, STA.h);
+  drawStatic(staC.ctx, metro);
+  const staTex = canvasTexture(staC.canvas);
 
-  const dg = new GeoBuilder();
-  const eyeTarget = eye.clone();
-  {
-    const c = V(0.62, 1.755, Z(0.52 + dz));
-    const f = facing(c, eyeTarget);
-    panel(dg, c, f.right, f.up, 0.56, 0.2, uvRect(R_CLUSTER, DYN.w, DYN.h));
-  }
-  {
-    // passenger display hanging behind the driver, facing the saloon
-    panel(dg, V(-0.25, 2.52, Z(2.06)), V(1, 0, 0), V(0, 1, 0), 0.8, 0.15, uvRect(R_STOP, DYN.w, DYN.h));
-  }
-  {
-    const c = V(0.2, 1.62, Z(0.73 + dz));
-    const f = facing(c, eyeTarget);
-    panel(dg, c, f.right, f.up, 0.2, 0.12, uvRect(R_TICKET, DYN.w, DYN.h));
-  }
   const dynMat = new THREE.MeshBasicMaterial({ map: dynTex, toneMapped: false });
-  const dynMesh = new THREE.Mesh(dg.build(), dynMat);
+  const dynMesh = new THREE.Mesh(built.dynamic, dynMat);
   dynMesh.name = 'instruments';
   group.add(dynMesh);
-
-  const sg = new GeoBuilder();
-  {
-    const c = V(1.06, 1.36, Z(0.76 + dz));
-    const f = facing(c, eyeTarget);
-    panel(sg, c, f.right, f.up, 0.2, 0.14, uvRect(R_SWITCH_R, STA.w, STA.h));
-    const c2 = V(0.16, 1.42, Z(0.64 + dz));
-    const f2 = facing(c2, eyeTarget);
-    panel(sg, c2, f2.right, f2.up, 0.22, 0.1, uvRect(R_SWITCH_L, STA.w, STA.h));
-    const c3 = V(-0.4, 1.235, Z(0.33 + dz));
-    const f3 = facing(c3, eyeTarget);
-    panel(sg, c3, f3.right, f3.up, 0.26, 0.16, uvRect(R_DESTCTL, STA.w, STA.h));
-  }
-  for (const d of sec.doors.slice(0, 2)) {
-    const zr = d.z1 + 0.06;
-    const x = -(B.hw - 0.08 - 0.25) + 0.105;
-    sg.quad(V(x, 1.09, Z(zr + 0.09)), V(x, 1.09, Z(zr - 0.09)), V(x, 1.31, Z(zr - 0.09)), V(x, 1.31, Z(zr + 0.09)), [1, 1, 1], uvRect(R_READER, STA.w, STA.h));
-  }
-  // stickers on the back of the driver's partition
-  sg.quad(V(0.3, 1.18, Z(1.925 + dz)), V(0.75, 1.18, Z(1.925 + dz)), V(0.75, 1.32, Z(1.925 + dz)), V(0.3, 1.32, Z(1.925 + dz)), [1, 1, 1], uvRect(R_STICKER, STA.w, STA.h));
-  sg.quad(V(0.8, 1.18, Z(1.925 + dz)), V(1.1, 1.18, Z(1.925 + dz)), V(1.1, 1.27, Z(1.925 + dz)), V(0.8, 1.27, Z(1.925 + dz)), [1, 1, 1], uvRect(R_CCTV, STA.w, STA.h));
-  const staMat = new THREE.MeshBasicMaterial({ map: staTex });
-  const staMesh = new THREE.Mesh(sg.build(), staMat);
+  const staMat = new THREE.MeshBasicMaterial({ map: staTex, vertexColors: true });
+  const staMesh = new THREE.Mesh(built.panels, staMat);
   staMesh.name = 'cabPanels';
   group.add(staMesh);
-
-  // sun visor (tinted roller blind) on the driver's side
-  const vg = new GeoBuilder();
-  vg.alpha = [];
-  const zv = frontZ(B, sec, 2.62) + 0.1;
-  const vy0 = metro ? 2.4 : 2.56, vy1 = metro ? 2.58 : 2.715;
-  // roller blind: darker toward the top edge
-  const c0 = vg.vertex(1.1, vy0, Z(zv), 0, 0, 1, 0, 0, [0.02, 0.02, 0.03], 0.35);
-  const c1 = vg.vertex(0.16, vy0, Z(zv), 0, 0, 1, 0, 0, [0.02, 0.02, 0.03], 0.35);
-  const c2 = vg.vertex(0.16, vy1, Z(zv + 0.02), 0, 0, 1, 0, 0, [0.02, 0.02, 0.03], 0.75);
-  const c3 = vg.vertex(1.1, vy1, Z(zv + 0.02), 0, 0, 1, 0, 0, [0.02, 0.02, 0.03], 0.75);
-  vg.tri(c0, c1, c2);
-  vg.tri(c0, c2, c3);
-  // bottom rail of the blind
-  vg.quad(V(1.1, vy0 - 0.012, Z(zv)), V(0.16, vy0 - 0.012, Z(zv)), V(0.16, vy0, Z(zv)), V(1.1, vy0, Z(zv)), [0.08, 0.08, 0.09], undefined, 1);
-  const visorMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false, side: THREE.DoubleSide });
-  const visor = new THREE.Mesh(vg.build(), visorMat);
-  visor.renderOrder = 3;
-  group.add(visor);
+  const mirMat = new THREE.MeshBasicMaterial({ map: mirrorTexture(), color: metro ? 0xffffff : 0xe2e6ea, toneMapped: !metro });
+  const mirMesh = new THREE.Mesh(built.mirrors, mirMat);
+  mirMesh.name = 'cabMirrors';
+  group.add(mirMesh);
+  const clearMat = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+  const clear = new THREE.Mesh(built.clear, clearMat);
+  clear.name = 'windscreen';
+  clear.renderOrder = 3;
+  group.add(clear);
 
   let lastKey = '';
   let lastDraw = -1;
   let lastT = 0;
   let trip = 0;
   let night: boolean | null = null;
+  let mirKey = '';
+  let mirT = -1;
 
   return {
     group,
@@ -582,6 +621,17 @@ export function createCab(type: BusType): Cab {
       if (night !== st.lights.headlights) {
         night = st.lights.headlights;
         saloon.setNight(night);
+        const k = night ? 0.62 : 1;
+        furnMat.color.setScalar(k);
+        wheelMat.color.setScalar(k);
+        staMat.color.setScalar(night ? 0.75 : 1);
+      }
+      // mirror reflections: repaint ~12 times a second while moving
+      const mk = `${type}|${playerSign.route}|${night ? 1 : 0}`;
+      if (mk !== mirKey || ((st.speedKmh > 0.5 || st.timeSeconds < mirT) && Math.abs(st.timeSeconds - mirT) > 0.08)) {
+        mirKey = mk;
+        mirT = st.timeSeconds;
+        paintMirrors({ type, route: playerSign.route, dist: trip * 1000, night: !!night });
       }
       const L = st.lights;
       const key = [
@@ -598,9 +648,9 @@ export function createCab(type: BusType): Cab {
       if (key !== lastKey && (st.timeSeconds - lastDraw > 0.05 || st.timeSeconds < lastDraw)) {
         lastKey = key;
         lastDraw = st.timeSeconds;
-        drawCluster(dyn.ctx, { speed: st.speedKmh, rpm: st.rpm, flash, st, trip, metro });
-        drawStop(dyn.ctx, st);
-        drawTicket(dyn.ctx, st);
+        drawCluster(dynC.ctx, { speed: st.speedKmh, rpm: st.rpm, flash, st, trip, metro });
+        drawStop(dynC.ctx, st);
+        drawTicket(dynC.ctx, st);
         dynTex.needsUpdate = true;
       }
     },
