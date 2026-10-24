@@ -210,14 +210,12 @@ export function createHighBus(spec: BusSpec, route: Route | undefined): BusMesh 
   let lastNight: boolean | null = null;
   let doorT = -1;
 
-  function hasCab(): boolean {
-    return sections[0].children.some((c) => c.userData.busCab === true);
-  }
-
   function updateWells(): void {
-    const cab = hasCab();
-    secs.forEach((s, i) => {
-      if (s.wells) s.wells.visible = !inside && !(i === 0 && cab);
+    // The cab interior is sealed inside the shell, so it is only drawn in
+    // first-person; outside views get the cheap dark door wells instead.
+    for (const c of sections[0].children) if (c.userData.busCab === true) c.visible = inside;
+    secs.forEach((s) => {
+      if (s.wells) s.wells.visible = !inside;
     });
   }
 

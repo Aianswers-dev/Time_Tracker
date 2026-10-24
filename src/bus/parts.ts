@@ -1,7 +1,7 @@
 // Exterior parts other than the painted shell.
 import * as THREE from 'three';
 import { BELLOWS, type BodyLayout, type SectionLayout } from './spec';
-import { frontZ, rearZ, ringAt, sideX } from './shell';
+import { frontZ, rearZ, sideX } from './shell';
 import { SIGN_UV } from './sign';
 import type { Livery } from './livery';
 import { GeoBuilder, mat4, rgb, type RGB } from './util';
@@ -167,6 +167,16 @@ export function addTrim(gb: GeoBuilder, B: BodyLayout, sec: SectionLayout, lv: L
       // TOSA charging receiver arm
       gb.rod(V(0, B.yTop + pod.h, pod.z0 + 0.2 + zo), V(0, B.yTop + pod.h + 0.18, pod.z0 + 0.7 + zo), 0.04, rgb('#55595f'), 6);
       gb.box(-0.45, B.yTop + pod.h + 0.15, pod.z0 + 0.55 + zo, 0.45, B.yTop + pod.h + 0.22, pod.z0 + 0.85 + zo, rgb('#2a2d31'));
+    }
+  }
+  if (!low) {
+    // roof escape hatches between the pods
+    const free = (z: number) => sec.roofPods.every((p) => z < p.z0 - 0.5 || z > p.z1 + 0.5);
+    for (let z = sec.bodyFront + 1.0; z < sec.bodyRear - 0.8; z += 0.25) {
+      if (!free(z)) continue;
+      gb.box(-0.36, B.yTop - 0.01, z + zo, 0.36, B.yTop + 0.045, z + 0.72 + zo, rgb('#c3c7cc'));
+      gb.box(-0.3, B.yTop + 0.045, z + 0.06 + zo, 0.3, B.yTop + 0.06, z + 0.66 + zo, rgb('#8d949b'), 4);
+      z += 2.6;
     }
   }
   if (!sec.isFront) return;
@@ -453,4 +463,3 @@ export class Bellows {
   }
 }
 
-export { ringAt };

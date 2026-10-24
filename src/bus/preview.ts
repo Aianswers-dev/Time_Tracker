@@ -170,7 +170,10 @@ function frame(time: number): void {
   requestAnimationFrame(frame);
   place(time);
   const tt = t + time / 1000;
-  for (const b of buses) b.bus.setLights(lights, q.has('t') ? t : tt);
+  for (const b of buses) {
+    b.bus.setLights(lights, q.has('t') ? t : tt);
+    b.bus.setInteriorView(q.get('view') === 'cab'); // like the game's CameraRig, every frame
+  }
   cab?.update({
     speedKmh: num('speed', 38),
     rpm: num('rpm', 1450),

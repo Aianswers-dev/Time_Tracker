@@ -10,10 +10,6 @@ export function rgb(c: string | number): RGB {
   return [col.r, col.g, col.b];
 }
 
-export function scaleRGB(c: RGB, k: number): RGB {
-  return [c[0] * k, c[1] * k, c[2] * k];
-}
-
 /** Fake interior lighting baked into vertex colours (interiors are unlit). */
 export function bakeShade(nx: number, ny: number, nz: number, y: number): number {
   // key light from above-front-left, fill from below; slight darkening near the floor
@@ -199,18 +195,6 @@ export function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w
   ctx.lineTo(x, y + rr);
   ctx.quadraticCurveTo(x, y, x + rr, y);
   ctx.closePath();
-}
-
-/** Deterministic PRNG (mulberry32). */
-export function rng(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
 }
 
 export function hashString(s: string): number {

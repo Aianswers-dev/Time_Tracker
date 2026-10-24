@@ -221,21 +221,3 @@ export const SEAT_UV = {
   plastic: [0.78, 0.3, 0.98, 0.95] as [number, number, number, number],
   dark: [0.8, 0.02, 0.98, 0.18] as [number, number, number, number],
 };
-
-let accordion: THREE.Texture | null = null;
-
-/** Silver accordion stripes for the bellows. */
-export function bellowsTexture(): THREE.Texture {
-  if (accordion) return accordion;
-  const { canvas, ctx } = makeCanvas(64, 8);
-  for (let x = 0; x < 64; x++) {
-    const t = (x % 8) / 8;
-    const v = Math.round(120 + 90 * Math.sin(t * Math.PI));
-    ctx.fillStyle = `rgb(${v},${v + 3},${v + 8})`;
-    ctx.fillRect(x, 0, 1, 8);
-  }
-  const t = canvasTexture(canvas);
-  t.wrapS = THREE.RepeatWrapping;
-  accordion = t;
-  return t;
-}
