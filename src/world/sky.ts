@@ -176,7 +176,8 @@ export class SkySystem {
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   }
 
-  update(camera: THREE.Camera, hours: number): void {
+  /** `groundH`: ground height under the camera (shadow box size and placement follow the terrain). */
+  update(camera: THREE.Camera, hours: number, groundH = 0): void {
     sunDirection(hours, this.sunDir);
     const e = Math.asin(clamp(this.sunDir.y, -1, 1)) / DEG;
     this.elevation = e;
@@ -229,7 +230,7 @@ export class SkySystem {
 
     // Shadow box follows the camera, snapped to texels to avoid shimmer.
     const cam = camera as THREE.PerspectiveCamera;
-    const camH = Math.max(0, cam.position.y);
+    const camH = Math.max(0, cam.position.y - groundH);
     const half = clamp(110 + camH * 0.9, 110, 700);
     if (Math.abs(half - this.shadowHalf) > 20) {
       this.shadowHalf = half;
@@ -254,9 +255,9 @@ export class SkySystem {
     if (right.lengthSq() < 1e-6) right.set(1, 0, 0);
     right.normalize();
     const upv = this.tmp4.copy(ld).cross(right).normalize();
-    const pr = Math.round((cx * right.x + cz * right.z) / texel) * texel;
-    const pu = Math.round((cx * upv.x + cz * upv.z) / texel) * texel;
-    const pd = cx * ld.x + cz * ld.z;
+    const pr = Math.round((cx * right.x + groundH * right.y + cz * right.z) / texel) * texel;
+    const pu = Math.round((cx * upv.x + groundH * upv.y + cz * upv.z) / texel) * texel;
+    const pd = cx * ld.x + groundH * ld.y + cz * ld.z;
     const tx = right.x * pr + upv.x * pu + ld.x * pd;
     const ty = right.y * pr + upv.y * pu + ld.y * pd;
     const tz = right.z * pr + upv.z * pu + ld.z * pd;

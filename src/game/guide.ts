@@ -289,6 +289,19 @@ export class RouteGuide {
     return { x: this.tmp.x, y: this.tmp.y, heading: this.tmp.heading, z: this.track.zAt(s) };
   }
 
+  /**
+   * The guidance lane at route distance `s` (metres along the route): map x/y
+   * and heading of the FRONT of the bus, and the road height there. This is
+   * the path the guide and the AI buses follow (on the carriageway at its
+   * level), unlike the raw GTFS shape, which can run metres off a busway
+   * tunnel. Use it to place the bus part-way along the route (dev `?s=`).
+   */
+  trackPose(s: number): { x: number; y: number; heading: number; z: number } {
+    const ss = Math.max(0, Math.min(this.route.length, s));
+    this.track.sample(ss, this.tmp);
+    return { x: this.tmp.x, y: this.tmp.y, heading: this.tmp.heading, z: this.track.zAt(ss) };
+  }
+
   /** Start of the stretch where the front of the bus counts as being at stop i. */
   private zoneFrom(i: number): number {
     const z = this.places[i]?.zone;

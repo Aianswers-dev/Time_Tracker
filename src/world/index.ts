@@ -144,6 +144,7 @@ export async function buildWorld(
 
   await step(0.12, 'Paving roads…');
   const roads = await buildRoads(ctx, field, stripMat, (f) => onProgress(0.12 + f * 0.24, 'Paving roads…'));
+  field.settle();
   await step(0.36, 'Shaping the hills…');
   await buildTerrain(ctx, field, terrainMat, outerMat);
   buildWater(ctx);
@@ -151,7 +152,7 @@ export async function buildWorld(
   buildStoryBridge(ctx);
 
   await step(0.4, 'Raising buildings…');
-  const bidx = await buildBuildings(ctx, (f) => onProgress(0.4 + f * 0.3, 'Raising buildings…'));
+  const bidx = await buildBuildings(ctx, roads, (f) => onProgress(0.4 + f * 0.3, 'Raising buildings…'));
   await step(0.7, 'Building Queenslanders…');
   const houses = await buildHouses(ctx, roads, bidx, (f) => onProgress(0.7 + f * 0.1, 'Building Queenslanders…'));
   await step(0.8, 'Planting jacarandas…');
@@ -189,11 +190,12 @@ export async function buildWorld(
       // underground: the camera is below the ground surface here (open cuttings don't count)
       const mx = camPos.x;
       const my = -camPos.z;
-      const depth = field.isHole(mx, my) ? 0 : field.renAt(mx, my) - camPos.y;
+      const groundH = field.renAt(mx, my);
+      const depth = field.isHole(mx, my) ? 0 : groundH - camPos.y;
       const under = Math.min(1, Math.max(0, (depth - 1.5) / 3));
       U.uUnder.value = under;
       U.uInTunnel.value = under > 0.5 ? 1 : 0;
-      sky.update(camera, hours);
+      sky.update(camera, hours, Math.min(groundH, camPos.y));
       if (under > 0) {
         sky.sun.intensity *= 1 - 0.85 * under;
         sky.hemi.intensity *= 1 - 0.55 * under;

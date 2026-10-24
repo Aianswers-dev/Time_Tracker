@@ -23,6 +23,10 @@ export class TerrainField {
   readonly ren: Float32Array;
   /** Per cell ((nx-1) x (ny-1)): 1 = no ground here (open cutting). */
   readonly hole: Uint8Array;
+  /** Per vertex: lowest height any road clamp allows (ground must stay under roads). */
+  readonly cap: Float32Array;
+  /** Per vertex: top of a structure buried below (tunnel roofs); ground and skirts stay above it. */
+  readonly floor: Float32Array;
   readonly ox0: number;
   readonly oy0: number;
   readonly ocell: number;
@@ -43,6 +47,8 @@ export class TerrainField {
     this.nat = inner.h;
     this.ren = Float32Array.from(inner.h);
     this.hole = new Uint8Array((this.nx - 1) * (this.ny - 1));
+    this.cap = new Float32Array(this.nx * this.ny).fill(Infinity);
+    this.floor = new Float32Array(this.nx * this.ny).fill(-Infinity);
     this.ox0 = outer.x0;
     this.oy0 = outer.y0;
     this.ocell = outer.cell;
@@ -139,11 +145,43 @@ export class TerrainField {
         const k = j * this.nx + i;
         const v = z - margin;
         if (v < this.ren[k]) this.ren[k] = v;
+        if (v < this.cap[k]) this.cap[k] = v;
       }
     }
   }
 
-  /** Mark cells whose centre lies within `expand` metres of the convex quad (x, y corners) as holes. */
+  /**
+   * Mark a buried structure (a tunnel roof segment, convex quad of x,y,z corners):
+   * vertices within `expand` metres keep the ground, and terrain skirts, above
+   * its highest corner.
+   */
+  protectQuad(q: number[], expand: number): void {
+    const xs = [q[0], q[3], q[6], q[9]];
+    const ys = [q[1], q[4], q[7], q[10]];
+    const top = Math.max(q[2], q[5], q[8], q[11]);
+    const i0 = Math.max(0, Math.ceil((Math.min(...xs) - expand - this.x0) / this.cell));
+    const i1 = Math.min(this.nx - 1, Math.floor((Math.max(...xs) + expand - this.x0) / this.cell));
+    const j0 = Math.max(0, Math.ceil((Math.min(...ys) - expand - this.y0) / this.cell));
+    const j1 = Math.min(this.ny - 1, Math.floor((Math.max(...ys) + expand - this.y0) / this.cell));
+    for (let j = j0; j <= j1; j++) {
+      const y = this.y0 + j * this.cell;
+      for (let i = i0; i <= i1; i++) {
+        const x = this.x0 + i * this.cell;
+        const k = j * this.nx + i;
+        if (top > this.floor[k] && quadDist(q, x, y) <= expand) this.floor[k] = top;
+      }
+    }
+  }
+
+  /** After all earthworks: lift ground that sags into a shallow tunnel roof (never above a road clamp). */
+  settle(): void {
+    const { ren, floor, cap } = this;
+    for (let k = 0; k < ren.length; k++) {
+      if (floor[k] + 0.3 > ren[k]) ren[k] = Math.max(ren[k], Math.min(floor[k] + 0.3, cap[k]));
+    }
+  }
+
+  /** Mark cells whose square overlaps the convex quad (x, y corners) grown by `expand` metres as holes. */
   holeQuad(q: number[], expand: number): void {
     const xs = [q[0], q[3], q[6], q[9]];
     const ys = [q[1], q[4], q[7], q[10]];
@@ -156,10 +194,39 @@ export class TerrainField {
       const y = this.y0 + (j + 0.5) * c;
       for (let i = i0; i <= i1; i++) {
         const x = this.x0 + (i + 0.5) * c;
-        if (quadDist(q, x, y) <= expand) this.hole[j * (this.nx - 1) + i] = 1;
+        if (squareMeetsQuad(q, x, y, c / 2, expand)) this.hole[j * (this.nx - 1) + i] = 1;
       }
     }
   }
+}
+
+/** Separating-axis test: does the axis-aligned square (centre, half size) overlap the convex quad grown by `margin`? */
+function squareMeetsQuad(q: number[], cx: number, cy: number, half: number, margin: number): boolean {
+  const axes: [number, number][] = [
+    [1, 0],
+    [0, 1],
+  ];
+  for (let k = 0; k < 4; k++) {
+    const a = k * 3;
+    const b = ((k + 1) % 4) * 3;
+    const ex = q[b] - q[a];
+    const ey = q[b + 1] - q[a + 1];
+    const l = Math.hypot(ex, ey);
+    if (l > 1e-6) axes.push([-ey / l, ex / l]);
+  }
+  for (const [ax, ay] of axes) {
+    const c = cx * ax + cy * ay;
+    const r = half * (Math.abs(ax) + Math.abs(ay));
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let k = 0; k < 12; k += 3) {
+      const p = q[k] * ax + q[k + 1] * ay;
+      lo = Math.min(lo, p);
+      hi = Math.max(hi, p);
+    }
+    if (c + r < lo - margin || c - r > hi + margin) return false;
+  }
+  return true;
 }
 
 /** z of point (x, y) on triangle (corners at q[a], q[b], q[c] as x,y,z triples) or null if outside. */
@@ -471,26 +538,64 @@ function chunkGeometry(f: TerrainField, ci0: number, cj0: number, ci1: number, c
     }
   }
   if (!idx.length) return null;
-  // skirts along the four edges
-  const edge = (list: number[]) => {
+  // Skirts along the four edges hide cracks against neighbours at another LOD.
+  // They hang only as deep as such a crack can be (twice the profile's
+  // deviation from 4-cell chords), never into a tunnel roof, and not across
+  // carved cells; the inner grid's outer boundary keeps the full depth to
+  // cover the seam with the horizon grid.
+  const chordDev = (k0: number, step: number, n: number): number => {
+    const a0 = H[k0];
+    const b0 = H[k0 + n * step];
+    let m = 0;
+    for (let t = 1; t < n; t++) m = Math.max(m, Math.abs(H[k0 + t * step] - (a0 + ((b0 - a0) * t) / n)));
+    return m;
+  };
+  const skirtDepth = (i: number, j: number, alongX: boolean, boundary: boolean): number => {
+    if (boundary) return SKIRT;
+    const u = alongX ? i : j;
+    const N = alongX ? nx - 1 : f.ny - 1;
+    const step = alongX ? 1 : nx;
+    const rowK = alongX ? j * nx : i;
+    let m = 0;
+    const w0 = Math.floor(u / 4) * 4;
+    for (const s0 of u % 4 === 0 ? [w0 - 4, w0] : [w0]) {
+      const a0 = Math.max(0, s0);
+      const b0 = Math.min(N, s0 + 4);
+      if (b0 - a0 >= 2) m = Math.max(m, chordDev(rowK + a0 * step, step, b0 - a0));
+    }
+    return Math.min(SKIRT, 2 * m + 0.3);
+  };
+  const edge = (list: [number, number, number][], alongX: boolean, boundary: boolean, inI: number, inJ: number) => {
+    const drop = list.map(([vi, i, j]) => {
+      const k = j * nx + i;
+      const bottom = Math.max(H[k] - skirtDepth(i, j, alongX, boundary), Math.min(H[k], f.floor[k]));
+      return pos[vi * 3 + 1] - bottom;
+    });
     for (let e = 0; e + 1 < list.length; e++) {
-      const a = list[e];
-      const b = list[e + 1];
+      const [a, ia, ja] = list[e];
+      const [b, ib, jb] = list[e + 1];
+      // the cell on the inside of this edge segment (block centre at coarse LOD)
+      const ci = Math.min(f.nx - 2, Math.floor((ia + ib) / 2) + (alongX ? 0 : inI));
+      const cj = Math.min(f.ny - 2, Math.floor((ja + jb) / 2) + (alongX ? inJ : 0));
+      if (f.hole[cj * hw + ci]) continue;
+      if (drop[e] < 0.05 && drop[e + 1] < 0.05) continue;
       const a2 = v;
-      pos.set([pos[a * 3], pos[a * 3 + 1] - SKIRT, pos[a * 3 + 2]], v * 3);
+      pos.set([pos[a * 3], pos[a * 3 + 1] - drop[e], pos[a * 3 + 2]], v * 3);
       nrm.set([nrm[a * 3], nrm[a * 3 + 1], nrm[a * 3 + 2]], v * 3);
       v++;
       const b2 = v;
-      pos.set([pos[b * 3], pos[b * 3 + 1] - SKIRT, pos[b * 3 + 2]], v * 3);
+      pos.set([pos[b * 3], pos[b * 3 + 1] - drop[e + 1], pos[b * 3 + 2]], v * 3);
       nrm.set([nrm[b * 3], nrm[b * 3 + 1], nrm[b * 3 + 2]], v * 3);
       v++;
       idx.push(a, b, b2, a, b2, a2);
     }
   };
-  edge(Array.from({ length: w }, (_, a) => a));
-  edge(Array.from({ length: w }, (_, a) => (h - 1) * w + a));
-  edge(Array.from({ length: h }, (_, b) => b * w));
-  edge(Array.from({ length: h }, (_, b) => b * w + w - 1));
+  const iLast = xsI[w - 1];
+  const jLast = ysJ[h - 1];
+  edge(xsI.map((i, a) => [a, i, ysJ[0]]), true, ysJ[0] === 0, 0, 0);
+  edge(xsI.map((i, a) => [(h - 1) * w + a, i, jLast]), true, jLast === f.ny - 1, 0, -1);
+  edge(ysJ.map((j, b) => [b * w, xsI[0], j]), false, xsI[0] === 0, 0, 0);
+  edge(ysJ.map((j, b) => [b * w + w - 1, iLast, j]), false, iLast === nx - 1, -1, 0);
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(pos.subarray(0, v * 3), 3));
   g.setAttribute('normal', new THREE.BufferAttribute(nrm.subarray(0, v * 3), 3, true));

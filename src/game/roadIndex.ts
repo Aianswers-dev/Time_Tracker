@@ -205,6 +205,52 @@ export class RoadIndex {
     h.z = bz;
     return h;
   }
+
+  /**
+   * Visit every road segment within `maxDist` of (x, y) once: the road
+   * index, the segment start, unit direction and length, the distance from
+   * (x, y) and the road height at the closest point.
+   */
+  forEachNear(x: number, y: number, maxDist: number, fn: (road: number, ax: number, ay: number, dx: number, dy: number, len: number, dist: number, z: number) => void): void {
+    const roads = this.data.roads;
+    const cx0 = this.cx(x - maxDist);
+    const cx1 = this.cx(x + maxDist);
+    const cy0 = this.cy(y - maxDist);
+    const cy1 = this.cy(y + maxDist);
+    const id = ++this.stampId;
+    if (id === 0xffffffff) {
+      this.stamp.fill(0);
+      this.stampId = 1;
+    }
+    for (let cy = cy0; cy <= cy1; cy++) {
+      for (let cx = cx0; cx <= cx1; cx++) {
+        const c = cy * this.nx + cx;
+        for (let k = this.cellStart[c]; k < this.cellStart[c + 1]; k++) {
+          const s = this.cellItems[k];
+          if (this.stamp[s] === id) continue;
+          this.stamp[s] = id;
+          const ax = this.sx0[s];
+          const ay = this.sy0[s];
+          const dx = this.sx1[s] - ax;
+          const dy = this.sy1[s] - ay;
+          const len = Math.hypot(dx, dy);
+          if (len < 1e-3) continue;
+          const ux = dx / len;
+          const uy = dy / len;
+          let t = (x - ax) * ux + (y - ay) * uy;
+          t = t < 0 ? 0 : t > len ? len : t;
+          const px = ax + ux * t;
+          const py = ay + uy * t;
+          const d = Math.hypot(x - px, y - py);
+          if (d > maxDist) continue;
+          const road = roads[this.sroad[s]];
+          const v = this.sseg[s];
+          const zz = road.z ? road.z[v] + (road.z[v + 1] - road.z[v]) * (t / len) : 0;
+          fn(this.sroad[s], ax, ay, ux, uy, len, d, zz);
+        }
+      }
+    }
+  }
 }
 
 const cache = new WeakMap<MapData, RoadIndex>();

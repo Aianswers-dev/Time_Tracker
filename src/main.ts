@@ -1,8 +1,7 @@
 import * as THREE from 'three';
 import './style.css';
 import { loadMapData } from './data/load';
-import { headingDir, pointAlong } from './data/coords';
-import { heightsFor } from './data/height';
+import { headingDir } from './data/coords';
 import { buildWorld } from './world';
 import { busFactory } from './bus';
 import { BusAudio, BusControls, BusPhysics, CameraRig, InputManager, buildCollider } from './sim';
@@ -98,7 +97,8 @@ async function main() {
   // startPose gives the FRONT of the bus; physics tracks the rear axle.
   const start = guide.startPose();
   const startS = Number(params.get('s') ?? 0);
-  if (startS > 0) Object.assign(start, pointAlong(route.pts, route.cum, startS), { z: heightsFor(data).routeZ(route, startS) });
+  // On the guidance lane (the raw GTFS shape can be metres off a busway tunnel, inside rock).
+  if (startS > 0) Object.assign(start, guide.trackPose(startS));
   const rearOffset = bus.spec.sections[0].axleFromFront;
   const [fx, fy] = headingDir(start.heading);
   // The route height picks the level (stays in a tunnel / up on a viaduct when starting there).

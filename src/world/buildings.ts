@@ -3,10 +3,12 @@
  * flat or pitched roofs, merged into 600 m chunks (one draw call each).
  */
 import * as THREE from 'three';
-import { BuildingKind, type Building } from '../types';
+import { BuildingKind, RoadKind, type Building } from '../types';
 import { type Ctx, densityAt } from './ctx';
 import { F_HIGHSET, F_PITCHED, F_ROOF, F_SOFFIT, F_TILE, Style, makeBuildingMaterial } from './facade';
 import { triangulate } from './ground';
+import type { RoadIndex } from './roadindex';
+import type { RI } from './roads';
 import { IdGrid, centroid, f32, hash1, i8, obb, oriented, pointInRing, ringBounds, signedArea, smoothstep, u32, u8, yieldFrame } from './util';
 
 export const CHUNK = 800;
@@ -174,7 +176,7 @@ function classify(b: Building, area: number, cx: number, cy: number, dens: numbe
 /** Ground height of the building being built: facade v coordinates are heights above it. */
 let gBase = 0;
 
-function walls(g: BGeo, ring: ArrayLike<number>, y0: number, y1: number, L: Look, seed: number, u0: number): void {
+function walls(g: BGeo, ring: ArrayLike<number>, y0in: number | ((edge: number) => number), y1: number, L: Look, seed: number, u0: number): void {
   const n = ring.length >> 1;
   let u = u0;
   const st = Math.round(L.storey * 10);
@@ -186,6 +188,11 @@ function walls(g: BGeo, ring: ArrayLike<number>, y0: number, y1: number, L: Look
     const by = ring[2 * j + 1];
     const len = Math.hypot(bx - ax, by - ay);
     if (len < 0.05) continue;
+    const y0 = typeof y0in === 'number' ? y0in : y0in(i);
+    if (y0 >= y1 - 0.05) {
+      u += len;
+      continue;
+    }
     const a = g.v(ax, y0, ay, u, y0 - gBase, L.wall, L.style, seed, L.flags, st);
     const b = g.v(bx, y0, by, u + len, y0 - gBase, L.wall, L.style, seed, L.flags, st);
     const c = g.v(bx, y1, by, u + len, y1 - gBase, L.wall, L.style, seed, L.flags, st);
@@ -333,8 +340,42 @@ export interface BuildingIndex {
   big: Uint8Array;
 }
 
-export async function buildBuildings(ctx: Ctx, progress: (f: number) => void): Promise<BuildingIndex> {
+export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: RoadIndex }, progress: (f: number) => void): Promise<BuildingIndex> {
   const { data, R } = ctx;
+  const traffic = (ri: number) => {
+    const k = roads.infos[ri].r.kind;
+    return k <= RoadKind.Tertiary || k === RoadKind.Busway;
+  };
+  /**
+   * Height a building's walls must keep clear above a road that runs through
+   * its outline in the open (a busway under a station building or hospital
+   * wing): road height + 5.2 m, or -Infinity when nothing passes. Walls only
+   * stand on the outline, so it is sampled along the outline's edges.
+   */
+  const clearanceOver = (ring: ArrayLike<number>, x0: number, y0: number, x1: number, y1: number, base: number): Float32Array | null => {
+    const r = Math.hypot(x1 - x0, y1 - y0) / 2;
+    if (roads.index.clearance((x0 + x1) / 2, (y0 + y1) / 2, r, traffic) > r) return null;
+    const nv = ring.length >> 1;
+    const need = new Float32Array(nv).fill(-Infinity);
+    let any = false;
+    for (let v = 0; v < nv; v++) {
+      const ax = ring[2 * v];
+      const ay = ring[2 * v + 1];
+      const bx = ring[(2 * v + 2) % ring.length];
+      const by = ring[(2 * v + 3) % ring.length];
+      const n = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / 2));
+      for (let q = 0; q < n; q++) {
+        const x = ax + ((bx - ax) * (q + 0.5)) / n;
+        const y = ay + ((by - ay) * (q + 0.5)) / n;
+        const nr = roads.index.nearest(x, y, 10, traffic);
+        if (!nr || nr.dist > roads.infos[nr.road].hw + 0.3) continue;
+        if (nr.z > base + 2 || ctx.field.natAt(x, y) - nr.z > 4.6) continue;
+        need[v] = Math.max(need[v], nr.z + 5.2);
+        any = true;
+      }
+    }
+    return any ? need : null;
+  };
   const nx = Math.ceil((R[2] - R[0]) / CHUNK);
   const ny = Math.ceil((R[3] - R[1]) / CHUNK);
   const chunks = new Map<number, BGeo>();
@@ -367,12 +408,22 @@ export async function buildBuildings(ctx: Ctx, progress: (f: number) => void): P
       g = new BGeo();
       chunks.set(key, g);
     }
-    const m = b.minHeight;
+    let m = b.minHeight;
     // base at the footprint centroid; walls reach down to the lowest ground under the footprint
     const base = b.z;
     let minG = base;
     for (let v = 0; v < ring.length; v += 2) minG = Math.min(minG, ctx.field.natAt(ring[v], ring[v + 1]));
     const bottom = minG - 0.4;
+    // ...but never down across a road that runs through underneath: those
+    // edges stop above the road, with a soffit over the passage
+    const need = clearanceOver(ring, x0, y0, x1, y1, base);
+    let foot: number | ((edge: number) => number) = bottom;
+    let soffit = -Infinity;
+    if (need) {
+      for (const v of need) soffit = Math.max(soffit, v);
+      if (soffit > base + 0.4) m = Math.max(m, Math.min(soffit - base, b.height - 2));
+      else foot = (e: number) => Math.max(bottom, need[e]);
+    }
     gBase = base;
     if (L.style === Style.Canopy) {
       const top = base + b.height;
@@ -384,16 +435,18 @@ export async function buildBuildings(ctx: Ctx, progress: (f: number) => void): P
       const o = obb(ring);
       const nv = ring.length >> 1;
       const eave = base + Math.max(m + 1, L.wallTop);
-      walls(g, ring, m > 0.4 ? base + m : bottom, eave, L, seed, seed);
+      walls(g, ring, m > 0.4 ? base + m : foot, eave, L, seed, seed);
+      if (m <= 0.4 && soffit > -Infinity) flatCap(g, ring, soffit, 0x4a4a4a, L, seed, false, F_SOFFIT);
       if (o.fill > 0.78 && nv <= 10) {
         boxRoof(g, o, eave, L.roofH, b.roof === 'g' || (L.style !== Style.House && b.roof !== 'h' && b.roof !== 'p'), L, seed);
       } else if (!(nv <= 14 && polyRoof(g, ring, eave, Math.min(L.roofH, 1.6), L, seed))) {
         flatCap(g, ring, eave, L.roof, L, seed, true, 0);
       }
     } else {
-      walls(g, ring, m > 0.4 ? base + m : bottom, base + b.height, L, seed, seed);
+      walls(g, ring, m > 0.4 ? base + m : foot, base + b.height, L, seed, seed);
       flatCap(g, ring, base + b.height, L.roof, L, seed, true, 0);
       if (m > 0.4) flatCap(g, ring, base + m, 0x4a4a4a, L, seed, false, F_SOFFIT);
+      else if (soffit > -Infinity) flatCap(g, ring, soffit, 0x4a4a4a, L, seed, false, F_SOFFIT);
     }
     if (bi % 4000 === 0) {
       progress(bi / n);
