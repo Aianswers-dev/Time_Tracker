@@ -626,6 +626,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   // ... and the Green Bridge's cable-stayed span its own pylons
   const green = greenBridgeSpan(ctx);
   const otherAt = (x: number, y: number, z: number, self: number, dz = 2.5) => index.penetrationZ(x, y, z, dz, self);
+  /** Over another carriageway (or its cutting wall, 1 m beyond its edge) 1.5-8.5 m below, in the open: a busway ramp between the carriageways of a street. */
+  const overOpen = (x: number, y: number, z: number, self: number) => index.penetrationZ(x, y, z - 5, 3.5, self, (q) => !roads[q].tunnel) > -1.05;
   // Mater Hill and Buranda busway stations stand between buff block cutting walls on a dark base
   const blockSites: [number, number][] = [];
   for (const pf of ctx.data.platforms) if (/Mater Hill|Buranda/i.test(pf.name) && pf.pts.length >= 2) blockSites.push([pf.pts[0], pf.pts[1]]);
@@ -1041,7 +1043,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         for (const off of [hw + 0.35, hw + 2.2, hw + 3.9]) {
           const qx = c.x + c.nx * side * off;
           const qy = c.y + c.ny * side * off;
-          if (otherAt(qx, qy, c.z, ri.i) > -0.25 || inWater(qx, qy)) return 0;
+          if (otherAt(qx, qy, c.z, ri.i) > -0.25 || inWater(qx, qy) || overOpen(qx, qy, c.z, ri.i)) return 0;
         }
         return 1;
       });
@@ -1239,7 +1241,9 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       // climbing to the ground above stays, as over the tunnels under King George Square)
       const lower = (o: number) => Math.max(index.penetrationZ(ox(o), oy(o), zE[k] - 5, 3, ri.i), tunnels.penetrationZ(ox(o), oy(o), zE[k] - 5, 3, ri.i)) > -1;
       const below = t === 1 && depth[k] < 0.3 && (lower(e0[k] + 1.5) || lower(e0[k] + 4));
-      if (nb || below || (inJ && t !== 2)) type[k] = 0;
+      // likewise a fill wall that would stand in a lower road's cutting: that road's wall holds the ground
+      const onLower = t === 3 && overOpen(ox(e0[k] + 0.3), oy(e0[k] + 0.3), zE[k], ri.i);
+      if (nb || below || onLower || (inJ && t !== 2)) type[k] = 0;
       else type[k] = t;
       if (t === 2 && (nb || inJ)) type[k] = 4; // cutting but open toward a neighbour: floor only
     }
@@ -1621,6 +1625,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       const c = roadAt(ri, end === 0 ? 0 : ri.len);
       const ground = field.natAt(c.x, c.y);
       if (c.z - depth - ground < 0.3) continue;
+      // none across a street that passes under the deck's end (Turbot Street over Roma Street)
+      if ([-edge, 0, edge].some((o) => index.penetrationZ(c.x + c.nx * o, c.y + c.ny * o, ground, 1, ri.i) > -1)) continue;
       g.box(c.x, c.y, ground - 1, c.z - 0.05, c.ny, -c.nx, 0.7, edge + 0.4, ...WALL);
     }
   }
