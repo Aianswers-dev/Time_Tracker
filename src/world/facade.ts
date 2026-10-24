@@ -255,7 +255,7 @@ void facade(inout vec3 albedo, inout float rough, inout float metal, inout vec3 
   metal = mix(metal, style < 0.5 ? 0.85 : 0.55, glassMask);
   float on = lit * uNight;
   float vary = 0.55 + 0.45 * w_hash(floor(uv / vec2(2.0, storey)) + seed * 41.0);
-  emis += litCol * on * vary * 1.6;
+  emis += litCol * on * vary * 0.85;
   albedo = mix(albedo, albedo * 0.4, on);
 }
 `;

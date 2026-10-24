@@ -87,9 +87,12 @@ async function main() {
   const input = new InputManager();
   const rig = new CameraRig(camera);
   const audio = new BusAudio();
+  audio.setType(choice.type);
   audio.start();
-  const guide = new RouteGuide(scene, data, route);
-  const hud = new Hud(document.body, data);
+  const guide = new RouteGuide(scene, data, route, { busLength: bus.spec.sections.reduce((a, s) => a + s.length, 0) });
+  const hud = new Hud(document.body, data, { traffic, guide });
+  // Player collides with buildings and with the AI buses and cars.
+  const playerCollider = traffic.wrapCollider(collider);
 
   // startPose gives the FRONT of the bus; physics tracks the rear axle.
   const start = guide.startPose();
@@ -106,6 +109,8 @@ async function main() {
   let fps = 60;
   const clock = new THREE.Clock();
   let simTime = 0;
+  let splashed = false;
+  let dingedStop = -1;
 
   const frame = () => {
     requestAnimationFrame(frame);
@@ -131,8 +136,11 @@ async function main() {
     hours = (hours + dt / 3600) % 24;
 
     controls.update(dt, inp, physics.pose);
-    const hit = physics.update(dt, inp, controls, collider);
+    const hit = physics.update(dt, inp, controls, playerCollider);
     if (hit.impact > 1) audio.impact(hit.impact);
+    guide.noteImpact(hit.impact);
+    if (hit.water && !splashed) hud.toast('Splash! The bus is going back on the road…');
+    splashed = !!hit.water;
     const pose = physics.pose;
 
     bus.setPose(pose);
@@ -142,7 +150,12 @@ async function main() {
     const [hx, hy] = headingDir(pose.heading);
     const frontX = pose.x + hx * rearOffset;
     const frontY = pose.y + hy * rearOffset;
-    const g = guide.update(dt, frontX, frontY, controls.doorsOpen, pose.speed);
+    const g = guide.update(dt, frontX, frontY, controls.doorsOpen, pose.speed, pose.heading, hours);
+    // Stop-request bell once per stop as it comes within 250 m.
+    if (!g.finished && g.nextStopDistance < 250 && g.nextStopIndex !== dingedStop) {
+      dingedStop = g.nextStopIndex;
+      audio.ding();
+    }
 
     cab.update({
       speedKmh: Math.abs(pose.speed) * 3.6,
@@ -157,7 +170,7 @@ async function main() {
     audio.update({ rpm: physics.rpm, throttle: inp.throttle, speed: pose.speed, brake: inp.brake });
     audio.horn(inp.held.has('horn'));
 
-    traffic.update(dt, simTime, pose, camera);
+    traffic.update(dt, simTime, pose, camera, hours);
     world.update(dt, camera, hours);
     hud.update({
       route,
@@ -171,6 +184,8 @@ async function main() {
       hours,
       cameraMode: rig.mode,
       fps,
+      parkBrake: controls.parkBrake,
+      paused,
     });
     renderer.render(scene, camera);
   };

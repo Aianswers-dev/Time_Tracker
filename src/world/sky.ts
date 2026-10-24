@@ -96,8 +96,8 @@ interface SkyKey {
 
 /** Keyframes by sun elevation (degrees). Colours are sRGB hex. */
 const KEYS: SkyKey[] = [
-  { e: -90, zenith: 0x02050c, horizon: 0x0a1020, glow: 0x000000, sun: 0x8aa0d0, sunI: 0.0, hemiSky: 0x2a3858, hemiGround: 0x15140f, hemiI: 0.35, cloud: 0x1b2232, shade: 0x0c1018, ground: 0x06070a },
-  { e: -12, zenith: 0x040a18, horizon: 0x101a30, glow: 0x050302, sun: 0x8aa0d0, sunI: 0.0, hemiSky: 0x2a3858, hemiGround: 0x15140f, hemiI: 0.38, cloud: 0x1d2536, shade: 0x0d111a, ground: 0x07080b },
+  { e: -90, zenith: 0x02050c, horizon: 0x0a1020, glow: 0x000000, sun: 0x8aa0d0, sunI: 0.0, hemiSky: 0x3a4a70, hemiGround: 0x1d1b16, hemiI: 0.6, cloud: 0x1b2232, shade: 0x0c1018, ground: 0x06070a },
+  { e: -12, zenith: 0x040a18, horizon: 0x101a30, glow: 0x050302, sun: 0x8aa0d0, sunI: 0.0, hemiSky: 0x3a4a70, hemiGround: 0x1d1b16, hemiI: 0.62, cloud: 0x1d2536, shade: 0x0d111a, ground: 0x07080b },
   { e: -6, zenith: 0x0e1a3a, horizon: 0x3a3550, glow: 0x6a3020, sun: 0xff8040, sunI: 0.0, hemiSky: 0x3c4870, hemiGround: 0x201a18, hemiI: 0.5, cloud: 0x4a3a48, shade: 0x1e1c28, ground: 0x0d0d10 },
   { e: -1.5, zenith: 0x203a6c, horizon: 0xd07850, glow: 0xff8a40, sun: 0xff7a30, sunI: 0.15, hemiSky: 0x5a6890, hemiGround: 0x3a2a20, hemiI: 0.75, cloud: 0xf09a70, shade: 0x584a5a, ground: 0x1a1612 },
   { e: 4, zenith: 0x2f5a9a, horizon: 0xf0b080, glow: 0xffb060, sun: 0xffa050, sunI: 1.6, hemiSky: 0x8aa8d0, hemiGround: 0x5a4a38, hemiI: 1.0, cloud: 0xffd0a8, shade: 0x8a7a84, ground: 0x2a2620 },
@@ -202,7 +202,7 @@ export class SkySystem {
     const hr = ((hours % 24) + 24) % 24;
     const evening = smoothstep(17, 19.5, hr) * (1 - smoothstep(22.5, 25.5, hr));
     const late = hr < 6 ? 1 - smoothstep(4.5, 6.5, hr) : 0;
-    U.uLit.value = 0.07 + night * (0.18 + 0.4 * evening + 0.1 * late) + evening * 0.05;
+    U.uLit.value = 0.06 + night * (0.12 + 0.26 * evening + 0.06 * late) + evening * 0.04;
 
     // Lights: the sun by day, the moon by night.
     const sunI = a.sunI + (b.sunI - a.sunI) * t;
@@ -211,7 +211,7 @@ export class SkySystem {
       this.sun.intensity = sunI;
       this.tmp.copy(this.sunDir);
     } else {
-      this.sun.intensity = 0.32 * night;
+      this.sun.intensity = 0.45 * night;
       this.sun.color.setHex(0x9fb4e0);
       this.tmp.copy(U.uMoonDir.value);
     }

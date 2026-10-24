@@ -536,7 +536,7 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       {
         key: 'pool',
         fogFade: true,
-        fragment: [['vec4 diffuseColor = vec4( diffuse, opacity );', 'vec4 diffuseColor = vec4( diffuse * uNight * 0.38, opacity );']],
+        fragment: [['vec4 diffuseColor = vec4( diffuse, opacity );', 'vec4 diffuseColor = vec4( diffuse * uNight * 0.75, opacity );']],
       },
     );
     const quadGeo = new THREE.PlaneGeometry(1, 1);
