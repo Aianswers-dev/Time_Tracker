@@ -103,6 +103,8 @@ export class Autopilot {
   private knelt = false;
   private holdT = 0;
   private lastZ = NaN;
+  /** How far left of the lane we steer (pulling in to a kerb stop), eased like the AI buses. */
+  private pull = 0;
   private queueT = 0;
   private redT = 0;
   private ignoreSignalUntil = -1;
@@ -122,6 +124,19 @@ export class Autopilot {
   reset(pose: BusPose): void {
     this.sRear = this.project(pose.x, pose.y, 0, this.track.length);
     this.lastZ = NaN;
+    this.pull = 0;
+  }
+
+  /** Put the bus back on the lane `jump` metres on, but not past the stop it's heading for. */
+  private rescueTo(jump: number, stopTarget: number): void {
+    const T = this.track;
+    const rearTarget = stopTarget - this.spec.sections[0].axleFromFront - 0.5;
+    const cap = rearTarget > this.sRear ? rearTarget : Infinity;
+    const s = Math.max(this.sRear + 3, Math.min(this.sRear + jump, cap));
+    T.sample(s, this.tmp, this.pull);
+    this.rescues++;
+    this.rescue = { x: this.tmp.x, y: this.tmp.y, heading: this.tmp.heading, z: T.zAt(s) };
+    this.sRear = s;
   }
 
   private project(x: number, y: number, from: number, to: number): number {
@@ -184,7 +199,7 @@ export class Autopilot {
 
     // --- Steering: pure pursuit from the rear axle --------------------------------
     const Ld = clamp(7 + Math.abs(v) * 0.9, 8, 26);
-    T.sample(this.sRear + Ld, this.tmp);
+    T.sample(this.sRear + Ld, this.tmp, this.pull);
     const tx = this.tmp.x - pose.x;
     const ty = this.tmp.y - pose.y;
     // Target in the bus frame: forward = h, right = (hy, -hx).
@@ -196,7 +211,7 @@ export class Autopilot {
     const ratio = 1 / (1 + Math.pow(Math.max(0, av - 1.5) / 6.5, 2));
     out.steer = clamp(delta / (spec.maxSteer * ratio), -1, 1);
     // Lateral error at the front axle.
-    T.sample(sFront - spec.frontOverhang, this.tmp);
+    T.sample(sFront - spec.frontOverhang, this.tmp, this.pull);
     const fx = pose.x + hx * L;
     const fy = pose.y + hy * L;
     const lat = (fx - this.tmp.x) * -this.tmp.hy + (fy - this.tmp.y) * this.tmp.hx;
@@ -225,10 +240,13 @@ export class Autopilot {
       this.holdT = 0;
     }
     let stopTarget = Infinity;
+    let pullWant = 0;
     if (stop && !g.finished) {
       // Front of the bus at the far end of a platform (whole bus alongside), else just past the flag.
-      stopTarget = stop.zone ? Math.max(stop.zone.s0 + 2, stop.zone.s1 - 1.5) : stop.s + 2;
+      stopTarget = stop.zone ? Math.max(stop.zone.s0 + 2, stop.target) : stop.s + 2;
       const d = stopTarget - sFront;
+      // Pull in towards the kerb or platform edge over the last 45 m (the track says how far).
+      if (d < 45 && d > -6) pullWant = stop.pull;
       const vs = Math.sqrt(2 * DECEL * Math.max(0, d - 0.3));
       if (vs < target) {
         target = vs;
@@ -269,6 +287,9 @@ export class Autopilot {
         }
       }
     }
+
+    if (this.phase === 'dwell' || this.phase === 'closing') pullWant = this.pull;
+    this.pull += clamp(pullWant - this.pull, -dt * 0.45, dt * 0.45);
 
     // --- Stop / dwell state machine ------------------------------------------------------
     const stopped = Math.abs(v) < 0.25;
@@ -376,11 +397,7 @@ export class Autopilot {
     if (this.stuckT > 8 && !g.finished) {
       this.problem('stuck', `no progress for 8 s (target ${target.toFixed(1)} m/s, why=${why}, hit=${a.hit?.hit ? (a.hit.wall ? 'wall' : 'body') : 'none'})`, at, 1);
       this.stuckT = 0;
-      this.rescues++;
-      const s = this.sRear + 14;
-      T.sample(s, this.tmp);
-      this.rescue = { x: this.tmp.x, y: this.tmp.y, heading: this.tmp.heading, z: T.zAt(s) };
-      this.sRear = s;
+      this.rescueTo(14, stopTarget);
     }
     if (a.hit?.hit && a.hit.impact > 0.4) {
       this.problem(a.hit.wall ? 'hit-wall' : 'hit', `impact ${a.hit.impact.toFixed(1)} m/s${a.hit.wall ? ` wall #${a.hit.wallIndex}` : ''} at ${(v * 3.6).toFixed(0)} km/h, lateral ${this.frame.lateral.toFixed(2)} m`, at, 2);
@@ -396,11 +413,7 @@ export class Autopilot {
     if (this.levelBadT > 3 && !this.rescue) {
       this.problem('wrong-level', `on the wrong level for 3 s (Δ ${(z - tz).toFixed(1)} m): put back on the lane`, at, 1);
       this.levelBadT = 0;
-      this.rescues++;
-      const s = this.sRear + 6;
-      T.sample(s, this.tmp);
-      this.rescue = { x: this.tmp.x, y: this.tmp.y, heading: this.tmp.heading, z: T.zAt(s) };
-      this.sRear = s;
+      this.rescueTo(6, stopTarget);
     }
     if (Number.isFinite(this.lastZ) && Math.abs(z - this.lastZ) > Math.max(0.25, av * dt * 0.25)) this.problem('z-jump', `road height jumped ${(z - this.lastZ).toFixed(2)} m in one frame at ${(v * 3.6).toFixed(0)} km/h`, at, 2);
     // A rescue teleports the bus before the next frame: don't count that as a jump.
