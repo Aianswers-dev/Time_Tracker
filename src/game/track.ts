@@ -1,7 +1,7 @@
 // A route resampled into a drivable left-lane path with kerb distances, a
 // curvature/limit speed profile and the traffic signals along it. Shared by
 // the player's RouteGuide and the AI traffic.
-import { RoadKind, type MapData, type Route } from '../types';
+import { RoadKind, type MapData, type Road, type Route } from '../types';
 import { pointAlong, wrapAngle } from '../data/coords';
 import { drivable, roadIndexFor, speedLimitOf } from './roadIndex';
 import { isStationStop } from './routeMeta';
@@ -83,6 +83,9 @@ function boxSmooth(src: Float32Array, half: number): Float32Array {
   return out;
 }
 
+/** Roads that can have walls along them (tunnels and viaducts). */
+const walledRoad = (r: Road): boolean => drivable(r) && (r.tunnel || r.bridge);
+
 /** Signals spatial hash shared by all tracks. */
 const signalGrids = new WeakMap<MapData, Map<number, number[]>>();
 function signalGrid(data: MapData): Map<number, number[]> {
@@ -122,6 +125,9 @@ export class RouteTrack {
   readonly road: Int32Array;
   /** Road surface height (m AHD) at each sample, from the route's own heights (tunnels, viaducts). */
   readonly z: Float32Array;
+  /** Lane-offset bounds that keep the bus off walls (-/+Infinity where unwalled); diagnostics. */
+  readonly bandLo: Float32Array;
+  readonly bandHi: Float32Array;
   readonly stops: TrackStop[];
   readonly signals: TrackSignal[];
   /** Every 40 m: [s, x, y] triples, for quick "is this route near me" tests. */
@@ -168,8 +174,9 @@ export class RouteTrack {
       const heading = Math.atan2(dx, dy);
       const zr = H.routeZ(route, s);
       this.z[i] = zr;
-      // Only roads at the route's level count (not the street under a viaduct).
-      const hit = idx.nearest(p.x, p.y, 14, heading, 0.8, drivable, zr);
+      // Only roads at the route's level count (not the street under a viaduct). In tunnels and on
+      // viaducts the GTFS shape can stray 20+ m off the mapped carriageway: look further for those.
+      const hit = idx.nearest(p.x, p.y, 14, heading, 0.8, drivable, zr) ?? idx.nearest(p.x, p.y, 32, heading, 0.8, walledRoad, zr);
       if (hit) {
         const road = data.roads[hit.road];
         const dC = (hit.px - p.x) * nx[i] + (hit.py - p.y) * ny[i];
@@ -243,10 +250,21 @@ export class RouteTrack {
         this.kerb[i] += (Math.max(PLATFORM_LANE, kerbNow - this.offset[i]) - this.kerb[i]) * w;
         if (s >= z.s0 && s <= z.s1) this.kerb[i] = PLATFORM_LANE;
       }
-      // Alongside the platform the space up to its edge is bay, not wall.
-      for (let i = Math.max(0, Math.floor((z.s0 - 2) / TRACK_STEP)); i <= Math.min(n - 1, Math.ceil((z.s1 + 2) / TRACK_STEP)); i++) hi[i] = Infinity;
+      // Alongside the platform the space up to its edge is bay, not wall, where the platform
+      // belongs to this level's road (the nearest road to its edge, as sim/collider.ts decides).
+      const under = data.platforms[z.platform]?.underground ?? false;
+      for (let i = Math.max(0, Math.floor((z.s0 - 2) / TRACK_STEP)); i <= Math.min(n - 1, Math.ceil((z.s1 + 2) / TRACK_STEP)); i++) {
+        if (hi[i] === Infinity) continue;
+        const e = edgeAt(i * TRACK_STEP);
+        const ex = bx[i] + nx[i] * e;
+        const ey = by[i] + ny[i] * e;
+        const near = idx.nearest(ex, ey, 16, undefined, 0, (r) => drivable(r) && r.tunnel === under) ?? idx.nearest(ex, ey, 16, undefined, 0, drivable);
+        if (near && Math.abs(near.z - this.z[i]) < 1.8) hi[i] = Infinity;
+      }
     }
     this.keepInside(lo, hi);
+    this.bandLo = lo;
+    this.bandHi = hi;
     for (let i = 0; i < n; i++) {
       this.x[i] = bx[i] + nx[i] * this.offset[i];
       this.y[i] = by[i] + ny[i] * this.offset[i];
