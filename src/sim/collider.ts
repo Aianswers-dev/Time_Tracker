@@ -1586,7 +1586,9 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     forEachRoadSegmentNear(x, y, 3, (s) => {
       const l = lines[sLine[s]];
       project(l, sIdx[s], x, y);
-      const w = l.width / 2 + 2.5;
+      // A tunnel's cutting or tube ends at its walls (hw + 0.9); other roads' verges and embankments
+      // run a little wider.
+      const w = l.width / 2 + (l.tunnel ? 1.0 : 2.5);
       if (PROJ.d2 < w * w && z > PROJ.z - 0.5 && z < PROJ.z + 6) {
         found = true;
         return true;

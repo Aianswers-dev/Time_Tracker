@@ -709,6 +709,7 @@ function cameraQueries(): void {
   check('camera in a covered tube: ceiling over the road', tube.ceilingAt(0, 0, 1), 5.7, 5.9, 'm');
   check('camera in a covered tube: clear under the ceiling', tube.viewBlocked(1, 0, 4.5) ? 1 : 0, 0, 0, '');
   check('camera in a covered tube: blocked in the roof', tube.viewBlocked(1, 0, 6.5) ? 1 : 0, 1, 1, '');
+  check('camera in a covered tube: blocked in the rock beside its wall', tube.viewBlocked(5.5, 0, 5) ? 1 : 0, 1, 1, '');
   check('camera in a covered tube: sight up through the ceiling', tube.lineOfSight(0, 0, 2, 0, -12, 8), 0, 0.75, '');
   check('camera in a covered tube: sight along under the ceiling', tube.lineOfSight(0, 0, 2, 0, -12, 4.5), 0.99, 1, '');
   const lifted = world(
