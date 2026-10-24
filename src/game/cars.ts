@@ -1098,11 +1098,16 @@ export class CarTraffic {
     }
     const out: BusJunction[] = [];
     const clampI = (i: number) => Math.max(0, Math.min(track.n - 1, i));
-    for (const [n, { i }] of best) {
+    const list = [...best].sort((a, b) => a[1].i - b[1].i);
+    list.forEach(([n, { i }], k) => {
       const nd = this.nodes[n];
       const s = i * TRACK_STEP;
-      const ia = clampI(Math.round((s - 12) / TRACK_STEP));
-      const ib = clampI(Math.round((s + 12) / TRACK_STEP));
+      // Directions in and out over up to 12 m, but not past halfway to the
+      // previous / next junction node (a turn there is not this node's movement).
+      const back = k > 0 ? Math.max(3, Math.min(12, ((i - list[k - 1][1].i) * TRACK_STEP) / 2)) : 12;
+      const fwd = k + 1 < list.length ? Math.max(3, Math.min(12, ((list[k + 1][1].i - i) * TRACK_STEP) / 2)) : 12;
+      const ia = clampI(Math.round((s - back) / TRACK_STEP));
+      const ib = clampI(Math.round((s + fwd) / TRACK_STEP));
       const inX = track.tx[ia];
       const inY = track.ty[ia];
       const outX = track.tx[ib];
@@ -1139,7 +1144,7 @@ export class CarTraffic {
         minor: rank + 0.01 < nd.rank,
         inside: false,
       });
-    }
+    });
     out.sort((a, b) => a.s - b.s);
     out.forEach((j, k) => {
       const p = out[k - 1];
