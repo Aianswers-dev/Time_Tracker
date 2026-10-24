@@ -210,6 +210,48 @@ export class TerrainField {
     return Math.max(f[k], f[k + 1], f[k + this.nx], f[k + this.nx + 1]);
   }
 
+  /** Total drop lowerAt() has given each grid vertex. */
+  private dropped: Float32Array | null = null;
+
+  /**
+   * Lower the three grid vertices of the ground triangle over (x, y) by `d`
+   * below their settled height, so the ground there drops by d. Refused
+   * (false, nothing changed) where a vertex holds ground over a buried roof,
+   * borders a cutting (whose walls and faces follow the ground as it is), or
+   * would drop more than `maxDrop` in all.
+   */
+  lowerAt(x: number, y: number, d: number, maxDrop = 0.35): boolean {
+    const fx = (x - this.x0) / this.cell;
+    const fy = (y - this.y0) / this.cell;
+    if (fx < 0 || fy < 0 || fx > this.nx - 1 || fy > this.ny - 1) return false;
+    const i = Math.min(this.nx - 2, Math.floor(fx));
+    const j = Math.min(this.ny - 2, Math.floor(fy));
+    const k = j * this.nx + i;
+    const vs = fx - i >= fy - j ? [k, k + 1, k + this.nx + 1] : [k, k + this.nx + 1, k + this.nx];
+    const t = vs.map((q) => {
+      const r = this.ren[q];
+      const f = this.floor[q] + 0.3;
+      return (f > r ? Math.max(r, Math.min(f, this.cap[q])) : r) - d;
+    });
+    const dr = (this.dropped ??= new Float32Array(this.nx * this.ny));
+    const hw = this.nx - 1;
+    for (let m = 0; m < 3; m++) {
+      const q = vs[m];
+      if (this.floor[q] + 0.3 > t[m] || dr[q] + d > maxDrop) return false;
+      const vi = q % this.nx;
+      const vj = (q - vi) / this.nx;
+      for (let cj = Math.max(0, vj - 1); cj <= Math.min(this.ny - 2, vj); cj++)
+        for (let ci = Math.max(0, vi - 1); ci <= Math.min(hw - 1, vi); ci++) if (this.hole[cj * hw + ci] === 1) return false;
+    }
+    for (let m = 0; m < 3; m++) {
+      const q = vs[m];
+      dr[q] += d;
+      if (t[m] < this.ren[q]) this.ren[q] = t[m];
+      if (t[m] < this.cap[q]) this.cap[q] = t[m];
+    }
+    return true;
+  }
+
   /** After all earthworks: lift ground that sags into a shallow tunnel roof (never above a road clamp). */
   settle(): void {
     const { ren, floor, cap } = this;
@@ -227,10 +269,12 @@ export class TerrainField {
    * centreline for cuttings). `roof`: a structure covers this cut (a tunnel
    * box roof), so it is not open to the sky. `endExpand`: the margin across the
    * quad's ends (edges 3-0 and 1-2), where the next sample's cut or surface
-   * takes over exactly.
+   * takes over exactly. `minor`: only a sliver of ground over a road surface
+   * (no cutting): carved in the near detail level only, and not a hole for
+   * trees and houses.
    */
-  holeQuad(q: number[], expand: number, roof = false, endExpand = expand): void {
-    const cut = makeCut(q, expand, roof, endExpand);
+  holeQuad(q: number[], expand: number, roof = false, endExpand = expand, minor = false): void {
+    const cut = makeCut(q, expand, roof, endExpand, minor);
     if (!cut) return;
     this.cutList.push(cut);
     const xs = [q[0], q[3], q[6], q[9]];
@@ -246,7 +290,7 @@ export class TerrainField {
         const x = this.x0 + (i + 0.5) * c;
         if (!squareMeetsQuad(q, x, y, c / 2, expand)) continue;
         const k = j * (this.nx - 1) + i;
-        this.hole[k] = 1;
+        this.hole[k] = minor && this.hole[k] !== 1 ? 2 : 1;
         let l = this.cuts.get(k);
         if (!l) this.cuts.set(k, (l = []));
         l.push(cut);
@@ -267,6 +311,37 @@ export class TerrainField {
     const l = this.cuts.get(j * (this.nx - 1) + i);
     if (!l) return [];
     return l.filter((c) => (roofed || !c.roof) && cutHas(c, x, y));
+  }
+
+  /** Tunnel boxes (per cell): earth faces stop at their roofs, so a cut ending at a portal never closes the mouth. */
+  readonly roofs = new Map<number, Cut[]>();
+
+  /** Record a tunnel box's footprint (convex quad, x, y, z per corner) and the top of its roof. */
+  addRoof(q: number[], top: number): void {
+    const qq = [q[0], q[1], top, q[3], q[4], top, q[6], q[7], top, q[9], q[10], top];
+    const cut = makeCut(qq, 0, true, 0);
+    if (!cut) return;
+    const i0 = Math.max(0, Math.floor((cut.x0 - this.x0) / this.cell));
+    const i1 = Math.min(this.nx - 2, Math.floor((cut.x1 - this.x0) / this.cell));
+    const j0 = Math.max(0, Math.floor((cut.y0 - this.y0) / this.cell));
+    const j1 = Math.min(this.ny - 2, Math.floor((cut.y1 - this.y0) / this.cell));
+    for (let j = j0; j <= j1; j++)
+      for (let i = i0; i <= i1; i++) {
+        const k = j * (this.nx - 1) + i;
+        let l = this.roofs.get(k);
+        if (!l) this.roofs.set(k, (l = []));
+        l.push(cut);
+      }
+  }
+
+  /** Top of the highest tunnel box roof over (x, y), or -Infinity. */
+  roofAt(x: number, y: number): number {
+    const i = Math.floor((x - this.x0) / this.cell);
+    const j = Math.floor((y - this.y0) / this.cell);
+    if (i < 0 || j < 0 || i >= this.nx - 1 || j >= this.ny - 1) return -Infinity;
+    let top = -Infinity;
+    for (const c of this.roofs.get(j * (this.nx - 1) + i) ?? []) if (cutHas(c, x, y)) top = Math.max(top, c.za);
+    return top;
   }
 
   /** Every cut (open or roofed) recorded in the cells overlapping the box. */
@@ -303,6 +378,8 @@ export interface Cut {
   za: number;
   zb: number;
   roof: boolean;
+  /** Carved in the near detail level only (see holeQuad). */
+  minor: boolean;
   x0: number;
   y0: number;
   x1: number;
@@ -311,7 +388,7 @@ export interface Cut {
   q: number[];
 }
 
-function makeCut(q: number[], expand: number, roof: boolean, endExpand: number): Cut | null {
+function makeCut(q: number[], expand: number, roof: boolean, endExpand: number, minor = false): Cut | null {
   // convex hull of the four corners (a sharp bend can fold a sample quad into a bow tie)
   const pts: [number, number, number][] = [
     [q[0], q[1], 0],
@@ -381,6 +458,7 @@ function makeCut(q: number[], expand: number, roof: boolean, endExpand: number):
     za: q[2],
     zb: q[5],
     roof,
+    minor,
     x0: Math.min(...xs) - m,
     y0: Math.min(...ys) - m,
     x1: Math.max(...xs) + m,
@@ -843,7 +921,12 @@ export function chunkGeometry(f: TerrainField, ci0: number, cj0: number, ci1: nu
     fine.set(key, v);
     return v;
   };
-  const isCarved = (i: number, j: number) => i >= 0 && j >= 0 && i < hw && j < ny - 1 && f.hole[j * hw + i] === 1;
+  // minor cuts (slivers over road surfaces) only in the near detail level
+  const isCarved = (i: number, j: number) => {
+    if (i < 0 || j < 0 || i >= hw || j >= ny - 1) return false;
+    const v = f.hole[j * hw + i];
+    return v === 1 || (v === 2 && s === 1);
+  };
 
   /** Ground triangle a-b-c minus the cuts, with earth faces along the cut edges. */
   const clipTri = (va: number, vb: number, vc: number, cuts: Cut[]) => {
@@ -932,6 +1015,7 @@ export function chunkGeometry(f: TerrainField, ci0: number, cj0: number, ci1: nu
         const dy = y2 - y1;
         const spans: [number, number, Cut][] = [];
         for (const c of f.cutsNear(Math.min(x1, x2) + ox * e, Math.min(y1, y2) + oy * e, Math.max(x1, x2) + ox * e, Math.max(y1, y2) + oy * e)) {
+          if (c.minor && s > 1) continue;
           let lo = 0;
           let hi = 1;
           for (let h = 0; h < c.hx.length && lo < hi; h++) {
@@ -969,11 +1053,25 @@ export function chunkGeometry(f: TerrainField, ci0: number, cj0: number, ci1: nu
           if (fa === -Infinity) continue;
           const za = z1 + (z2 - z1) * ta;
           const zb = z1 + (z2 - z1) * tb;
+          // a sliver cleared from over a road surface: where the ground beside it lies below the surface,
+          // close the gap under the surface's edge with a face back onto the ground
+          if (Math.min(za - fa, zb - fb) < -0.05 && spans.every(([lo, hi, c]) => tm < lo || tm > hi || c.minor)) {
+            const g1 = put(ax2, za, ay2, -ox, 0, oy);
+            const g2 = put(bx2, zb, by2, -ox, 0, oy);
+            const h2 = put(bx2, Math.max(zb, fb - 0.03), by2, -ox, 0, oy);
+            const h1 = put(ax2, Math.max(za, fa - 0.03), ay2, -ox, 0, oy);
+            tri(h1, h2, g2, -ox, 0, oy);
+            tri(h1, g2, g1, -ox, 0, oy);
+          }
           if (Math.max(za, zb) < Math.max(fa, fb) + 0.05) continue;
+          // the ground behind sits on a tunnel box (a cut that ends at a portal): the face stops at its roof
+          const roof = f.roofAt(x1 + dx * tm - ox * 0.3, y1 + dy * tm - oy * 0.3);
+          const ba = Math.max(Math.min(za - 0.02, fa - 0.25), Math.min(roof, za - 0.02));
+          const bb = Math.max(Math.min(zb - 0.02, fb - 0.25), Math.min(roof, zb - 0.02));
           const t1 = put(ax2, za, ay2, ox, 0, -oy);
           const t2 = put(bx2, zb, by2, ox, 0, -oy);
-          const u2 = put(bx2, Math.min(zb - 0.02, fb - 0.25), by2, ox, 0, -oy);
-          const u1 = put(ax2, Math.min(za - 0.02, fa - 0.25), ay2, ox, 0, -oy);
+          const u2 = put(bx2, bb, by2, ox, 0, -oy);
+          const u1 = put(ax2, ba, ay2, ox, 0, -oy);
           tri(t1, t2, u2, ox, 0, -oy);
           tri(t1, u2, u1, ox, 0, -oy);
         }
@@ -1008,7 +1106,8 @@ export function chunkGeometry(f: TerrainField, ci0: number, cj0: number, ci1: nu
             idx.push(v00, v10, v11, v00, v11, v01);
             continue;
           }
-          const cuts = f.cuts.get(j * hw + i);
+          const all = f.cuts.get(j * hw + i);
+          const cuts = s > 1 && all ? all.filter((c) => !c.minor) : all;
           if (!cuts || !cuts.length) continue;
           clipTri(v00, v10, v11, cuts);
           clipTri(v00, v11, v01, cuts);

@@ -37,6 +37,8 @@ export const U = {
   uInTunnel: { value: 0 },
   /** 0..1 how far underground the camera is (tunnel haze instead of sky fog). */
   uUnder: { value: 0 },
+  /** Underground: distance from the camera to the nearest tunnel portal (daylight lies beyond it). */
+  uPortalDist: { value: 1e6 },
 };
 
 export type SharedUniforms = typeof U;
@@ -91,6 +93,9 @@ if (vWDist > uCompress.x) {
 const FRAG_PARS = /* glsl */ `
 uniform float uFogHeight;
 uniform float uUnder;
+uniform float uPortalDist;
+/** Set to 1 by tunnel-interior surfaces (tubes, roads in tunnels): they take the tunnel haze, never the daylight glare. */
+float w_inTube = 0.0;
 varying float vWDist;
 varying vec3 vWDir;
 varying vec3 vWView;
@@ -125,8 +130,12 @@ const FRAG_FOG = /* glsl */ `
   #ifdef W_FOG_FADE
   gl_FragColor.rgb *= 1.0 - wf;
   #else
-  vec3 wfc = mix(w_fogColor(normalize(vWDir)), vec3(0.035, 0.032, 0.028), uUnder);
+  // underground, what lies beyond the nearest portal is daylight: it hazes toward the bright sky and
+  // glares (the eye is adapted to the tunnel); everything else takes the tunnel's murk
+  float wOut = uUnder * (1.0 - w_inTube) * smoothstep(uPortalDist - 4.0, uPortalDist + 12.0, vWDist);
+  vec3 wfc = mix(w_fogColor(normalize(vWDir)), vec3(0.035, 0.032, 0.028), uUnder * (1.0 - wOut));
   gl_FragColor.rgb = mix(gl_FragColor.rgb, w_outputColor(wfc), wf);
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(1.0), wOut * 0.3) * (1.0 + wOut * 0.5);
   #endif
 }
 #endif

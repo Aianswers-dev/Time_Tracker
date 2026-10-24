@@ -124,6 +124,28 @@ export class RoadIndex {
     return best;
   }
 
+  /**
+   * The lowest road surface over (x, y) (within its half-width + margin) that lies
+   * above zMin: its height and road id, or z Infinity and road -1.
+   */
+  lowestAbove(x: number, y: number, zMin: number, margin = 0, skip = -1): { z: number; road: number } {
+    let bz = Infinity;
+    let br = -1;
+    const g = ++this.gen;
+    this.grid.query(x - margin, y - margin, x + margin, y + margin, (k) => {
+      if (this.stamp[k] === g) return;
+      this.stamp[k] = g;
+      const ri = this.segRoad[k];
+      if (ri === skip || this.segHW[k] + margin - this.segDist(k, x, y) < 0) return;
+      const z = this.segZAt(k, x, y);
+      if (z > zMin && z < bz) {
+        bz = z;
+        br = ri;
+      }
+    });
+    return { z: bz, road: br };
+  }
+
   /** Distance from (x, y) to the nearest carriageway edge (negative inside). */
   clearance(x: number, y: number, radius: number, filter?: (road: number) => boolean): number {
     let best = Infinity;
