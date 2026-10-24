@@ -512,7 +512,12 @@ export class RouteGuide {
     let lane: { s: number; dist: number } | null = null;
     const at = (i: number): { s: number; dist: number; near: number } => {
       if (!this.places[i]?.zone) return { s: st.s, dist: pr.dist, near: 14 };
-      lane ??= this.track.project(frontX, frontY, st.s - 40, st.s + 40);
+      if (!lane) {
+        lane = this.track.project(frontX, frontY, st.s - 40, st.s + 40);
+        // (Fallen off a viaduct platform onto the street below is not alongside it.)
+        const dz = frontZ === undefined ? 0 : Math.abs(frontZ - this.track.zAt(lane.s));
+        if (dz > LEVEL_GAP) lane.dist = Math.max(lane.dist, 35 + dz);
+      }
       return { s: lane.s, dist: lane.dist, near: 3.5 };
     };
 
