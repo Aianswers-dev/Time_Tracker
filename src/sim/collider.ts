@@ -451,7 +451,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
   // From every ~2 m of platform edge facing a road, a 5 m wide strip back to that road (at its level)
   // counts as carriageway.
   const bayLines: Line[] = [];
-  const addBay = (px: number, py: number, underground: boolean, poly: Float32Array | null): void => {
+  const addBay = (px: number, py: number, underground: boolean, poly: Float32Array | null, levelZ: number | null): void => {
     let bestD = 16 * 16;
     let bestScore = Infinity;
     let qx = 0;
@@ -462,8 +462,12 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       if (l.kind === RoadKind.Pedestrian) return;
       project(l, sIdx[sg], px, py);
       if (PROJ.d2 >= 16 * 16) return;
-      // Underground platforms belong to tunnel roads; others usually not (covered busways are tagged tunnel).
-      const score = Math.sqrt(PROJ.d2) + (l.tunnel === underground ? 0 : underground ? 8 : 3);
+      // The road at the platform's own level (from its stop) wins: PA Hospital's platforms sit on the
+      // busway viaduct above a street. Without a level, underground platforms belong to tunnel roads and
+      // others usually not (covered busways are tagged tunnel).
+      if (levelZ !== null && Math.abs(PROJ.z - levelZ) > 3) return;
+      const score =
+        Math.sqrt(PROJ.d2) + (levelZ !== null ? Math.abs(PROJ.z - levelZ) * 2 : l.tunnel === underground ? 0 : underground ? 8 : 3);
       if (score < bestScore) {
         bestScore = score;
         bestD = PROJ.d2;
@@ -490,11 +494,44 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       bay: true,
     });
   };
+  /**
+   * Height of a platform: the nearest busway within 20 m (platforms serve busways; PA Hospital's sit on
+   * the busway viaduct with a street stop below), else the road height at the nearest stop within 40 m.
+   */
+  const platformLevel = (p: Float32Array): number | null => {
+    let bestB = 20 * 20;
+    let zb: number | null = null;
+    for (let i = 0; i < p.length; i += 2) {
+      forEachRoadSegmentNear(p[i], p[i + 1], 20, (sg) => {
+        const l = lines[sLine[sg]];
+        if (l.kind !== RoadKind.Busway) return;
+        project(l, sIdx[sg], p[i], p[i + 1]);
+        if (PROJ.d2 < bestB) {
+          bestB = PROJ.d2;
+          zb = PROJ.z;
+        }
+      });
+    }
+    if (zb !== null) return zb;
+    let best = 40 * 40;
+    let z: number | null = null;
+    for (const st of data.stops ?? []) {
+      for (let i = 0; i < p.length; i += 2) {
+        const d2 = (st.x - p[i]) ** 2 + (st.y - p[i + 1]) ** 2;
+        if (d2 < best) {
+          best = d2;
+          z = st.z ?? null;
+        }
+      }
+    }
+    return z;
+  };
   for (const pl of data.platforms ?? []) {
     const p = pl.pts;
     const n = p.length / 2;
     if (n < 2) continue;
     const poly = pl.area ? p : null;
+    const level = platformLevel(p);
     const edges = pl.area ? n : n - 1;
     let ldx = 0;
     let ldy = 0;
@@ -511,7 +548,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
         ldy = (by - ay) / (L || 1);
       }
       const steps = Math.max(1, Math.ceil(L / 2));
-      for (let k = 0; k <= steps; k++) addBay(ax + ((bx - ax) * k) / steps, ay + ((by - ay) * k) / steps, pl.underground, poly);
+      for (let k = 0; k <= steps; k++) addBay(ax + ((bx - ax) * k) / steps, ay + ((by - ay) * k) / steps, pl.underground, poly, level);
     }
     // The bays taper in and out beyond the platform ends (buses ease across well before the platform).
     let lo = Infinity;
@@ -530,8 +567,8 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       }
     }
     for (let k = 2; k <= 36; k += 2) {
-      addBay(p[2 * iLo] - ldx * k, p[2 * iLo + 1] - ldy * k, pl.underground, poly);
-      addBay(p[2 * iHi] + ldx * k, p[2 * iHi + 1] + ldy * k, pl.underground, poly);
+      addBay(p[2 * iLo] - ldx * k, p[2 * iLo + 1] - ldy * k, pl.underground, poly, level);
+      addBay(p[2 * iHi] + ldx * k, p[2 * iHi + 1] + ldy * k, pl.underground, poly, level);
     }
   }
   const bayBase = lines.length;
@@ -1423,44 +1460,112 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
         }
         for (let k = a; k < b; k += 2) vertexContact(v[k], v[k + 1], cx, cy, fx, fy, rx, ry, hl, hw, s, false);
       }
-      // Walls: keep every corner on the side of the wall the section's centre is on.
+      // Walls: exact segment-vs-box overlap (separating axes: the box's two axes and the wall normal).
+      // Across the wall line the push always goes back to the side the section's centre is on.
       const wl = secWalls[s];
       for (let wi = 0; wi < wl.length; wi++) {
         const w = wl[wi];
         if (walls.lo[w] >= hi || walls.hi[w] <= lo) continue;
         const ax = walls.ax[w];
         const ay = walls.ay[w];
-        const ex = walls.bx[w] - ax;
-        const ey = walls.by[w] - ay;
+        const bx = walls.bx[w];
+        const by = walls.by[w];
+        const ex = bx - ax;
+        const ey = by - ay;
         const L = Math.hypot(ex, ey);
         if (L < 1e-4) continue;
-        const dxu = ex / L;
-        const dyu = ey / L;
-        const nx = -dyu;
-        const ny = dxu;
-        const sc = (cx - ax) * nx + (cy - ay) * ny;
-        const side = sc >= 0 ? 1 : -1;
-        for (let k = 0; k < 8; k += 2) {
-          const qx = corners[k] - ax;
-          const qy = corners[k + 1] - ay;
-          const u = qx * dxu + qy * dyu;
-          if (u < 0 || u > L) continue;
-          const d = -(qx * nx + qy * ny) * side;
-          if (d > 0 && d < 3 && d > best.depth) {
-            best.depth = d;
-            best.px = nx * side * d;
-            best.py = ny * side * d;
-            best.qx = corners[k];
-            best.qy = corners[k + 1];
-            best.sec = s;
-            best.wall = true;
-            best.wallIndex = w;
+        // Segment in the box frame (u forward, v right), centred on the box.
+        const ua = (ax - cx) * fx + (ay - cy) * fy;
+        const va = (ax - cx) * rx + (ay - cy) * ry;
+        const ub = (bx - cx) * fx + (by - cy) * fy;
+        const vb = (bx - cx) * rx + (by - cy) * ry;
+        // Box axes.
+        const uMin = Math.min(ua, ub);
+        const uMax = Math.max(ua, ub);
+        if (uMax <= -hl || uMin >= hl) continue;
+        const vMin = Math.min(va, vb);
+        const vMax = Math.max(va, vb);
+        if (vMax <= -hw || vMin >= hw) continue;
+        // Wall normal.
+        const nx = -ey / L;
+        const ny = ex / L;
+        const cn = (cx - ax) * nx + (cy - ay) * ny; // centre's signed distance from the wall line
+        const en = hl * Math.abs(fx * nx + fy * ny) + hw * Math.abs(rx * nx + ry * ny);
+        if (Math.abs(cn) >= en) continue;
+        const side = cn >= 0 ? 1 : -1;
+        // Clip the segment to the box: the part of the wall inside the bus (for the contact point).
+        let t0 = 0;
+        let t1 = 1;
+        const du = ub - ua;
+        const dv = vb - va;
+        const clip = (pp: number, qq: number): boolean => {
+          if (Math.abs(pp) < 1e-9) return qq >= 0;
+          const r = qq / pp;
+          if (pp < 0) {
+            if (r > t1) return false;
+            if (r > t0) t0 = r;
+          } else {
+            if (r < t0) return false;
+            if (r < t1) t1 = r;
           }
+          return true;
+        };
+        if (!(clip(-du, ua + hl) && clip(du, hl - ua) && clip(-dv, va + hw) && clip(dv, hw - va) && t0 <= t1)) continue;
+        const tm = (t0 + t1) / 2;
+        // Penetration along each axis; the shallowest is the way out.
+        const dN = en - Math.abs(cn); // how far the box reaches across the wall line
+        const dUf = uMax + hl; // move the bus forward to clear the piece
+        const dUb = hl - uMin; // ... or back
+        const dVr = vMax + hw; // move it right
+        const dVl = hw - vMin; // ... or left
+        let d = dN;
+        let px = nx * side * dN;
+        let py = ny * side * dN;
+        // Contact point: where the wall cuts into the box.
+        let qx = ax + ex * tm;
+        let qy = ay + ey * tm;
+        if (dUf < d) {
+          d = dUf;
+          px = fx * dUf;
+          py = fy * dUf;
+          const k = ua > ub ? 1 : 0; // the end furthest forward
+          qx = k ? ax + ex * t0 : ax + ex * t1;
+          qy = k ? ay + ey * t0 : ay + ey * t1;
         }
-        const before = best.depth;
-        vertexContact(ax, ay, cx, cy, fx, fy, rx, ry, hl, hw, s, true);
-        vertexContact(walls.bx[w], walls.by[w], cx, cy, fx, fy, rx, ry, hl, hw, s, true);
-        if (best.depth > before) best.wallIndex = w;
+        if (dUb < d) {
+          d = dUb;
+          px = -fx * dUb;
+          py = -fy * dUb;
+          const k = ua < ub ? 1 : 0;
+          qx = k ? ax + ex * t0 : ax + ex * t1;
+          qy = k ? ay + ey * t0 : ay + ey * t1;
+        }
+        if (dVr < d) {
+          d = dVr;
+          px = rx * dVr;
+          py = ry * dVr;
+          const k = va > vb ? 1 : 0;
+          qx = k ? ax + ex * t0 : ax + ex * t1;
+          qy = k ? ay + ey * t0 : ay + ey * t1;
+        }
+        if (dVl < d) {
+          d = dVl;
+          px = -rx * dVl;
+          py = -ry * dVl;
+          const k = va < vb ? 1 : 0;
+          qx = k ? ax + ex * t0 : ax + ex * t1;
+          qy = k ? ay + ey * t0 : ay + ey * t1;
+        }
+        if (d > best.depth) {
+          best.depth = d;
+          best.px = px;
+          best.py = py;
+          best.qx = qx;
+          best.qy = qy;
+          best.sec = s;
+          best.wall = true;
+          best.wallIndex = w;
+        }
       }
     }
     return best.depth > 1e-4;
