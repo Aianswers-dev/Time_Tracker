@@ -380,7 +380,10 @@ export interface WorldHandle {
    * Current state of the traffic signal nearest to a point, for AI and HUD.
    * Pass the approaching vehicle's travel direction (dirX, dirY, unit, map
    * coords) to get the phase for that approach; without it the approach is
-   * guessed from the point's bearing from the junction centre.
+   * guessed from the point's bearing from the junction centre. `z` (the
+   * vehicle's road height) picks the level where junctions stack (a street
+   * over a motorway). Null where no signal controls the approach. Junctions,
+   * arms and phases: src/data/signals.ts.
    */
-  signalStateAt?(x: number, y: number, timeSeconds: number, dirX?: number, dirY?: number): 'green' | 'amber' | 'red' | null;
+  signalStateAt?(x: number, y: number, timeSeconds: number, dirX?: number, dirY?: number, z?: number): 'green' | 'amber' | 'red' | null;
 }

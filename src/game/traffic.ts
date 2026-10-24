@@ -17,6 +17,7 @@ import { makeBody, type Body } from './bodies';
 import { LEVEL_GAP, heightAt } from './height';
 import { session } from './session';
 import { buildPlatforms } from './platforms';
+import { signalsFor } from '../data/signals';
 
 const VIEW_DIST = 950;
 const LOOK_MAX = 40;
@@ -131,6 +132,7 @@ export class Traffic {
   private radius = 1100;
   private byId = new Map<number, AiBus>();
   private mids = new WeakMap<RouteTrack, TrackSignal[]>();
+  private asks = new WeakMap<TrackSignal, { x: number; y: number; dx: number; dy: number; z: number }>();
   private bodiesOut: Body[] = [];
   private exemptOut: boolean[] = [];
   /** Dev: simulate the traffic this many times per frame (?tff=N). */
@@ -652,6 +654,19 @@ export class Traffic {
     this.active.splice(i, 1);
   }
 
+  /** How a track signal is asked for: the approach point and direction into its junction, and the level. */
+  private signalAsk(tr: RouteTrack, sig: TrackSignal): { x: number; y: number; dx: number; dy: number; z: number } {
+    let q = this.asks.get(sig);
+    if (!q) {
+      const z = tr.zAt(sig.s);
+      const ad = signalsFor(this.data).approachDir(sig.x, sig.y, z, (s, o) => Object.assign(o, tr.sample(s, this.tmp2)), sig.s);
+      tr.sample(sig.s, this.tmp2);
+      q = ad ? { x: ad.x, y: ad.y, dx: ad.dx, dy: ad.dy, z } : { x: sig.x, y: sig.y, dx: this.tmp2.hx, dy: this.tmp2.hy, z };
+      this.asks.set(sig, q);
+    }
+    return q;
+  }
+
   /** Mid-block signals of a route: the ones not at a managed junction. */
   private midSignals(track: RouteTrack): TrackSignal[] {
     let m = this.mids.get(track);
@@ -783,8 +798,9 @@ export class Traffic {
         b.sigTimer -= dt;
         if (b.sigTimer <= 0 || b.sigState === null) {
           b.sigTimer = 0.25;
-          tr.sample(sig.s, this.tmp2);
-          b.sigState = signalAt.call(this.world, sig.x, sig.y, time, this.tmp2.hx, this.tmp2.hy);
+          // Asked the way the player's guide asks (same approach point, direction and level).
+          const q = this.signalAsk(tr, sig);
+          b.sigState = signalAt.call(this.world, q.x, q.y, time, q.dx, q.dy, q.z);
         }
         const stopDist = (b.v * b.v) / (2 * 2.6);
         if (b.sigState === 'red' || (b.sigState === 'amber' && !b.sigCommit && gap > stopDist + 1)) {

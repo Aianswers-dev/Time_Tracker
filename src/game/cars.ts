@@ -882,7 +882,8 @@ export class CarTraffic {
   signalFor(node: number, dirX: number, dirY: number, time: number): 'green' | 'amber' | 'red' | null {
     const nd = this.nodes[node];
     if (!nd.sig || !this.world.signalStateAt) return null;
-    return this.world.signalStateAt(nd.x, nd.y, time, dirX, dirY);
+    // Asked from a point on the approach, on the node's level (src/data/signals.ts).
+    return this.world.signalStateAt(nd.x - dirX * 10, nd.y - dirY * 10, time, dirX, dirY, nd.z);
   }
 
   /** Is the box clear of movements that conflict with this one? (Expired holders are dropped.) */
@@ -1402,7 +1403,7 @@ export class CarTraffic {
             c.sigTimer = 0.3;
             const xy = e.sigXY[c.lane & 1];
             this.at(c.lane, sig[c.sigI], 0, this.pt2);
-            c.sigState = signalAt.call(this.world, xy[2 * c.sigI], xy[2 * c.sigI + 1], time, this.pt2.hx, this.pt2.hy);
+            c.sigState = signalAt.call(this.world, xy[2 * c.sigI], xy[2 * c.sigI + 1], time, this.pt2.hx, this.pt2.hy, this.pt2.z);
           }
           if (c.sigState === 'red' || (c.sigState === 'amber' && sgap > (c.v * c.v) / (2 * 3) + 2)) lim(idm(sgap, 0, 0.8), Wait.Red);
         }
