@@ -10,9 +10,9 @@
  * 2. Every lane of the AI car graph into a signalised node sees green within
  *    a cycle (the same lookup the AI cars and buses use).
  * 3. With --routes: every route's track signals (both directions), asked the
- *    way the player's guide asks, see green within a cycle; and where an AI
- *    bus uses the car graph's junction for the same light, the guide and the
- *    AI agree (per cent of a 240 s window).
+ *    way the player's guide (and the AI buses, traffic.ts signalPlan) ask, see
+ *    green within a cycle; and where the AI cars' junction node is the same
+ *    junction, the guide and the cars agree (per cent of a 240 s window).
  *
  * Exits non-zero when a check fails.
  */
@@ -137,7 +137,7 @@ if (args.includes('--routes')) {
         deadSigs++;
         console.log(`  ROUTE ${r.id}/${r.dir} signal s=${sg.s.toFixed(0)} (${sg.x.toFixed(0)},${sg.y.toFixed(0)}) never green`);
       }
-      // The AI's light for the same junction (when its stop line is near this one).
+      // The AI cars' light for the same junction (when its stop line is near this one).
       const gj = model.junctionAt(qx, qy, hx, hy, zq);
       const bj = jl.find((j) => {
         if (!j.sig || Math.abs(j.stopS - sg.s) > 25) return false;
@@ -156,11 +156,11 @@ if (args.includes('--routes')) {
       }
       pairs++;
       agreeSum += same / n;
-      if (same / n < 0.9) bad.push(`  DISAGREE ${r.id}/${r.dir}@${sg.s.toFixed(0)} (${sg.x.toFixed(0)},${sg.y.toFixed(0)}) guide vs AI agree ${((100 * same) / n).toFixed(0)}%`);
+      if (same / n < 0.9) bad.push(`  DISAGREE ${r.id}/${r.dir}@${sg.s.toFixed(0)} (${sg.x.toFixed(0)},${sg.y.toFixed(0)}) guide vs cars agree ${((100 * same) / n).toFixed(0)}%`);
     }
   }
   for (const b of bad.slice(0, verbose ? bad.length : 15)) console.log(b);
-  console.log(`routes: ${sigs} track signals, ${deadSigs} never green; guide vs AI at ${pairs} shared lights: mean agreement ${((100 * agreeSum) / Math.max(1, pairs)).toFixed(1)}%, ${bad.length} below 90% (${((performance.now() - t1) / 1000).toFixed(0)} s)`);
+  console.log(`routes: ${sigs} track signals, ${deadSigs} never green; guide vs cars at ${pairs} shared lights: mean agreement ${((100 * agreeSum) / Math.max(1, pairs)).toFixed(1)}%, ${bad.length} below 90% (${((performance.now() - t1) / 1000).toFixed(0)} s)`);
   if (deadSigs) fail++;
 }
 void phaseLight;

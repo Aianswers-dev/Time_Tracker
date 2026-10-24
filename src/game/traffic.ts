@@ -55,6 +55,8 @@ interface AiBus {
   sigCommit: boolean;
   /** Mid-block signals on the route (junction signals go through the reservations). */
   mids: TrackSignal[];
+  /** Per junction of `jl`: how its light is asked (the guide's way, from the route's own signal), else null. */
+  jAsk: (SignalAsk | null)[];
   /** Junctions on the route, the next one to commit to, and the ones we hold. */
   jl: BusJunction[];
   jNext: number;
@@ -72,6 +74,15 @@ interface AiBus {
   marker: MapMarker;
   age: number;
   turnSign: number;
+}
+
+/** Where and how a light is asked: the approach point and direction into its junction, and the level. */
+interface SignalAsk {
+  x: number;
+  y: number;
+  dx: number;
+  dy: number;
+  z: number;
 }
 
 interface Candidate {
@@ -131,8 +142,8 @@ export class Traffic {
   private maxActive = this.capBuses;
   private radius = 1100;
   private byId = new Map<number, AiBus>();
-  private mids = new WeakMap<RouteTrack, TrackSignal[]>();
-  private asks = new WeakMap<TrackSignal, { x: number; y: number; dx: number; dy: number; z: number }>();
+  private plans = new WeakMap<RouteTrack, { mids: TrackSignal[]; jAsk: (SignalAsk | null)[] }>();
+  private asks = new WeakMap<TrackSignal, SignalAsk>();
   private bodiesOut: Body[] = [];
   private exemptOut: boolean[] = [];
   /** Dev: simulate the traffic this many times per frame (?tff=N). */
@@ -359,7 +370,8 @@ export class Traffic {
       sigState: null,
       sigTimer: 0,
       sigCommit: false,
-      mids: this.midSignals(c.track),
+      mids: this.signalPlan(c.track).mids,
+      jAsk: this.signalPlan(c.track).jAsk,
       jl: this.cars.junctionsAlong(c.track),
       jNext: 0,
       holds: [],
@@ -655,7 +667,7 @@ export class Traffic {
   }
 
   /** How a track signal is asked for: the approach point and direction into its junction, and the level. */
-  private signalAsk(tr: RouteTrack, sig: TrackSignal): { x: number; y: number; dx: number; dy: number; z: number } {
+  private signalAsk(tr: RouteTrack, sig: TrackSignal): SignalAsk {
     let q = this.asks.get(sig);
     if (!q) {
       const z = tr.zAt(sig.s);
@@ -667,15 +679,33 @@ export class Traffic {
     return q;
   }
 
-  /** Mid-block signals of a route: the ones not at a managed junction. */
-  private midSignals(track: RouteTrack): TrackSignal[] {
-    let m = this.mids.get(track);
-    if (!m) {
+  /**
+   * How a route's lights are obeyed. A track signal at a signalised junction
+   * the bus manages through the reservations is that junction's light, asked
+   * exactly as the player's guide asks it (so the AI and the HUD agree); every
+   * other track signal is a mid-block light obeyed at its own stop line.
+   */
+  private signalPlan(track: RouteTrack): { mids: TrackSignal[]; jAsk: (SignalAsk | null)[] } {
+    let p = this.plans.get(track);
+    if (!p) {
       const jl = this.cars.junctionsAlong(track);
-      m = track.signals.filter((sg) => !jl.some((j) => Math.abs(j.s - sg.s) < 30));
-      this.mids.set(track, m);
+      const model = signalsFor(this.data);
+      const jAsk: (SignalAsk | null)[] = jl.map(() => null);
+      const mids = track.signals.filter((sg) => {
+        const q = this.signalAsk(track, sg);
+        const ji = model.junctionAt(q.x, q.y, q.dx, q.dy, q.z);
+        if (ji < 0) return true;
+        let managed = false;
+        jl.forEach((j, k) => {
+          if (!j.sig || Math.abs(j.s - sg.s) >= 30 || this.cars.signalJunction(j.node, j.inX, j.inY) !== ji) return;
+          managed = true;
+          jAsk[k] ??= q;
+        });
+        return !managed;
+      });
+      this.plans.set(track, (p = { mids, jAsk }));
     }
-    return m;
+    return p;
   }
 
   private step(b: AiBus, dt: number, time: number): void {
@@ -765,10 +795,10 @@ export class Traffic {
       const commitDist = Math.max(3, (b.v * b.v) / (2 * 2.2)) + 2;
       if (stopAt < commitDist + 35) {
         // Junctions closer together than our length are taken in one go.
-        let res = this.junctionOk(b, j, stopAt, time);
+        let res = this.junctionOk(b, b.jNext, stopAt, time);
         let k = b.jNext + 1;
         while (res === Wait.None && k < jl.length && jl[k].s - j.s < j.boxR + jl[k].boxR + b.len) {
-          res = this.junctionOk(b, jl[k], stopAt + (jl[k].stopS - j.stopS), time);
+          res = this.junctionOk(b, k, stopAt + (jl[k].stopS - j.stopS), time);
           k++;
         }
         if (res !== Wait.None) lim(idm(b.v, v0, Math.max(0.05, stopAt), 0, 0.8), res);
@@ -915,9 +945,11 @@ export class Traffic {
   }
 
   /** May this bus go through junction `j` (stop line `stopAt` ahead) now? */
-  private junctionOk(b: AiBus, j: BusJunction, stopAt: number, time: number): Wait {
+  private junctionOk(b: AiBus, k: number, stopAt: number, time: number): Wait {
+    const j = b.jl[k];
     if (j.sig) {
-      const st = this.cars.signalFor(j.node, j.inX, j.inY, time);
+      const a = b.jAsk[k];
+      const st = a ? (this.world.signalStateAt?.(a.x, a.y, time, a.dx, a.dy, a.z) ?? null) : this.cars.signalFor(j.node, j.inX, j.inY, time);
       if (st === 'red') return Wait.Red;
       if (st === 'amber' && stopAt > (b.v * b.v) / (2 * 3)) return Wait.Red;
     } else if (this.cars.giveWayBusy(j.node, j.minor, time)) return Wait.Junction;

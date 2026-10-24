@@ -18,6 +18,7 @@ import { PointGrid, type Body } from './bodies';
 import { LEVEL_GAP, heightsOf } from './height';
 import { TRACK_STEP, type RouteTrack } from './track';
 import { rng } from './util';
+import { signalsFor } from '../data/signals';
 
 const VIEW = 600;
 /** Instance capacity per model (the Normal level keeps ~95 cars). */
@@ -51,6 +52,8 @@ interface Edge {
   width: number;
   limit: number;
   kind: RoadKind;
+  /** Bus-only (busway, bus road): in the graph for the AI buses' junctions, never driven by cars. */
+  bus: boolean;
   weight: number;
   /** Priority class at junctions. */
   rank: number;
@@ -415,8 +418,12 @@ export class CarTraffic {
     const useAt = (kk: number, z: number) => uses.get(kk)?.find((u) => Math.abs(u.z - z) < LEVEL_GAP);
     const included: number[] = [];
     roads.forEach((r, i) => {
-      // Never bus-only roads, busways or service roads (stations, platforms, car parks).
-      if (!INCLUDE.has(r.kind) || r.bus || r.tunnel) return;
+      // Car roads (never service roads: stations, platforms, car parks; nor car
+      // tunnels), plus busways and bus roads, also in tunnels: cars never drive
+      // those, but where they meet each other or a street the AI buses get the
+      // same junction boxes, lights and give-way as everyone else.
+      const busOnly = r.bus || r.kind === RoadKind.Busway;
+      if (!busOnly && (!INCLUDE.has(r.kind) || r.tunnel)) return;
       included.push(i);
       for (let k = 0; k < r.pts.length; k += 2) {
         const kk = key(r.pts[k], r.pts[k + 1]);
@@ -470,7 +477,8 @@ export class CarTraffic {
           width: Math.max(3.4, r.width),
           limit: speedLimitOf(r),
           kind: r.kind,
-          weight: len * (CLASS_W[r.kind] ?? 0.3) * (r.link ? 0.3 : 1),
+          bus: r.bus || r.kind === RoadKind.Busway,
+          weight: r.bus || r.kind === RoadKind.Busway ? 0 : len * (CLASS_W[r.kind] ?? 0.3) * (r.link ? 0.3 : 1),
           rank: (CLASS_W[r.kind] ?? 0.3) * (r.link ? 0.5 : 1),
           z: zs,
           mx: (pts[0] + pts[pts.length - 2]) / 2,
@@ -552,6 +560,26 @@ export class CarTraffic {
       l.push(i);
     });
     const H = heightsOf(this.data);
+    // Every graph node of a signalised junction is controlled (a dual-carriageway
+    // crossing is several nodes, and a light is not always nearest its own node):
+    // the nodes on the junction's level close to one of its signal nodes.
+    for (const j of signalsFor(this.data).junctions) {
+      if (!j.phases.length) continue;
+      for (const k of j.nodes) {
+        const sx = sg[2 * k];
+        const sy = sg[2 * k + 1];
+        const gx = Math.floor(sx / 50);
+        const gy = Math.floor(sy / 50);
+        for (let ox = -1; ox <= 1; ox++) {
+          for (let oy = -1; oy <= 1; oy++) {
+            for (const n of this.nodeGrid.get((gx + ox) * 4096 + gy + oy) ?? []) {
+              const nd = this.nodes[n];
+              if (Math.abs(nd.z - j.z) <= LEVEL_GAP && Math.hypot(nd.x - sx, nd.y - sy) < nd.boxR + 10) nd.sig = true;
+            }
+          }
+        }
+      }
+    }
     for (let k = 0; k < sg.length; k += 2) {
       const sx = sg[k];
       const sy = sg[k + 1];
@@ -568,6 +596,7 @@ export class CarTraffic {
         for (let ox = -1; ox <= 1; ox++) {
           for (const ei of edgeGrid.get((gx + ox) * 1000 + gy + oy) ?? []) {
             const e = this.edges[ei];
+            if (e.bus) continue;
             const pr = this.project(e, sx, sy);
             if (pr.d > 7 || Math.abs(this.zAlong(e, pr.s) - sz) > LEVEL_GAP) continue;
             const fwd = pr.s - 6;
@@ -603,11 +632,65 @@ export class CarTraffic {
     this.buildBuswayCrossings(edgeGrid);
   }
 
-  /** Where a car road crosses a busway at grade, cars give way to buses. */
+  /**
+   * Where a car road crosses a busway at grade, cars give way to buses. Only
+   * real crossings (the busway goes on across the road): where a busway or
+   * bus road merely starts or ends on a street the junction box handles it.
+   */
   private buildBuswayCrossings(edgeGrid: Map<number, number[]>): void {
     const roads = this.data.roads;
-    for (const r of roads) {
-      if (!(r.bus || r.kind === RoadKind.Busway)) continue;
+    const isBus = (r: (typeof roads)[number]) => r.bus || r.kind === RoadKind.Busway;
+    // Bus roads by end point, to follow a busway across a node where OSM splits it.
+    const ends = new Map<number, number[]>();
+    const ek = (x: number, y: number) => Math.round(x) * 100003 + Math.round(y);
+    roads.forEach((r, i) => {
+      if (!isBus(r)) return;
+      for (const k of [0, r.pts.length - 2]) {
+        const kk = ek(r.pts[k], r.pts[k + 1]);
+        let l = ends.get(kk);
+        if (!l) ends.set(kk, (l = []));
+        l.push(i);
+      }
+    });
+    // Does the bus road ri (and any bus road joined to it near X, Y) reach at
+    // least 2.5 m to both sides of the line through (X, Y) along (dx, dy)?
+    const crossesBoth = (ri: number, X: number, Y: number, dx: number, dy: number, Z: number): boolean => {
+      const set = new Set<number>([ri]);
+      const r0 = roads[ri];
+      for (const k of [0, r0.pts.length - 2]) {
+        if (Math.hypot(r0.pts[k] - X, r0.pts[k + 1] - Y) > 14) continue;
+        for (const q of ends.get(ek(r0.pts[k], r0.pts[k + 1])) ?? []) set.add(q);
+      }
+      const l = Math.hypot(dx, dy) || 1;
+      const nx = -dy / l;
+      const ny = dx / l;
+      let pos = false;
+      let neg = false;
+      for (const q of set) {
+        const r = roads[q];
+        const p = r.pts;
+        for (let i = 0; i + 3 < p.length; i += 2) {
+          const sl = Math.hypot(p[i + 2] - p[i], p[i + 3] - p[i + 1]);
+          const n = Math.max(1, Math.ceil(sl / 2));
+          for (let k = 0; k <= n; k++) {
+            const t = k / n;
+            const x = p[i] + (p[i + 2] - p[i]) * t;
+            const y = p[i + 1] + (p[i + 3] - p[i + 1]) * t;
+            if (Math.hypot(x - X, y - Y) > 12) continue;
+            const z = r.z[i / 2] + (r.z[i / 2 + 1] - r.z[i / 2]) * t;
+            if (Math.abs(z - Z) > 1.5) continue;
+            const side = (x - X) * nx + (y - Y) * ny;
+            if (side > 2.5) pos = true;
+            if (side < -2.5) neg = true;
+            if (pos && neg) return true;
+          }
+        }
+      }
+      return false;
+    };
+    for (let ri = 0; ri < roads.length; ri++) {
+      const r = roads[ri];
+      if (!isBus(r)) continue;
       const p = r.pts;
       for (let i = 0; i + 3 < p.length; i += 2) {
         const ax = p[i];
@@ -626,6 +709,7 @@ export class CarTraffic {
           for (let gy = gy0; gy <= gy1; gy++) {
             for (const ei of edgeGrid.get(gx * 1000 + gy) ?? []) {
               const e = this.edges[ei];
+              if (e.bus) continue;
               const q = e.pts;
               for (let k = 0; k + 3 < q.length; k += 2) {
                 const cx = q[k];
@@ -646,6 +730,7 @@ export class CarTraffic {
                 const along = e.cum[k / 2] + t * Math.hypot(dx, dy);
                 const X = cx + dx * t;
                 const Y = cy + dy * t;
+                if (!crossesBoth(ri, X, Y, dx, dy, zw)) continue;
                 const fwd = along - 5;
                 if (fwd > 0) {
                   e.xs[0].push(fwd);
@@ -664,9 +749,15 @@ export class CarTraffic {
     for (const e of this.edges) {
       for (const d of [0, 1] as const) {
         const order = e.xs[d].map((s, i) => [s, i] as const).sort((x, y) => x[0] - y[0]);
-        e.xs[d] = order.map(([s]) => s);
+        const s2: number[] = [];
         const xy: number[] = [];
-        for (const [, i] of order) xy.push(...e.xsXY[d].slice(i * 5, i * 5 + 5));
+        for (const [s, i] of order) {
+          // One give-way line per crossing (segments meeting at the crossing node both hit it).
+          if (s2.length && s - s2[s2.length - 1] < 3) continue;
+          s2.push(s);
+          xy.push(...e.xsXY[d].slice(i * 5, i * 5 + 5));
+        }
+        e.xs[d] = s2;
         e.xsXY[d] = xy;
       }
     }
@@ -806,6 +897,7 @@ export class CarTraffic {
     for (const o of node.out) {
       if (o >> 1 === lane >> 1) continue;
       const oe = this.edges[o >> 1];
+      if (oe.bus) continue;
       const op = oe.pts;
       const on = op.length;
       const [ox, oy] = o & 1 ? [op[on - 4] - op[on - 2], op[on - 3] - op[on - 1]] : [op[2] - op[0], op[3] - op[1]];
@@ -876,6 +968,13 @@ export class CarTraffic {
     }
     const l = Math.hypot(dx, dy) || 1;
     return [dx / l, dy / l];
+  }
+
+  /** The signal-model junction (src/data/signals.ts) a vehicle travelling (dirX, dirY) into `node` asks, or -1. */
+  signalJunction(node: number, dirX: number, dirY: number): number {
+    const nd = this.nodes[node];
+    if (!nd.sig) return -1;
+    return signalsFor(this.data).junctionAt(nd.x - dirX * 10, nd.y - dirY * 10, dirX, dirY, nd.z);
   }
 
   /** Signal state for a vehicle travelling (dirX, dirY) into junction `node`, or null if unsignalised. */
@@ -1020,6 +1119,7 @@ export class CarTraffic {
     const R2 = this.radius * this.radius;
     for (let i = 0; i < this.edges.length; i++) {
       const e = this.edges[i];
+      if (e.bus) continue;
       const dx = e.mx - px;
       const dy = e.my - py;
       if (dx * dx + dy * dy > R2) continue;
