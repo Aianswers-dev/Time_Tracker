@@ -1034,6 +1034,21 @@ export class RouteTrack {
       const tail = Math.max(25, shift * 4);
       const i0 = Math.max(0, Math.floor((z.s0 - lead - 5) / TRACK_STEP));
       const i1 = Math.min(n - 1, Math.ceil((z.s1 + tail) / TRACK_STEP));
+      // Before and after the platform the lane eases from the road lane to the platform line carried on
+      // from the platform's end; where that would put the bus off the carriageway (the road bends away
+      // from the route line at a split, and the eased lane cuts across the gore) it eases by the shift
+      // from the road lane instead, carried along the road lane.
+      const homeAt = (s: number) => home[Math.max(0, Math.min(n - 1, Math.round(s / TRACK_STEP)))];
+      const pullIn = edgeAt(z.s0) - PLATFORM_LANE - homeAt(z.s0);
+      const pullOut = edgeAt(z.s1) - PLATFORM_LANE - homeAt(z.s1);
+      const offPaved = (i: number, o: number) => {
+        let worst = -Infinity;
+        for (const side of [-1.25, 0, 1.25]) {
+          const q = H.surfaceAt(bx[i] + nx[i] * (o + side), by[i] + ny[i] * (o + side), this.z[i]);
+          worst = Math.max(worst, q.road < 0 ? Infinity : q.edge);
+        }
+        return worst > 0.3;
+      };
       for (let i = i0; i <= i1; i++) {
         const s = i * TRACK_STEP;
         const w = s < z.s0 ? smooth01((s - (z.s0 - lead - 5)) / lead) : s > z.s1 ? 1 - smooth01((s - z.s1) / tail) : 1;
@@ -1041,7 +1056,12 @@ export class RouteTrack {
         if (s > z.s0 - 8 && s < z.s1 + 8) skew[i] |= 2; // (alongside the platform: the lane's shift from the road is meant)
         if (s >= z.s0 && s <= z.s1) skew[i] |= 4;
         else skew[i] |= 8; // (pulling in or out)
-        const want = edgeAt(s) - PLATFORM_LANE;
+        let want = edgeAt(s) - PLATFORM_LANE;
+        if (s < z.s0 || s > z.s1) {
+          const alt = home[i] + (s < z.s0 ? pullIn : pullOut);
+          const cur = this.offset[i];
+          if (offPaved(i, cur + (want - cur) * w) && !offPaved(i, cur + (alt - cur) * w)) want = alt;
+        }
         const kerbNow = this.kerb[i] + this.offset[i];
         this.offset[i] += (want - this.offset[i]) * w;
         this.kerb[i] += (Math.max(PLATFORM_LANE, kerbNow - this.offset[i]) - this.kerb[i]) * w;
@@ -1173,6 +1193,7 @@ export class RouteTrack {
     }
     // The kerb from the lane as it finally runs, and the platform zones trimmed to where it runs alongside.
     this.fitKerb(data, zones);
+    this.fillLimits(data, zones);
     // Speed profile: curvature, posted limits, then braking pass.
     // (Over the lane's own length: through a station hall or round the outside of a bend a sample's 4 m of
     // route can be twice that of lane, and on the inside much less.)
@@ -1668,6 +1689,59 @@ export class RouteTrack {
       }
       if (!moved) break;
       look = next;
+    }
+  }
+
+  /**
+   * Posted limits on busways OSM leaves untagged. Busway ways are split at every bridge, tunnel and
+   * platform and only some carry `maxspeed`, so the class default (80, 60 in tunnels) would flick the
+   * limit up between tagged neighbours and put 80 through a station: an untagged busway stretch takes
+   * the higher of the tagged busway limits either side of it along the route (within 2 km), or 60 (the
+   * most any busway in the map is tagged) with none in reach, never above the default; and through a
+   * station at most 50, as nearly all tagged station ways are.
+   */
+  private fillLimits(data: MapData, zones: (PlatformZone | null)[]): void {
+    const n = this.n;
+    // Tagged busway limit per sample: > 0 tagged, 0 untagged busway, -1 not a busway.
+    // (Unmatched samples carry their limit from the matched one before them: on a busway, untagged.)
+    const tag = new Int16Array(n).fill(-1);
+    for (let i = 0; i < n; i++) {
+      const ri = this.road[i];
+      if (ri < 0) {
+        if (i > 0 && tag[i - 1] >= 0) tag[i] = 0;
+        continue;
+      }
+      const r = data.roads[ri];
+      if (r.kind === RoadKind.Busway) tag[i] = r.maxspeed && r.maxspeed >= 10 ? r.maxspeed : 0;
+    }
+    const reach = Math.round(2000 / TRACK_STEP);
+    const before = new Int16Array(n);
+    let last = 0;
+    let lastI = -Infinity;
+    for (let i = 0; i < n; i++) {
+      if (tag[i] > 0) {
+        last = tag[i];
+        lastI = i;
+      }
+      before[i] = i - lastI <= reach ? last : 0;
+    }
+    last = 0;
+    lastI = Infinity;
+    for (let i = n - 1; i >= 0; i--) {
+      if (tag[i] > 0) {
+        last = tag[i];
+        lastI = i;
+      }
+      if (tag[i] !== 0) continue;
+      const after = lastI - i <= reach ? last : 0;
+      const nb = Math.max(before[i], after);
+      this.limit[i] = Math.min(this.limit[i], nb > 0 ? nb : 60);
+    }
+    for (const z of zones) {
+      if (!z) continue;
+      const i0 = Math.max(0, Math.floor((z.s0 - 15) / TRACK_STEP));
+      const i1 = Math.min(n - 1, Math.ceil((z.s1 + 10) / TRACK_STEP));
+      for (let i = i0; i <= i1; i++) if (tag[i] === 0) this.limit[i] = Math.min(this.limit[i], 50);
     }
   }
 
