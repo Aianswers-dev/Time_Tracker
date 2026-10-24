@@ -575,6 +575,25 @@
 .bbh-tt.on.haz {
   color: #ff5a3c;
 }
+/* Cab view: the dashboard already shows speed, gear and lamps, so the
+   cluster shrinks to the limit sign (and the park brake, which the dash lacks). */
+.bbh.cab .bbh-cluster {
+  grid-template-columns: auto;
+  padding: 7px;
+  column-gap: 0;
+  row-gap: 4px;
+  justify-items: center;
+}
+.bbh.cab .bbh-speed,
+.bbh.cab .bbh-row > * {
+  display: none;
+}
+.bbh.cab .bbh-row > .bbh-tt.park.on {
+  display: flex;
+}
+.bbh.cab .bbh-limit {
+  grid-row: auto;
+}
 
 /* Traffic signal ahead (left of the cluster) */
 .bbh-sig {
@@ -594,6 +613,9 @@
 .bbh-sig.show {
   opacity: 1;
   transform: none;
+}
+.bbh.cab .bbh-sig {
+  right: calc(max(16px, env(safe-area-inset-right)) + 96px);
 }
 .bbh-lamps {
   display: flex;
@@ -623,11 +645,12 @@
   box-shadow: 0 0 8px #2fe07a;
 }
 
-/* Centre: off-route and contextual prompts */
+/* Centre: off-route and contextual prompts. The off-route card takes the
+   turn card's place (hidden while off route), above the toasts. */
 .bbh-off {
   position: absolute;
   left: 50%;
-  top: 26%;
+  top: max(14px, env(safe-area-inset-top));
   transform: translateX(-50%);
   display: none;
   align-items: center;
@@ -871,6 +894,14 @@
 .bbh-toast small {
   font-weight: 800;
   color: var(--muted);
+}
+.bbh-toast .bbh-tn {
+  font-size: 12px;
+  font-weight: 850;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--fg);
 }
 @keyframes bbh-toast-in {
   from {
@@ -1202,8 +1233,34 @@
     padding: 6px 10px;
   }
   .bbh-sig {
-    right: calc(max(10px, env(safe-area-inset-right)) + 290px);
+    /* clear of the cluster (~350 px wide here) */
+    right: calc(max(10px, env(safe-area-inset-right)) + 362px);
     bottom: max(10px, env(safe-area-inset-bottom));
+  }
+  .bbh.cab .bbh-sig {
+    right: calc(max(10px, env(safe-area-inset-right)) + 70px);
+  }
+  .bbh.cab .bbh-cluster {
+    padding: 5px;
+  }
+  .bbh-off {
+    top: max(8px, env(safe-area-inset-top));
+    padding: 6px 14px 6px 8px;
+    gap: 10px;
+  }
+  .bbh-off .bbh-oarrow {
+    width: 40px;
+    height: 40px;
+  }
+  .bbh-off .bbh-oarrow svg {
+    width: 26px;
+    height: 26px;
+  }
+  .bbh-off .t1 {
+    font-size: 15px;
+  }
+  .bbh-off .t2 {
+    font-size: 12px;
   }
   .bbh-limit {
     width: 46px;
@@ -1306,7 +1363,7 @@
     top: 44%;
   }
   .bbh-off {
-    top: 30%;
+    top: var(--top);
   }
   /* The touch overlay has its own gear selector and lamp buttons. */
   .bbh-cluster .bbh-row {
