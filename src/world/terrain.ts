@@ -696,10 +696,18 @@ vec3 terrainAlbedo() {
   c = mix(c, sport, smoothstep(0.2, 0.8, lc.b));
   c = mix(c, plaza, smoothstep(0.2, 0.8, lc.a));
 #endif
-  // steep banks and cuttings: bare earth; river margins: mud
-  float steep = 1.0 - smoothstep(0.72, 0.9, normalize(vGNrm).y);
-  vec3 earth = mix(vec3(0.42, 0.36, 0.27), vec3(0.33, 0.30, 0.25), n1.r) * (0.85 + 0.3 * n3.g);
-  c = mix(c, earth, steep * 0.75);
+  // steep banks and cuttings: bare earth; river margins: mud. A face steep in itself (cut faces, the
+  // earth faces at cutting edges) is bare earth whatever its vertex normals say, textured in its own
+  // plane (plan mapping would smear it into vertical streaks), with faint strata.
+  vec3 fn = normalize(cross(dFdx(vGPos), dFdy(vGPos)));
+  float steepF = 1.0 - smoothstep(0.5, 0.8, abs(fn.y));
+  float steep = max(1.0 - smoothstep(0.72, 0.9, normalize(vGNrm).y), steepF);
+  vec2 ep = steepF > 0.5 ? (abs(fn.x) > abs(fn.z) ? vec2(-vGPos.z, vGPos.y) : vec2(vGPos.x, vGPos.y)) : p;
+  vec4 e1 = texture2D(uNoise, ep / 23.0);
+  vec4 e3 = texture2D(uNoise, ep / vec2(4.3, 2.2));
+  vec3 earth = mix(vec3(0.42, 0.36, 0.27), vec3(0.33, 0.30, 0.25), e1.r) * (0.85 + 0.3 * e3.g);
+  earth *= 1.0 - 0.07 * steepF * smoothstep(0.3, 0.7, fract(vGPos.y * 1.3 + e1.g * 1.7));
+  c = mix(c, earth, max(steep * 0.75, steepF));
   float bank = 1.0 - smoothstep(uWaterLevel + 0.3, uWaterLevel + 1.6, vGPos.y + (n1.g - 0.5) * 0.6);
   vec3 mud = mix(vec3(0.33, 0.29, 0.22), vec3(0.20, 0.18, 0.15), smoothstep(uWaterLevel + 0.2, uWaterLevel - 1.5, vGPos.y));
   c = mix(c, mud, bank);
