@@ -86,7 +86,7 @@ async function main() {
   const physics = new BusPhysics(bus.spec);
   const controls = new BusControls();
   const input = new InputManager();
-  const rig = new CameraRig(camera);
+  const rig = new CameraRig(camera, collider);
   const audio = new BusAudio();
   audio.setType(choice.type);
   audio.start();

@@ -673,6 +673,34 @@ function wallsUnderDeck(): void {
   check('street cutting under a viaduct: retaining wall tops away from it', away, 8.9, 9.1, 'm');
 }
 
+function cameraQueries(): void {
+  // Cameras: a covered busway tube (ground 14 m over a road at 0) has its ceiling at 5.8 m and rock
+  // above it; a building a street runs under is drawn lifted 5.2 m over the street, so a camera under
+  // it is clear and one up in it is not (buses pass: it is not solid to them).
+  const tube = world(
+    makeMap({
+      roads: [{ pts: [0, -150, 0, 150], z: [0, 0], tunnel: true, width: 7.4, kind: 7 }],
+      ground: () => 14,
+    }),
+  );
+  check('camera in a covered tube: ceiling over the road', tube.ceilingAt(0, 0, 1), 5.7, 5.9, 'm');
+  check('camera in a covered tube: clear under the ceiling', tube.viewBlocked(1, 0, 4.5) ? 1 : 0, 0, 0, '');
+  check('camera in a covered tube: blocked in the roof', tube.viewBlocked(1, 0, 6.5) ? 1 : 0, 1, 1, '');
+  check('camera in a covered tube: sight up through the ceiling', tube.lineOfSight(0, 0, 2, 0, -12, 8), 0, 0.75, '');
+  check('camera in a covered tube: sight along under the ceiling', tube.lineOfSight(0, 0, 2, 0, -12, 4.5), 0.99, 1, '');
+  const lifted = world(
+    makeMap({
+      roads: [{ pts: [0, -150, 0, 150], z: [0, 0], width: 7 }],
+      buildings: [{ pts: [-20, -10, 20, -10, 20, 10, -20, 10], height: 15 }],
+    }),
+  );
+  check('building over a street: not solid to a bus', lifted.pointInBuilding(0, 0, 2) ? 1 : 0, 0, 0, '');
+  check('building over a street: camera under it clear', lifted.viewBlocked(0, 0, 4) ? 1 : 0, 0, 0, '');
+  check('building over a street: camera up in it blocked', lifted.viewBlocked(0, 0, 7) ? 1 : 0, 1, 1, '');
+  check('building over a street: its underside is the ceiling', lifted.ceilingAt(0, 0, 1), 4.9, 5.3, 'm');
+  check('building over a street: sight from under it up into it', lifted.lineOfSight(0, 0, 2, 0, -12, 8), 0, 0.8, '');
+}
+
 function stationBays(spec: BusSpec): void {
   // A busway (7.4 m, at 10 m) with a platform whose kerb is 8.2 m from the centreline (PA Hospital on a
   // viaduct, Mater Hill in a cutting): along the bay, 1.6 m off the kerb (beyond the busway's own
@@ -774,6 +802,7 @@ async function main(): Promise<void> {
   levelsAfterReset(S.rigid);
   noDriveOffEdge(S.rigid);
   wallsUnderDeck();
+  cameraQueries();
   stationBays(S.rigid);
   stepsAndGrades(S.rigid);
   console.log('--- glider ---');
