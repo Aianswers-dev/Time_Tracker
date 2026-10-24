@@ -126,7 +126,9 @@ export class Hud {
   /** Sim time (s) from the frames' clock, for debouncing what the guide reports. */
   private simT = 0;
   private lastHours = NaN;
-  private road = new Steady('', 1.5);
+  // 2 s: a branch joining the road (Eastern Busway onto the SEB, 222 #15) wins the lookup for
+  // up to ~2 s; a real turn onto a new street still shows within a couple of seconds.
+  private road = new Steady('', 2);
   private limit = new Steady(50, 1.2);
   private offStartT = -1e9;
   private lastOnToastT = -1e9;
