@@ -113,6 +113,8 @@ export interface TrackWalls {
   drivable(x: number, y: number, z: number): boolean;
   /** The map road with this index (to tell which map the walls belong to). */
   road?(index: number): Road | undefined;
+  /** (x, y) is inside a solid building footprint at height z (the lane keeps the bus off shop fronts). */
+  pointInBuilding?(x: number, y: number, z?: number): boolean;
 }
 
 const registered = new WeakMap<MapData, TrackWalls>();
@@ -178,21 +180,27 @@ function wallGrid(w: TrackWalls['walls']): WallGrid {
   return g;
 }
 
-/** A road the route might be on at a sample: closest point, unit direction along travel, and a cost. */
+/** A road the route might be on at a sample: closest point, unit direction along travel, its height there, and a cost. */
 interface RoadCand {
   road: number;
   px: number;
   py: number;
   dx: number;
   dy: number;
+  z: number;
   cost: number;
 }
+
+/** A road only buses use (busway, bus lane, bus link). */
+const busRoad = (r: Road): boolean => r.bus || r.kind === RoadKind.Busway;
 
 /**
  * Roads at level z within `radius` of (qx, qy) that run with the route
  * (one-way roads forwards only). (gdx, gdy) is the route's general direction
  * over ~60 m, (ldx, ldy) its local one: GTFS shapes wobble round junction
  * halls, and a bus carrying straight on does not tour the turnaround beside it.
+ * Bus-only roads are looked for up to `busRadius` away: TransLink shapes cut
+ * the corners their slip lanes take (Victoria Bridge onto North Quay).
  */
 function roadCands(
   data: MapData,
@@ -206,22 +214,26 @@ function roadCands(
   radius: number,
   minDot: number,
   accept: (r: Road) => boolean,
+  busRadius = radius,
 ): RoadCand[] {
   const list: RoadCand[] = [];
-  roadIndexFor(data).forEachNear(qx, qy, radius, (ri, ax, ay, sdx, sdy, slen, d, zz) => {
+  roadIndexFor(data).forEachNear(qx, qy, Math.max(radius, busRadius), (ri, ax, ay, sdx, sdy, slen, d, zz) => {
     const r = data.roads[ri];
     if (!accept(r) || Math.abs(zz - z) > LEVEL_GAP) return;
+    if (d > radius && !busRoad(r)) return;
     const dot = sdx * gdx + sdy * gdy;
     const ldot = sdx * ldx + sdy * ldy;
     const best = Math.abs(dot) > Math.abs(ldot) ? dot : ldot;
     if (r.oneway ? best < minDot : Math.abs(best) < minDot) return;
     const t = Math.max(0, Math.min(slen, (qx - ax) * sdx + (qy - ay) * sdy));
     const sg = best < 0 ? -1 : 1;
-    // (Main carriageways over narrow ramps and turnaround loops beside them.)
-    const cost = d * 0.5 + (1 - Math.abs(dot)) * 30 + (r.width < 5 ? 4 : 0);
+    // (Main carriageways over narrow ramps and turnaround loops beside them; not a one-way bus lane or
+    // slip road, which is where the bus really runs.)
+    const narrow = r.width < 5 && !(busRoad(r) && r.oneway && !r.tunnel);
+    const cost = d * 0.5 + (1 - Math.abs(dot)) * 30 + (narrow ? 4 : 0);
     const old = list.find((c) => c.road === ri);
     if (old && old.cost <= cost) return;
-    const c = { road: ri, px: ax + sdx * t, py: ay + sdy * t, dx: sdx * sg, dy: sdy * sg, cost };
+    const c = { road: ri, px: ax + sdx * t, py: ay + sdy * t, dx: sdx * sg, dy: sdy * sg, z: zz, cost };
     if (old) Object.assign(old, c);
     else list.push(c);
   });
@@ -294,7 +306,10 @@ function matchRoads(data: MapData, cands: RoadCand[][]): (RoadCand | null)[] {
               (at[0] - P[q].px) * P[q].dx + (at[1] - P[q].py) * P[q].dy > -3 &&
               (L[j].px - at[0]) * L[j].dx + (L[j].py - at[1]) * L[j].dy > -3 &&
               Math.hypot(P[q].px - at[0], P[q].py - at[1]) + Math.hypot(L[j].px - at[0], L[j].py - at[1]) < 40;
-            tr = via ? 1 + turn * 15 : 80;
+            // (A bus does not pivot: turning back on itself at a node is a last resort when a slip road
+            // or a wider sweep is on offer.)
+            const deg = (Math.acos(Math.max(-1, Math.min(1, 1 - turn))) * 180) / Math.PI;
+            tr = via ? 1 + turn * 15 + Math.max(0, deg - 95) * 2.5 : 80;
           }
           const v = ps[q] + tr + L[j].cost;
           if (v < sc[j]) {
@@ -514,6 +529,87 @@ function resample(path: number[], ox: Float32Array, oy: Float32Array): void {
 /** Roads that can have walls along them (tunnels and viaducts). */
 const walledRoad = (r: Road): boolean => drivable(r) && (r.tunnel || r.bridge);
 
+/** A road's lane centre from its own centreline (+ = left of travel): the kerb lane. */
+function laneFromCentre(r: Road): number {
+  const w = Math.max(3.2, r.width);
+  return r.oneway ? Math.max(0, w / 2 - 1.75) : Math.min(6, Math.max(1.6, w / 2 - 1.75));
+}
+/** From a road's centreline to its left kerb (two-way roads at least a lane each way). */
+function halfWidthLeft(r: Road): number {
+  const w = Math.max(3.2, r.width);
+  return r.oneway ? w / 2 : Math.max(w / 2, 3.2);
+}
+
+/**
+ * Least squares over the free points of a window of lane samples a..a+m-1: minimise the sum of
+ * rows' w * (sum of cx * x + cy * y over the row's samples - c)^2, where a row names samples by their
+ * index in the window and samples not in `free` stay where they are (X, Y). The free points' solved
+ * coordinates come back interleaved (x0, y0, x1, y1, ...). Rows span at most three neighbouring
+ * samples, so the system is banded and solved directly.
+ */
+interface LsqRow {
+  w: number;
+  k: number[];
+  cx: number[];
+  cy: number[];
+  c: number;
+}
+function solveRows(X: Float32Array, Y: Float32Array, a: number, m: number, free: number[], rows: LsqRow[]): Float64Array {
+  const f = free.length;
+  const N = 2 * f;
+  const at = new Int32Array(m).fill(-1);
+  free.forEach((k, j) => (at[k] = j));
+  const M = new Float64Array(N * N);
+  const r = new Float64Array(N);
+  const idx: number[] = [];
+  const co: number[] = [];
+  for (const row of rows) {
+    let c0 = row.c;
+    idx.length = 0;
+    co.length = 0;
+    for (let q = 0; q < row.k.length; q++) {
+      const k = row.k[q];
+      const u = at[k];
+      if (u < 0) {
+        c0 -= row.cx[q] * X[a + k] + row.cy[q] * Y[a + k];
+        continue;
+      }
+      if (row.cx[q]) {
+        idx.push(2 * u);
+        co.push(row.cx[q]);
+      }
+      if (row.cy[q]) {
+        idx.push(2 * u + 1);
+        co.push(row.cy[q]);
+      }
+    }
+    for (let p = 0; p < idx.length; p++) {
+      r[idx[p]] += row.w * co[p] * c0;
+      for (let q = 0; q < idx.length; q++) M[idx[p] * N + idx[q]] += row.w * co[p] * co[q];
+    }
+  }
+  // Gaussian elimination within the band (symmetric positive definite: no pivoting, no fill outside it).
+  const BW = 7;
+  for (let c = 0; c < N; c++) {
+    const d = M[c * N + c] || 1e-9;
+    const e = Math.min(N - 1, c + BW);
+    for (let row = c + 1; row <= e; row++) {
+      const g = M[row * N + c] / d;
+      if (!g) continue;
+      for (let k = c; k <= e; k++) M[row * N + k] -= g * M[c * N + k];
+      r[row] -= g * r[c];
+    }
+  }
+  const x = new Float64Array(N);
+  for (let c = N - 1; c >= 0; c--) {
+    let v = r[c];
+    const e = Math.min(N - 1, c + BW);
+    for (let k = c + 1; k <= e; k++) v -= M[c * N + k] * x[k];
+    x[c] = v / (M[c * N + c] || 1e-9);
+  }
+  return x;
+}
+
 /** Signals spatial hash shared by all tracks. */
 const signalGrids = new WeakMap<MapData, Map<number, number[]>>();
 function signalGrid(data: MapData): Map<number, number[]> {
@@ -576,7 +672,6 @@ export class RouteTrack {
     const by = new Float32Array(n);
     const nx = new Float32Array(n);
     const ny = new Float32Array(n);
-    const target = new Float32Array(n);
     /** Lateral position of the matched road's centreline (along each sample's normal). */
     const roadC = new Float32Array(n);
     /**
@@ -623,9 +718,28 @@ export class RouteTrack {
       const sl = Math.hypot(sb.x - sa.x, sb.y - sa.y) || 1;
       const gdx = (sb.x - sa.x) / sl;
       const gdy = (sb.y - sa.y) / sl;
-      let list = roadCands(data, p.x, p.y, zr, gdx, gdy, dx, dy, 14, 0.5, drivable);
+      let list = roadCands(data, p.x, p.y, zr, gdx, gdy, dx, dy, 14, 0.5, drivable, 22);
       if (!list.length) list = roadCands(data, p.x, p.y, zr, gdx, gdy, dx, dy, 32, 0.6, walledRoad);
       cands.push(list);
+    }
+    // The road at each sample, matched along the whole route.
+    const picks = matchRoads(data, cands);
+    // The lane's height: the matched road's own (the GTFS line's heights can be the median's or a
+    // neighbouring carriageway's, up to ~0.7 m off), kept within a metre of the route's level.
+    {
+      const dz = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        const c = picks[i];
+        dz[i] = c ? Math.max(-1, Math.min(1, c.z - this.z[i])) : 0;
+      }
+      const dzS = boxSmooth(median7(dz), 1);
+      for (let i = 0; i < n; i++) this.z[i] += dzS[i];
+    }
+    for (let i = 0; i < n; i++) {
+      const p = { x: bx[i], y: by[i] };
+      const dx = ny[i];
+      const dy = -nx[i];
+      const zr = this.z[i];
       // The collider's walls crossing this sample's normal (and halfway to its neighbours, so walls at
       // an angle cannot slip between samples), where they stand in the bus's way at this height.
       wallStart[i] = wallPos.length;
@@ -677,8 +791,8 @@ export class RouteTrack {
       }
     }
     wallStart[n] = wallPos.length;
-    // The road at each sample, matched along the whole route.
-    const picks = matchRoads(data, cands);
+    /** The matched road's lane offset from its own centreline (+ = left). */
+    const fromC = new Float32Array(n);
     for (let i = 0; i < n; i++) {
       const c = picks[i];
       if (!c) continue;
@@ -692,11 +806,9 @@ export class RouteTrack {
       const oy = c.py - by[i];
       const dC = Math.abs(cosN) > 0.5 ? (ox * rnx + oy * rny) / cosN : ox * nx[i] + oy * ny[i];
       if (Math.abs(cosN) < 0.9) skew[i] = 1;
-      const w = Math.max(3.2, road.width);
-      const fromCentre = road.oneway ? Math.max(0, w / 2 - 1.75) : Math.min(6, Math.max(1.6, w / 2 - 1.75));
-      target[i] = dC + fromCentre;
+      fromC[i] = laneFromCentre(road);
       roadC[i] = dC;
-      kerbBase[i] = dC + (road.oneway ? w / 2 : Math.max(w / 2, 3.2));
+      kerbBase[i] = dC + halfWidthLeft(road);
       known[i] = 1;
       this.limit[i] = speedLimitOf(road);
       this.road[i] = c.road;
@@ -707,38 +819,58 @@ export class RouteTrack {
       if (i < n && !known[i]) continue;
       const a = lastKnown;
       const b = i < n ? i : -1;
-      const ta = a >= 0 ? target[a] : b >= 0 ? target[b] : 1.75;
-      const tb = b >= 0 ? target[b] : ta;
+      const ca = a >= 0 ? roadC[a] : b >= 0 ? roadC[b] : 0;
+      const cb = b >= 0 ? roadC[b] : ca;
+      const fa = a >= 0 ? fromC[a] : b >= 0 ? fromC[b] : 1.75;
+      const fb = b >= 0 ? fromC[b] : fa;
       const ka = a >= 0 ? kerbBase[a] : b >= 0 ? kerbBase[b] : 3.6;
       const kb = b >= 0 ? kerbBase[b] : ka;
       const la = a >= 0 ? this.limit[a] : b >= 0 ? this.limit[b] : 50;
       for (let j = a + 1; j < (b >= 0 ? b : n); j++) {
         const f = b > a ? (j - a) / (b - a) : 0;
-        target[j] = ta + (tb - ta) * f;
+        roadC[j] = ca + (cb - ca) * f;
+        fromC[j] = fa + (fb - fa) * f;
         kerbBase[j] = ka + (kb - ka) * f;
         this.limit[j] = la;
       }
       lastKnown = i;
     }
-    const tMed = median7(target);
-    const tS = boxSmooth(tMed, 4);
+    // The lane is the matched road's own lane: where the road is (exactly: a GTFS shape that wanders
+    // 10 m off a curving tunnel must not drag the lane across the centreline), plus the road's lane
+    // offset, eased where that changes (a one-way ramp off a two-way busway). Only jumps in where the
+    // road is (onto a carriageway that does not continue the last one, gaps in the match) are eased.
+    const fS = boxSmooth(median7(fromC), 3);
+    const cS = Float32Array.from(roadC);
+    {
+      const jump = new Uint8Array(n);
+      for (let i = 1; i < n; i++) {
+        const d = Math.abs(roadC[i] - roadC[i - 1]);
+        if (d > 1.2 && (!known[i] || !known[i - 1] || this.road[i] !== this.road[i - 1])) {
+          for (let j = Math.max(0, i - 3); j <= Math.min(n - 1, i + 2); j++) jump[j] = 1;
+        }
+      }
+      for (let pass = 0; pass < 3; pass++) {
+        const sm = boxSmooth(cS, 2);
+        for (let i = 0; i < n; i++) if (jump[i]) cS[i] = sm[i];
+      }
+    }
     const kS = boxSmooth(median7(kerbBase), 3);
     this.x = new Float32Array(n);
     this.y = new Float32Array(n);
     this.offset = new Float32Array(n);
     this.kerb = new Float32Array(n);
+    // Samples matched to a road (or between matched ones) follow it however far the GTFS line is off;
+    // elsewhere the lane keeps near the line.
+    const near = new Uint8Array(n);
+    for (let i = 0; i < n; i++) if (known[i]) for (let j = Math.max(0, i - 3); j <= Math.min(n - 1, i + 3); j++) near[j] = 1;
     for (let i = 0; i < n; i++) {
-      // (GTFS shapes can run well off a mapped tunnel or viaduct, e.g. 12 m off a busway tunnel:
-      // follow the road there.)
-      const rd = this.road[i] >= 0 ? data.roads[this.road[i]] : null;
-      const wide = !!rd && (rd.tunnel || rd.bridge);
-      const off = wide ? Math.max(-24, Math.min(24, tS[i])) : Math.max(-3, Math.min(8, tS[i]));
+      const t = cS[i] + fS[i];
+      const off = near[i] ? Math.max(-24, Math.min(24, t)) : Math.max(-3, Math.min(8, t));
       this.offset[i] = off;
       this.kerb[i] = Math.max(1.3, Math.min(6, kS[i] - off));
     }
-    // The lane's own carriageway (unsmoothed, so it stays on the road where the GTFS shape kinks away
-    // from it; before platform lead-ins): the walls either side of it bound the lane.
-    const home = Float32Array.from(tMed, (v, i) => Math.max(-24, Math.min(24, v, this.offset[i] + 6), this.offset[i] - 6));
+    // The lane's own carriageway (before platform lead-ins): the walls either side of it bound the lane.
+    const home = Float32Array.from(this.offset);
     const lo = new Float32Array(n).fill(-Infinity);
     const hi = new Float32Array(n).fill(Infinity);
     // Busway platforms: the lane hugs the platform edge so buses pull right alongside.
@@ -853,6 +985,23 @@ export class RouteTrack {
     }
     if (TW && WG) {
       this.fitToRoads(TW, WG, roadC, skew, picks);
+      this.nudgeOffBuildings(TW);
+      this.nudgeOffWalls(TW, WG);
+      this.nudgeForTrailers(TW, WG);
+    }
+    // Sweep corners a bus can drive. Alongside a platform the lane stays on the platform line, except at
+    // its ends, where it may ease in later and out sooner.
+    const fixed = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      if (!(skew[i] & 4)) continue;
+      let b = i;
+      while (b + 1 < n && skew[b + 1] & 4) b++;
+      for (let k = i + 2; k <= b - 2; k++) fixed[k] = 1;
+      i = b;
+    }
+    this.regularize(TW, WG, fixed, data, skew);
+    if (TW && WG) {
+      // (Smoothing can bring a trailer's sweep back to a wall at a tunnel throat.)
       this.nudgeOffWalls(TW, WG);
       this.nudgeForTrailers(TW, WG);
     }
@@ -1290,6 +1439,77 @@ export class RouteTrack {
   }
 
   /**
+   * Where a bus on the lane would stand in a building (a footprint mapped over
+   * the kerb, a lane offset towards the shops), move the lane sideways to the
+   * nearest place clear of it that is still on the road, easing in and out.
+   */
+  private nudgeOffBuildings(TW: TrackWalls): void {
+    const inB = TW.pointInBuilding;
+    if (!inB) return;
+    const n = this.n;
+    const X = this.x;
+    const Y = this.y;
+    const HALF = 1.4;
+    const lxs = new Float32Array(n);
+    const lys = new Float32Array(n);
+    const want = new Float32Array(n);
+    let any = false;
+    const clear = (x: number, y: number, z: number, lx: number, ly: number) =>
+      !inB(x, y, z + 1.5) && !inB(x + lx * HALF, y + ly * HALF, z + 1.5) && !inB(x - lx * HALF, y - ly * HALF, z + 1.5);
+    for (let i = 0; i < n; i++) {
+      const a = Math.max(0, i - 1);
+      const b = Math.min(n - 1, i + 1);
+      const dx = X[b] - X[a];
+      const dy = Y[b] - Y[a];
+      const dl = Math.hypot(dx, dy) || 1;
+      const lx = -dy / dl;
+      const ly = dx / dl;
+      lxs[i] = lx;
+      lys[i] = ly;
+      const z = this.z[i];
+      if (clear(X[i], Y[i], z, lx, ly)) continue;
+      for (let d = 0.25; d <= 5; d += 0.25) {
+        const sg = [1, -1].find((g) => {
+          const x = X[i] + lx * d * g;
+          const y = Y[i] + ly * d * g;
+          return TW.drivable(x, y, z) && clear(x, y, z, lx, ly);
+        });
+        if (sg !== undefined) {
+          want[i] = (d + 0.25) * sg;
+          any = true;
+          break;
+        }
+      }
+    }
+    if (!any) return;
+    // Ease: each way, no more than 0.3 m sideways per metre along.
+    const RAMP = 0.3 * TRACK_STEP;
+    const pos = new Float32Array(n);
+    const neg = new Float32Array(n);
+    // (Also a sample either side: the lane between samples is a chord.)
+    for (let i = 0; i < n; i++) {
+      for (let k = Math.max(0, i - 1); k <= Math.min(n - 1, i + 1); k++) {
+        pos[i] = Math.max(pos[i], want[k]);
+        neg[i] = Math.max(neg[i], -want[k]);
+      }
+    }
+    for (const arr of [pos, neg]) {
+      for (let i = 1; i < n; i++) arr[i] = Math.max(arr[i], arr[i - 1] - RAMP);
+      for (let i = n - 2; i >= 0; i--) arr[i] = Math.max(arr[i], arr[i + 1] - RAMP);
+    }
+    for (let i = 0; i < n; i++) {
+      const d = pos[i] >= neg[i] ? pos[i] : -neg[i];
+      if (!d) continue;
+      const x = X[i] + lxs[i] * d;
+      const y = Y[i] + lys[i] * d;
+      // (Only onto the road.)
+      if (!TW.drivable(x, y, this.z[i])) continue;
+      X[i] = x;
+      Y[i] = y;
+    }
+  }
+
+  /**
    * Drive an articulated bus (the longest the routes use) along the lane and,
    * where a section sweeps into a wall (trailers cut the inside of tight
    * corners), swing the lane out there a little at a time.
@@ -1433,6 +1653,354 @@ export class RouteTrack {
         if (!movedAt[k]) continue;
         for (let q = Math.max(0, k - WARM / TRACK_STEP - 4); q <= Math.min(n - 1, k + 10); q++) sim[q] = 1;
       }
+    }
+  }
+
+  /** Local lane radius at sample i (from its two chords; 0 where the lane stalls or folds back). */
+  private radiusAt(i: number): number {
+    if (i < 1 || i + 1 >= this.n) return Infinity;
+    const X = this.x;
+    const Y = this.y;
+    const ax = X[i] - X[i - 1];
+    const ay = Y[i] - Y[i - 1];
+    const bx = X[i + 1] - X[i];
+    const by = Y[i + 1] - Y[i];
+    const la = Math.hypot(ax, ay);
+    const lb = Math.hypot(bx, by);
+    if (la < 0.25 * TRACK_STEP || lb < 0.25 * TRACK_STEP) return 0;
+    const d = Math.abs(wrapAngle(Math.atan2(bx, by) - Math.atan2(ax, ay)));
+    return d > 1e-4 ? (la + lb) / 2 / d : Infinity;
+  }
+
+  /**
+   * Corners, cusps and jogs tighter than a bus turns (a lane mitred round a
+   * junction node, a GTFS corner offset to its inside, a platform pull-in):
+   * relax each stretch around them towards the least bent curve between its
+   * fixed ends (a bus sweeps a corner, swinging wide where the road has room)
+   * while every point stays where a bus fits (on the carriageway or a bay,
+   * clear of walls and buildings), then space the stretch's samples evenly.
+   * `fixed` samples (alongside a platform) do not move.
+   */
+  private regularize(TW: TrackWalls | null, G: WallGrid | null, fixed: Uint8Array, data: MapData, skew: Uint8Array): void {
+    const n = this.n;
+    if (n < 6) return;
+    const X = this.x;
+    const Y = this.y;
+    const W = TW?.walls;
+    // Lane radius aimed for: a 24.7 m Metro's trailers and a 12.5 m bus's swing need ~10 m and up.
+    const RMIN = 11;
+    // Mid-block on a two-way road (away from the junctions at its ends, not at a platform) the lane keeps
+    // to its own half: its nearest segment of the matched road, and the road's length along it.
+    const own = new Int32Array(n).fill(-1);
+    const cumOf = new Map<number, Float32Array>();
+    for (let i = 0; i < n; i++) {
+      const ri = this.road[i];
+      if (ri < 0 || skew[i] & 2) continue;
+      const r = data.roads[ri];
+      if (r.oneway || r.width < 6) continue;
+      const p = r.pts;
+      let cum = cumOf.get(ri);
+      if (!cum) {
+        cum = roadCum(r);
+        cumOf.set(ri, cum);
+      }
+      let best = 12;
+      for (let k = 0; k + 1 < cum.length; k++) {
+        const ex = p[2 * k + 2] - p[2 * k];
+        const ey = p[2 * k + 3] - p[2 * k + 1];
+        const t = Math.max(0, Math.min(1, ((X[i] - p[2 * k]) * ex + (Y[i] - p[2 * k + 1]) * ey) / (ex * ex + ey * ey || 1e-9)));
+        const d = Math.hypot(X[i] - p[2 * k] - ex * t, Y[i] - p[2 * k + 1] - ey * t);
+        if (d < best) {
+          best = d;
+          own[i] = k;
+        }
+      }
+    }
+    /** How far left of the matched road's centre line (x, y) is, facing (ux, uy); Infinity near the road's ends. */
+    const sideOf = (i: number, x: number, y: number, ux: number, uy: number): number => {
+      const ri = this.road[i];
+      const p = data.roads[ri].pts;
+      const cum = cumOf.get(ri)!;
+      const last = cum.length - 1;
+      let best = Infinity;
+      let lat = Infinity;
+      for (let k = Math.max(0, own[i] - 2); k <= Math.min(last - 1, own[i] + 2); k++) {
+        const ex = p[2 * k + 2] - p[2 * k];
+        const ey = p[2 * k + 3] - p[2 * k + 1];
+        const l2 = ex * ex + ey * ey || 1e-9;
+        const t = Math.max(0, Math.min(1, ((x - p[2 * k]) * ex + (y - p[2 * k + 1]) * ey) / l2));
+        const d = Math.hypot(x - p[2 * k] - ex * t, y - p[2 * k + 1] - ey * t);
+        if (d >= best) continue;
+        best = d;
+        const along = cum[k] + (cum[k + 1] - cum[k]) * t;
+        if (along < 20 || along > cum[last] - 20) {
+          lat = Infinity;
+          continue;
+        }
+        const sg = ex * ux + ey * uy >= 0 ? 1 : -1;
+        lat = (sg * (ex * (y - p[2 * k + 1]) - ey * (x - p[2 * k]))) / Math.sqrt(l2);
+      }
+      return lat;
+    };
+    /** How badly a bus would stand with its lane centre at (x, y) (0 = fine): off the carriageway, near walls or buildings. */
+    const badness = (i: number, x: number, y: number, ux: number, uy: number): number => {
+      if (!TW) return 0;
+      const z = this.z[i];
+      let bad = 0;
+      if (!TW.drivable(x, y, z)) bad += 3;
+      // (The body's sides: half a bus out, on the road too.)
+      const lx = -uy;
+      const ly = ux;
+      if (!TW.drivable(x + lx * 1.05, y + ly * 1.05, z)) bad += 1;
+      if (!TW.drivable(x - lx * 1.05, y - ly * 1.05, z)) bad += 1;
+      if (W && G) {
+        const d = this.wallDist(W, G, x, y, z, 3);
+        if (d < WALL_CLEAR - 0.45) bad += 1 + (WALL_CLEAR - 0.45 - d) * 2;
+      }
+      if (TW.pointInBuilding) {
+        if (TW.pointInBuilding(x + lx * 1.5, y + ly * 1.5, z + 1.5)) bad += 2;
+        if (TW.pointInBuilding(x - lx * 1.5, y - ly * 1.5, z + 1.5)) bad += 2;
+      }
+      // (The body may lean over the centre line, not the lane.)
+      if (own[i] >= 0 && sideOf(i, x, y, ux, uy) < 0.5) bad += 1;
+      return bad;
+    };
+    const dirAt = (i: number): [number, number] => {
+      const a = Math.max(0, i - 1);
+      const b = Math.min(n - 1, i + 1);
+      const dx = X[b] - X[a];
+      const dy = Y[b] - Y[a];
+      const l = Math.hypot(dx, dy) || 1;
+      return [dx / l, dy / l];
+    };
+    for (let round = 0; round < 3; round++) {
+      // Stretches that need it, widened by the corner's setback (a tangent arc of RMIN needs RMIN tan(turn/2)
+      // either side of the apex) plus room to ease in.
+      const wins: [number, number][] = [];
+      for (let i = 1; i + 1 < n; i++) {
+        if (!(this.radiusAt(i) < RMIN)) continue;
+        let b = i;
+        while (b + 2 < n && this.radiusAt(b + 1) < RMIN) b++;
+        let turn = 0;
+        for (let k = Math.max(1, i - 1); k <= Math.min(n - 2, b + 1); k++) {
+          const r = this.radiusAt(k);
+          turn += r === 0 ? Math.PI / 2 : r === Infinity ? 0 : (Math.hypot(X[k + 1] - X[k], Y[k + 1] - Y[k]) + Math.hypot(X[k] - X[k - 1], Y[k] - Y[k - 1])) / 2 / r;
+        }
+        const setback = RMIN * Math.tan(Math.min(2.4, turn) / 2);
+        const M = Math.max(3, Math.min(12, Math.ceil(setback / TRACK_STEP) + 2 + round * 2));
+        const a0 = Math.max(0, i - M);
+        const b0 = Math.min(n - 1, b + M);
+        const last = wins[wins.length - 1];
+        if (last && a0 <= last[1]) last[1] = Math.max(last[1], b0);
+        else wins.push([a0, b0]);
+        i = b;
+      }
+      if (!wins.length) return;
+      for (const [A, B] of wins) {
+        if (B - A < 4) continue;
+        const m = B - A + 1;
+        const X0 = X.slice(A, B + 1);
+        const Y0 = Y.slice(A, B + 1);
+        const lock = (i: number) => i <= A + 1 || i >= B - 1 || fixed[i] === 1;
+        const cur = new Float32Array(m);
+        for (let i = A; i <= B; i++) {
+          const [ux, uy] = dirAt(i);
+          cur[i - A] = badness(i, X[i], Y[i], ux, uy);
+        }
+        // The least bent curve through the locked points (bending energy: squared second differences, with
+        // a weak pull back to where the lane was), solved directly. A point it puts where a bus does not fit
+        // gets a one-sided constraint: stay on the near side of a line through the nearest place across the
+        // lane that does fit (it may slide along that edge, or leave it when the curve swings wide); solved
+        // again until all fit. If some still do not, the stretch goes only part of the way from the old lane.
+        const LAM = 0.01;
+        const CW = 60;
+        const SPACE = 4;
+        const S0X = Float64Array.from(X0);
+        const S0Y = Float64Array.from(Y0);
+        const wt = new Float64Array(m).fill(LAM);
+        // (Bending weighs more, iteration by iteration, where the curve is still tighter than RMIN: the
+        // turn spreads out, swinging wide, rather than bunching where the road is narrowest.)
+        const bw = new Float64Array(m).fill(1);
+        const cw = new Float64Array(m);
+        const cnx = new Float64Array(m);
+        const cny = new Float64Array(m);
+        const cc = new Float64Array(m);
+        const free: number[] = [];
+        for (let k = 0; k < m; k++) if (!lock(A + k)) free.push(k);
+        if (!free.length) continue;
+        const PX = Float32Array.from(X0);
+        const PY = Float32Array.from(Y0);
+        const bad = (k: number, x: number, y: number, ux: number, uy: number) => badness(A + k, x, y, ux, uy) > cur[k] + 1e-6;
+        const tangent = (QX: ArrayLike<number>, QY: ArrayLike<number>, k: number): [number, number] => {
+          const dx = QX[Math.min(m - 1, k + 1)] - QX[Math.max(0, k - 1)];
+          const dy = QY[Math.min(m - 1, k + 1)] - QY[Math.max(0, k - 1)];
+          const dl = Math.hypot(dx, dy) || 1;
+          return [dx / dl, dy / dl];
+        };
+        let it = 0;
+        let left = 0;
+        for (; it < 30; it++) {
+          // Rows: bending (second differences, which measure curvature only while samples stay evenly
+          // spaced, so also: each chord, along its present direction, as long as the stretch's mean), the
+          // pull back to the old lane, and the half planes.
+          const rows: LsqRow[] = [];
+          let total = 0;
+          for (let k = 0; k + 1 < m; k++) total += Math.hypot(PX[k + 1] - PX[k], PY[k + 1] - PY[k]);
+          const hbar = Math.max(total, Math.hypot(PX[m - 1] - PX[0], PY[m - 1] - PY[0])) / (m - 1);
+          let lux = PX[1] - PX[0];
+          let luy = PY[1] - PY[0];
+          for (let k = 0; k + 1 < m; k++) {
+            const dx = PX[k + 1] - PX[k];
+            const dy = PY[k + 1] - PY[k];
+            const dl = Math.hypot(dx, dy);
+            if (dl > 0.05) {
+              lux = dx / dl;
+              luy = dy / dl;
+            }
+            rows.push({ w: SPACE, k: [k, k + 1], cx: [-lux, lux], cy: [-luy, luy], c: hbar });
+          }
+          for (let j = 1; j + 1 < m; j++) {
+            rows.push({ w: bw[j], k: [j - 1, j, j + 1], cx: [1, -2, 1], cy: [0, 0, 0], c: 0 });
+            rows.push({ w: bw[j], k: [j - 1, j, j + 1], cx: [0, 0, 0], cy: [1, -2, 1], c: 0 });
+          }
+          for (const k of free) {
+            rows.push({ w: wt[k], k: [k], cx: [1], cy: [0], c: S0X[k] });
+            rows.push({ w: wt[k], k: [k], cx: [0], cy: [1], c: S0Y[k] });
+            if (cw[k] > 0) rows.push({ w: cw[k], k: [k], cx: [cnx[k]], cy: [cny[k]], c: cc[k] });
+          }
+          const sol = solveRows(X, Y, A, m, free, rows);
+          free.forEach((k, f) => {
+            PX[k] = sol[2 * f];
+            PY[k] = sol[2 * f + 1];
+          });
+          left = 0;
+          let changed = 0;
+          for (let j = 1; j + 1 < m; j++) {
+            const ax = PX[j] - PX[j - 1];
+            const ay = PY[j] - PY[j - 1];
+            const bx = PX[j + 1] - PX[j];
+            const by = PY[j + 1] - PY[j];
+            const turn = Math.abs(wrapAngle(Math.atan2(bx, by) - Math.atan2(ax, ay)));
+            const len = (Math.hypot(ax, ay) + Math.hypot(bx, by)) / 2;
+            if (turn * RMIN > len * 1.02 && bw[j] < 200) {
+              bw[j] *= 2;
+              changed++;
+            }
+          }
+          for (const k of free) {
+            const [ux, uy] = tangent(PX, PY, k);
+            const isBad = bad(k, PX[k], PY[k], ux, uy);
+            if (!isBad) {
+              // Released where the curve pulls it further onto the good side.
+              if (cw[k] > 0 && cnx[k] * PX[k] + cny[k] * PY[k] > cc[k] + 0.02) {
+                cw[k] = 0;
+                changed++;
+              }
+              continue;
+            }
+            left++;
+            // The nearest place across the lane where a bus fits.
+            let found = false;
+            for (let d = 0.25; d <= 6 && !found; d += 0.25) {
+              for (const sg of [1, -1]) {
+                const qx = PX[k] - uy * d * sg;
+                const qy = PY[k] + ux * d * sg;
+                if (bad(k, qx, qy, ux, uy)) continue;
+                const nx2 = -uy * sg;
+                const ny2 = ux * sg;
+                // (Keep the old edge if this one is barely different, else take the new one.)
+                cnx[k] = nx2;
+                cny[k] = ny2;
+                cc[k] = nx2 * qx + ny2 * qy + 0.1;
+                cw[k] = CW;
+                found = true;
+                break;
+              }
+            }
+            if (!found) {
+              // Nowhere across: back where it was.
+              wt[k] += CW;
+            }
+            changed++;
+          }
+          if (!left && !changed && it >= 3) break;
+        }
+        // Whatever still does not fit: only part of the way from the old lane.
+        let t = 1;
+        if (left) {
+          for (t = 0.75; t > 0; t -= 0.25) {
+            let ok = true;
+            for (const k of free) {
+              const x = S0X[k] + (PX[k] - S0X[k]) * t;
+              const y = S0Y[k] + (PY[k] - S0Y[k]) * t;
+              const [ux, uy] = tangent(PX, PY, k);
+              if (bad(k, x, y, ux, uy)) {
+                ok = false;
+                break;
+              }
+            }
+            if (ok) break;
+          }
+          t = Math.max(0, t);
+        }
+        let before = Infinity;
+        for (let i = A + 1; i < B; i++) before = Math.min(before, this.radiusAt(i));
+        for (const k of free) {
+          X[A + k] = S0X[k] + (PX[k] - S0X[k]) * t;
+          Y[A + k] = S0Y[k] + (PY[k] - S0Y[k]) * t;
+        }
+        let after = Infinity;
+        for (let i = A + 1; i < B; i++) after = Math.min(after, this.radiusAt(i));
+        if (after < before) {
+          // (No better: as it was.)
+          for (const k of free) {
+            X[A + k] = S0X[k];
+            Y[A + k] = S0Y[k];
+          }
+        }
+        for (let i = A; i <= B; i++) {
+          const [ux, uy] = dirAt(i);
+          cur[i - A] = badness(i, X[i], Y[i], ux, uy);
+        }
+        // Even spacing between the stretch's fixed points (each sample stands for the same length of lane).
+        let k0 = A;
+        for (let k = A + 1; k <= B; k++) {
+          if (!(k === B || fixed[k] === 1)) continue;
+          this.respace(k0, k, badness, dirAt);
+          k0 = k;
+        }
+      }
+    }
+  }
+
+  /** Space samples a..b evenly along the lane between them (where that leaves no point worse off). */
+  private respace(a: number, b: number, badness: (i: number, x: number, y: number, ux: number, uy: number) => number, dirAt: (i: number) => [number, number]): void {
+    if (b - a < 2) return;
+    const X = this.x;
+    const Y = this.y;
+    const m = b - a;
+    const cum = new Float64Array(m + 1);
+    for (let k = 1; k <= m; k++) cum[k] = cum[k - 1] + Math.hypot(X[a + k] - X[a + k - 1], Y[a + k] - Y[a + k - 1]);
+    const total = cum[m];
+    if (total < 1) return;
+    const nxs = new Float32Array(m + 1);
+    const nys = new Float32Array(m + 1);
+    let seg = 0;
+    for (let k = 0; k <= m; k++) {
+      const u = (total * k) / m;
+      while (seg + 1 < m && cum[seg + 1] < u) seg++;
+      const L = cum[seg + 1] - cum[seg] || 1e-6;
+      const t = Math.max(0, Math.min(1, (u - cum[seg]) / L));
+      nxs[k] = X[a + seg] + (X[a + seg + 1] - X[a + seg]) * t;
+      nys[k] = Y[a + seg] + (Y[a + seg + 1] - Y[a + seg]) * t;
+    }
+    for (let k = 1; k < m; k++) {
+      const [ux, uy] = dirAt(a + k);
+      if (badness(a + k, nxs[k], nys[k], ux, uy) > badness(a + k, X[a + k], Y[a + k], ux, uy) + 0.5) return;
+    }
+    for (let k = 1; k < m; k++) {
+      X[a + k] = nxs[k];
+      Y[a + k] = nys[k];
     }
   }
 
