@@ -9,9 +9,14 @@
  *
  * Level of detail is per tree: the trees are stored by 100 m cell and copied
  * into a few instanced "buckets" (full detail near the camera, two cheaper
- * shapes further out) whenever the camera has moved or turned enough. Only
- * the near buckets cast shadows (the sun's shadow box is ~220 m across), and
- * the far ones are culled by cell against the view.
+ * shapes further out). Only the near buckets cast shadows (the sun's shadow
+ * box is ~220 m across), and the far ones are culled by cell against the view.
+ *
+ * The work is kept small per frame: the cells within ~500 m are re-sorted
+ * whenever the camera has moved 6 m or turned 9 degrees (whole cells at once
+ * where every tree lands in the same bucket), and the far crowns (whole cells
+ * out to 2.6 km) are gathered into a second, hidden set over a few frames
+ * after the camera has moved 40 m or turned 7 degrees, then swapped in.
  */
 import * as THREE from 'three';
 import { AreaKind, RoadKind } from '../types';
@@ -335,11 +340,25 @@ const R_HI = 150;
 const R_MID = 420;
 /** No trees beyond this horizontal distance (fog has them by then). */
 const R_FAR = 2600;
-/** Rebuild the buckets after the camera moves this far (m) or turns this much. */
+/** Re-sort the near trees after the camera moves this far (m) or turns this much. */
 const MOVE = 6;
 const TURN_COS = Math.cos((9 * Math.PI) / 180);
 /** Cells within this angle outside the view still count as in view (covers turning between rebuilds). */
 const VIEW_MARGIN = Math.sin((16 * Math.PI) / 180);
+/** Re-gather the far crowns (whole cells) after the camera moves this far or turns this much. */
+const FAR_MOVE = 40;
+const FAR_TURN_COS = Math.cos((7 * Math.PI) / 180);
+/**
+ * Cells within this much of the middle radius (from where the far crowns were
+ * gathered) are sorted per tree instead, so a whole far cell is never nearer
+ * than the middle radius while the camera moves on before the next gathering.
+ */
+const FAR_MARGIN = FAR_MOVE + 30;
+/** Gathering the far crowns is spread over frames, at most about this long (ms) per frame. */
+const FAR_BUDGET = 0.5;
+/** A camera that jumps this far (m) or turns this much in a frame is a cut: everything is redone at once. */
+const CUT_MOVE = 30;
+const CUT_COS = Math.cos((25 * Math.PI) / 180);
 
 /** Per-template tree data sorted by cell (instance layout, ready to copy). */
 interface Store {
@@ -354,14 +373,23 @@ interface Store {
   count: Int32Array;
 }
 
+/** dst[d ..] = src[s .. s + len] without a temporary view for short runs. */
+function copyF(src: Float32Array, s: number, dst: Float32Array, d: number, len: number): void {
+  if (len > 512) dst.set(src.subarray(s, s + len), d);
+  else for (let k = 0; k < len; k++) dst[d + k] = src[s + k];
+}
+
 class Bucket {
   readonly mesh: THREE.InstancedMesh;
   n = 0;
+  /** Trees from whole far cells at the start of the far buckets; the near pass appends after them. */
+  base = 0;
   private cap = 0;
   private mat!: THREE.InstancedBufferAttribute;
   private col!: THREE.InstancedBufferAttribute;
   private flw!: THREE.InstancedBufferAttribute;
   private trk!: THREE.InstancedBufferAttribute;
+  private attrs: THREE.InstancedBufferAttribute[] = [];
 
   constructor(geo: THREE.BufferGeometry, material: THREE.Material, name: string, cap: number) {
     this.mesh = new THREE.InstancedMesh(geo, material, 0);
@@ -381,10 +409,10 @@ class Bucket {
     this.col = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3), 3);
     this.flw = new THREE.InstancedBufferAttribute(new Float32Array(cap * 4), 4);
     this.trk = new THREE.InstancedBufferAttribute(new Float32Array(cap * 4), 4);
-    for (const a of [this.mat, this.col, this.flw, this.trk]) a.setUsage(THREE.DynamicDrawUsage);
+    this.attrs = [this.mat, this.col, this.flw, this.trk];
+    for (const a of this.attrs) a.setUsage(THREE.DynamicDrawUsage);
     if (old) {
-      const fresh = [this.mat, this.col, this.flw, this.trk];
-      old.forEach((a, i) => fresh[i].array.set((a.array as Float32Array).subarray(0, this.n * a.itemSize)));
+      old.forEach((a, i) => this.attrs[i].array.set((a.array as Float32Array).subarray(0, this.n * a.itemSize)));
       // free the old GPU buffers with the geometry; it re-uploads on the next draw
       g.dispose();
     }
@@ -398,10 +426,10 @@ class Bucket {
   push(st: Store, i: number, cnt: number): void {
     if (this.n + cnt > this.cap) this.grow(Math.max(this.cap * 2, this.n + cnt + 256));
     const n = this.n;
-    (this.mat.array as Float32Array).set(st.mat.subarray(i * 16, (i + cnt) * 16), n * 16);
-    (this.col.array as Float32Array).set(st.col.subarray(i * 3, (i + cnt) * 3), n * 3);
-    (this.flw.array as Float32Array).set(st.flw.subarray(i * 4, (i + cnt) * 4), n * 4);
-    (this.trk.array as Float32Array).set(st.trk.subarray(i * 4, (i + cnt) * 4), n * 4);
+    copyF(st.mat, i * 16, this.mat.array as Float32Array, n * 16, cnt * 16);
+    copyF(st.col, i * 3, this.col.array as Float32Array, n * 3, cnt * 3);
+    copyF(st.flw, i * 4, this.flw.array as Float32Array, n * 4, cnt * 4);
+    copyF(st.trk, i * 4, this.trk.array as Float32Array, n * 4, cnt * 4);
     this.n += cnt;
   }
 
@@ -421,13 +449,17 @@ class Bucket {
     }
   }
 
-  commit(): void {
+  /** Show the first n trees; upload those from `from` on (with anything not uploaded yet). */
+  commit(from = 0): void {
     this.mesh.count = this.n;
     this.mesh.visible = this.n > 0;
-    if (!this.n) return;
-    for (const a of [this.mat, this.col, this.flw, this.trk]) {
+    if (this.n <= from) return;
+    for (const a of this.attrs) {
+      // three.js clears the ranges once it has uploaded them: keep one range from the lowest pending start
+      let start = from * a.itemSize;
+      for (const r of a.updateRanges) start = Math.min(start, r.start);
       a.clearUpdateRanges();
-      a.addUpdateRange(0, this.n * a.itemSize);
+      a.addUpdateRange(start, this.n * a.itemSize - start);
       a.needsUpdate = true;
     }
   }
@@ -677,102 +709,249 @@ export async function buildTrees(
   });
   progress(0.9);
 
-  // ---- buckets: [lod][template]; near ones cast shadows
+  // ---- buckets: [lod][template]; near ones cast shadows. The far crowns come in
+  // two sets: one is shown while the other is gathered (over a few frames when
+  // the camera has moved or turned enough), then they swap.
   const mat = treeMaterial();
   const depth = treeDepthMaterial();
   const builders = [broadleaf, palm, conifer];
-  const BUCKETS = [
-    { lod: 0 as Lod, shadow: true, name: 'hi', cap: 1024 },
-    { lod: 1 as Lod, shadow: true, name: 'mid-sh', cap: 2048 },
-    { lod: 1 as Lod, shadow: false, name: 'mid', cap: 2048 },
-    { lod: 2 as Lod, shadow: false, name: 'far', cap: 8192 },
-  ];
-  const buckets: Bucket[][] = BUCKETS.map((b) =>
+  const row = (lod: Lod, shadow: boolean, name: string, cap: number): Bucket[] =>
     [0, 1, 2].map((tpl) => {
-      const bk = new Bucket(builders[tpl](b.lod), mat, `trees-${b.name}-${tpl}`, Math.min(b.cap, Math.max(16, stores[tpl].n)));
-      bk.mesh.castShadow = b.shadow;
-      bk.mesh.receiveShadow = b.lod < 2;
-      if (b.shadow) bk.mesh.customDepthMaterial = depth;
+      const bk = new Bucket(builders[tpl](lod), mat, `trees-${name}-${tpl}`, Math.min(cap, Math.max(16, stores[tpl].n)));
+      bk.mesh.castShadow = shadow;
+      bk.mesh.receiveShadow = lod < 2;
+      if (shadow) bk.mesh.customDepthMaterial = depth;
       ctx.root.add(bk.mesh);
       return bk;
-    }),
-  );
-  const [HI, MIDSH, MID, FAR] = buckets;
+    });
+  const HI = row(0, true, 'hi', 1024);
+  const MIDSH = row(1, true, 'mid-sh', 2048);
+  const MID = row(1, false, 'mid', 2048);
+  const FARS = [row(2, false, 'far', 8192), row(2, false, 'far', 8192)];
+  let front = 0;
 
-  const last = { x: NaN, y: 0, z: 0, fx: 0, fy: 0, fz: 0, p0: 0, p5: 0 };
-  const fwd = new THREE.Vector3();
+  // cell bounds for the view test (three.js coordinates)
+  const nCells = gnx * gny;
+  const cellX = new Float32Array(nCells);
+  const cellY = new Float32Array(nCells);
+  const cellZ = new Float32Array(nCells);
+  const cellR = new Float32Array(nCells);
+  for (let c = 0; c < nCells; c++) {
+    const i = c % gnx;
+    const j = (c - i) / gnx;
+    cellX[c] = gx0 + (i + 0.5) * CELL;
+    cellZ[c] = -(gy0 + (j + 0.5) * CELL);
+    cellY[c] = (cellY0[c] + cellY1[c]) / 2;
+    cellR[c] = CELL * 0.71 + Math.max(0, cellY1[c] - cellY0[c]) / 2;
+  }
+  /** Whether cell c (horizontal distance d) is within the view of `pl` (6 planes as nx, ny, nz, constant), with margins. */
+  const inView = (pl: Float64Array, c: number, d: number): boolean => {
+    const m = cellR[c] + d * VIEW_MARGIN;
+    const x = cellX[c];
+    const y = cellY[c];
+    const z = cellZ[c];
+    for (let k = 0; k < 24; k += 4) if (pl[k] * x + pl[k + 1] * y + pl[k + 2] * z + pl[k + 3] < -m) return false;
+    return true;
+  };
   const frustum = new THREE.Frustum();
   const pm = new THREE.Matrix4();
-  const planes = frustum.planes;
-  const rebuild = (cam: THREE.Camera): void => {
-    const px = last.x;
-    const py = last.y;
-    const pz = last.z;
-    for (const row of buckets) for (const b of row) b.n = 0;
-    // the shadow box (sky.ts) is +-(110 + 0.9 x camera height) and sits half its size ahead
-    const camH = Math.max(0, py - ctx.field.renAt(px, -pz));
-    const half = clamp(110 + camH * 0.9, 110, 700);
-    const rSh = 2 * half + 25;
-    const rMid = Math.max(R_MID, rSh);
+  const planesOf = (cam: THREE.Camera, out: Float64Array): void => {
     pm.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
     frustum.setFromProjectionMatrix(pm);
-    const inView = (cx: number, cy: number, cz: number, rad: number, dist: number): boolean => {
-      const m = rad + dist * VIEW_MARGIN;
-      for (let i = 0; i < 6; i++) {
-        const pl = planes[i];
-        if (pl.normal.x * cx + pl.normal.y * cy + pl.normal.z * cz + pl.constant < -m) return false;
-      }
-      return true;
-    };
-    const i0 = Math.max(0, Math.floor((px - R_FAR - gx0) / CELL));
-    const i1 = Math.min(gnx - 1, Math.floor((px + R_FAR - gx0) / CELL));
-    const j0 = Math.max(0, Math.floor((-pz - R_FAR - gy0) / CELL));
-    const j1 = Math.min(gny - 1, Math.floor((-pz + R_FAR - gy0) / CELL));
-    for (let j = j0; j <= j1; j++) {
-      // three.js z of the cell's north and south edges
+    for (let k = 0; k < 6; k++) {
+      const pl = frustum.planes[k];
+      out[4 * k] = pl.normal.x;
+      out[4 * k + 1] = pl.normal.y;
+      out[4 * k + 2] = pl.normal.z;
+      out[4 * k + 3] = pl.constant;
+    }
+  };
+  const nearPl = new Float64Array(24);
+  const jobPl = new Float64Array(24);
+
+  /** Cells sorted per tree: the list that goes with the shown far set, and the one being gathered. */
+  let nearCells = new Int32Array(nCells);
+  let nearBack = new Int32Array(nCells);
+  let nNear = 0;
+
+  // Far gathering: whole cells beyond the near ring, by rows, into the hidden far set.
+  const job = { active: false, px: 0, pz: 0, rNear: 0, j: 0, j1: 0, i: 0, i0: 0, i1: 0, n: 0 };
+  /** Where the shown far set was gathered (x, z). */
+  const shown = { x: NaN, z: 0 };
+  /** Camera when the latest far gathering started. */
+  const farSnap = { x: NaN, y: 0, z: 0, fx: 0, fy: 0, fz: 0, p0: 0, p5: 0, rMid: 0 };
+  const fwd = new THREE.Vector3();
+  const startFar = (cam: THREE.Camera, x: number, y: number, z: number, rMid: number): void => {
+    const pe = cam.projectionMatrix.elements;
+    farSnap.x = x;
+    farSnap.y = y;
+    farSnap.z = z;
+    farSnap.fx = fwd.x;
+    farSnap.fy = fwd.y;
+    farSnap.fz = fwd.z;
+    farSnap.p0 = pe[0];
+    farSnap.p5 = pe[5];
+    farSnap.rMid = rMid;
+    planesOf(cam, jobPl);
+    job.active = true;
+    job.px = x;
+    job.pz = z;
+    job.rNear = rMid + FAR_MARGIN;
+    job.j = Math.max(0, Math.floor((-z - R_FAR - gy0) / CELL));
+    job.j1 = Math.min(gny - 1, Math.floor((-z + R_FAR - gy0) / CELL));
+    job.i0 = Math.max(0, Math.floor((x - R_FAR - gx0) / CELL));
+    job.i1 = Math.min(gnx - 1, Math.floor((x + R_FAR - gx0) / CELL));
+    job.i = job.i0;
+    job.n = 0;
+    for (const b of FARS[1 - front]) b.n = 0;
+  };
+  /** Gather cells until `budget` ms have passed; true when done. */
+  const stepFar = (budget: number): boolean => {
+    const t0 = performance.now();
+    const back = FARS[1 - front];
+    const { px, pz, rNear, i0, i1 } = job;
+    let work = 0;
+    for (; job.j <= job.j1; job.j++, job.i = i0) {
+      const j = job.j;
+      // three.js z of the cell row's north and south edges
       const zn = -(gy0 + (j + 1) * CELL);
       const zs = -(gy0 + j * CELL);
       const dz = Math.max(zn - pz, 0, pz - zs);
-      for (let i = i0; i <= i1; i++) {
-        const c = j * gnx + i;
+      if (dz > R_FAR) continue;
+      for (; job.i <= i1; job.i++) {
+        const c = j * gnx + job.i;
         if (cellY1[c] < cellY0[c]) continue;
-        const xw = gx0 + i * CELL;
+        const xw = gx0 + job.i * CELL;
         const dx = Math.max(xw - px, 0, px - xw - CELL);
-        const d = Math.hypot(dx, dz);
+        const d = Math.sqrt(dx * dx + dz * dz);
         if (d > R_FAR) continue;
-        const cy = (cellY0[c] + cellY1[c]) / 2;
-        const vis = inView(xw + CELL / 2, cy, (zn + zs) / 2, CELL * 0.71 + (cellY1[c] - cellY0[c]) / 2, d);
-        if (d >= rMid) {
-          if (!vis) continue;
+        if (d < rNear) {
+          nearBack[job.n++] = c;
+          continue;
+        }
+        work += 4;
+        if (inView(jobPl, c, d)) {
           for (let tpl = 0; tpl < 3; tpl++) {
             const st = stores[tpl];
             const n = st.count[c];
-            if (n) FAR[tpl].push(st, st.start[c], n);
+            if (n) back[tpl].push(st, st.start[c], n);
+            work += n;
           }
-          continue;
         }
-        // near cells: per tree
-        for (let tpl = 0; tpl < 3; tpl++) {
-          const st = stores[tpl];
-          const n = st.count[c];
-          if (!n) continue;
-          const s0 = st.start[c];
-          const P = st.p;
-          for (let q = s0; q < s0 + n; q++) {
-            const ex = P[3 * q] - px;
-            const ez = P[3 * q + 2] - pz;
-            const d2 = Math.sqrt(ex * ex + ez * ez);
-            if (d2 < rSh) {
-              const ey = P[3 * q + 1] - py;
-              (d2 * d2 + ey * ey < R_HI * R_HI ? HI : MIDSH)[tpl].pushOne(st, q);
-            } else if (vis) (d2 < rMid ? MID : FAR)[tpl].pushOne(st, q);
+        // look at the clock every few hundred trees
+        if (work > 400) {
+          work = 0;
+          if (performance.now() - t0 > budget) {
+            job.i++;
+            return false;
           }
         }
       }
     }
-    for (const row of buckets) for (const b of row) b.commit();
+    return true;
   };
-  ctx.tick.push((_dt, camera) => {
+  /** Show the gathered far set (and the near list that goes with it). */
+  const swapFar = (): void => {
+    job.active = false;
+    for (const b of FARS[front]) b.mesh.visible = false;
+    front = 1 - front;
+    for (const b of FARS[front]) {
+      b.base = b.n;
+      b.commit(0);
+    }
+    const t = nearCells;
+    nearCells = nearBack;
+    nearBack = t;
+    nNear = job.n;
+    shown.x = job.px;
+    shown.z = job.pz;
+  };
+
+  /** Add all of cell c's trees to a row of buckets. */
+  const addCell = (bk: Bucket[], c: number): void => {
+    for (let tpl = 0; tpl < 3; tpl++) {
+      const st = stores[tpl];
+      const n = st.count[c];
+      if (n) bk[tpl].push(st, st.start[c], n);
+    }
+  };
+  /** Sort the trees of the near cells into the near buckets (and the shown far set's tail) for a camera at (px, py, pz). */
+  const nearPass = (px: number, py: number, pz: number, rSh: number, rMid: number): void => {
+    for (const b of HI) b.n = 0;
+    for (const b of MIDSH) b.n = 0;
+    for (const b of MID) b.n = 0;
+    const FAR = FARS[front];
+    for (const b of FAR) b.n = b.base;
+    for (let k = 0; k < nNear; k++) {
+      const c = nearCells[k];
+      const i = c % gnx;
+      const j = (c - i) / gnx;
+      const xw = gx0 + i * CELL;
+      const zn = -(gy0 + (j + 1) * CELL);
+      const zs = -(gy0 + j * CELL);
+      const dx = Math.max(xw - px, 0, px - xw - CELL);
+      const dz = Math.max(zn - pz, 0, pz - zs);
+      const dmin = Math.sqrt(dx * dx + dz * dz);
+      const vis = inView(nearPl, c, dmin);
+      // whole cells where every tree goes to the same bucket
+      if (dmin >= rMid) {
+        if (vis) addCell(FAR, c);
+        continue;
+      }
+      if (dmin >= rSh && !vis) continue;
+      const ex = Math.max(Math.abs(px - xw), Math.abs(px - xw - CELL));
+      const ez = Math.max(Math.abs(pz - zn), Math.abs(pz - zs));
+      const dmax = Math.sqrt(ex * ex + ez * ez);
+      if (dmin >= rSh && dmax < rMid) {
+        addCell(MID, c);
+        continue;
+      }
+      if (dmax < rSh) {
+        const ey = Math.max(Math.abs(cellY0[c] - py), Math.abs(cellY1[c] - py));
+        if (dmax * dmax + ey * ey < R_HI * R_HI) {
+          addCell(HI, c);
+          continue;
+        }
+        if (dmin >= R_HI) {
+          addCell(MIDSH, c);
+          continue;
+        }
+      }
+      // per tree
+      for (let tpl = 0; tpl < 3; tpl++) {
+        const st = stores[tpl];
+        const n = st.count[c];
+        if (!n) continue;
+        const s0 = st.start[c];
+        const P = st.p;
+        for (let q = s0; q < s0 + n; q++) {
+          const ex = P[3 * q] - px;
+          const ez = P[3 * q + 2] - pz;
+          const d2 = Math.sqrt(ex * ex + ez * ez);
+          if (d2 < rSh) {
+            const ey = P[3 * q + 1] - py;
+            (d2 * d2 + ey * ey < R_HI * R_HI ? HI : MIDSH)[tpl].pushOne(st, q);
+          } else if (vis) (d2 < rMid ? MID : FAR)[tpl].pushOne(st, q);
+        }
+      }
+    }
+    for (const b of HI) b.commit();
+    for (const b of MIDSH) b.commit();
+    for (const b of MID) b.commit();
+    for (const b of FAR) b.commit(b.base);
+  };
+
+  /** Camera at the latest near pass, and last frame. */
+  const last = { x: NaN, y: 0, z: 0, fx: 0, fy: 0, fz: 0, p0: 0, p5: 0 };
+  const prev = { x: NaN, y: 0, z: 0, fx: 0, fy: 0, fz: 0 };
+  /** Whether the camera at (x, y, z) looking along fwd with projection pe has moved, turned or zoomed enough since `s`. */
+  const due = (s: typeof last, x: number, y: number, z: number, pe: number[], move: number, cos: number): boolean =>
+    !(Math.hypot(x - s.x, y - s.y, z - s.z) < move) ||
+    fwd.x * s.fx + fwd.y * s.fy + fwd.z * s.fz < cos ||
+    Math.abs(pe[0] - s.p0) > 0.02 * Math.abs(pe[0]) ||
+    Math.abs(pe[5] - s.p5) > 0.02 * Math.abs(pe[5]);
+  ctx.tick.push((dt, camera) => {
+    const t0 = performance.now();
     camera.updateWorldMatrix(true, false);
     const e = camera.matrixWorld.elements;
     const x = e[12];
@@ -780,22 +959,64 @@ export async function buildTrees(
     const z = e[14];
     fwd.set(-e[8], -e[9], -e[10]).normalize();
     const pe = camera.projectionMatrix.elements;
-    const moved = !(Math.hypot(x - last.x, y - last.y, z - last.z) < MOVE);
-    const turned = fwd.x * last.fx + fwd.y * last.fy + fwd.z * last.fz < TURN_COS;
-    const zoomed = Math.abs(pe[0] - last.p0) > 0.02 * Math.abs(pe[0]) || Math.abs(pe[5] - last.p5) > 0.02 * Math.abs(pe[5]);
-    if (!moved && !turned && !zoomed) return;
-    Object.assign(last, { x, y, z, fx: fwd.x, fy: fwd.y, fz: fwd.z, p0: pe[0], p5: pe[5] });
-    const t0 = performance.now();
-    rebuild(camera);
+    // the shadow box (sky.ts) is +-(110 + 0.9 x camera height) and sits half its size ahead
+    const camH = Math.max(0, y - ctx.field.renAt(x, -z));
+    const half = clamp(110 + camH * 0.9, 110, 700);
+    const rSh = 2 * half + 25;
+    const rMid = Math.max(R_MID, rSh);
+    const jump = Math.hypot(x - prev.x, y - prev.y, z - prev.z);
+    const cut = !(jump < CUT_MOVE) || fwd.x * prev.fx + fwd.y * prev.fy + fwd.z * prev.fz < CUT_COS || dt > 0.1;
+    prev.x = x;
+    prev.y = y;
+    prev.z = z;
+    prev.fx = fwd.x;
+    prev.fy = fwd.y;
+    prev.fz = fwd.z;
+    let swapped = false;
+    if (cut) {
+      // a jump (start, teleport, camera cut, a long frame): everything at once
+      startFar(camera, x, y, z, rMid);
+      stepFar(Infinity);
+      swapFar();
+      swapped = true;
+    } else {
+      if (!job.active && (due(farSnap, x, y, z, pe, FAR_MOVE, FAR_TURN_COS) || Math.abs(rMid - farSnap.rMid) > 15)) startFar(camera, x, y, z, rMid);
+      if (job.active) {
+        // about to leave the shown set's near ring: finish now
+        const drift = Math.hypot(x - shown.x, z - shown.z);
+        if (stepFar(drift > FAR_MARGIN - 15 ? Infinity : FAR_BUDGET)) {
+          swapFar();
+          swapped = true;
+        }
+      }
+    }
+    if (!swapped && !due(last, x, y, z, pe, MOVE, TURN_COS)) {
+      if (debug && job.active) debug.maxMs = Math.max(debug.maxMs, performance.now() - t0);
+      return;
+    }
+    last.x = x;
+    last.y = y;
+    last.z = z;
+    last.fx = fwd.x;
+    last.fy = fwd.y;
+    last.fz = fwd.z;
+    last.p0 = pe[0];
+    last.p5 = pe[5];
+    planesOf(camera, nearPl);
+    nearPass(x, y, z, rSh, rMid);
     if (debug) {
+      const ms = performance.now() - t0;
       debug.rebuilds++;
-      debug.lastMs = performance.now() - t0;
-      debug.maxMs = Math.max(debug.maxMs, debug.lastMs);
-      debug.counts = buckets.map((row) => row.map((b) => b.n));
+      if (swapped) debug.farJobs++;
+      debug.lastMs = ms;
+      if (cut) debug.cutMs = Math.max(debug.cutMs, ms);
+      else debug.maxMs = Math.max(debug.maxMs, ms);
+      debug.counts = [HI, MIDSH, MID, FARS[front]].map((r) => r.map((b) => b.n));
     }
   });
   // ?world=debug: window.__trees has the bucket sizes and rebuild cost
-  const debug = location.search.includes('world=debug') ? { rebuilds: 0, lastMs: 0, maxMs: 0, counts: [] as number[][] } : null;
+  // (maxMs: the most any frame spent here, cuts aside; cutMs: the most a cut frame spent redoing everything)
+  const debug = location.search.includes('world=debug') ? { rebuilds: 0, farJobs: 0, lastMs: 0, maxMs: 0, cutMs: 0, counts: [] as number[][] } : null;
   if (debug) (window as unknown as { __trees: typeof debug }).__trees = debug;
   console.info(
     `[world] trees by roads (${Math.round(fitT1 - fitT0)} ms): ${stats.lifted} crowns lifted, ${stats.narrowed} narrowed, ${stats.palms} swapped for palms, ${stats.dropped} left out, ${bridgeTrees} off bridges`,
