@@ -447,8 +447,8 @@ function buildCab(B: BodyLayout, sec: SectionLayout, d: Dims, eyeL: THREE.Vector
   // --- "PLEASE HAIL DRIVER" on the top of the glass (Optimus), reversed from inside
   if (!metro) {
     // matches the exterior sticker (paint.ts): kerb side of centre, just under the top frit
-    const y0 = d.g1 - 0.13, y1 = d.g1 - 0.06;
-    const x0 = -0.63, x1 = 0.19;
+    const y0 = 2.348, y1 = 2.432;
+    const x0 = -0.72, x1 = 0.28;
     pan.quad(P(x0, y0, inner(x0, y0) - 0.004), P(x1, y0, inner(x1, y0) - 0.004), P(x1, y1, inner(x1, y1) - 0.004), P(x0, y1, inner(x0, y1) - 0.004), [0.9, 0.9, 0.9], uvRect(R_HAIL, STA.w, STA.h));
   }
   // --- passenger display hanging behind the driver, facing the saloon
