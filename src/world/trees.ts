@@ -1,7 +1,17 @@
 /**
- * Vegetation: low-poly instanced trees in 1 km chunks with a near and a far
- * LOD. Mapped OSM trees, park/forest scatter, street trees and backyard trees.
- * Brisbane in late October: jacarandas in purple bloom, poincianas starting.
+ * Vegetation: low-poly instanced trees. Mapped OSM trees, park/forest
+ * scatter, street trees and backyard trees. Brisbane in late October:
+ * jacarandas in purple bloom, poincianas starting.
+ *
+ * Crowns keep clear of carriageways: a crown that would hang into the space a
+ * bus needs over a road is lifted (pruned trunk), narrowed, swapped for a
+ * palm or the tree is left out.
+ *
+ * Level of detail is per tree: the trees are stored by 100 m cell and copied
+ * into a few instanced "buckets" (full detail near the camera, two cheaper
+ * shapes further out) whenever the camera has moved or turned enough. Only
+ * the near buckets cast shadows (the sun's shadow box is ~220 m across), and
+ * the far ones are culled by cell against the view.
  */
 import * as THREE from 'three';
 import { AreaKind, RoadKind } from '../types';
@@ -18,6 +28,7 @@ import {
   MASK_RAIL,
   MASK_SPORT,
   MASK_WATER,
+  clamp,
   hash2,
   pointInRing,
   ringBounds,
@@ -26,8 +37,6 @@ import {
   smoothstep,
   yieldFrame,
 } from './util';
-
-const TREE_CHUNK = 1500;
 
 interface Species {
   tpl: 0 | 1 | 2; // broadleaf, palm, conifer
@@ -122,30 +131,38 @@ function trunk(g: MeshGeo, h: number, r0: number, r1: number, sides: number): vo
   }
 }
 
-function broadleaf(detail: number): THREE.BufferGeometry {
+/** Level of detail: 0 near (~150 tris), 1 middle distance (~45), 2 far (crown only, ~8). */
+type Lod = 0 | 1 | 2;
+
+function broadleaf(lod: Lod): THREE.BufferGeometry {
   const g = new MeshGeo(SPEC);
-  trunk(g, 0.42, 0.035, 0.022, detail > 0 ? 6 : 3);
-  if (detail > 0) {
+  if (lod === 0) {
+    trunk(g, 0.42, 0.035, 0.022, 6);
     lump(g, 0, 0.56, 0, 0.38, 0.3, 0.38, 1, 11);
     lump(g, 0.17, 0.68, 0.1, 0.26, 0.24, 0.26, 0, 12);
     lump(g, -0.15, 0.66, -0.12, 0.27, 0.24, 0.27, 0, 13);
     lump(g, 0.02, 0.8, -0.02, 0.24, 0.2, 0.24, 0, 14);
+  } else if (lod === 1) {
+    // the same silhouette from two coarse lumps, so the switch at ~150 m does not pop
+    trunk(g, 0.42, 0.035, 0.022, 3);
+    lump(g, 0, 0.58, 0, 0.43, 0.33, 0.43, 0, 16);
+    lump(g, 0.02, 0.78, -0.02, 0.27, 0.22, 0.27, 0, 17);
   } else {
     lump(g, 0, 0.62, 0, 0.5, 0.38, 0.5, -1, 15);
   }
   return g.build();
 }
 
-function palm(detail: number): THREE.BufferGeometry {
+function palm(lod: Lod): THREE.BufferGeometry {
   const g = new MeshGeo(SPEC);
-  trunk(g, 0.92, 0.018, 0.012, detail > 0 ? 6 : 3);
-  const fronds = detail > 0 ? 8 : 5;
+  if (lod < 2) trunk(g, 0.92, 0.018, 0.012, lod === 0 ? 6 : 3);
+  const fronds = lod === 0 ? 8 : lod === 1 ? 5 : 3;
   for (let f = 0; f < fronds; f++) {
     const a = (f / fronds) * Math.PI * 2 + 0.3;
     const dx = Math.cos(a);
     const dy = Math.sin(a);
-    const px = -dy * 0.07;
-    const py = dx * 0.07;
+    const px = -dy * (lod === 2 ? 0.1 : 0.07);
+    const py = dx * (lod === 2 ? 0.1 : 0.07);
     // a drooping two-segment leaf, both faces
     const p0 = [0, 0.92, 0];
     const p1 = [dx * 0.28, 0.98, dy * 0.28];
@@ -163,18 +180,18 @@ function palm(detail: number): THREE.BufferGeometry {
     g.tri(w0, w1a, w1b, 0, -1, 0);
     g.tri(w1a, w2, w1b, 0, -1, 0);
   }
-  if (detail > 0) lump(g, 0, 0.92, 0, 0.05, 0.05, 0.05, 0, 21);
+  if (lod === 0) lump(g, 0, 0.92, 0, 0.05, 0.05, 0.05, 0, 21);
   return g.build();
 }
 
-function conifer(detail: number): THREE.BufferGeometry {
+function conifer(lod: Lod): THREE.BufferGeometry {
   const g = new MeshGeo(SPEC);
-  trunk(g, 0.3, 0.03, 0.02, 5);
-  const tiers = detail > 0 ? 4 : 2;
-  const sides = detail > 0 ? 7 : 5;
+  if (lod < 2) trunk(g, 0.3, 0.03, 0.02, lod === 0 ? 5 : 3);
+  const tiers = lod === 0 ? 4 : lod === 1 ? 2 : 1;
+  const sides = lod === 0 ? 7 : 5;
   for (let t = 0; t < tiers; t++) {
     const y0 = 0.22 + (t / tiers) * 0.7;
-    const y1 = y0 + 0.3;
+    const y1 = lod === 2 ? 1.0 : y0 + 0.3;
     const r = 0.5 * (1 - t / (tiers + 0.6));
     const ring: number[] = [];
     for (let i = 0; i < sides; i++) {
@@ -191,12 +208,43 @@ function conifer(detail: number): THREE.BufferGeometry {
 }
 
 // ---------------------------------------------------------------------------
+// Crown envelope (fractions of the tree's width w and height h), for keeping
+// crowns out of the space over carriageways.
+
+/** Horizontal reach of the crown from the trunk, per template (fraction of w). */
+const REACH = [0.49, 0.5, 0.5];
+/** Top of the crown (fraction of h). */
+const TOP = [1.0, 0.98, 1.05];
+/** Most a crown may be raised on a longer, pruned trunk (fraction of h). */
+const MAX_LIFT = [0.45, 0.3, 0.15];
+
+/** Lowest point of the crown at horizontal distance `rw` (fraction of w) from the trunk, as a fraction of h. */
+function crownBottom(tpl: number, rw: number): number {
+  if (tpl === 1) return 0.8; // palm fronds droop to 0.82 h at their tips
+  if (tpl === 2) return 0.22;
+  // broadleaf: the main lump (centre 0.56 h, semi-axes 0.426 w x 0.336 h with
+  // jitter) and the side lumps (centre 0.2 w out at 0.67 h, 0.29 w x 0.27 h),
+  // whichever way the tree is turned
+  let b = 1;
+  const m = rw / 0.426;
+  if (m < 1) b = 0.56 - 0.336 * Math.sqrt(1 - m * m);
+  const s = (rw - 0.197) / 0.29;
+  if (Math.abs(s) < 1) b = Math.min(b, 0.67 - 0.27 * Math.sqrt(1 - s * s));
+  return b;
+}
+
+/** Height above a carriageway that crowns must clear (bus 3.4 m, pruned like real street trees). */
+const ROAD_CLEAR = 4.5;
+/** Crowns may hang this far over the kerb line at any height (the gutter is outside the bus). */
+const KERB_OVERHANG = 0.3;
+/** Trunks keep at least this far from the edge of a carriageway. */
+const TRUNK_CLEAR = 0.6;
 
 function treeMaterial(): THREE.MeshLambertMaterial {
   const mat = new THREE.MeshLambertMaterial({ color: 0xffffff, flatShading: false });
   return patch(mat, {
-    key: 'tree',
-    vertexPars: 'uniform float uTime;\nattribute float aPart;\nattribute vec4 iFlower;\nattribute vec3 iTrunk;\nvarying float vPart;\nvarying vec3 vLocal;\nvarying vec4 vFlower;\nvarying vec3 vTrunk;\nvarying vec3 vLeaf;',
+    key: 'tree2',
+    vertexPars: 'uniform float uTime;\nattribute float aPart;\nattribute vec4 iFlower;\nattribute vec4 iTrunk;\nvarying float vPart;\nvarying vec3 vLocal;\nvarying vec4 vFlower;\nvarying vec3 vTrunk;\nvarying vec3 vLeaf;',
     vertex: [
       [
         '#include <begin_vertex>',
@@ -204,7 +252,7 @@ function treeMaterial(): THREE.MeshLambertMaterial {
         vPart = aPart;
         vLocal = position;
         vFlower = iFlower;
-        vTrunk = iTrunk;
+        vTrunk = iTrunk.rgb;
         #ifdef USE_INSTANCING_COLOR
         vLeaf = instanceColor;
         #else
@@ -214,7 +262,9 @@ function treeMaterial(): THREE.MeshLambertMaterial {
         vec3 ip = instanceMatrix[3].xyz;
         float sway = sin(uTime * 1.3 + ip.x * 0.11 + ip.z * 0.07) * 0.012 * aPart * position.y;
         transformed.x += sway;
-        transformed.z += sway * 0.6;`,
+        transformed.z += sway * 0.6;
+        // pruned street trees: the crown sits higher on a longer trunk
+        transformed.y += iTrunk.w * mix(step(0.001, position.y), 1.0, aPart);`,
       ],
       ['#include <color_vertex>', ''],
     ],
@@ -236,6 +286,18 @@ function treeMaterial(): THREE.MeshLambertMaterial {
   });
 }
 
+/** Shadow-pass material with the same crown lift as treeMaterial(). */
+function treeDepthMaterial(): THREE.MeshDepthMaterial {
+  const mat = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+  mat.onBeforeCompile = (sh) => {
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float aPart;\nattribute vec4 iTrunk;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\ntransformed.y += iTrunk.w * mix(step(0.001, position.y), 1.0, aPart);');
+  };
+  mat.customProgramCacheKey = () => 'tree-depth';
+  return mat;
+}
+
 interface Inst {
   x: number;
   y: number;
@@ -243,6 +305,120 @@ interface Inst {
   s: number;
   /** Base height when known (street trees stand on the verge); otherwise the terrain. */
   z?: number;
+  /** Size and crown lift (metres) once fitted against the roads. */
+  w?: number;
+  h?: number;
+  lift?: number;
+  /** Mapped trees are swapped for a palm rather than dropped when their crown does not fit. */
+  mapped?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Per-tree LOD
+
+const CELL = 100;
+/** Full-detail trees within this 3D distance. */
+const R_HI = 150;
+/** The middle shape out to here (or the shadow radius, whichever is larger), then crowns only. */
+const R_MID = 420;
+/** No trees beyond this horizontal distance (fog has them by then). */
+const R_FAR = 2600;
+/** Rebuild the buckets after the camera moves this far (m) or turns this much. */
+const MOVE = 6;
+const TURN_COS = Math.cos((9 * Math.PI) / 180);
+/** Cells within this angle outside the view still count as in view (covers turning between rebuilds). */
+const VIEW_MARGIN = Math.sin((16 * Math.PI) / 180);
+
+/** Per-template tree data sorted by cell (instance layout, ready to copy). */
+interface Store {
+  n: number;
+  mat: Float32Array;
+  col: Float32Array;
+  flw: Float32Array;
+  trk: Float32Array;
+  /** three.js position of the base: x, y (up), z */
+  p: Float32Array;
+  start: Int32Array;
+  count: Int32Array;
+}
+
+class Bucket {
+  readonly mesh: THREE.InstancedMesh;
+  n = 0;
+  private cap = 0;
+  private mat!: THREE.InstancedBufferAttribute;
+  private col!: THREE.InstancedBufferAttribute;
+  private flw!: THREE.InstancedBufferAttribute;
+  private trk!: THREE.InstancedBufferAttribute;
+
+  constructor(geo: THREE.BufferGeometry, material: THREE.Material, name: string, cap: number) {
+    this.mesh = new THREE.InstancedMesh(geo, material, 0);
+    this.mesh.name = name;
+    this.mesh.frustumCulled = false;
+    // whole-map bounds (the world's underground culling keeps trees near tunnel portals)
+    this.mesh.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e6);
+    this.mesh.visible = false;
+    this.grow(cap);
+  }
+
+  private grow(cap: number): void {
+    const old = this.cap ? [this.mat, this.col, this.flw, this.trk] : null;
+    this.cap = cap;
+    const g = this.mesh.geometry;
+    this.mat = new THREE.InstancedBufferAttribute(new Float32Array(cap * 16), 16);
+    this.col = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3), 3);
+    this.flw = new THREE.InstancedBufferAttribute(new Float32Array(cap * 4), 4);
+    this.trk = new THREE.InstancedBufferAttribute(new Float32Array(cap * 4), 4);
+    for (const a of [this.mat, this.col, this.flw, this.trk]) a.setUsage(THREE.DynamicDrawUsage);
+    if (old) {
+      const fresh = [this.mat, this.col, this.flw, this.trk];
+      old.forEach((a, i) => fresh[i].array.set((a.array as Float32Array).subarray(0, this.n * a.itemSize)));
+      // free the old GPU buffers with the geometry; it re-uploads on the next draw
+      g.dispose();
+    }
+    this.mesh.instanceMatrix = this.mat;
+    this.mesh.instanceColor = this.col;
+    g.setAttribute('iFlower', this.flw);
+    g.setAttribute('iTrunk', this.trk);
+  }
+
+  /** Append `cnt` trees of `st` starting at index `i`. */
+  push(st: Store, i: number, cnt: number): void {
+    if (this.n + cnt > this.cap) this.grow(Math.max(this.cap * 2, this.n + cnt + 256));
+    const n = this.n;
+    (this.mat.array as Float32Array).set(st.mat.subarray(i * 16, (i + cnt) * 16), n * 16);
+    (this.col.array as Float32Array).set(st.col.subarray(i * 3, (i + cnt) * 3), n * 3);
+    (this.flw.array as Float32Array).set(st.flw.subarray(i * 4, (i + cnt) * 4), n * 4);
+    (this.trk.array as Float32Array).set(st.trk.subarray(i * 4, (i + cnt) * 4), n * 4);
+    this.n += cnt;
+  }
+
+  /** Append tree `i` of `st` (no temporary views; the near buckets add trees one by one). */
+  pushOne(st: Store, i: number): void {
+    if (this.n + 1 > this.cap) this.grow(this.cap * 2);
+    const n = this.n++;
+    const M = this.mat.array as Float32Array;
+    for (let c = 0; c < 16; c++) M[n * 16 + c] = st.mat[i * 16 + c];
+    const C = this.col.array as Float32Array;
+    for (let c = 0; c < 3; c++) C[n * 3 + c] = st.col[i * 3 + c];
+    const F = this.flw.array as Float32Array;
+    const T = this.trk.array as Float32Array;
+    for (let c = 0; c < 4; c++) {
+      F[n * 4 + c] = st.flw[i * 4 + c];
+      T[n * 4 + c] = st.trk[i * 4 + c];
+    }
+  }
+
+  commit(): void {
+    this.mesh.count = this.n;
+    this.mesh.visible = this.n > 0;
+    if (!this.n) return;
+    for (const a of [this.mat, this.col, this.flw, this.trk]) {
+      a.clearUpdateRanges();
+      a.addUpdateRange(0, this.n * a.itemSize);
+      a.needsUpdate = true;
+    }
+  }
 }
 
 export async function buildTrees(
@@ -253,7 +429,6 @@ export async function buildTrees(
 ): Promise<number> {
   const { data, mask, R } = ctx;
   const index = roads.index;
-  lodPairs.length = 0;
   const list: Inst[] = [];
   const r = rng(4242);
   const blocked = (x: number, y: number, rad: number, flags = MASK_BUILDING | MASK_WATER | MASK_POOL | MASK_RAIL | MASK_SPORT) =>
@@ -270,7 +445,7 @@ export async function buildTrees(
     const h = hash2(x, y, 1);
     let sp = pickSpecies(h, cbdness(x, y) > 0.5 ? T_MAPPED_CBD : T_MAPPED);
     if (newFarm(x, y) && h < 0.7) sp = 'jacaranda';
-    list.push({ x, y, sp, s: hash2(x, y, 2) });
+    list.push({ x, y, sp, s: hash2(x, y, 2), mapped: true });
   }
   progress(0.1);
   await yieldFrame();
@@ -344,96 +519,256 @@ export async function buildTrees(
     list.length = w;
   }
 
-  // ---- build instanced chunks
-  const tplHi = [broadleaf(1), palm(1), conifer(1)];
-  const tplLo = [broadleaf(0), palm(0), conifer(0)];
-  const mat = treeMaterial();
-  const nx = Math.ceil((R[2] - R[0]) / TREE_CHUNK);
-  const groups = new Map<number, Inst[][]>();
-  for (const it of list) {
-    const i = Math.max(0, Math.min(nx - 1, Math.floor((it.x - R[0]) / TREE_CHUNK)));
-    const j = Math.max(0, Math.floor((it.y - R[1]) / TREE_CHUNK));
-    const key = j * nx + i;
-    let g = groups.get(key);
-    if (!g) {
-      g = [[], [], []];
-      groups.set(key, g);
-    }
-    g[SP[it.sp].tpl].push(it);
-  }
-  const m4 = new THREE.Matrix4();
-  const q = new THREE.Quaternion();
-  const up = new THREE.Vector3(0, 1, 0);
-  const pos = new THREE.Vector3();
-  const scl = new THREE.Vector3();
-  const col = new THREE.Color();
-  for (const [key, g] of groups) {
-    for (let tpl = 0; tpl < 3; tpl++) {
-      const items = g[tpl];
-      if (!items.length) continue;
-      const n = items.length;
-      const flower = new Float32Array(n * 4);
-      const trunkC = new Float32Array(n * 3);
-      const hi = new THREE.InstancedMesh(tplHi[tpl], mat, n);
-      let x0 = Infinity;
-      let x1 = -Infinity;
-      let z0 = Infinity;
-      let z1 = -Infinity;
-      items.forEach((it, i) => {
-        const sp: Species = SP[it.sp];
-        const hgt = sp.h[0] + (sp.h[1] - sp.h[0]) * it.s;
-        const wid = sp.w[0] + (sp.w[1] - sp.w[0]) * (it.s * 0.7 + hash2(it.x, it.y, 11) * 0.3);
-        q.setFromAxisAngle(up, hash2(it.x, it.y, 12) * Math.PI * 2);
-        pos.set(it.x, it.z ?? ctx.field.renAt(it.x, it.y) - 0.2, -it.y);
-        scl.set(wid, hgt, wid);
-        m4.compose(pos, q, scl);
-        hi.setMatrixAt(i, m4);
-        const leafHex = sp.leaf[Math.floor(hash2(it.x, it.y, 13) * sp.leaf.length) % sp.leaf.length];
-        col.setHex(leafHex);
-        col.multiplyScalar(0.9 + hash2(it.x, it.y, 14) * 0.2);
-        hi.setColorAt(i, col);
-        col.setHex(sp.flower);
-        flower.set([col.r, col.g, col.b, sp.flowerAmt * (0.6 + hash2(it.x, it.y, 15) * 0.8)], i * 4);
-        col.setHex(sp.trunk);
-        trunkC.set([col.r, col.g, col.b], i * 3);
-        x0 = Math.min(x0, it.x);
-        x1 = Math.max(x1, it.x);
-        z0 = Math.min(z0, -it.y);
-        z1 = Math.max(z1, -it.y);
+  // ---- crowns clear of the carriageways
+  const fitT0 = performance.now();
+  const stats = { lifted: 0, narrowed: 0, palms: 0, dropped: 0 };
+  {
+    const seg = index.seg;
+    const segZ = index.segZ;
+    const segHW = index.segHW;
+    const kinds = index.roads.map((rd) => rd.kind);
+    /** Lift (m) the crown needs over the roads near (x, y), or Infinity when the trunk is on a carriageway. */
+    const liftNeeded = (x: number, y: number, base: number, tpl: number, w: number, h: number): number => {
+      const reach = REACH[tpl] * w;
+      let need = 0;
+      index.roadsNear(x, y, reach + index.maxHW, (ri, k, dist) => {
+        if (kinds[ri] === RoadKind.Pedestrian) return;
+        const c = dist - segHW[k];
+        if (c < TRUNK_CLEAR) {
+          need = Infinity;
+          return;
+        }
+        const rr = c + KERB_OVERHANG;
+        if (rr >= reach) return;
+        // road height at the closest point
+        const ax = seg[4 * k];
+        const ay = seg[4 * k + 1];
+        const dx = seg[4 * k + 2] - ax;
+        const dy = seg[4 * k + 3] - ay;
+        const l2 = dx * dx + dy * dy;
+        const u = l2 > 0 ? clamp(((x - ax) * dx + (y - ay) * dy) / l2, 0, 1) : 0;
+        const z = segZ[2 * k] + (segZ[2 * k + 1] - segZ[2 * k]) * u;
+        // a crown wholly below a deck is no trouble
+        if (base + TOP[tpl] * h < z - 1.2) return;
+        need = Math.max(need, z + ROAD_CLEAR - (base + crownBottom(tpl, rr / w) * h));
       });
-      const fAttr = new THREE.InstancedBufferAttribute(flower, 4);
-      const tAttr = new THREE.InstancedBufferAttribute(trunkC, 3);
-      hi.geometry = tplHi[tpl].clone();
-      hi.geometry.setAttribute('iFlower', fAttr);
-      hi.geometry.setAttribute('iTrunk', tAttr);
-      hi.castShadow = true;
-      hi.receiveShadow = true;
-      hi.computeBoundingSphere();
-      hi.name = `trees-${key}-${tpl}`;
-      const lo = new THREE.InstancedMesh(tplLo[tpl].clone(), mat, n);
-      lo.instanceMatrix = hi.instanceMatrix;
-      lo.instanceColor = hi.instanceColor;
-      lo.geometry.setAttribute('iFlower', fAttr);
-      lo.geometry.setAttribute('iTrunk', tAttr);
-      lo.boundingSphere = hi.boundingSphere;
-      lo.name = `trees-lo-${key}-${tpl}`;
-      ctx.root.add(hi, lo);
-      // near/far LOD by distance to the chunk's extent (handled by a tick below)
-      lodPairs.push({ hi, lo, x0, x1, z0, z1 });
+      return need;
+    };
+    const fit = (it: Inst, sp: SpName, base: number): boolean => {
+      const S: Species = SP[sp];
+      const h = S.h[0] + (S.h[1] - S.h[0]) * it.s;
+      const w = S.w[0] + (S.w[1] - S.w[0]) * (it.s * 0.7 + hash2(it.x, it.y, 11) * 0.3);
+      for (const f of [1, 0.8, 0.62]) {
+        const need = liftNeeded(it.x, it.y, base, S.tpl, w * f, h);
+        if (need === Infinity) return false;
+        if (need > MAX_LIFT[S.tpl] * h) continue;
+        it.sp = sp;
+        it.w = w * f;
+        it.h = h;
+        it.lift = Math.max(0, need);
+        if (need > 0) stats.lifted++;
+        if (f < 1) stats.narrowed++;
+        return true;
+      }
+      return false;
+    };
+    let w = 0;
+    for (let i = 0; i < list.length; i++) {
+      const it = list[i];
+      const base = it.z ?? ctx.field.renAt(it.x, it.y) - 0.2;
+      it.z = base;
+      if (fit(it, it.sp, base)) list[w++] = it;
+      else if (it.mapped && it.sp !== 'palm' && fit(it, 'palm', base)) {
+        stats.palms++;
+        list[w++] = it;
+      } else stats.dropped++;
+      if (i % 20000 === 19999) await yieldFrame();
     }
+    list.length = w;
   }
+  const fitT1 = performance.now();
+  progress(0.75);
+  await yieldFrame();
+
+  // ---- per-template stores, sorted by cell (random order within a cell)
+  const gx0 = R[0];
+  const gy0 = R[1];
+  const gnx = Math.ceil((R[2] - R[0]) / CELL);
+  const gny = Math.ceil((R[3] - R[1]) / CELL);
+  const cellOf = (x: number, y: number) => clamp(Math.floor((y - gy0) / CELL), 0, gny - 1) * gnx + clamp(Math.floor((x - gx0) / CELL), 0, gnx - 1);
+  const keyed = list.map((it) => ({ it, cell: cellOf(it.x, it.y), ord: hash2(it.x, it.y, 31) }));
+  keyed.sort((a, b) => a.cell - b.cell || a.ord - b.ord);
+  const cellY0 = new Float32Array(gnx * gny).fill(Infinity);
+  const cellY1 = new Float32Array(gnx * gny).fill(-Infinity);
+  const stores: Store[] = [0, 1, 2].map((tpl) => {
+    const items = keyed.filter((e) => SP[e.it.sp].tpl === tpl);
+    const n = items.length;
+    const st: Store = {
+      n,
+      mat: new Float32Array(n * 16),
+      col: new Float32Array(n * 3),
+      flw: new Float32Array(n * 4),
+      trk: new Float32Array(n * 4),
+      p: new Float32Array(n * 3),
+      start: new Int32Array(gnx * gny),
+      count: new Int32Array(gnx * gny),
+    };
+    const m4 = new THREE.Matrix4();
+    const q = new THREE.Quaternion();
+    const up = new THREE.Vector3(0, 1, 0);
+    const pos = new THREE.Vector3();
+    const scl = new THREE.Vector3();
+    const col = new THREE.Color();
+    items.forEach(({ it, cell }, i) => {
+      const sp: Species = SP[it.sp];
+      const hgt = it.h!;
+      q.setFromAxisAngle(up, hash2(it.x, it.y, 12) * Math.PI * 2);
+      pos.set(it.x, it.z!, -it.y);
+      scl.set(it.w!, hgt, it.w!);
+      m4.compose(pos, q, scl);
+      m4.toArray(st.mat, i * 16);
+      const leafHex = sp.leaf[Math.floor(hash2(it.x, it.y, 13) * sp.leaf.length) % sp.leaf.length];
+      col.setHex(leafHex);
+      col.multiplyScalar(0.9 + hash2(it.x, it.y, 14) * 0.2);
+      st.col.set([col.r, col.g, col.b], i * 3);
+      col.setHex(sp.flower);
+      st.flw.set([col.r, col.g, col.b, sp.flowerAmt * (0.6 + hash2(it.x, it.y, 15) * 0.8)], i * 4);
+      col.setHex(sp.trunk);
+      // lift in units of the tree's height (the instance matrix scales y by it)
+      st.trk.set([col.r, col.g, col.b, (it.lift ?? 0) / hgt], i * 4);
+      st.p.set([it.x, it.z!, -it.y], i * 3);
+      if (st.count[cell] === 0) st.start[cell] = i;
+      st.count[cell]++;
+      cellY0[cell] = Math.min(cellY0[cell], it.z!);
+      cellY1[cell] = Math.max(cellY1[cell], it.z! + hgt + (it.lift ?? 0));
+    });
+    return st;
+  });
+  progress(0.9);
+
+  // ---- buckets: [lod][template]; near ones cast shadows
+  const mat = treeMaterial();
+  const depth = treeDepthMaterial();
+  const builders = [broadleaf, palm, conifer];
+  const BUCKETS = [
+    { lod: 0 as Lod, shadow: true, name: 'hi', cap: 1024 },
+    { lod: 1 as Lod, shadow: true, name: 'mid-sh', cap: 2048 },
+    { lod: 1 as Lod, shadow: false, name: 'mid', cap: 2048 },
+    { lod: 2 as Lod, shadow: false, name: 'far', cap: 8192 },
+  ];
+  const buckets: Bucket[][] = BUCKETS.map((b) =>
+    [0, 1, 2].map((tpl) => {
+      const bk = new Bucket(builders[tpl](b.lod), mat, `trees-${b.name}-${tpl}`, Math.min(b.cap, Math.max(16, stores[tpl].n)));
+      bk.mesh.castShadow = b.shadow;
+      bk.mesh.receiveShadow = b.lod < 2;
+      if (b.shadow) bk.mesh.customDepthMaterial = depth;
+      ctx.root.add(bk.mesh);
+      return bk;
+    }),
+  );
+  const [HI, MIDSH, MID, FAR] = buckets;
+
+  const last = { x: NaN, y: 0, z: 0, fx: 0, fy: 0, fz: 0, p0: 0, p5: 0 };
+  const fwd = new THREE.Vector3();
+  const frustum = new THREE.Frustum();
+  const pm = new THREE.Matrix4();
+  const planes = frustum.planes;
+  const rebuild = (cam: THREE.Camera): void => {
+    const px = last.x;
+    const py = last.y;
+    const pz = last.z;
+    for (const row of buckets) for (const b of row) b.n = 0;
+    // the shadow box (sky.ts) is +-(110 + 0.9 x camera height) and sits half its size ahead
+    const camH = Math.max(0, py - ctx.field.renAt(px, -pz));
+    const half = clamp(110 + camH * 0.9, 110, 700);
+    const rSh = 2 * half + 25;
+    const rMid = Math.max(R_MID, rSh);
+    pm.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    frustum.setFromProjectionMatrix(pm);
+    const inView = (cx: number, cy: number, cz: number, rad: number, dist: number): boolean => {
+      const m = rad + dist * VIEW_MARGIN;
+      for (let i = 0; i < 6; i++) {
+        const pl = planes[i];
+        if (pl.normal.x * cx + pl.normal.y * cy + pl.normal.z * cz + pl.constant < -m) return false;
+      }
+      return true;
+    };
+    const i0 = Math.max(0, Math.floor((px - R_FAR - gx0) / CELL));
+    const i1 = Math.min(gnx - 1, Math.floor((px + R_FAR - gx0) / CELL));
+    const j0 = Math.max(0, Math.floor((-pz - R_FAR - gy0) / CELL));
+    const j1 = Math.min(gny - 1, Math.floor((-pz + R_FAR - gy0) / CELL));
+    for (let j = j0; j <= j1; j++) {
+      // three.js z of the cell's north and south edges
+      const zn = -(gy0 + (j + 1) * CELL);
+      const zs = -(gy0 + j * CELL);
+      const dz = Math.max(zn - pz, 0, pz - zs);
+      for (let i = i0; i <= i1; i++) {
+        const c = j * gnx + i;
+        if (cellY1[c] < cellY0[c]) continue;
+        const xw = gx0 + i * CELL;
+        const dx = Math.max(xw - px, 0, px - xw - CELL);
+        const d = Math.hypot(dx, dz);
+        if (d > R_FAR) continue;
+        const cy = (cellY0[c] + cellY1[c]) / 2;
+        const vis = inView(xw + CELL / 2, cy, (zn + zs) / 2, CELL * 0.71 + (cellY1[c] - cellY0[c]) / 2, d);
+        if (d >= rMid) {
+          if (!vis) continue;
+          for (let tpl = 0; tpl < 3; tpl++) {
+            const st = stores[tpl];
+            const n = st.count[c];
+            if (n) FAR[tpl].push(st, st.start[c], n);
+          }
+          continue;
+        }
+        // near cells: per tree
+        for (let tpl = 0; tpl < 3; tpl++) {
+          const st = stores[tpl];
+          const n = st.count[c];
+          if (!n) continue;
+          const s0 = st.start[c];
+          const P = st.p;
+          for (let q = s0; q < s0 + n; q++) {
+            const ex = P[3 * q] - px;
+            const ez = P[3 * q + 2] - pz;
+            const d2 = Math.sqrt(ex * ex + ez * ez);
+            if (d2 < rSh) {
+              const ey = P[3 * q + 1] - py;
+              (d2 * d2 + ey * ey < R_HI * R_HI ? HI : MIDSH)[tpl].pushOne(st, q);
+            } else if (vis) (d2 < rMid ? MID : FAR)[tpl].pushOne(st, q);
+          }
+        }
+      }
+    }
+    for (const row of buckets) for (const b of row) b.commit();
+  };
   ctx.tick.push((_dt, camera) => {
-    const p = camera.position;
-    for (const l of lodPairs) {
-      const dx = Math.max(l.x0 - p.x, 0, p.x - l.x1);
-      const dz = Math.max(l.z0 - p.z, 0, p.z - l.z1);
-      const d = Math.hypot(dx, dz);
-      l.hi.visible = d < 380;
-      l.lo.visible = d >= 380 && d < 2600;
+    camera.updateWorldMatrix(true, false);
+    const e = camera.matrixWorld.elements;
+    const x = e[12];
+    const y = e[13];
+    const z = e[14];
+    fwd.set(-e[8], -e[9], -e[10]).normalize();
+    const pe = camera.projectionMatrix.elements;
+    const moved = !(Math.hypot(x - last.x, y - last.y, z - last.z) < MOVE);
+    const turned = fwd.x * last.fx + fwd.y * last.fy + fwd.z * last.fz < TURN_COS;
+    const zoomed = Math.abs(pe[0] - last.p0) > 0.02 * Math.abs(pe[0]) || Math.abs(pe[5] - last.p5) > 0.02 * Math.abs(pe[5]);
+    if (!moved && !turned && !zoomed) return;
+    Object.assign(last, { x, y, z, fx: fwd.x, fy: fwd.y, fz: fwd.z, p0: pe[0], p5: pe[5] });
+    const t0 = performance.now();
+    rebuild(camera);
+    if (debug) {
+      debug.rebuilds++;
+      debug.lastMs = performance.now() - t0;
+      debug.maxMs = Math.max(debug.maxMs, debug.lastMs);
+      debug.counts = buckets.map((row) => row.map((b) => b.n));
     }
   });
+  // ?world=debug: window.__trees has the bucket sizes and rebuild cost
+  const debug = location.search.includes('world=debug') ? { rebuilds: 0, lastMs: 0, maxMs: 0, counts: [] as number[][] } : null;
+  if (debug) (window as unknown as { __trees: typeof debug }).__trees = debug;
+  console.info(
+    `[world] trees by roads (${Math.round(fitT1 - fitT0)} ms): ${stats.lifted} crowns lifted, ${stats.narrowed} narrowed, ${stats.palms} swapped for palms, ${stats.dropped} left out`,
+  );
   progress(1);
   return list.length;
 }
-
-const lodPairs: { hi: THREE.InstancedMesh; lo: THREE.InstancedMesh; x0: number; x1: number; z0: number; z1: number }[] = [];
