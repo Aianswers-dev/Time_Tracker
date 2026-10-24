@@ -2117,7 +2117,17 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       const roof = c.z + hc[k];
       const half = wallOff + 1.2;
       const st = L.struct;
-      for (const sd of [1, -1]) st.boxF(c.x + c.nx * sd * (half - 0.3) - tx * 0.3, c.y + c.ny * sd * (half - 0.3) - ty * 0.3, c.z - 0.2, roof, tx, ty, 0.3, 0.3, ...CONC);
+      // nothing of the portal stands on another carriageway at this level (a station bay's portal beside
+      // its busway's, two tubes side by side) or on a platform
+      const clear = (o: number, m: number) => {
+        const x = c.x + c.nx * o;
+        const y = c.y + c.ny * o;
+        return tubeNb(x, y, c.z) <= -m && !data.platforms.some((pf) => pf.area && pointInRing(x, y, pf.pts));
+      };
+      for (const sd of [1, -1]) {
+        if (!clear(sd * (half - 0.3), 0.6)) continue;
+        st.boxF(c.x + c.nx * sd * (half - 0.3) - tx * 0.3, c.y + c.ny * sd * (half - 0.3) - ty * 0.3, c.z - 0.2, roof, tx, ty, 0.3, 0.3, ...CONC);
+      }
       const N = Math.max(4, Math.round((2 * half) / 1.2));
       const w = (2 * half) / N;
       let lintelTop = Infinity;
@@ -2125,6 +2135,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const o = -half + (j + 0.5) * w;
         const px = c.x + c.nx * o;
         const py = c.y + c.ny * o;
+        if (tubeNb(px, py, c.z) > 0) continue;
         const g = Math.max(groundAt(px + tx * 3, py + ty * 3), roof + 0.6);
         let top = g + 0.3;
         const above = index.lowestAbove(px - tx * 0.4, py - ty * 0.4, roof - 0.5, 0.5);
@@ -2142,7 +2153,11 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       // lintel beam over the opening, standing 0.3 m proud of the headwall
       const lt = Math.min(roof + 1.0, lintelTop);
       if (lt > roof + 0.3) {
-        st.boxF(c.x - tx * 0.45, c.y - ty * 0.45, roof - 0.2, lt, tx, ty, 0.45, wallOff + 0.6, ...CONC);
+        // (only over this carriageway on a side where another one runs alongside)
+        const eL = clear(hw + 0.6, 0.3) ? wallOff + 0.6 : hw;
+        const eR = clear(-(hw + 0.6), 0.3) ? wallOff + 0.6 : hw;
+        const mo = (eL - eR) / 2;
+        st.boxF(c.x + c.nx * mo - tx * 0.45, c.y + c.ny * mo - ty * 0.45, roof - 0.2, lt, tx, ty, 0.45, (eL + eR) / 2, ...CONC);
         if (plate >= 0 && lt > roof + 0.75) namePlate(L, c.x - tx * 0.905, c.y - ty * 0.905, tx, ty, roof + (lt - roof - 0.2) / 2 - 0.1 + 0.0, Math.min(0.62, lt - roof - 0.1), wallOff * 2 - 0.4, plate);
       }
       // ground over the mouth (covers the carved edge of the approach cutting)
@@ -2159,8 +2174,9 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       for (let a = 0; a + 1 < rows.length; a++) for (let b = 0; b + 1 < cols.length; b++) g.quad(ids[a][b], ids[a][b + 1], ids[a + 1][b + 1], ids[a + 1][b], 0, 1, 0);
     };
     for (const [k, inward] of tp.portals) portalAt(k, inward);
-    // a covered dead end (the way stops here and nothing joins it): an end wall across the tube
-    for (const end of [0, 1]) {
+    // a covered dead end (the way stops here and nothing joins it): an end wall across the tube (never at
+    // a station bay's ends, which taper into the busway without joining it in the graph)
+    for (const end of r.bay ? [] : [0, 1]) {
       const k = end === 0 ? 0 : ss.length - 1;
       const v = end === 0 ? 0 : ri.n - 1;
       if ((nodes.get(nodeKey(r.pts[2 * v], r.pts[2 * v + 1]))?.deg ?? 0) !== 1 || !cov[k]) continue;
@@ -2178,7 +2194,21 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       };
       const oL = span(1, reach[0][sg] ?? 0);
       const oR = span(-1, reach[1][sg] ?? 0);
-      t.quad(e(-oR, -0.3), e(oL, -0.3), e(oL, hc[k]), e(-oR, hc[k]), -ox, 0, oy);
+      // never across another carriageway at this level (a station bay tapering into its busway, a road
+      // ending on another's edge): only from the tube's walls in to where that carriageway begins
+      const onRoad = (o: number) => tubeNb(c.x + c.nx * o + ox * 0.3, c.y + c.ny * o + oy * 0.3, c.z) > -0.15;
+      const piece = (a: number, b: number) => {
+        if (b - a > 0.1) t.quad(e(a, -0.3), e(b, -0.3), e(b, hc[k]), e(a, hc[k]), -ox, 0, oy);
+      };
+      let l0 = oL;
+      while (l0 - 0.25 > -oR && !onRoad(l0 - 0.25)) l0 -= 0.25;
+      if (l0 - 0.25 <= -oR) piece(-oR, oL);
+      else {
+        piece(l0, oL);
+        let r1 = -oR;
+        while (r1 + 0.25 < l0 && !onRoad(r1 + 0.25)) r1 += 0.25;
+        piece(-oR, r1);
+      }
     }
     tubesBuilt.push({ ri, tp, L, reach, open: openSide, boxSeg });
   }
