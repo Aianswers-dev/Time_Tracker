@@ -8,6 +8,7 @@ import * as THREE from 'three';
 import { RoadKind } from '../types';
 import { type Ctx, densityAt } from './ctx';
 import { MeshGeo } from './geo';
+import { cellInstances } from './instcells';
 import type { RoadIndex } from './roadindex';
 import { type RI, markMaterial, roadAt, structMaterial } from './roads';
 import { U, patch } from './shaders';
@@ -215,19 +216,19 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
   const struct = structMaterial(ctx, 'furn');
   {
     const poleMat = patch(new THREE.MeshLambertMaterial({ color: 0x8c9294 }), { key: 'pole' });
-    const pm = new THREE.InstancedMesh(poleTemplate(), poleMat, poles.length);
+    const pmM = new Float32Array(poles.length * 16);
     poles.forEach((p, i) => {
       m4.makeScale(0.2, p.h, 0.2).setPosition(p.x, p.z, -p.y);
-      pm.setMatrixAt(i, m4);
+      m4.toArray(pmM, i * 16);
     });
-    const am = new THREE.InstancedMesh(boxTemplate(), poleMat, arms.length);
+    const amM = new Float32Array(arms.length * 16);
     arms.forEach((a, i) => {
       const ang = Math.atan2(a.dy, a.dx); // local +x -> map direction (dx, dy)
       q.setFromAxisAngle(yAxis, ang);
       v.set(a.x + (a.dx * a.len) / 2, a.h, -(a.y + (a.dy * a.len) / 2));
       sc.set(a.len, 0.16, 0.16);
       m4.compose(v, q, sc);
-      am.setMatrixAt(i, m4);
+      m4.toArray(amM, i * 16);
     });
     const headMat = patch(new THREE.MeshLambertMaterial({ color: 0x1a1c1e }), {
       key: 'sighead',
@@ -254,7 +255,7 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       ],
     });
     const hgeo = headTemplate();
-    const hm = new THREE.InstancedMesh(hgeo, headMat, heads.length);
+    const hmM = new Float32Array(heads.length * 16);
     const sigAttr = new Float32Array(heads.length * 4);
     const grpAttr = new Float32Array(heads.length);
     heads.forEach((h, i) => {
@@ -264,24 +265,27 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       v.set(h.x, h.h, -h.y);
       sc.set(1, 1, 1);
       m4.compose(v, q, sc);
-      hm.setMatrixAt(i, m4);
+      m4.toArray(hmM, i * 16);
       const j = junctions[h.j];
       const ph = j.phases[h.group];
       sigAttr.set([j.offset, j.cycle, ph.start, ph.green], i * 4);
       grpAttr[i] = h.group;
     });
-    hgeo.setAttribute('iSig', new THREE.InstancedBufferAttribute(sigAttr, 4));
-    hgeo.setAttribute('iGroup', new THREE.InstancedBufferAttribute(grpAttr, 1));
-    for (const m of [pm, am, hm]) {
-      m.castShadow = true;
-      m.receiveShadow = true;
-      m.computeBoundingSphere();
-      m.frustumCulled = false;
-      ctx.root.add(m);
-    }
-    pm.name = 'signal-poles';
-    am.name = 'signal-arms';
-    hm.name = 'signal-heads';
+    // within 1.2 km (a signal head is under a pixel beyond), shadows from those near the shadow box
+    const sig = { range: 1200, castShadow: true, receiveShadow: true };
+    cellInstances(ctx, poleTemplate(), poleMat, pmM, [], { ...sig, name: 'signal-poles' });
+    cellInstances(ctx, boxTemplate(), poleMat, amM, [], { ...sig, name: 'signal-arms' });
+    cellInstances(
+      ctx,
+      hgeo,
+      headMat,
+      hmM,
+      [
+        { name: 'iSig', size: 4, data: sigAttr },
+        { name: 'iGroup', size: 1, data: grpAttr },
+      ],
+      { ...sig, name: 'signal-heads' },
+    );
   }
   progress(0.35);
   await yieldFrame();
@@ -424,18 +428,22 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       }
       a.push(l);
     }
+    // the poles (a hairline beyond 1.5 km), shadows from those near the shadow box; glows and pools by 1.5 km chunk
+    const poleM = new Float32Array(lights.length * 16);
+    lights.forEach((l, i) => {
+      q.setFromAxisAngle(yAxis, l.ang);
+      v.set(l.x, l.z, -l.y);
+      m4.compose(v, q, sc.set(1, 1, 1));
+      m4.toArray(poleM, i * 16);
+    });
+    cellInstances(ctx, tpl, poleMat, poleM, [], { name: 'streetlights', range: 1500, castShadow: true, receiveShadow: true });
     for (const [key, ls] of byChunk) {
       const n = ls.length;
-      const pm = new THREE.InstancedMesh(tpl, poleMat, n);
       const gm = new THREE.InstancedMesh(quadGeo, glowMat, n);
       const om = new THREE.InstancedMesh(poolGeo, poolMat, n);
       let cx = 0;
       let cz = 0;
       ls.forEach((l, i) => {
-        q.setFromAxisAngle(yAxis, l.ang);
-        v.set(l.x, l.z, -l.y);
-        m4.compose(v, q, sc.set(1, 1, 1));
-        pm.setMatrixAt(i, m4);
         const hx = l.x + Math.cos(l.ang) * 2.55;
         const hz = -l.y - Math.sin(l.ang) * 2.55;
         m4.makeScale(3.2, 3.2, 3.2).setPosition(hx, l.z + 9.0, hz);
@@ -445,9 +453,7 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
         cx += l.x;
         cz -= l.y;
       });
-      pm.castShadow = true;
-      pm.receiveShadow = true;
-      for (const m of [pm, gm, om]) {
+      for (const m of [gm, om]) {
         m.computeBoundingSphere();
         m.name = `streetlights-${key}`;
         ctx.root.add(m);
@@ -456,7 +462,6 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       om.renderOrder = 4;
       cx /= n;
       cz /= n;
-      ctx.cull.push({ obj: pm, x: cx, z: cz, range: 2600 });
       ctx.cull.push({ obj: gm, x: cx, z: cz, range: 6000 });
       ctx.cull.push({ obj: om, x: cx, z: cz, range: 2600 });
       nightOnly.push(gm, om);
@@ -501,17 +506,13 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
     mg.beam(0, 6.6, 0, 3.6, 6.6, 0, 0.05, 120, 124, 126);
     mg.beam(0, 7.1, 0, 3.6, 6.65, 0, 0.03, 120, 124, 126);
     const mastGeo = mg.build();
-    const mm = new THREE.InstancedMesh(mastGeo, struct, masts.length);
+    const mastM = new Float32Array(masts.length * 16);
     masts.forEach((m, i) => {
       q.setFromAxisAngle(yAxis, m.ang);
       m4.compose(v.set(m.x, m.z, -m.y), q, sc.set(1, 1, 1));
-      mm.setMatrixAt(i, m4);
+      m4.toArray(mastM, i * 16);
     });
-    mm.castShadow = true;
-    mm.computeBoundingSphere();
-    mm.name = 'rail-masts';
-    mm.frustumCulled = false;
-    ctx.root.add(mm);
+    cellInstances(ctx, mastGeo, struct, mastM, [], { name: 'rail-masts', range: 1500, castShadow: true });
   }
   progress(0.8);
   await yieldFrame();
@@ -550,18 +551,13 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       const by = ly * side;
       items.push({ x, y, z: nr.z + 0.15, ang: Math.atan2(-bx, by) });
     }
-    const sm = new THREE.InstancedMesh(tpl, struct, items.length);
+    const shM = new Float32Array(items.length * 16);
     items.forEach((it, i) => {
       q.setFromAxisAngle(yAxis, it.ang);
       m4.compose(v.set(it.x, it.z, -it.y), q, sc.set(1, 1, 1));
-      sm.setMatrixAt(i, m4);
+      m4.toArray(shM, i * 16);
     });
-    sm.castShadow = true;
-    sm.receiveShadow = true;
-    sm.computeBoundingSphere();
-    sm.frustumCulled = false;
-    sm.name = 'shelters';
-    ctx.root.add(sm);
+    cellInstances(ctx, tpl, struct, shM, [], { name: 'shelters', range: 1500, castShadow: true, receiveShadow: true });
   }
   progress(1);
 
