@@ -490,6 +490,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   const infos = roads.map((r, i) => prepRoad(r, i));
   const index = new RoadIndex(roads, data.bounds);
   const tunnels = new RoadIndex(roads, data.bounds, (r) => r.tunnel);
+  // station stopping bays (pipeline roads beside the busway, under the platform's edge)
+  const bays = new RoadIndex(roads, data.bounds, (r) => !!r.bay);
   const mask = ctx.mask;
   const underPlatforms = data.platforms.filter((p) => p.underground || p.layer < 0);
   // each underground platform's level: the bus tunnel beside it, where src/game/platforms.ts takes the
@@ -1110,6 +1112,20 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   }
 
   /**
+   * Far edge of the station bay pavement alongside a busway, along the ray from (x, y) in the unit
+   * direction (dx, dy): a bay that starts within 1 m of the carriageway edge `hw`, followed out to where
+   * it ends (it widens beside the platform and tapers away beyond its ends). -1 if there is none.
+   */
+  function bayFar(x: number, y: number, z: number, dx: number, dy: number, hw: number): number {
+    let last = -1;
+    for (let o = hw - 0.25; o <= hw + 14; o += 0.25) {
+      if (bays.penetrationZ(x + dx * o, y + dy * o, z, 1.2) > 0.05) last = o;
+      else if (last > 0 || o > hw + 1) break;
+    }
+    return last;
+  }
+
+  /**
    * Shoulders / retaining walls / cuttings on one side of an at-grade road.
    * Profile types per sample: 0 none (junction), 1 batter, 2 cutting wall, 3 fill wall.
    */
@@ -1127,9 +1143,10 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     if (m1 && ss[n - 1] === ri.len) P[n - 1] = { ...P[n - 1], nx: m1[0], ny: m1[1] };
     // A station platform beside a busway: the batter or cutting wall stands behind it, with the stopping
     // bay and the platform's footprint level with the road in front (from one sample before each
-    // platform end on, so a cutting wall never cuts across the platform's corner).
+    // platform end on, so a cutting wall never cuts across the platform's corner); beyond the platform's
+    // ends it stands behind the bay as it tapers back into the busway.
     let pfar: Float32Array | null = null;
-    if (r.kind === RoadKind.Busway && gradePlatforms.length) {
+    if (r.kind === RoadKind.Busway && !r.bay) {
       let rx0 = Infinity;
       let ry0 = Infinity;
       let rx1 = -Infinity;
@@ -1141,11 +1158,18 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         ry1 = Math.max(ry1, r.pts[i + 1]);
       }
       const R = hw + 16;
-      if (gradePlatforms.some((g) => g.x0 < rx1 + R && g.x1 > rx0 - R && g.y0 < ry1 + R && g.y1 > ry0 - R)) {
-        const at0 = ss.map((s) => {
-          const c = roadAt(ri, s);
-          return platformFar(c.x, c.y, c.nx * side, c.ny * side, hw);
-        });
+      // (only a platform or bay on our side: one beyond the other carriageway of a dual busway is its)
+      const carriageway = (q: number) => !roads[q].bay && roads[q].kind !== RoadKind.Pedestrian;
+      const far = (c: ReturnType<typeof roadAt>) => {
+        const dx = c.nx * side;
+        const dy = c.ny * side;
+        const f = Math.max(platformFar(c.x, c.y, dx, dy, hw), bayFar(c.x, c.y, c.z, dx, dy, hw));
+        for (let o = hw + 0.5; o < f - 0.3; o += 0.5) if (index.penetrationZ(c.x + dx * o, c.y + dy * o, c.z, 1.5, ri.i, carriageway) > 0.3) return -1;
+        return f;
+      };
+      const nearBay = P.some((c) => bays.nearest(c.x, c.y, R) !== null);
+      if (nearBay || gradePlatforms.some((g) => g.x0 < rx1 + R && g.x1 > rx0 - R && g.y0 < ry1 + R && g.y1 > ry0 - R)) {
+        const at0 = ss.map((s) => far(roadAt(ri, s)));
         if (at0.some((v) => v > 0)) {
           pfar = new Float32Array(n).fill(-1);
           for (let k = 0; k < n; k++) {
@@ -1153,10 +1177,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
             const sb = ss[Math.min(n - 1, k + 1)];
             if (Math.max(at0[Math.max(0, k - 1)], at0[k], at0[Math.min(n - 1, k + 1)]) <= 0 && sb - sa < 12) continue;
             const steps = Math.max(1, Math.ceil((sb - sa) / 0.5));
-            for (let q = 0; q <= steps; q++) {
-              const c = roadAt(ri, sa + ((sb - sa) * q) / steps);
-              pfar[k] = Math.max(pfar[k], platformFar(c.x, c.y, c.nx * side, c.ny * side, hw));
-            }
+            for (let q = 0; q <= steps; q++) pfar[k] = Math.max(pfar[k], far(roadAt(ri, sa + ((sb - sa) * q) / steps)));
           }
         }
       }
