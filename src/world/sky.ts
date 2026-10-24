@@ -140,12 +140,15 @@ export class SkySystem {
       fragmentShader: DOME_FRAG,
       side: THREE.BackSide,
       depthWrite: false,
-      depthTest: false,
       fog: false,
     });
     this.dome = new THREE.Mesh(new THREE.SphereGeometry(4000, 48, 24), mat);
     this.dome.frustumCulled = false;
-    this.dome.renderOrder = -1000;
+    // Drawn after the opaque world with the depth test on, so the clouds and stars are
+    // only shaded where no building, terrain or cab covers them (the dome's plain depth
+    // at 4 km is beyond every log-depth value nearer than ~6 km). Transparent things
+    // (glass, glows) still draw over it afterwards.
+    this.dome.renderOrder = 1e6;
     this.dome.name = 'sky';
     scene.add(this.dome);
 
