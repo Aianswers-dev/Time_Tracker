@@ -1391,6 +1391,14 @@ export class RouteTrack {
             idx.forEachNear(sx, sy, 1.2, (ri) => {
               if (!data.roads[ri].tunnel) tunnelOnly = false;
             });
+            // The traffic the node faces along its own road (OSM traffic_signals:direction, from the
+            // pipeline), against the lane's way in over the last 12 m (before any turn at the node).
+            const rk = data.signalRoad?.[k] ?? -1;
+            const dk = data.signalDir?.[k] ?? 0;
+            const i0 = Math.max(0, i - 3);
+            const inL = Math.hypot(X[i] - X[i0], Y[i] - Y[i0]);
+            const inX = inL > 1 ? (X[i] - X[i0]) / inL : this.tx[i];
+            const inY = inL > 1 ? (Y[i] - Y[i0]) / inL : this.ty[i];
             idx.forEachNear(sx, sy, 1.2, (ri, _ax, _ay, ux, uy, _len, _d, zz) => {
               const r = data.roads[ri];
               if (r.tunnel && !tunnelOnly) return;
@@ -1400,6 +1408,12 @@ export class RouteTrack {
               const fwd = ux * this.tx[i] + uy * this.ty[i];
               // (A one-way carriageway the other way: the general lanes beside a contraflow bus lane.)
               if (r.oneway && fwd < -0.5) return;
+              // A node facing one way controls the lane coming in that way, as the signal model has it
+              // (src/data/signals.ts): not the opposing lane past it, nor a cross street at its vertex.
+              if (dk && rk >= 0) {
+                if (ri === rk) applies ||= (ux * inX + uy * inY) * dk > 0.5;
+                return;
+              }
               // A node out on an approach to a junction controls the traffic heading into it: not the
               // traffic leaving it (the signal for the other direction, on the arm the lane turns into).
               const cum = roadCum(r);
