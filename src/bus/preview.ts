@@ -57,7 +57,7 @@ const ROUTES: Record<string, [string, string]> = {
 
 function fakeRoute(id: string): Route {
   const [headsign, operator] = ROUTES[id] ?? ['City', 'BT'];
-  return { id, name: id, dir: 0, headsign, color: '#000', textColor: '#fff', operator, trips: 1, pts: new Float32Array(4), cum: new Float32Array(2), length: 1, stops: [] };
+  return { id, name: id, dir: 0, headsign, color: '#000', textColor: '#fff', operator, trips: 1, pts: new Float32Array(4), cum: new Float32Array(2), z: new Float32Array(2), length: 1, stops: [] };
 }
 
 function poseFor(bus: BusMesh, x: number, y: number, heading: number, bendDeg: number, steer: number): BusPose {

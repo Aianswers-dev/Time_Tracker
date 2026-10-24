@@ -31,7 +31,9 @@ interface Shot {
   kind: ShotKind;
   x: number;
   y: number;
+  /** Height above the bus's road level (moving shots) and absolute height (fixed shots, m AHD). */
   h: number;
+  z: number;
   t: number;
   maxT: number;
   side: number;
@@ -70,6 +72,8 @@ export class CameraRig {
   lookIntoTurns = true;
   /** The bus and cab last passed to update() (for tooling). */
   last: { bus: BusMesh; cab: Cab } | null = null;
+  /** Chase-camera internals from the last frame (for tooling). */
+  readonly debug: Record<string, number> = {};
 
   private collider: SimCollider | null;
   private interior: boolean | null = null;
@@ -95,6 +99,10 @@ export class CameraRig {
   private chasePull = 1;
   private topHeading = 0;
   private headingInit = false;
+  /** Smoothed bus height (m AHD) and 0..1 "in a tunnel" blend. */
+  private busZ = 0;
+  private busZInit = false;
+  private tunnelF = 0;
 
   // cinematic
   private shot: Shot | null = null;
@@ -169,6 +177,14 @@ export class CameraRig {
       this.headingInit = true;
     }
     this.shakeAmp *= Math.exp(-dt * 5);
+    let zs = 0;
+    for (const sp of pose.sections) zs += sp.z ?? pose.z ?? 0;
+    const zNow = pose.sections.length ? zs / pose.sections.length : (pose.z ?? 0);
+    if (!this.busZInit || Math.abs(zNow - this.busZ) > 8) {
+      this.busZ = zNow;
+      this.busZInit = true;
+    } else this.busZ = damp(this.busZ, zNow, 10, dt);
+    this.tunnelF = damp(this.tunnelF, telemetry.inTunnel ? 1 : 0, 2.5, dt);
 
     let targetFov = 70;
     switch (this.mode) {
@@ -320,31 +336,51 @@ export class CameraRig {
     const pitchAdd = sim ? sim.lookPitch : 0;
 
     // Behind the rear face: ~8 m for a 12.5 m bus, ~11 m for the 25 m Metro (plus a little with speed).
-    const dist = 5 + L * 0.25 + this.zoomChase + Math.min(3, speed * 0.12);
-    const hgt = Math.max(1.5, 2.6 + L * 0.14 + this.zoomChase * 0.3 - pitchAdd * 8);
+    // In a tunnel: lower and closer, under the ~5 m ceiling.
+    const tf = this.tunnelF;
+    const dist = (5 + L * 0.25 + this.zoomChase + Math.min(3, speed * 0.12)) * (1 - 0.35 * tf);
+    let hgt = Math.max(1.5, 2.6 + L * 0.14 + this.zoomChase * 0.3 - pitchAdd * 8);
+    hgt = hgt + (Math.min(hgt, 3.9) - hgt) * tf;
     const hd = this.chaseHeading + orbit;
+    const bz = this.busZ;
     // Desired offset from the vehicle centre (map coords), behind along the smoothed heading.
     let ox = -Math.sin(hd) * (dist + L / 2);
     let oy = -Math.cos(hd) * (dist + L / 2);
-    // Keep the camera out of buildings: pull in along the ray if something tall is in the way.
-    if (this.collider) {
-      const t = this.collider.raycast(cx, cy, cx + ox, cy + oy, hgt - 0.5);
-      const target = t < 1 ? Math.max(0.25, t - 1.0 / Math.hypot(ox, oy)) : 1;
-      this.chasePull = damp(this.chasePull, target, target < this.chasePull ? 10 : 2, dt);
+    let oz = hgt;
+    const col = this.collider;
+    if (col) {
+      // Not under the road or the ground behind the bus (hills, ramps)...
+      const gx = cx + ox;
+      const gy = cy + oy;
+      const under = col.surface(gx, gy, bz, 2.5);
+      const floor = (under.road >= 0 ? under.z : tf > 0.5 ? bz : col.ground(gx, gy)) + 1.2 - bz;
+      if (oz < floor) oz = floor;
+      // ...and pulled in along the line of sight past buildings, walls, tunnel walls and hillsides.
+      const t = col.lineOfSight(cx, cy, bz + 2.0, cx + ox, cy + oy, bz + oz, L / 2 + 2);
+      this.debug.los = t;
+      this.debug.floor = floor;
+      this.debug.under = under.road;
+      this.debug.dist = Math.hypot(ox, oy);
+      const lenO = Math.hypot(ox, oy, oz - 2);
+      const target = t < 1 ? Math.max(0.15, t - 0.8 / Math.max(lenO, 1)) : 1;
+      this.chasePull = damp(this.chasePull, target, target < this.chasePull ? 12 : 2, dt);
       ox *= this.chasePull;
       oy *= this.chasePull;
+      oz = 2 + (oz - 2) * this.chasePull;
     }
-    const off = this.tmpV.set(ox, hgt + (1 - this.chasePull) * 3, -oy);
+    const off = this.tmpV.set(ox, oz, -oy);
     const o = this.chaseOffset.update(off, 6, dt);
     const lead = Math.min(L * 0.25 + speed * 0.3, 14);
     const turn = clamp(telemetry.yawRate * Math.max(speed, 2) * 0.9, -8, 8);
     const fH = this.chaseHeading;
     const lx = cx + Math.sin(fH) * lead + Math.cos(fH) * turn;
     const ly = cy + Math.cos(fH) * lead - Math.sin(fH) * turn;
-    const look = this.chaseTarget.update(this.tmpV2.set(lx - cx, 1.6, -(ly - cy)), 8, dt);
-    this.camera.position.set(cx + o.x, o.y, -cy + o.z);
+    // Look ahead along the grade too.
+    const lz = 1.6 + Math.tan(telemetry.grade) * lead;
+    const look = this.chaseTarget.update(this.tmpV2.set(lx - cx, lz, -(ly - cy)), 8, dt);
+    this.camera.position.set(cx + o.x, bz + o.y, -cy + o.z);
     this.camera.up.set(0, 1, 0);
-    this.camera.lookAt(cx + look.x, look.y, -cy + look.z);
+    this.camera.lookAt(cx + look.x, bz + look.y, -cy + look.z);
     if (this.shakeAmp > 1e-3) this.camera.rotateZ(this.shakeAmp * Math.sin(this.time * 53) * 0.3);
   }
 
@@ -361,9 +397,14 @@ export class CameraRig {
     const ahead = L * 0.4 + Math.abs(pose.speed) * 0.8;
     const tx = cx + Math.sin(this.topHeading) * ahead;
     const ty = cy + Math.cos(this.topHeading) * ahead;
-    this.camera.position.set(tx - fx * H * 0.18, H, -(ty - fy * H * 0.18));
+    const bz = this.busZ;
+    // In a tunnel the street is in the way: drop to a steep view inside the tube.
+    const tf = this.tunnelF;
+    const h = H + (4.4 - H) * tf;
+    const back = H * 0.18 + (L * 0.5 + 3 - H * 0.18) * tf;
+    this.camera.position.set(tx - fx * back, bz + h, -(ty - fy * back));
     this.camera.up.set(fx, 0, -fy);
-    this.camera.lookAt(tx, 0, -ty);
+    this.camera.lookAt(tx, bz, -ty);
   }
 
   // ---------------------------------------------------------------------------
@@ -399,7 +440,7 @@ export class CameraRig {
       const d = Math.hypot(dx, dy);
       if (fwd < -(L * 0.5 + 10) || d > 140) s = null;
       if (s && this.collider && Math.floor(s.t * 4) !== Math.floor((s.t - dt) * 4)) {
-        const clear = this.collider.raycast(s.x, s.y, cx, cy, s.h + 0.5) >= 0.999;
+        const clear = this.collider.lineOfSight(s.x, s.y, s.z, cx, cy, this.busZ + 1.6) >= 0.98;
         s.blocked = clear ? 0 : s.blocked + 0.25;
         if (s.blocked > 0.6) s = null;
       }
@@ -407,28 +448,37 @@ export class CameraRig {
     if (s && s.t > s.maxT) s = null;
     if (!s) s = this.newShot(pose, cx, cy, L);
     this.shot = s;
+    const bz = this.busZ;
+    const tunnel = this.tunnelF > 0.5;
 
-    // Moving shots.
-    if (s.kind === 'tracking') {
-      const hd = pose.heading;
-      const back = -2 - L * 0.1;
-      s.x = cx + Math.sin(hd) * back + Math.cos(hd) * s.side * (5.5 + L * 0.12);
-      s.y = cy + Math.cos(hd) * back - Math.sin(hd) * s.side * (5.5 + L * 0.12);
-      if (this.collider?.pointInBuilding(s.x, s.y, 0)) s.maxT = Math.min(s.maxT, s.t + 0.2);
-    } else if (s.kind === 'orbit') {
-      s.angle += dt * 0.16 * s.side;
-      const r = 12 + L * 0.55;
-      s.x = cx + Math.sin(s.angle) * r;
-      s.y = cy + Math.cos(s.angle) * r;
+    // Moving shots ride along at the bus's level (kept inside the tube in tunnels, above ground outside).
+    if (s.kind === 'tracking' || s.kind === 'orbit') {
+      if (s.kind === 'tracking') {
+        const hd = pose.heading;
+        const back = -2 - L * 0.1;
+        const lat = s.side * (tunnel ? 2.4 : 5.5 + L * 0.12);
+        s.x = cx + Math.sin(hd) * back + Math.cos(hd) * lat;
+        s.y = cy + Math.cos(hd) * back - Math.sin(hd) * lat;
+      } else {
+        s.angle += dt * 0.16 * s.side;
+        const r = tunnel ? 7 + L * 0.3 : 12 + L * 0.55;
+        s.x = cx + Math.sin(s.angle) * r;
+        s.y = cy + Math.cos(s.angle) * r;
+      }
+      let z = bz + (tunnel ? Math.min(s.h, 3.2) : s.h);
+      const col = this.collider;
+      if (col && !tunnel) z = Math.max(z, col.ground(s.x, s.y) + 1);
+      s.z = z;
+      if (col && (col.pointInBuilding(s.x, s.y, z) || col.lineOfSight(s.x, s.y, z, cx, cy, bz + 1.6) < 0.9)) s.maxT = Math.min(s.maxT, s.t + 0.3);
     }
 
     const first = s.t < dt * 1.5;
     if (first) this.shotLook.init = false;
-    const look = this.shotLook.update(this.tmpV2.set(cx + Math.sin(pose.heading) * 2, 1.5, -(cy + Math.cos(pose.heading) * 2)), 4, dt);
-    this.camera.position.set(s.x, s.h, -s.y);
+    const look = this.shotLook.update(this.tmpV2.set(cx + Math.sin(pose.heading) * 2, bz + 1.5, -(cy + Math.cos(pose.heading) * 2)), 4, dt);
+    this.camera.position.set(s.x, s.z, -s.y);
     this.camera.up.set(0, 1, 0);
     this.camera.lookAt(look);
-    const dist = Math.hypot(s.x - cx, s.y - cy, s.h - 1.5);
+    const dist = Math.hypot(s.x - cx, s.y - cy, s.z - bz - 1.5);
     const span = s.kind === 'drone' ? L * 0.9 + 8 : L * 0.62 + 2;
     const fov = ((2 * Math.atan(span / Math.max(1, dist))) * 180) / Math.PI;
     return clamp(fov, s.kind === 'roadside' ? 14 : 22, 62);
@@ -437,29 +487,39 @@ export class CameraRig {
   private newShot(pose: BusPose, cx: number, cy: number, L: number): Shot {
     const speed = Math.abs(pose.speed);
     const side = this.rand() < 0.62 ? -1 : 1; // favour the kerb (left) side
-    const base: Shot = { kind: 'roadside', x: cx, y: cy, h: 1.6, t: 0, maxT: 14, side, blocked: 0, angle: 0 };
+    const bz = this.busZ;
+    const tunnel = this.tunnelF > 0.5;
+    const base: Shot = { kind: 'roadside', x: cx, y: cy, h: 1.6, z: bz + 1.6, t: 0, maxT: 14, side, blocked: 0, angle: 0 };
     if (this.stillT > 1.5) {
       // Start off the front quarter on the kerb side and drift slowly round.
       return { ...base, kind: 'orbit', h: 3.2 + this.rand() * 3, angle: pose.heading + side * (0.6 + this.rand() * 0.6), maxT: 30 };
     }
     const roll = this.rand();
     if (roll < 0.18) return { ...base, kind: 'tracking', h: 1.3 + this.rand() * 1.5, maxT: 6 + this.rand() * 4 };
-    const kind: ShotKind = roll < 0.36 ? 'drone' : roll < 0.48 ? 'lowfront' : 'roadside';
+    let kind: ShotKind = roll < 0.36 ? 'drone' : roll < 0.48 ? 'lowfront' : 'roadside';
+    if (tunnel && kind === 'drone') kind = 'roadside';
     // Predict where the bus will be in a few seconds along its current arc.
     for (let attempt = 0; attempt < 8; attempt++) {
       const ahead = (kind === 'lowfront' ? 22 : 38) + speed * (kind === 'drone' ? 3.2 : 2.4) + this.rand() * 14 + L * 0.5;
       const tAhead = ahead / Math.max(speed, 4);
       const hd = pose.heading + clamp(telemetry.yawRate, -0.25, 0.25) * tAhead * 0.5;
       const sd = attempt % 2 === 0 ? side : -side;
-      const lat = kind === 'lowfront' ? sd * (2.5 + this.rand() * 1.5) : sd * (6 + this.rand() * 5 + (kind === 'drone' ? 8 : 0));
+      const latM = tunnel ? 2.2 + this.rand() * 1.2 : kind === 'lowfront' ? 2.5 + this.rand() * 1.5 : 6 + this.rand() * 5 + (kind === 'drone' ? 8 : 0);
+      const lat = sd * latM;
       const px = cx + Math.sin(hd) * ahead + Math.cos(hd) * lat;
       const py = cy + Math.cos(hd) * ahead - Math.sin(hd) * lat;
-      const h = kind === 'drone' ? 16 + this.rand() * 18 : kind === 'lowfront' ? 0.6 : 1.1 + this.rand() * 1.6;
-      if (this.collider) {
-        if (this.collider.pointInBuilding(px, py, 0)) continue;
-        if (this.collider.raycast(px, py, cx, cy, h + 0.5) < 0.999) continue;
+      const h = kind === 'drone' ? 16 + this.rand() * 18 : kind === 'lowfront' ? 0.6 : tunnel ? 1.2 + this.rand() * 1.8 : 1.1 + this.rand() * 1.6;
+      // Stand on the road at the bus's level if there is one there (tunnels, viaducts), else on the ground.
+      let pz = bz + h;
+      const col = this.collider;
+      if (col) {
+        const sfc = col.surface(px, py, bz, 2.5);
+        if (tunnel && sfc.road < 0) continue;
+        pz = (sfc.road >= 0 ? sfc.z : col.ground(px, py)) + h;
+        if (col.pointInBuilding(px, py, pz)) continue;
+        if (col.lineOfSight(px, py, pz, cx, cy, bz + 1.6) < 0.98) continue;
       }
-      return { ...base, kind, x: px, y: py, h, side: sd, maxT: kind === 'drone' ? 12 : 16 };
+      return { ...base, kind, x: px, y: py, h, z: pz, side: sd, maxT: kind === 'drone' ? 12 : 16 };
     }
     return { ...base, kind: 'tracking', h: 1.8, maxT: 5 };
   }

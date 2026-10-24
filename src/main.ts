@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import './style.css';
 import { loadMapData } from './data/load';
-import { headingDir, pointAlong } from './data/coords';
+import { headingDir } from './data/coords';
 import { buildWorld } from './world';
 import { busFactory } from './bus';
 import { BusAudio, BusControls, BusPhysics, CameraRig, InputManager, buildCollider } from './sim';
@@ -89,7 +89,7 @@ async function main() {
   const audio = new BusAudio();
   audio.setType(choice.type);
   audio.start();
-  const guide = new RouteGuide(scene, data, route, { busLength: bus.spec.sections.reduce((a, s) => a + s.length, 0) });
+  const guide = new RouteGuide(scene, data, route, { busLength: bus.spec.sections.reduce((a, s) => a + s.length, 0), walls: collider });
   const hud = new Hud(document.body, data, { traffic, guide });
   // Player collides with buildings and with the AI buses and cars.
   const playerCollider = traffic.wrapCollider(collider);
@@ -97,10 +97,12 @@ async function main() {
   // startPose gives the FRONT of the bus; physics tracks the rear axle.
   const start = guide.startPose();
   const startS = Number(params.get('s') ?? 0);
-  if (startS > 0) Object.assign(start, pointAlong(route.pts, route.cum, startS));
+  // On the guidance lane (the raw GTFS shape can be metres off a busway tunnel, inside rock).
+  if (startS > 0) Object.assign(start, guide.trackPose(startS));
   const rearOffset = bus.spec.sections[0].axleFromFront;
   const [fx, fy] = headingDir(start.heading);
-  physics.reset(start.x - fx * rearOffset, start.y - fy * rearOffset, start.heading);
+  // The route height picks the level (stays in a tunnel / up on a viaduct when starting there).
+  physics.reset(start.x - fx * rearOffset, start.y - fy * rearOffset, start.heading, start.z);
   controls.lights.headlights = choice.hours < 6.5 || choice.hours > 18;
 
   for (let i = 0; i < Number(params.get('cam') === 'chase' ? 1 : params.get('cam') === 'top' ? 2 : 0); i++) rig.cycle();
@@ -150,7 +152,10 @@ async function main() {
     const [hx, hy] = headingDir(pose.heading);
     const frontX = pose.x + hx * rearOffset;
     const frontY = pose.y + hy * rearOffset;
-    const g = guide.update(dt, frontX, frontY, controls.doorsOpen, pose.speed, pose.heading, hours);
+    // Height at the front of the bus, so the guide keeps the right level under viaducts and in tunnels.
+    const s0 = pose.sections[0];
+    const frontZ = (s0.z ?? pose.z ?? 0) + Math.tan(s0.pitch ?? 0) * rearOffset;
+    const g = guide.update(dt, frontX, frontY, controls.doorsOpen, pose.speed, pose.heading, hours, frontZ);
     // Stop-request bell once per stop as it comes within 250 m.
     if (!g.finished && g.nextStopDistance < 250 && g.nextStopIndex !== dingedStop) {
       dingedStop = g.nextStopIndex;

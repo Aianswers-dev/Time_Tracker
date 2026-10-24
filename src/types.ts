@@ -12,8 +12,11 @@
  * heading 0 faces north (+y, three.js -z), PI/2 faces east (+x).
  * Australia drives on the LEFT. Buses are right-hand drive.
  *
- * The world is flat: ground is y = 0 everywhere (bridges included). The river
- * surface sits below ground level.
+ * Heights are metres AHD (about mean sea level) and three.js y = height. Use
+ * src/data/height.ts: `Heights.ground(x, y)` for terrain and
+ * `Heights.surfaceAt(x, y, hintZ)` for the road surface a vehicle is on
+ * (bridges sit above what they cross, tunnels below; the hint picks the level).
+ * The river surface is at `terrain.waterLevel`.
  */
 
 import type * as THREE from 'three';
@@ -50,12 +53,16 @@ export interface Road {
   maxspeed?: number;
   /** Polyline, flat [x0, y0, x1, y1, ...] in metres. One-way roads point in the direction of travel. */
   pts: Float32Array;
+  /** Surface height (m AHD) at each vertex. Bridges sit above what they cross, tunnels below. */
+  z: Float32Array;
 }
 
 export interface Rail {
   bridge: boolean;
   tunnel: boolean;
   pts: Float32Array;
+  /** Rail height (m AHD) at each vertex. */
+  z: Float32Array;
 }
 
 export const enum BuildingKind {
@@ -86,6 +93,8 @@ export interface Building {
   name?: string;
   /** Footprint outer ring, flat [x, y, ...], not closed (last != first). */
   pts: Float32Array;
+  /** Ground height (m AHD) at the footprint centroid; `height`/`minHeight` are relative to it. */
+  z: number;
 }
 
 export const enum AreaKind {
@@ -109,6 +118,8 @@ export interface Stop {
   code: string;
   x: number;
   y: number;
+  /** Road surface height at the stop (m AHD). */
+  z: number;
 }
 
 export interface RouteStop {
@@ -138,6 +149,8 @@ export interface Route {
   pts: Float32Array;
   /** Cumulative distance at each vertex, cum[0] = 0, cum[n-1] = length. */
   cum: Float32Array;
+  /** Road surface height (m AHD) at each vertex: stays in tunnels and on viaducts. */
+  z: Float32Array;
   length: number;
   stops: RouteStop[];
 }
@@ -176,6 +189,16 @@ export interface MapData {
   routes: Route[];
   /** Bus platforms at busway stations and interchanges (not solid buildings). */
   platforms: Platform[];
+  terrain: TerrainGrids;
+}
+
+/** Ground height grids (m AHD), row-major from the south-west corner. See src/data/height.ts. */
+export interface TerrainGrids {
+  /** River / water surface height. */
+  waterLevel: number;
+  /** Fine grid over the map first, then a coarse horizon grid. */
+  grids: { name: string; x0: number; y0: number; cell: number; nx: number; ny: number; h: Float32Array }[];
+  attribution: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +250,8 @@ export interface BusPose {
   /** Position of section 0's REAR AXLE centre at ground level, metres (map x/y). */
   x: number;
   y: number;
+  /** Height of the road surface under section 0's rear axle (m AHD). Optional for old callers: treat missing as 0. */
+  z?: number;
   heading: number;
   /** Signed speed in m/s along heading (negative = reversing). */
   speed: number;
@@ -234,8 +259,11 @@ export interface BusPose {
   steer: number;
   /** Accumulated wheel rotation in radians. */
   wheelSpin: number;
-  /** Pose of each section's rear axle (index 0 duplicates x/y/heading above). */
-  sections: { x: number; y: number; heading: number }[];
+  /**
+   * Pose of each section's rear axle. z = road height there (m AHD); pitch =
+   * the section's grade angle (radians, + = nose up), not including sway.
+   */
+  sections: { x: number; y: number; heading: number; z?: number; pitch?: number }[];
   /** Body roll (radians, + = leaning right) and pitch (+ = nose up) for visual sway. */
   roll: number;
   pitch: number;
@@ -348,6 +376,11 @@ export interface Collider {
 export interface WorldHandle {
   /** Call every frame. `hours` is local time of day 0..24. */
   update(dt: number, camera: THREE.Camera, hours: number): void;
-  /** Current state of the traffic signal nearest to a point, for AI and HUD. */
-  signalStateAt?(x: number, y: number, timeSeconds: number): 'green' | 'amber' | 'red' | null;
+  /**
+   * Current state of the traffic signal nearest to a point, for AI and HUD.
+   * Pass the approaching vehicle's travel direction (dirX, dirY, unit, map
+   * coords) to get the phase for that approach; without it the approach is
+   * guessed from the point's bearing from the junction centre.
+   */
+  signalStateAt?(x: number, y: number, timeSeconds: number, dirX?: number, dirY?: number): 'green' | 'amber' | 'red' | null;
 }

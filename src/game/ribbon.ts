@@ -60,7 +60,7 @@ export class Ribbon {
   private readonly q = new THREE.Quaternion();
   private readonly pos = new THREE.Vector3();
   private readonly one = new THREE.Vector3(1, 1, 1);
-  private readonly up = new THREE.Vector3(0, 1, 0);
+  private readonly euler = new THREE.Euler();
   private phase = 0;
   visible = true;
   private fade = 1;
@@ -113,8 +113,10 @@ export class Ribbon {
       }
       this.alpha.setX(i, a * this.fade);
       this.track.sample(ss, this.tmp);
-      this.pos.set(this.tmp.x, 0.09, -this.tmp.y);
-      this.q.setFromAxisAngle(this.up, -this.tmp.heading);
+      // On the road surface, tilted to the grade (tunnels, viaducts, hills).
+      this.pos.set(this.tmp.x, this.track.zAt(ss) + 0.09, -this.tmp.y);
+      this.euler.set(Math.atan(this.track.gradeAt(ss, 2)), -this.tmp.heading, 0, 'YXZ');
+      this.q.setFromEuler(this.euler);
       this.m4.compose(this.pos, this.q, this.one);
       this.mesh.setMatrixAt(i, this.m4);
     }
@@ -151,6 +153,7 @@ function bayTexture(): THREE.CanvasTexture {
   ctx.restore();
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapT = THREE.RepeatWrapping;
   return t;
 }
 
@@ -223,7 +226,11 @@ export class NextStopMarker {
   }
 
   /** Place the marker at stop position (x, y) and the bay ending at route distance s. */
-  setStop(s: number | null, x: number, y: number): void {
+  /**
+   * Place the marker at (x, y) and the painted bay ending at route distance s.
+   * `from` starts the bay earlier (a whole platform: it repeats every ~18 m, one per bay).
+   */
+  setStop(s: number | null, x: number, y: number, from?: number, z = 0): void {
     if (s === null) {
       this.group.visible = false;
       this.bay.visible = false;
@@ -232,16 +239,17 @@ export class NextStopMarker {
     }
     this.group.visible = true;
     this.bay.visible = true;
-    this.group.position.set(x, 0, -y);
+    this.group.position.set(x, z, -y);
     if (s === this.stopS) return;
     this.stopS = s;
-    // Bay strip hugging the kerb, from 16 m before the flag to 2 m past it.
+    // Bay strip hugging the kerb, from 16 m before the flag to 2 m past it (or the whole platform).
     const pos: number[] = [];
     const uv: number[] = [];
     const idx: number[] = [];
-    const s0 = s - 16;
-    const s1 = s + 2;
-    const steps = 9;
+    const s0 = from ?? s - 16;
+    const s1 = from !== undefined ? s : s + 2;
+    const reps = Math.max(1, Math.round((s1 - s0) / 18));
+    const steps = Math.max(9, Math.ceil((s1 - s0) / 2));
     const w = 3.0;
     for (let k = 0; k <= steps; k++) {
       const ss = s0 + ((s1 - s0) * k) / steps;
@@ -251,10 +259,11 @@ export class NextStopMarker {
       const ly = this.tmp.hx;
       const inner = kb - 0.25 - w;
       const outer = kb - 0.25;
-      pos.push(this.tmp.x + lx * inner, 0.085, -(this.tmp.y + ly * inner));
-      pos.push(this.tmp.x + lx * outer, 0.085, -(this.tmp.y + ly * outer));
-      // Texture runs along v from the far end (s1) at the top.
-      const v = k / steps;
+      const h = this.track.zAt(ss) + 0.085;
+      pos.push(this.tmp.x + lx * inner, h, -(this.tmp.y + ly * inner));
+      pos.push(this.tmp.x + lx * outer, h, -(this.tmp.y + ly * outer));
+      // Texture runs along v from the far end (s1) at the top; one repeat per bay.
+      const v = (k / steps) * reps;
       uv.push(1, v, 0, v);
       if (k < steps) {
         const a = k * 2;

@@ -29,6 +29,8 @@ export interface Junction {
   gA: number;
   gB: number;
   offset: number;
+  /** Arms (unit vectors pointing out of the junction) and their phase group. */
+  arms?: { ux: number; uy: number; g: number }[];
 }
 
 export type Light = 'green' | 'amber' | 'red';
@@ -148,7 +150,9 @@ function shelterTemplate(): THREE.BufferGeometry {
 // ---------------------------------------------------------------------------
 
 interface Arm {
-  y: number;
+  /** Road surface height at the junction, and the road's rank lift. */
+  z: number;
+  lift: number;
   ux: number;
   uy: number;
   hw: number;
@@ -161,14 +165,20 @@ interface Arm {
 export interface Signals {
   junctions: Junction[];
   grid: IdGrid;
-  stateAt(x: number, y: number, t: number): Light | null;
+  /**
+   * State for the junction nearest (x, y). With a travel direction (dirX, dirY)
+   * the approach group comes from the direction of travel, which is exact;
+   * otherwise it is guessed from the bearing of (x, y) from the junction centre
+   * (ambiguous for points at the centre or on a corner).
+   */
+  stateAt(x: number, y: number, t: number, dirX?: number, dirY?: number): Light | null;
 }
 
 export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: RoadIndex }, progress: (f: number) => void): Promise<Signals> {
   const { data, R } = ctx;
   const index = roads.index;
   const infos = roads.infos;
-  const marks = new MeshGeo([{ name: 'aMark', size: 2, type: 'f32' }]);
+  const marks = new MeshGeo([{ name: 'aMark', size: 3, type: 'f32' }]);
 
   // ---- cluster signal nodes into junctions
   const sig = data.signals;
@@ -213,7 +223,7 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
     group: number;
   }
   const heads: Head[] = [];
-  const poles: { x: number; y: number; h: number }[] = [];
+  const poles: { x: number; y: number; z: number; h: number }[] = [];
   const arms: { x: number; y: number; dx: number; dy: number; len: number; h: number }[] = [];
 
   const stopLine = (sx: number, sy: number, tx: number, ty: number, o0: number, o1: number, h: number) => {
@@ -221,10 +231,10 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
     const lx = -ty;
     const ly = tx;
     const w = 0.22;
-    const a = marks.vert(sx + lx * o0 - tx * w, h, sy + ly * o0 - ty * w, 0, 0);
-    const b = marks.vert(sx + lx * o1 - tx * w, h, sy + ly * o1 - ty * w, 0, 0);
-    const c = marks.vert(sx + lx * o1 + tx * w, h, sy + ly * o1 + ty * w, 0, 0);
-    const d = marks.vert(sx + lx * o0 + tx * w, h, sy + ly * o0 + ty * w, 0, 0);
+    const a = marks.vert(sx + lx * o0 - tx * w, h, sy + ly * o0 - ty * w, 0, 0, 0);
+    const b = marks.vert(sx + lx * o1 - tx * w, h, sy + ly * o1 - ty * w, 0, 0, 0);
+    const c = marks.vert(sx + lx * o1 + tx * w, h, sy + ly * o1 + ty * w, 0, 0, 0);
+    const d = marks.vert(sx + lx * o0 + tx * w, h, sy + ly * o0 + ty * w, 0, 0, 0);
     marks.up(a, b, c, d);
   };
 
@@ -240,6 +250,9 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
     // approaches
     const found: Arm[] = [];
     const seen = new Set<number>();
+    // the junction's level: the road nearest to the signal nodes (skip viaducts passing over)
+    const near0 = index.nearest(cx, cy, 30, (ri) => !infos[ri].r.tunnel);
+    const zLevel = near0 ? near0.z : ctx.field.natAt(cx, cy);
     index.roadsNear(cx, cy, 24, (road) => {
       if (seen.has(road)) return;
       seen.add(road);
@@ -264,6 +277,8 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
           s0 = ri.cum[k] + t * Math.sqrt(l2);
         }
       }
+      const zr = roadAt(ri, s0).z;
+      if (Math.abs(zr - zLevel) > 3) return;
       for (const dir of [1, -1]) {
         const s = s0 + dir * 16;
         if (s < 0 || s > ri.len) continue;
@@ -275,7 +290,7 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
         ux /= l;
         uy /= l;
         const incoming = !rd.oneway || dir === -1;
-        found.push({ y: ri.y, ux, uy, hw: ri.hw, lanes: rd.lanes, oneway: rd.oneway, kind: rd.kind, incoming });
+        found.push({ z: zr, lift: ri.lift, ux, uy, hw: ri.hw, lanes: rd.lanes, oneway: rd.oneway, kind: rd.kind, incoming });
       }
     });
     if (!found.length) continue;
@@ -294,7 +309,17 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
     const usable = cycle - 2 * (AMBER + ALL_RED);
     const gA = hasB ? usable * (main.kind <= RoadKind.Primary ? 0.62 : 0.55) : cycle - 20;
     const gB = hasB ? usable - gA : 0;
-    const jn: Junction = { x: cx, y: cy, ax: main.ux, ay: main.uy, cycle, gA, gB, offset: hash2(cx, cy, 71) * cycle };
+    const jn: Junction = {
+      x: cx,
+      y: cy,
+      ax: main.ux,
+      ay: main.uy,
+      cycle,
+      gA,
+      gB,
+      offset: hash2(cx, cy, 71) * cycle,
+      arms: armsJ.map((a) => ({ ux: a.ux, uy: a.uy, g: groupOf(a) })),
+    };
     const ji = junctions.length;
     junctions.push(jn);
 
@@ -311,27 +336,28 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       const ly = tx;
       const group = groupOf(a);
       // stop line across the incoming lanes (left half for two-way roads)
-      if (a.kind !== RoadKind.Service) stopLine(sx, sy, tx, ty, a.oneway ? -a.hw + 0.3 : 0.2, a.hw - 0.3, a.y + 0.003);
+      if (a.kind !== RoadKind.Service) stopLine(sx, sy, tx, ty, a.oneway ? -a.hw + 0.3 : 0.2, a.hw - 0.3, a.z + a.lift + 0.005);
       // primary pole on the left kerb
       const px = sx + lx * (a.hw + 0.9);
       const py = sy + ly * (a.hw + 0.9);
-      if (index.penetration(px, py) > -0.3) continue;
-      poles.push({ x: px, y: py, h: 4.6 });
-      heads.push({ x: px, y: py, h: 3.4, fx: a.ux, fy: a.uy, j: ji, group });
+      if (index.penetrationZ(px, py, a.z, 3) > -0.3) continue;
+      const base = a.z + 0.15;
+      poles.push({ x: px, y: py, z: base, h: 4.6 });
+      heads.push({ x: px, y: py, h: base + 3.4, fx: a.ux, fy: a.uy, j: ji, group });
       const multi = (a.oneway ? a.lanes : a.lanes / 2) >= 2 || a.kind <= RoadKind.Secondary;
       if (multi) {
         const len = Math.min(a.oneway ? a.hw * 1.3 : a.hw * 0.9, 9);
-        poles.push({ x: px, y: py, h: 6.4 });
-        arms.push({ x: px, y: py, dx: -lx, dy: -ly, len, h: 6.2 });
-        heads.push({ x: px - lx * len, y: py - ly * len, h: 5.6, fx: a.ux, fy: a.uy, j: ji, group });
+        poles.push({ x: px, y: py, z: base, h: 6.4 });
+        arms.push({ x: px, y: py, dx: -lx, dy: -ly, len, h: base + 6.2 });
+        heads.push({ x: px - lx * len, y: py - ly * len, h: base + 5.6, fx: a.ux, fy: a.uy, j: ji, group });
       }
       // far-side right pole (across the junction) for major roads
       if (a.kind <= RoadKind.Secondary) {
         const fx = cx - a.ux * ds - lx * (a.oneway ? a.hw + 0.9 : 1.5);
         const fy = cy - a.uy * ds - ly * (a.oneway ? a.hw + 0.9 : 1.5);
-        if (index.penetration(fx, fy) < -0.3) {
-          poles.push({ x: fx, y: fy, h: 4.6 });
-          heads.push({ x: fx, y: fy, h: 3.4, fx: a.ux, fy: a.uy, j: ji, group });
+        if (index.penetrationZ(fx, fy, a.z, 3) < -0.3) {
+          poles.push({ x: fx, y: fy, z: base, h: 4.6 });
+          heads.push({ x: fx, y: fy, h: base + 3.4, fx: a.ux, fy: a.uy, j: ji, group });
         }
       }
     }
@@ -350,7 +376,7 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
     const poleMat = patch(new THREE.MeshLambertMaterial({ color: 0x8c9294 }), { key: 'pole' });
     const pm = new THREE.InstancedMesh(poleTemplate(), poleMat, poles.length);
     poles.forEach((p, i) => {
-      m4.makeScale(0.2, p.h, 0.2).setPosition(p.x, 0, -p.y);
+      m4.makeScale(0.2, p.h, 0.2).setPosition(p.x, p.z, -p.y);
       pm.setMatrixAt(i, m4);
     });
     const am = new THREE.InstancedMesh(boxTemplate(), poleMat, arms.length);
@@ -441,7 +467,7 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
     const ty = nr.dy;
     const lx = -ty;
     const ly = tx;
-    const h = infos[nr.road].y + 0.003;
+    const h = nr.z + infos[nr.road].lift + 0.005;
     const signalised = nearJunction(x, y, 40);
     const P = (a: number, b: number) => [nr.px + tx * a + lx * b, nr.py + ty * a + ly * b];
     const quad = (a0: number, a1: number, b0: number, b1: number) => {
@@ -449,10 +475,10 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       const p1 = P(a1, b0);
       const p2 = P(a1, b1);
       const p3 = P(a0, b1);
-      const ia = marks.vert(p0[0], h, p0[1], 0, 0);
-      const ib = marks.vert(p1[0], h, p1[1], 0, 0);
-      const ic = marks.vert(p2[0], h, p2[1], 0, 0);
-      const id = marks.vert(p3[0], h, p3[1], 0, 0);
+      const ia = marks.vert(p0[0], h, p0[1], 0, 0, 0);
+      const ib = marks.vert(p1[0], h, p1[1], 0, 0, 0);
+      const ic = marks.vert(p2[0], h, p2[1], 0, 0, 0);
+      const id = marks.vert(p3[0], h, p3[1], 0, 0, 0);
       marks.up(ia, ib, ic, id);
     };
     if (signalised) {
@@ -478,6 +504,9 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
     interface SL {
       x: number;
       y: number;
+      /** Pole base and road surface heights. */
+      z: number;
+      zr: number;
       ang: number;
     }
     const lights: SL[] = [];
@@ -494,12 +523,12 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
           const off = ri.hw + (rd.bridge ? 0.5 : 1.0);
           const x = c.x + c.nx * side * off;
           const y = c.y + c.ny * side * off;
-          if (index.penetration(x, y, ri.i) > -0.4) continue;
+          if (index.penetrationZ(x, y, c.z, 3, ri.i) > -0.4) continue;
           if (!rd.bridge && ctx.mask.has(x, y, MASK_WATER)) continue;
           // arm points back over the road: local +x -> map (-nx*side, -ny*side)
           const dx = -c.nx * side;
           const dy = -c.ny * side;
-          lights.push({ x, y, ang: Math.atan2(dy, dx) });
+          lights.push({ x, y, z: c.z + (rd.bridge ? 0.95 : 0.15), zr: c.z, ang: Math.atan2(dy, dx) });
         }
       }
     }
@@ -562,14 +591,14 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       let cz = 0;
       ls.forEach((l, i) => {
         q.setFromAxisAngle(yAxis, l.ang);
-        v.set(l.x, 0, -l.y);
+        v.set(l.x, l.z, -l.y);
         m4.compose(v, q, sc.set(1, 1, 1));
         pm.setMatrixAt(i, m4);
         const hx = l.x + Math.cos(l.ang) * 2.55;
         const hz = -l.y - Math.sin(l.ang) * 2.55;
-        m4.makeScale(3.2, 3.2, 3.2).setPosition(hx, 9.0, hz);
+        m4.makeScale(3.2, 3.2, 3.2).setPosition(hx, l.z + 9.0, hz);
         gm.setMatrixAt(i, m4);
-        m4.makeScale(17, 1, 17).setPosition(hx, 0.17, hz);
+        m4.makeScale(17, 1, 17).setPosition(hx, l.zr + 0.25, hz);
         om.setMatrixAt(i, m4);
         cx += l.x;
         cz -= l.y;
@@ -598,54 +627,32 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
   progress(0.65);
   await yieldFrame();
 
-  // ---- railway: ballast + sleepers + rails, overhead masts
+  // ---- railway overhead masts (the track bed itself is built with the roads)
   {
-    const track = new MeshGeo([
-      { name: 'uv', size: 2, type: 'f32' },
-      { name: 'color', size: 3, type: 'u8', normalized: true },
-    ]);
-    const masts: { x: number; y: number; ang: number }[] = [];
+    const masts: { x: number; y: number; z: number; ang: number }[] = [];
     for (const rl of data.rail) {
       if (rl.tunnel) continue;
       const p = rl.pts;
-      const n = p.length >> 1;
-      if (n < 2) continue;
-      let s = 0;
-      let prevL = -1;
-      let prevR = -1;
-      for (let i = 0; i < n; i++) {
-        const a = Math.max(0, i - 1);
-        const b = Math.min(n - 1, i + 1);
-        let dx = p[2 * b] - p[2 * a];
-        let dy = p[2 * b + 1] - p[2 * a + 1];
-        const l = Math.hypot(dx, dy) || 1;
-        dx /= l;
-        dy /= l;
-        if (i > 0) s += Math.hypot(p[2 * i] - p[2 * i - 2], p[2 * i + 1] - p[2 * i - 1]);
-        const h = rl.bridge ? 0.08 : 0.012;
-        const L = track.vert(p[2 * i] - dy * 2, h, p[2 * i + 1] + dx * 2, 0, s / 3.9, 255, 255, 255);
-        const Rr = track.vert(p[2 * i] + dy * 2, h, p[2 * i + 1] - dx * 2, 1, s / 3.9, 255, 255, 255);
-        if (prevL >= 0) track.up(prevL, prevR, Rr, L);
-        prevL = L;
-        prevR = Rr;
-      }
-      walk(p, 60, (x, y, dx, dy) => {
+      if (p.length < 4) continue;
+      let vi = 0;
+      walk(p, 60, (x, y, dx, dy, s) => {
+        // height along the line at s
+        let acc = 0;
+        let z = rl.z[0];
+        for (vi = 0; vi + 1 < rl.z.length; vi++) {
+          const L = Math.hypot(p[2 * vi + 2] - p[2 * vi], p[2 * vi + 3] - p[2 * vi + 1]);
+          if (acc + L >= s) {
+            z = rl.z[vi] + (rl.z[vi + 1] - rl.z[vi]) * ((s - acc) / (L || 1));
+            break;
+          }
+          acc += L;
+        }
         const mx = x - dy * 3.2;
         const my = y + dx * 3.2;
-        if (index.penetration(mx, my) > -0.5 || ctx.mask.has(mx, my, MASK_WATER)) return;
-        masts.push({ x: mx, y: my, ang: Math.atan2(-dx, dy) });
+        if (index.penetrationZ(mx, my, z, 4) > -0.5 || (!rl.bridge && ctx.mask.has(mx, my, MASK_WATER))) return;
+        masts.push({ x: mx, y: my, z, ang: Math.atan2(-dx, dy) });
       }, 20);
     }
-    const trackMat = patch(new THREE.MeshLambertMaterial({ map: ctx.tex.track, vertexColors: true }), {
-      key: 'track',
-      vertex: [['#include <beginnormal_vertex>', 'vec3 objectNormal = vec3(0.0, 1.0, 0.0);']],
-      fragment: [['#include <map_fragment>', '#include <map_fragment>\ndiffuseColor.rgb = pow(diffuseColor.rgb, vec3(2.2));']],
-    });
-    const tm = new THREE.Mesh(track.build(), trackMat);
-    tm.receiveShadow = true;
-    tm.name = 'rail';
-    tm.frustumCulled = false;
-    ctx.root.add(tm);
     // masts: pole + cantilever over the track
     const mg = new MeshGeo([{ name: 'color', size: 3, type: 'u8', normalized: true }]);
     mg.box(0, 0, 0, 7.2, 1, 0, 0.12, 0.12, 120, 124, 126);
@@ -655,7 +662,7 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
     const mm = new THREE.InstancedMesh(mastGeo, struct, masts.length);
     masts.forEach((m, i) => {
       q.setFromAxisAngle(yAxis, m.ang);
-      m4.compose(v.set(m.x, 0, -m.y), q, sc.set(1, 1, 1));
+      m4.compose(v.set(m.x, m.z, -m.y), q, sc.set(1, 1, 1));
       mm.setMatrixAt(i, m4);
     });
     mm.castShadow = true;
@@ -670,12 +677,23 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
   // ---- bus stop shelters
   {
     const tpl = shelterTemplate();
-    const items: { x: number; y: number; ang: number }[] = [];
+    const items: { x: number; y: number; z: number; ang: number }[] = [];
+    // Busway platforms draw their own canopies (src/game/platforms.ts).
+    const platformBoxes = data.platforms.map((pf) => {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (let i = 0; i < pf.pts.length; i += 2) {
+        x0 = Math.min(x0, pf.pts[i]); x1 = Math.max(x1, pf.pts[i]);
+        y0 = Math.min(y0, pf.pts[i + 1]); y1 = Math.max(y1, pf.pts[i + 1]);
+      }
+      return [x0 - 12, y0 - 12, x1 + 12, y1 + 12];
+    });
+    const nearPlatform = (x: number, y: number) => platformBoxes.some((bb) => x >= bb[0] && x <= bb[2] && y >= bb[1] && y <= bb[3]);
     for (const st of data.stops) {
+      if (nearPlatform(st.x, st.y)) continue;
       const nr = index.nearest(st.x, st.y, 25, (ri) => !infos[ri].r.tunnel && infos[ri].r.kind !== RoadKind.Motorway);
-      if (!nr) continue;
+      if (!nr || Math.abs(nr.z - st.z) > 3) continue;
       const ri = infos[nr.road];
-      if (ri.r.kind === RoadKind.Busway || ri.r.bus) continue;
+      if (ri.r.kind === RoadKind.Busway || ri.r.bus || ri.r.bridge) continue;
       // side of the road the stop is on
       const lx = -nr.dy;
       const ly = nr.dx;
@@ -683,17 +701,17 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       const off = ri.hw + 1.3;
       const x = nr.px + lx * side * off;
       const y = nr.py + ly * side * off;
-      if (index.penetration(x, y, nr.road) > -1 || ctx.mask.near(x, y, 1.5, 4)) continue;
+      if (index.penetrationZ(x, y, nr.z, 3, nr.road) > -1 || ctx.mask.near(x, y, 1.5, 4)) continue;
       if (densityAt(ctx, x, y) > 0.6) continue;
       // template back (+map y) faces away from the road: local +y -> side normal
       const bx = lx * side;
       const by = ly * side;
-      items.push({ x, y, ang: Math.atan2(-bx, by) });
+      items.push({ x, y, z: nr.z + 0.15, ang: Math.atan2(-bx, by) });
     }
     const sm = new THREE.InstancedMesh(tpl, struct, items.length);
     items.forEach((it, i) => {
       q.setFromAxisAngle(yAxis, it.ang);
-      m4.compose(v.set(it.x, 0, -it.y), q, sc.set(1, 1, 1));
+      m4.compose(v.set(it.x, it.z, -it.y), q, sc.set(1, 1, 1));
       sm.setMatrixAt(i, m4);
     });
     sm.castShadow = true;
@@ -710,7 +728,7 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
   return {
     junctions,
     grid,
-    stateAt(x: number, y: number, t: number): Light | null {
+    stateAt(x: number, y: number, t: number, dirX?: number, dirY?: number): Light | null {
       let best = -1;
       let bd = 40;
       grid.query(x - 40, y - 40, x + 40, y + 40, (i) => {
@@ -722,9 +740,26 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       });
       if (best < 0) return null;
       const j = junctions[best];
-      const dx = x - j.x;
-      const dy = y - j.y;
+      let dx = x - j.x;
+      let dy = y - j.y;
+      if (dirX !== undefined && dirY !== undefined && (dirX !== 0 || dirY !== 0)) {
+        // The approach arm is the one pointing back along the travel direction:
+        // use that arm's group so the answer matches its signal heads exactly.
+        let bestDot = 0.5;
+        let g = -1;
+        for (const a of j.arms ?? []) {
+          const d = -(a.ux * dirX + a.uy * dirY);
+          if (d > bestDot) {
+            bestDot = d;
+            g = a.g;
+          }
+        }
+        if (g >= 0) return phaseState(j, g, t);
+        dx = -dirX;
+        dy = -dirY;
+      }
       const l = Math.hypot(dx, dy) || 1;
+      // Same rule as the heads: arms within ~45° of the main axis are group 0.
       const group = Math.abs((dx * j.ax + dy * j.ay) / l) > 0.7 ? 0 : 1;
       return phaseState(j, group, t);
     },

@@ -176,7 +176,8 @@ export class SkySystem {
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   }
 
-  update(camera: THREE.Camera, hours: number): void {
+  /** `groundH`: ground height under the camera (shadow box size and placement follow the terrain). */
+  update(camera: THREE.Camera, hours: number, groundH = 0): void {
     sunDirection(hours, this.sunDir);
     const e = Math.asin(clamp(this.sunDir.y, -1, 1)) / DEG;
     this.elevation = e;
@@ -202,7 +203,8 @@ export class SkySystem {
     const hr = ((hours % 24) + 24) % 24;
     const evening = smoothstep(17, 19.5, hr) * (1 - smoothstep(22.5, 25.5, hr));
     const late = hr < 6 ? 1 - smoothstep(4.5, 6.5, hr) : 0;
-    U.uLit.value = 0.06 + night * (0.12 + 0.26 * evening + 0.06 * late) + evening * 0.04;
+    // about 35-40% of windows lit at dusk, a quarter at midnight, ~15-20% in the small hours
+    U.uLit.value = 0.04 + night * (0.1 + 0.22 * evening + 0.04 * late);
 
     // Lights: the sun by day, the moon by night.
     const sunI = a.sunI + (b.sunI - a.sunI) * t;
@@ -229,7 +231,7 @@ export class SkySystem {
 
     // Shadow box follows the camera, snapped to texels to avoid shimmer.
     const cam = camera as THREE.PerspectiveCamera;
-    const camH = Math.max(0, cam.position.y);
+    const camH = Math.max(0, cam.position.y - groundH);
     const half = clamp(110 + camH * 0.9, 110, 700);
     if (Math.abs(half - this.shadowHalf) > 20) {
       this.shadowHalf = half;
@@ -254,9 +256,9 @@ export class SkySystem {
     if (right.lengthSq() < 1e-6) right.set(1, 0, 0);
     right.normalize();
     const upv = this.tmp4.copy(ld).cross(right).normalize();
-    const pr = Math.round((cx * right.x + cz * right.z) / texel) * texel;
-    const pu = Math.round((cx * upv.x + cz * upv.z) / texel) * texel;
-    const pd = cx * ld.x + cz * ld.z;
+    const pr = Math.round((cx * right.x + groundH * right.y + cz * right.z) / texel) * texel;
+    const pu = Math.round((cx * upv.x + groundH * upv.y + cz * upv.z) / texel) * texel;
+    const pd = cx * ld.x + groundH * ld.y + cz * ld.z;
     const tx = right.x * pr + upv.x * pu + ld.x * pd;
     const ty = right.y * pr + upv.y * pu + ld.y * pd;
     const tz = right.z * pr + upv.z * pu + ld.z * pd;

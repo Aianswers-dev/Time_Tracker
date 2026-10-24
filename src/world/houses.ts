@@ -146,6 +146,8 @@ export async function buildHouses(ctx: Ctx, roads: { infos: RI[]; index: RoadInd
     w: number;
     d: number;
     h: number;
+    /** Lowest ground under the house (the walls start there). */
+    base: number;
     tpl: number;
     style: number;
     seed: number;
@@ -227,6 +229,26 @@ export async function buildHouses(ctx: Ctx, roads: { infos: RI[]; index: RoadInd
         if (!footprintFree(cx, cy, tx, ty, ox, oy, w / 2, d / 2)) continue;
         if (nearBig(cx, cy, 18)) continue;
         if (densityAt(ctx, cx, cy) > 0.22) continue;
+        // ground under the footprint: skip cuttings and very steep lots
+        let zMin = Infinity;
+        let zMax = -Infinity;
+        let carved = false;
+        for (const [a2, b2] of [
+          [-1, -1],
+          [1, -1],
+          [1, 1],
+          [-1, 1],
+          [0, 0],
+        ]) {
+          const px = cx + tx * a2 * (w / 2) + ox * b2 * (d / 2);
+          const py = cy + ty * a2 * (w / 2) + oy * b2 * (d / 2);
+          const gz = ctx.field.renAt(px, py);
+          zMin = Math.min(zMin, gz);
+          zMax = Math.max(zMax, gz);
+          if (ctx.field.isHole(px, py)) carved = true;
+        }
+        if (carved || zMax - zMin > 4.5) continue;
+        const zc = ctx.field.renAt(cx, cy);
         stamp(cx, cy, tx, ty, ox, oy, w / 2, d / 2);
         const hsh = hash2(cx, cy, 31);
         const brick = hsh < 0.14;
@@ -241,7 +263,8 @@ export async function buildHouses(ctx: Ctx, roads: { infos: RI[]; index: RoadInd
           oy,
           w,
           d,
-          h: highset ? 5.4 : 3.1,
+          h: (highset ? 5.4 : 3.1) + (zc - zMin),
+          base: zMin - 0.15,
           tpl: brick || hash2(cx, cy, 34) < 0.25 ? 1 : 0,
           style: Style.House,
           seed: Math.floor(hash2(cx, cy, 35) * 255),
@@ -277,11 +300,12 @@ export async function buildHouses(ctx: Ctx, roads: { infos: RI[]; index: RoadInd
   // ---- instanced meshes per building chunk
   const mat = makeHouseMaterial(ctx.tex.noise);
   const tpls = [houseTemplate(true, 0.12), houseTemplate(false, 0.28)];
-  const nx = Math.ceil((R[2] - R[0]) / CHUNK);
+  const HCH = CHUNK * 2;
+  const nx = Math.ceil((R[2] - R[0]) / HCH);
   const groups = new Map<number, H[][]>();
   for (const h of houses) {
-    const i = Math.max(0, Math.min(nx - 1, Math.floor((h.x - R[0]) / CHUNK)));
-    const j = Math.max(0, Math.floor((h.y - R[1]) / CHUNK));
+    const i = Math.max(0, Math.min(nx - 1, Math.floor((h.x - R[0]) / HCH)));
+    const j = Math.max(0, Math.floor((h.y - R[1]) / HCH));
     const key = j * nx + i;
     let g = groups.get(key);
     if (!g) {
@@ -314,7 +338,7 @@ export async function buildHouses(ctx: Ctx, roads: { infos: RI[]; index: RoadInd
           xx = -xx;
           xy = -xy;
         }
-        m.set(xx * h.w, 0, h.ox * h.d, h.x, 0, h.h, 0, 0, -xy * h.w, 0, -h.oy * h.d, -h.y, 0, 0, 0, 1);
+        m.set(xx * h.w, 0, h.ox * h.d, h.x, 0, h.h, 0, h.base, -xy * h.w, 0, -h.oy * h.d, -h.y, 0, 0, 0, 1);
         mesh.setMatrixAt(i, m);
         style.set([h.style, h.seed, h.flags, 30], i * 4);
         wall.set(hexRgb(h.wall), i * 3);

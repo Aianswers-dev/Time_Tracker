@@ -67,6 +67,13 @@ export class MeshGeo {
     this.tri(a, b, c, fx, fy, fz);
     this.tri(a, c, d, fx, fy, fz);
   }
+  /** Override the normal of some vertices (e.g. smooth ground strips). */
+  setNormal(v: number, nx: number, ny: number, nz: number): void {
+    const n = this.nrm.arr;
+    n[3 * v] = nx;
+    n[3 * v + 1] = ny;
+    n[3 * v + 2] = nz;
+  }
   /** Quad facing up. */
   up(a: number, b: number, c: number, d: number): void {
     this.quad(a, b, c, d, 0, 1, 0);
@@ -119,19 +126,15 @@ export class MeshGeo {
       s1.clone().negate().sub(s2),
       s1.clone().negate().add(s2),
     ];
-    const ia: number[] = [];
-    const ib: number[] = [];
-    for (const c of corners) {
-      ia.push(this.vert(A.x + c.x, A.y + c.y, -(A.z + c.z), ...a));
-      ib.push(this.vert(B.x + c.x, B.y + c.y, -(B.z + c.z), ...a));
-    }
+    // separate vertices per face so each face keeps its own flat normal
+    const at = (P: THREE.Vector3, c: THREE.Vector3) => this.vert(P.x + c.x, P.y + c.y, -(P.z + c.z), ...a);
     for (let i = 0; i < 4; i++) {
       const j = (i + 1) % 4;
       const m = corners[i].clone().add(corners[j]);
-      this.quad(ia[i], ia[j], ib[j], ib[i], m.x, m.y, m.z);
+      this.quad(at(A, corners[i]), at(A, corners[j]), at(B, corners[j]), at(B, corners[i]), m.x, m.y, m.z);
     }
-    this.quad(ia[0], ia[1], ia[2], ia[3], -d.x, -d.y, -d.z);
-    this.quad(ib[0], ib[1], ib[2], ib[3], d.x, d.y, d.z);
+    this.quad(at(A, corners[0]), at(A, corners[1]), at(A, corners[2]), at(A, corners[3]), -d.x, -d.y, -d.z);
+    this.quad(at(B, corners[0]), at(B, corners[1]), at(B, corners[2]), at(B, corners[3]), d.x, d.y, d.z);
   }
   /** Vertical cylinder (n sides) from h0 to h1, radius r. */
   cylinder(x: number, y: number, h0: number, h1: number, r: number, n: number, ...a: number[]): void {

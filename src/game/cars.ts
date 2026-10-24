@@ -1,17 +1,44 @@
 // Ambient AI cars: instanced low-poly Aussie traffic (hatches, sedans, SUVs,
 // utes, vans and taxis) driving a road graph built from the OSM roads.
+//
+// Junctions are managed, not just signalled: every junction (graph node with
+// three or more arms) has a box with a reservation list. A vehicle decides at
+// its commit point (the last place it can still stop comfortably at the stop
+// line) and only enters when its signal allows it (or it has right of way),
+// no conflicting movement holds the box (left-hand-traffic rules: opposing
+// right turns cross straight-through traffic, crossing movements always
+// conflict, movements into the same exit merge) and its exit has room, so it
+// never stops inside the box. AI buses use the same reservations.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { RoadKind, type BusPose, type MapData, type WorldHandle } from '../types';
 import { wrapAngle } from '../data/coords';
 import { speedLimitOf } from './roadIndex';
 import { PointGrid, type Body } from './bodies';
+import { LEVEL_GAP, heightsOf } from './height';
+import { TRACK_STEP, type RouteTrack } from './track';
 import { rng } from './util';
 
-const RADIUS = 650;
-const DESPAWN = 800;
 const VIEW = 600;
-const MAX_CARS = 170;
+/** Instance capacity per model (the Normal level keeps ~95 cars). */
+const CAPACITY = 110;
+
+/** Why a vehicle is held up (the binding constraint this frame). */
+export const enum Wait {
+  None = 0,
+  Red = 1,
+  Player = 2,
+  Car = 3,
+  Bus = 4,
+  Junction = 5,
+  Crossing = 6,
+}
+
+export const enum Turn {
+  Left = 0,
+  Straight = 1,
+  Right = 2,
+}
 
 interface Edge {
   pts: Float32Array;
@@ -27,22 +54,60 @@ interface Edge {
   weight: number;
   /** Priority class at junctions. */
   rank: number;
+  /** Road height (m AHD) at each vertex of `pts`: vehicles on different levels never meet. */
+  z: Float32Array;
   mx: number;
   my: number;
-  /** Stop lines (distance along the directed lane) and signal coordinates, per direction. */
+  /** Mid-block signals (pedestrian lights): stop-line distance along the directed lane, per direction. */
   sig: [number[], number[]];
+  /** Signal node x, y for each entry of `sig`. */
   sigXY: [number[], number[]];
+  /** Busway crossings: give-way line distance along the directed lane, per direction. */
+  xs: [number[], number[]];
+  /** Crossing point x, y, busway direction bx, by and height z for each entry of `xs` (5 numbers each). */
+  xsXY: [number[], number[]];
+}
+
+interface Occupant {
+  id: number;
+  inX: number;
+  inY: number;
+  outX: number;
+  outY: number;
+  cls: Turn;
+  until: number;
 }
 
 interface Node {
   x: number;
   y: number;
+  /** Road height at the node (m AHD). */
+  z: number;
   out: number[];
+  /** Edges touching this node. */
+  edges: number[];
   deg: number;
+  /** Main-road traffic passing an unsignalised junction marks it busy until this time. */
   until: number;
   holder: number;
   /** Highest road class meeting here (side roads give way to it). */
   rank: number;
+  /** A traffic signal controls this junction. */
+  sig: boolean;
+  /** Junction box radius from the node, metres. */
+  boxR: number;
+  occ: Occupant[];
+}
+
+interface Hold {
+  node: number;
+  /** Distance travelled past the node (-1 until reached). */
+  d: number;
+  inX: number;
+  inY: number;
+  outX: number;
+  outY: number;
+  cls: Turn;
 }
 
 interface Car {
@@ -55,20 +120,78 @@ interface Car {
   model: number;
   color: THREE.Color;
   next: number;
+  next2: number;
   vWant: number;
   x: number;
   y: number;
+  /** Road height (m AHD) and grade pitch (radians, + = nose up). */
+  z: number;
+  pitch: number;
   heading: number;
   len: number;
   braking: boolean;
   sigI: number;
   sigState: 'green' | 'amber' | 'red' | null;
   sigTimer: number;
-  stuck: number;
-  ghost: number;
-  claimed: number;
+  xsI: number;
+  xsCommit: number;
+  holds: Hold[];
   /** Seconds held up by a bus (for overtaking on multi-lane roads). */
   busWait: number;
+  /** Seconds stationary while not legitimately waiting. */
+  idle: number;
+  /** Legitimately waiting (red light, the player, or a queue behind those). */
+  exempt: boolean;
+  visible: boolean;
+  dead: boolean;
+}
+
+/** A junction on an AI bus route (for the shared reservations). */
+export interface BusJunction {
+  node: number;
+  x: number;
+  y: number;
+  /** Route distance of the node and of the bus's stop line. */
+  s: number;
+  stopS: number;
+  inX: number;
+  inY: number;
+  outX: number;
+  outY: number;
+  cls: Turn;
+  boxR: number;
+  sig: boolean;
+  /** The bus arrives from a side road and must give way. */
+  minor: boolean;
+}
+
+export interface CarStats {
+  overlapDespawns: number;
+  stuckDespawns: number;
+  waitingRed: number;
+  waitingJunction: number;
+  stationary: number;
+}
+
+function classify(turn: number): Turn {
+  return turn < -0.6 ? Turn.Left : turn > 0.6 ? Turn.Right : Turn.Straight;
+}
+
+/** Do two movements through the same junction box conflict? (left-hand traffic) */
+export function movementsConflict(
+  aInX: number,
+  aInY: number,
+  aOutX: number,
+  aOutY: number,
+  aCls: Turn,
+  b: { inX: number; inY: number; outX: number; outY: number; cls: Turn },
+): boolean {
+  const inDot = aInX * b.inX + aInY * b.inY;
+  if (inDot > 0.8) return false; // same approach: lanes and following handle it
+  if (aOutX * b.outX + aOutY * b.outY > 0.8) return true; // merging into the same exit
+  if (aCls === Turn.Left || b.cls === Turn.Left) return false; // left turns hug the kerb
+  if (inDot < -0.8) return (aCls === Turn.Right) !== (b.cls === Turn.Right); // right turn across oncoming
+  return true; // crossing paths
 }
 
 interface Model {
@@ -177,6 +300,16 @@ function lampGeometry(L: number, W: number, y: number, front: boolean): THREE.Bu
   return mergeGeometries(quads)!;
 }
 
+/** A point on a lane: position, unit direction of travel, road height and grade (rise / run along travel). */
+interface LanePt {
+  x: number;
+  y: number;
+  hx: number;
+  hy: number;
+  z: number;
+  g: number;
+}
+
 export class CarTraffic {
   private edges: Edge[] = [];
   private nodes: Node[] = [];
@@ -190,10 +323,18 @@ export class CarTraffic {
   private candTimer = 0;
   private initial = true;
   private busGrid = new PointGrid(8, 1024);
-  /** Car positions for buses to avoid. */
+  /** Car positions for buses to avoid (payload = speed, id = car id). */
   readonly grid = new PointGrid(8, 1024);
   private buckets = new Map<number, Car[]>();
-  private maxCars = MAX_CARS;
+  private byId = new Map<number, Car>();
+  /** Stop-line distance from the end node for each directed lane (0 = uncontrolled). */
+  private stopD: Float32Array = new Float32Array(0);
+  /** Junction nodes (3+ arms) on a coarse grid, for mapping bus routes onto them. */
+  private nodeGrid = new Map<number, number[]>();
+  private busJunctions = new WeakMap<RouteTrack, BusJunction[]>();
+  private capCars = 55;
+  private radius = 520;
+  private maxCars = 55;
   private costEma = 0.3;
   private costTimer = 0;
   private sphere = new THREE.Sphere();
@@ -201,13 +342,20 @@ export class CarTraffic {
   private q = new THREE.Quaternion();
   private v3 = new THREE.Vector3();
   private one = new THREE.Vector3(1, 1, 1);
-  private up = new THREE.Vector3(0, 1, 0);
+  private euler = new THREE.Euler(0, 0, 0, 'YXZ');
   private headMat: THREE.MeshBasicMaterial;
   private tailMat: THREE.MeshBasicMaterial;
   private tailDay = new THREE.Color(0x5a0a0a);
   private tailNight = new THREE.Color(0xff2a1a);
   private tailBrake = new THREE.Color(0xff5040);
   private lastNight = -1;
+  private pt: LanePt = { x: 0, y: 0, hx: 0, hy: 0, z: 0, g: 0 };
+  /** The car whose queue fills a junction exit (set by canGo when it returns Junction for that reason). */
+  private blockRef = 0;
+  private pt2: LanePt = { x: 0, y: 0, hx: 0, hy: 0, z: 0, g: 0 };
+  readonly stats: CarStats = { overlapDespawns: 0, stuckDespawns: 0, waitingRed: 0, waitingJunction: 0, stationary: 0 };
+  /** Recent safety-valve events (diagnostics). */
+  readonly events: string[] = [];
   enabled = true;
 
   constructor(
@@ -229,15 +377,15 @@ export class CarTraffic {
     ];
     for (const [kind, L, W, H] of defs) {
       const geo = carGeometry(kind, L, W, H);
-      const mesh = new THREE.InstancedMesh(geo, mat, MAX_CARS);
+      const mesh = new THREE.InstancedMesh(geo, mat, CAPACITY);
       mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       mesh.setColorAt(0, new THREE.Color(1, 1, 1));
       mesh.frustumCulled = false;
       mesh.count = 0;
-      const head = new THREE.InstancedMesh(lampGeometry(L, W, 0.62, true), this.headMat, MAX_CARS);
+      const head = new THREE.InstancedMesh(lampGeometry(L, W, 0.62, true), this.headMat, CAPACITY);
       head.frustumCulled = false;
       head.count = 0;
-      const tail = new THREE.InstancedMesh(lampGeometry(L, W, 0.66, false), this.tailMat, MAX_CARS);
+      const tail = new THREE.InstancedMesh(lampGeometry(L, W, 0.66, false), this.tailMat, CAPACITY);
       tail.setColorAt(0, this.tailDay);
       tail.frustumCulled = false;
       tail.count = 0;
@@ -246,31 +394,52 @@ export class CarTraffic {
     }
   }
 
+  /** Density caps (from the traffic level). */
+  setCaps(cars: number, radius: number): void {
+    this.capCars = Math.min(CAPACITY, cars);
+    this.maxCars = Math.min(this.maxCars, this.capCars) || this.capCars;
+    this.radius = radius;
+    this.candTimer = 0;
+    if (cars === 0) for (const c of this.cars) this.kill(c);
+  }
+
   // -------------------------------------------------------------------------
   // Graph
 
   private buildGraph(): void {
     const roads = this.data.roads;
     const key = (x: number, y: number) => Math.round(x * 2) * 100003 + Math.round(y * 2);
-    const uses = new Map<number, number>();
+    // Vertex uses per position *and level*: a viaduct passing over a street at
+    // the same x/y is not a junction with it.
+    const uses = new Map<number, { z: number; n: number }[]>();
+    const useAt = (kk: number, z: number) => uses.get(kk)?.find((u) => Math.abs(u.z - z) < LEVEL_GAP);
     const included: number[] = [];
     roads.forEach((r, i) => {
+      // Never bus-only roads, busways or service roads (stations, platforms, car parks).
       if (!INCLUDE.has(r.kind) || r.bus || r.tunnel) return;
       included.push(i);
       for (let k = 0; k < r.pts.length; k += 2) {
         const kk = key(r.pts[k], r.pts[k + 1]);
-        uses.set(kk, (uses.get(kk) ?? 0) + (k === 0 || k === r.pts.length - 2 ? 1 : 2));
+        const add = k === 0 || k === r.pts.length - 2 ? 1 : 2;
+        const u = useAt(kk, r.z[k / 2]);
+        if (u) u.n += add;
+        else {
+          let l = uses.get(kk);
+          if (!l) uses.set(kk, (l = []));
+          l.push({ z: r.z[k / 2], n: add });
+        }
       }
     });
-    const nodeOf = new Map<number, number>();
-    const node = (x: number, y: number): number => {
+    const nodeOf = new Map<number, number[]>();
+    const node = (x: number, y: number, z: number): number => {
       const kk = key(x, y);
-      let n = nodeOf.get(kk);
-      if (n === undefined) {
-        n = this.nodes.length;
-        this.nodes.push({ x, y, out: [], deg: 0, until: -1, holder: -1, rank: 0 });
-        nodeOf.set(kk, n);
-      }
+      let l = nodeOf.get(kk);
+      if (!l) nodeOf.set(kk, (l = []));
+      const hit = l.find((n) => Math.abs(this.nodes[n].z - z) < LEVEL_GAP);
+      if (hit !== undefined) return hit;
+      const n = this.nodes.length;
+      this.nodes.push({ x, y, z, out: [], edges: [], deg: 0, until: -1, holder: -1, rank: 0, sig: false, boxR: 4, occ: [] });
+      l.push(n);
       return n;
     };
     for (const ri of included) {
@@ -279,16 +448,17 @@ export class CarTraffic {
       let start = 0;
       const nv = p.length / 2;
       for (let v = 1; v < nv; v++) {
-        const split = v === nv - 1 || (uses.get(key(p[2 * v], p[2 * v + 1])) ?? 0) >= 3;
+        const split = v === nv - 1 || (useAt(key(p[2 * v], p[2 * v + 1]), r.z[v])?.n ?? 0) >= 3;
         if (!split) continue;
         const pts = p.slice(start * 2, v * 2 + 2);
+        const zs = r.z.slice(start, v + 1);
         start = v;
         const cum = new Float32Array(pts.length / 2);
         for (let k = 1; k < cum.length; k++) cum[k] = cum[k - 1] + Math.hypot(pts[2 * k] - pts[2 * k - 2], pts[2 * k + 1] - pts[2 * k - 1]);
         const len = cum[cum.length - 1];
         if (len < 1) continue;
-        const a = node(pts[0], pts[1]);
-        const b = node(pts[pts.length - 2], pts[pts.length - 1]);
+        const a = node(pts[0], pts[1], zs[0]);
+        const b = node(pts[pts.length - 2], pts[pts.length - 1], zs[zs.length - 1]);
         const e: Edge = {
           pts,
           cum,
@@ -302,41 +472,104 @@ export class CarTraffic {
           kind: r.kind,
           weight: len * (CLASS_W[r.kind] ?? 0.3) * (r.link ? 0.3 : 1),
           rank: (CLASS_W[r.kind] ?? 0.3) * (r.link ? 0.5 : 1),
+          z: zs,
           mx: (pts[0] + pts[pts.length - 2]) / 2,
           my: (pts[1] + pts[pts.length - 1]) / 2,
           sig: [[], []],
           sigXY: [[], []],
+          xs: [[], []],
+          xsXY: [[], []],
         };
         const id = this.edges.length;
         this.edges.push(e);
         this.nodes[a].out.push(id * 2);
-        this.nodes[a].deg++;
-        this.nodes[b].deg++;
-        this.nodes[a].rank = Math.max(this.nodes[a].rank, e.rank);
-        this.nodes[b].rank = Math.max(this.nodes[b].rank, e.rank);
         if (!r.oneway) this.nodes[b].out.push(id * 2 + 1);
+        for (const n of a === b ? [a] : [a, b]) {
+          const nd = this.nodes[n];
+          nd.deg++;
+          nd.edges.push(id);
+          nd.rank = Math.max(nd.rank, e.rank);
+        }
       }
     }
-    // Signals onto lanes.
+    // Junction boxes: big enough to clear the widest crossing road.
+    for (let n = 0; n < this.nodes.length; n++) {
+      const nd = this.nodes[n];
+      if (nd.deg < 3) continue;
+      let hw = 0;
+      for (const ei of nd.edges) hw = Math.max(hw, this.edges[ei].width / 2);
+      nd.boxR = Math.max(4, Math.min(16, hw + 2.5));
+      const gk = Math.floor(nd.x / 50) * 4096 + Math.floor(nd.y / 50);
+      let l = this.nodeGrid.get(gk);
+      if (!l) this.nodeGrid.set(gk, (l = []));
+      l.push(n);
+    }
+    // Stop lines per directed lane, where the world paints them: clear of the
+    // widest *other* road at the junction.
+    this.stopD = new Float32Array(this.edges.length * 2);
+    for (let lane = 0; lane < this.edges.length * 2; lane++) {
+      const e = this.edges[lane >> 1];
+      if (e.oneway && lane & 1) continue;
+      const n = this.endNode(lane);
+      const nd = this.nodes[n];
+      if (nd.deg < 3 || e.len < 6) continue;
+      let hw = 0;
+      for (const ei of nd.edges) if (ei !== lane >> 1) hw = Math.max(hw, this.edges[ei].width / 2);
+      this.stopD[lane] = Math.max(3.5, Math.min(Math.min(18, hw + 2.5), e.len - 2));
+    }
+    // Lanes that converge at a shallow angle meet before the node: hold them further back.
+    const incoming = new Map<number, number[]>();
+    for (let lane = 0; lane < this.edges.length * 2; lane++) {
+      if (!this.stopD[lane]) continue;
+      const n = this.endNode(lane);
+      let l = incoming.get(n);
+      if (!l) incoming.set(n, (l = []));
+      l.push(lane);
+    }
+    for (const lanes of incoming.values()) {
+      for (const a of lanes) {
+        const [ax, ay] = this.laneEndDir(a);
+        for (const b of lanes) {
+          if (b >> 1 === a >> 1) continue;
+          const [bx, by] = this.laneEndDir(b);
+          const cos = ax * bx + ay * by;
+          if (cos < 0.82) continue;
+          const sin = Math.max(0.08, Math.sqrt(Math.max(0, 1 - cos * cos)));
+          const need = Math.min(25, 2.6 / sin + 2);
+          const e = this.edges[a >> 1];
+          this.stopD[a] = Math.max(this.stopD[a], Math.min(need, e.len - 2));
+        }
+      }
+    }
+    // Signals: those near a junction control the junction; the rest are
+    // mid-block (pedestrian) lights with their own stop line on the lane.
     const sg = this.data.signals;
-    const grid = new Map<number, number[]>();
+    const edgeGrid = new Map<number, number[]>();
     this.edges.forEach((e, i) => {
       const gk = Math.floor(e.mx / 200) * 1000 + Math.floor(e.my / 200);
-      let l = grid.get(gk);
-      if (!l) grid.set(gk, (l = []));
+      let l = edgeGrid.get(gk);
+      if (!l) edgeGrid.set(gk, (l = []));
       l.push(i);
     });
+    const H = heightsOf(this.data);
     for (let k = 0; k < sg.length; k += 2) {
       const sx = sg[k];
       const sy = sg[k + 1];
+      // Signals stand at street level: they control only roads at that level.
+      const sz = H.surfaceAt(sx, sy).z;
+      const jn = this.nearestJunction(sx, sy, 30, sz);
+      if (jn >= 0 && Math.hypot(this.nodes[jn].x - sx, this.nodes[jn].y - sy) < this.nodes[jn].boxR + 14) {
+        this.nodes[jn].sig = true;
+        continue;
+      }
       const gx = Math.floor(sx / 200);
       const gy = Math.floor(sy / 200);
       for (let oy = -1; oy <= 1; oy++) {
         for (let ox = -1; ox <= 1; ox++) {
-          for (const ei of grid.get((gx + ox) * 1000 + gy + oy) ?? []) {
+          for (const ei of edgeGrid.get((gx + ox) * 1000 + gy + oy) ?? []) {
             const e = this.edges[ei];
             const pr = this.project(e, sx, sy);
-            if (pr.d > 7) continue;
+            if (pr.d > 7 || Math.abs(this.zAlong(e, pr.s) - sz) > LEVEL_GAP) continue;
             const fwd = pr.s - 6;
             if (fwd > 0 && fwd < e.len) {
               e.sig[0].push(fwd);
@@ -367,6 +600,97 @@ export class CarTraffic {
         e.sigXY[d] = xy;
       }
     }
+    this.buildBuswayCrossings(edgeGrid);
+  }
+
+  /** Where a car road crosses a busway at grade, cars give way to buses. */
+  private buildBuswayCrossings(edgeGrid: Map<number, number[]>): void {
+    const roads = this.data.roads;
+    for (const r of roads) {
+      if (!(r.bus || r.kind === RoadKind.Busway)) continue;
+      const p = r.pts;
+      for (let i = 0; i + 3 < p.length; i += 2) {
+        const ax = p[i];
+        const ay = p[i + 1];
+        const bx = p[i + 2];
+        const by = p[i + 3];
+        const za = r.z[i / 2];
+        const zb = r.z[i / 2 + 1];
+        const blen = Math.hypot(bx - ax, by - ay);
+        if (blen < 0.1) continue;
+        const gx0 = Math.floor(Math.min(ax, bx) / 200) - 1;
+        const gx1 = Math.floor(Math.max(ax, bx) / 200) + 1;
+        const gy0 = Math.floor(Math.min(ay, by) / 200) - 1;
+        const gy1 = Math.floor(Math.max(ay, by) / 200) + 1;
+        for (let gx = gx0; gx <= gx1; gx++) {
+          for (let gy = gy0; gy <= gy1; gy++) {
+            for (const ei of edgeGrid.get(gx * 1000 + gy) ?? []) {
+              const e = this.edges[ei];
+              const q = e.pts;
+              for (let k = 0; k + 3 < q.length; k += 2) {
+                const cx = q[k];
+                const cy = q[k + 1];
+                const dx = q[k + 2] - cx;
+                const dy = q[k + 3] - cy;
+                const ex = bx - ax;
+                const ey = by - ay;
+                const den = dx * ey - dy * ex;
+                if (Math.abs(den) < 1e-6) continue;
+                const t = ((ax - cx) * ey - (ay - cy) * ex) / den;
+                const s = ((ax - cx) * dy - (ay - cy) * dx) / den;
+                if (t < 0 || t > 1 || s < 0 || s > 1) continue;
+                // Only where the two really meet (not a busway viaduct or tunnel crossing the street).
+                const zc = e.z[k / 2] + (e.z[k / 2 + 1] - e.z[k / 2]) * t;
+                const zw = za + (zb - za) * s;
+                if (Math.abs(zc - zw) >= 1.5) continue;
+                const along = e.cum[k / 2] + t * Math.hypot(dx, dy);
+                const X = cx + dx * t;
+                const Y = cy + dy * t;
+                const fwd = along - 5;
+                if (fwd > 0) {
+                  e.xs[0].push(fwd);
+                  e.xsXY[0].push(X, Y, ex / blen, ey / blen, zw);
+                }
+                if (!e.oneway && e.len - along - 5 > 0) {
+                  e.xs[1].push(e.len - along - 5);
+                  e.xsXY[1].push(X, Y, ex / blen, ey / blen, zw);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    for (const e of this.edges) {
+      for (const d of [0, 1] as const) {
+        const order = e.xs[d].map((s, i) => [s, i] as const).sort((x, y) => x[0] - y[0]);
+        e.xs[d] = order.map(([s]) => s);
+        const xy: number[] = [];
+        for (const [, i] of order) xy.push(...e.xsXY[d].slice(i * 5, i * 5 + 5));
+        e.xsXY[d] = xy;
+      }
+    }
+  }
+
+  /** Nearest junction node within r of (x, y) on the level of z (any level without z), or -1. */
+  private nearestJunction(x: number, y: number, r: number, z?: number): number {
+    let best = -1;
+    let bd = r;
+    const gx = Math.floor(x / 50);
+    const gy = Math.floor(y / 50);
+    for (let ox = -1; ox <= 1; ox++) {
+      for (let oy = -1; oy <= 1; oy++) {
+        for (const n of this.nodeGrid.get((gx + ox) * 4096 + gy + oy) ?? []) {
+          if (z !== undefined && Math.abs(this.nodes[n].z - z) > LEVEL_GAP) continue;
+          const d = Math.hypot(this.nodes[n].x - x, this.nodes[n].y - y);
+          if (d < bd) {
+            bd = d;
+            best = n;
+          }
+        }
+      }
+    }
+    return best;
   }
 
   private project(e: Edge, x: number, y: number): { s: number; d: number } {
@@ -389,8 +713,22 @@ export class CarTraffic {
     return { s: bs, d: best };
   }
 
+  /** Road height at distance s along an edge (from its `a` end). */
+  private zAlong(e: Edge, s: number): number {
+    const c = e.cum;
+    let lo = 0;
+    let hi = c.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (c[mid] <= s) lo = mid;
+      else hi = mid;
+    }
+    const t = Math.max(0, Math.min(1, (s - c[lo]) / Math.max(1e-6, c[hi] - c[lo])));
+    return e.z[lo] + (e.z[hi] - e.z[lo]) * t;
+  }
+
   /** Point on a directed lane at distance u, shifted `lat` to the left. */
-  private at(lane: number, u: number, lat: number, out: { x: number; y: number; hx: number; hy: number }): void {
+  private at(lane: number, u: number, lat: number, out: LanePt): void {
     const e = this.edges[lane >> 1];
     const rev = (lane & 1) === 1;
     const s = Math.max(0, Math.min(e.len, rev ? e.len - u : u));
@@ -417,23 +755,35 @@ export class CarTraffic {
     out.y = p[2 * lo + 1] + (p[2 * hi + 1] - p[2 * lo + 1]) * t + hx * lat;
     out.hx = hx;
     out.hy = hy;
+    const z = e.z;
+    out.z = z[lo] + (z[hi] - z[lo]) * t;
+    const g = (z[hi] - z[lo]) / l;
+    out.g = rev ? -g : g;
   }
 
+  /**
+   * Lateral offset (left of the centreline) of lane `idx` (0 = kerb lane).
+   * Lanes are spread evenly over the space the road really has, so two lanes
+   * never share an offset even where OSM claims more lanes than fit.
+   */
   private laneOffset(lane: number, idx: number): number {
     const e = this.edges[lane >> 1];
     const half = e.width / 2;
-    if (e.oneway) {
-      const k = Math.min(idx, e.lanes - 1);
-      return Math.max(-half + 1.6, half - 1.65 - k * 3.2);
-    }
-    const per = Math.max(1, Math.floor(e.lanes / 2));
-    const k = Math.min(idx, per - 1);
-    return Math.max(1.55, half - 1.65 - k * 3.2);
+    const n = this.lanesIn(lane);
+    const k = Math.min(idx, n - 1);
+    const outer = half - 1.6;
+    const inner = e.oneway ? -outer : Math.min(outer, 1.55);
+    if (n <= 1) return e.oneway ? Math.max(0, outer) : Math.max(1.55, outer);
+    const step = Math.min(3.2, (outer - inner) / (n - 1));
+    return outer - k * step;
   }
 
+  /** Usable lanes in this direction (what fits at ~2.7 m spacing). */
   private lanesIn(lane: number): number {
     const e = this.edges[lane >> 1];
-    return e.oneway ? e.lanes : Math.max(1, Math.floor(e.lanes / 2));
+    const half = e.width / 2;
+    if (e.oneway) return Math.max(1, Math.min(e.lanes, 1 + Math.floor((2 * half - 3.2) / 2.7)));
+    return Math.max(1, Math.min(Math.floor(e.lanes / 2), 1 + Math.floor((half - 3.15) / 2.7)));
   }
 
   private endNode(lane: number): number {
@@ -490,12 +840,183 @@ export class CarTraffic {
   }
 
   // -------------------------------------------------------------------------
+  // Junction reservations (shared with the AI buses)
+
+  /** Unit direction of travel at the end of a lane (into its end node). */
+  private laneEndDir(lane: number): [number, number] {
+    const e = this.edges[lane >> 1];
+    const p = e.pts;
+    const n = p.length;
+    let dx: number;
+    let dy: number;
+    if (lane & 1) {
+      dx = p[0] - p[2];
+      dy = p[1] - p[3];
+    } else {
+      dx = p[n - 2] - p[n - 4];
+      dy = p[n - 1] - p[n - 3];
+    }
+    const l = Math.hypot(dx, dy) || 1;
+    return [dx / l, dy / l];
+  }
+
+  /** Unit direction of travel at the start of a lane (out of its start node). */
+  private laneStartDir(lane: number): [number, number] {
+    const e = this.edges[lane >> 1];
+    const p = e.pts;
+    const n = p.length;
+    let dx: number;
+    let dy: number;
+    if (lane & 1) {
+      dx = p[n - 4] - p[n - 2];
+      dy = p[n - 3] - p[n - 1];
+    } else {
+      dx = p[2] - p[0];
+      dy = p[3] - p[1];
+    }
+    const l = Math.hypot(dx, dy) || 1;
+    return [dx / l, dy / l];
+  }
+
+  /** Signal state for a vehicle travelling (dirX, dirY) into junction `node`, or null if unsignalised. */
+  signalFor(node: number, dirX: number, dirY: number, time: number): 'green' | 'amber' | 'red' | null {
+    const nd = this.nodes[node];
+    if (!nd.sig || !this.world.signalStateAt) return null;
+    return this.world.signalStateAt(nd.x, nd.y, time, dirX, dirY);
+  }
+
+  /** Is the box clear of movements that conflict with this one? (Expired holders are dropped.) */
+  boxClear(node: number, id: number, inX: number, inY: number, outX: number, outY: number, cls: Turn, time: number): boolean {
+    const nd = this.nodes[node];
+    let w = 0;
+    for (let i = 0; i < nd.occ.length; i++) {
+      const o = nd.occ[i];
+      if (o.until >= time) nd.occ[w++] = o;
+    }
+    nd.occ.length = w;
+    for (const o of nd.occ) if (o.id !== id && movementsConflict(inX, inY, outX, outY, cls, o)) return false;
+    return true;
+  }
+
+  /** Reserve the box for a movement until `until` (refreshes an existing hold). */
+  enter(node: number, id: number, inX: number, inY: number, outX: number, outY: number, cls: Turn, until: number): void {
+    const nd = this.nodes[node];
+    const o = nd.occ.find((x) => x.id === id);
+    if (o) o.until = Math.max(o.until, until);
+    else nd.occ.push({ id, inX, inY, outX, outY, cls, until });
+  }
+
+  leave(node: number, id: number): void {
+    const occ = this.nodes[node].occ;
+    const i = occ.findIndex((o) => o.id === id);
+    if (i >= 0) occ.splice(i, 1);
+  }
+
+  /** Unsignalised junction: a side-road vehicle must wait while main-road traffic is passing. */
+  giveWayBusy(node: number, minor: boolean, time: number): boolean {
+    const nd = this.nodes[node];
+    return !nd.sig && minor && nd.until > time;
+  }
+
+  /** Main-road vehicle approaching an unsignalised junction: mark it busy. */
+  markMajor(node: number, time: number, holder: number): void {
+    const nd = this.nodes[node];
+    if (nd.sig) return;
+    nd.until = time + 1.6;
+    nd.holder = holder;
+  }
+
+  /** A slow car within r of (x, y) on the level of z (an exit that is not clear). */
+  slowCarNear(x: number, y: number, r: number, z?: number): boolean {
+    const i = this.grid.nearest(x, y, r, undefined, z);
+    return i >= 0 && this.grid.pv[i] < 2;
+  }
+
+  /** Junctions an AI bus route passes through, in route order (cached per track). */
+  junctionsAlong(track: RouteTrack): BusJunction[] {
+    const cached = this.busJunctions.get(track);
+    if (cached) return cached;
+    const best = new Map<number, { i: number; d: number }>();
+    for (let i = 0; i < track.n; i++) {
+      // Only junctions on the route's level (not the street under a busway viaduct).
+      const n = this.nearestJunction(track.x[i], track.y[i], 7, track.z[i]);
+      if (n < 0) continue;
+      const d = Math.hypot(this.nodes[n].x - track.x[i], this.nodes[n].y - track.y[i]);
+      const cur = best.get(n);
+      if (!cur || d < cur.d) best.set(n, { i, d });
+    }
+    const out: BusJunction[] = [];
+    const clampI = (i: number) => Math.max(0, Math.min(track.n - 1, i));
+    for (const [n, { i }] of best) {
+      const nd = this.nodes[n];
+      const s = i * TRACK_STEP;
+      const ia = clampI(Math.round((s - 12) / TRACK_STEP));
+      const ib = clampI(Math.round((s + 12) / TRACK_STEP));
+      const inX = track.tx[ia];
+      const inY = track.ty[ia];
+      const outX = track.tx[ib];
+      const outY = track.ty[ib];
+      const turn = wrapAngle(Math.atan2(outX, outY) - Math.atan2(inX, inY));
+      // The arm we arrive on points back along our travel direction.
+      let arrive = -1;
+      let bestDot = -2;
+      for (const ei of nd.edges) {
+        const [dx, dy] = this.edgeDirFrom(ei, n);
+        const dot = -(dx * inX + dy * inY);
+        if (dot > bestDot) {
+          bestDot = dot;
+          arrive = ei;
+        }
+      }
+      let hw = 0;
+      for (const ei of nd.edges) if (ei !== arrive) hw = Math.max(hw, this.edges[ei].width / 2);
+      const stop = Math.max(3.5, Math.min(18, hw + 2.5));
+      const rank = arrive >= 0 && bestDot > 0.6 ? this.edges[arrive].rank : nd.rank;
+      out.push({
+        node: n,
+        x: nd.x,
+        y: nd.y,
+        s,
+        stopS: s - stop,
+        inX,
+        inY,
+        outX,
+        outY,
+        cls: classify(turn),
+        boxR: nd.boxR,
+        sig: nd.sig,
+        minor: rank + 0.01 < nd.rank,
+      });
+    }
+    out.sort((a, b) => a.s - b.s);
+    this.busJunctions.set(track, out);
+    return out;
+  }
+
+  private edgeDirFrom(ei: number, node: number): [number, number] {
+    const e = this.edges[ei];
+    const p = e.pts;
+    const n = p.length;
+    let dx: number;
+    let dy: number;
+    if (e.a === node) {
+      dx = p[2] - p[0];
+      dy = p[3] - p[1];
+    } else {
+      dx = p[n - 4] - p[n - 2];
+      dy = p[n - 3] - p[n - 1];
+    }
+    const l = Math.hypot(dx, dy) || 1;
+    return [dx / l, dy / l];
+  }
+
+  // -------------------------------------------------------------------------
 
   private refreshCandidates(px: number, py: number): void {
     this.candidates.length = 0;
     this.candW.length = 0;
     this.candSum = 0;
-    const R2 = RADIUS * RADIUS;
+    const R2 = this.radius * this.radius;
     for (let i = 0; i < this.edges.length; i++) {
       const e = this.edges[i];
       const dx = e.mx - px;
@@ -531,21 +1052,26 @@ export class CarTraffic {
     }
     const e = this.edges[ei];
     const lane = ei * 2 + (!e.oneway && this.rand() < 0.5 ? 1 : 0);
-    const u = this.rand() * e.len;
+    // Never inside a junction box.
+    const startN = this.nodes[lane & 1 ? e.b : e.a];
+    const u0 = startN.deg >= 3 ? startN.boxR + 3 : 2;
+    const u1 = e.len - this.stopD[lane] - 3;
+    if (u1 <= u0) return false;
+    const u = u0 + this.rand() * (u1 - u0);
     const laneIdx = Math.floor(this.rand() * this.lanesIn(lane));
     const lat = this.laneOffset(lane, laneIdx);
-    const pt = { x: 0, y: 0, hx: 0, hy: 0 };
+    const pt = this.pt;
     this.at(lane, u, lat, pt);
     const d = Math.hypot(pt.x - px, pt.y - py);
-    if (d > RADIUS || d < (this.initial ? 30 : 130)) return false;
+    if (d > this.radius || d < (this.initial ? 35 : 130)) return false;
     if (!this.initial && d < 420) {
-      this.sphere.center.set(pt.x, 1, -pt.y);
+      this.sphere.center.set(pt.x, pt.z + 1, -pt.y);
       this.sphere.radius = 4;
       if (frustum.intersectsSphere(this.sphere)) return false;
     }
-    if (this.busGrid.nearest(pt.x, pt.y, 9) >= 0) return false;
-    if (this.grid.nearest(pt.x, pt.y, 9) >= 0) return false;
-    for (const c of this.cars) if (c.lane === lane && Math.abs(c.u - u) < 10) return false;
+    if (this.busGrid.nearest(pt.x, pt.y, 10, undefined, pt.z) >= 0) return false;
+    if (this.grid.nearest(pt.x, pt.y, 10, undefined, pt.z) >= 0) return false;
+    for (const c of this.cars) if (c.lane === lane && Math.abs(c.u - u) < 12) return false;
     const roll = this.rand();
     const model = roll < 0.22 ? 0 : roll < 0.47 ? 1 : roll < 0.68 ? 2 : roll < 0.85 ? 3 : roll < 0.93 ? 4 : 5;
     let color = this.pickPaint();
@@ -561,46 +1087,179 @@ export class CarTraffic {
       model,
       color,
       next: -1,
+      next2: -1,
       vWant: 0.88 + this.rand() * 0.2,
       x: pt.x,
       y: pt.y,
+      z: pt.z,
+      pitch: Math.atan(pt.g),
       heading: Math.atan2(pt.hx, pt.hy),
       len: this.models[model].len,
       braking: false,
       sigI: 0,
       sigState: null,
       sigTimer: 0,
-      stuck: 0,
-      ghost: 0,
-      claimed: -1,
+      xsI: 0,
+      xsCommit: -1,
+      holds: [],
       busWait: 0,
+      idle: 0,
+      exempt: false,
+      visible: false,
+      dead: false,
     };
     const sig = e.sig[lane & 1];
     while (c.sigI < sig.length && sig[c.sigI] < u) c.sigI++;
+    const xs = e.xs[lane & 1];
+    while (c.xsI < xs.length && xs[c.xsI] < u) c.xsI++;
     this.cars.push(c);
     return true;
   }
 
-  /** Speed of a car within r of (x, y), or -1 if none. */
-  probe(x: number, y: number, r: number): number {
-    const i = this.grid.nearest(x, y, r);
+  private note(msg: string): void {
+    this.events.push(msg);
+    if (this.events.length > 30) this.events.shift();
+  }
+
+  private kill(c: Car): void {
+    if (c.dead) return;
+    c.dead = true;
+    for (const h of c.holds) this.leave(h.node, c.id);
+    c.holds.length = 0;
+  }
+
+  /** Grid index of the nearest other (live) car within r of (x, y) on the level of z, or -1. */
+  private carNear(x: number, y: number, r: number, skip: number, z: number): number {
+    const g = this.grid;
+    let best = -1;
+    let bd = r * r;
+    g.query(x, y, r, (i) => {
+      if (g.pid[i] === skip || Math.abs(g.pz[i] - z) > LEVEL_GAP) return false;
+      const o = this.byId.get(g.pid[i]);
+      if (!o || o.dead) return false;
+      const d = (g.px[i] - x) ** 2 + (g.py[i] - y) ** 2;
+      if (d < bd) {
+        bd = d;
+        best = i;
+      }
+      return false;
+    });
+    return best;
+  }
+
+  /** Speed of a car within r of (x, y) (on the level of z, if given), or -1 if none. */
+  probe(x: number, y: number, r: number, z?: number): number {
+    const i = this.grid.nearest(x, y, r, undefined, z);
     return i < 0 ? -1 : this.grid.pv[i];
   }
 
-  update(dt: number, time: number, player: BusPose, playerBody: Body, busBodies: Body[], frustum: THREE.Frustum, cam: THREE.Vector3, hours: number): void {
-    const t0 = performance.now();
-    if (!this.enabled) {
-      for (const m of this.models) m.mesh.count = m.head.count = m.tail.count = 0;
-      return;
+  /** Is the car with this id waiting legitimately (red light, player, or a queue behind those)? */
+  isExempt(id: number): boolean {
+    return this.byId.get(id)?.exempt ?? false;
+  }
+
+  /** Car id of the car within r of (x, y) (on the level of z, if given), or -1. */
+  carAt(x: number, y: number, r: number, z?: number): number {
+    const i = this.grid.nearest(x, y, r, undefined, z);
+    return i < 0 ? -1 : this.grid.pid[i];
+  }
+
+  /** Can this car go through the junction at the end of `lane` onto `next` right now? */
+  private canGo(c: Car, lane: number, next: number, stopAt: number, time: number, depth: number): Wait {
+    const N = this.endNode(lane);
+    const nd = this.nodes[N];
+    const [inX, inY] = this.laneEndDir(lane);
+    const [outX, outY] = this.laneStartDir(next);
+    if (nd.sig) {
+      const st = this.signalFor(N, inX, inY, time);
+      if (st === 'red') return Wait.Red;
+      if (st === 'amber' && stopAt > (c.v * c.v) / (2 * 3.5)) return Wait.Red;
+    } else {
+      const e = this.edges[lane >> 1];
+      if (e.rank + 0.01 < nd.rank && nd.until > time && nd.holder !== lane) return Wait.Junction;
     }
+    const cls = classify(wrapAngle(Math.atan2(outX, outY) - Math.atan2(inX, inY)));
+    if (!this.boxClear(N, c.id, inX, inY, outX, outY, cls, time)) return Wait.Junction;
+    // The exit must have room for the whole car, so it never stops in the box.
+    const idx = Math.min(c.laneIdx, this.lanesIn(next) - 1);
+    const room = nd.boxR + c.len + 1.5;
+    const nb = this.buckets.get(next);
+    if (nb) {
+      for (const o of nb) {
+        if (o === c || o.dead) continue;
+        if (this.lanesIn(next) > 1 && o.laneIdx !== idx) continue;
+        if (o.u < room && o.v < 2) {
+          this.blockRef = o.id;
+          return Wait.Junction;
+        }
+      }
+    }
+    const ne = this.edges[next >> 1];
+    this.at(next, Math.min(ne.len, nd.boxR + 3), this.laneOffset(next, idx), this.pt2);
+    const hb = this.busGrid.nearest(this.pt2.x, this.pt2.y, 2.6, undefined, this.pt2.z);
+    if (hb >= 0 && this.busGrid.pv[hb] < 2) return Wait.Junction;
+    // A link too short to stop on: the junction after it must be enterable too.
+    if (depth === 0 && this.shortLink(next, nd.boxR, c.len)) {
+      if (c.next2 < 0) c.next2 = this.chooseNext(next);
+      if (c.next2 >= 0) return this.canGo(c, next, c.next2, stopAt + ne.len, time, 1);
+    }
+    return Wait.None;
+  }
+
+  private commit(c: Car, lane: number, next: number, stopAt: number, time: number, depth: number): void {
+    const N = this.endNode(lane);
+    const nd = this.nodes[N];
+    const [inX, inY] = this.laneEndDir(lane);
+    const [outX, outY] = this.laneStartDir(next);
+    const cls = classify(wrapAngle(Math.atan2(outX, outY) - Math.atan2(inX, inY)));
+    const until = time + Math.min(16, (stopAt + 2 * nd.boxR + c.len) / Math.max(c.v, 3) + 2.5);
+    this.enter(N, c.id, inX, inY, outX, outY, cls, until);
+    if (!c.holds.some((h) => h.node === N)) c.holds.push({ node: N, d: -1, inX, inY, outX, outY, cls });
+    const ne = this.edges[next >> 1];
+    if (depth === 0 && c.next2 >= 0 && this.shortLink(next, nd.boxR, c.len)) this.commit(c, next, c.next2, stopAt + ne.len, time, 1);
+  }
+
+  /** A lane too short to wait on between two junction boxes. */
+  private shortLink(lane: number, boxR: number, len: number): boolean {
+    const e = this.edges[lane >> 1];
+    const nd = this.nodes[this.endNode(lane)];
+    return nd.deg >= 3 && e.len - this.stopD[lane] < boxR + len;
+  }
+
+  /** Index of a bus (or -1 = player) on the busway near a crossing at (X, Y, Z) along (bx, by), else -2. */
+  private busOnBusway(X: number, Y: number, bx: number, by: number, Z: number): number {
+    const g = this.busGrid;
+    let found = -2;
+    g.query(X, Y, 26, (i) => {
+      if (Math.abs(g.pz[i] - Z) > LEVEL_GAP) return false;
+      const dx = g.px[i] - X;
+      const dy = g.py[i] - Y;
+      const along = dx * bx + dy * by;
+      const lat = Math.abs(dx * by - dy * bx);
+      // On the crossing, or moving and close enough to reach it soon. (A bus
+      // standing at a nearby platform or light is not a reason to wait.)
+      if (lat < 4.5 && (Math.abs(along) < 7 || (g.pv[i] > 0.8 && Math.abs(along) < 25))) {
+        found = g.pid[i];
+        return true;
+      }
+      return false;
+    });
+    return found;
+  }
+
+  /**
+   * Advance the car simulation. `busBodies` / `busExempt` are the AI buses
+   * (index-aligned); the player is avoided through `playerBody`.
+   */
+  simulate(dt: number, time: number, player: BusPose, playerBody: Body, busBodies: readonly Body[], busExempt: readonly boolean[], frustum: THREE.Frustum): void {
+    const t0 = performance.now();
     const px = player.x;
     const py = player.y;
-    // Bus footprints for avoidance.
     const bg = this.busGrid;
     bg.clear();
-    for (let k = 0; k < playerBody.n; k++) bg.add(playerBody.x[k], playerBody.y[k], Math.max(0, playerBody.speed), -1);
+    for (let k = 0; k < playerBody.n; k++) bg.add(playerBody.x[k], playerBody.y[k], Math.max(0, Math.abs(playerBody.speed)), -1, playerBody.z[k]);
     busBodies.forEach((b, i) => {
-      for (let k = 0; k < b.n; k++) bg.add(b.x[k], b.y[k], b.speed, i);
+      for (let k = 0; k < b.n; k++) bg.add(b.x[k], b.y[k], b.speed, i, b.z[k]);
     });
 
     this.candTimer -= dt;
@@ -608,37 +1267,47 @@ export class CarTraffic {
       this.candTimer = 2;
       this.refreshCandidates(px, py);
     }
-    // Despawn.
+    // Remove dead and far-away cars.
     for (let i = this.cars.length - 1; i >= 0; i--) {
       const c = this.cars[i];
       const d = Math.hypot(c.x - px, c.y - py);
-      if (d > DESPAWN || i >= this.maxCars + 6 || c.lane < 0) {
+      if (c.dead || d > this.radius + 150 || i >= this.maxCars + 6) {
+        this.kill(c);
         this.cars[i] = this.cars[this.cars.length - 1];
         this.cars.pop();
       }
     }
     // Spawn.
-    const desired = Math.min(this.maxCars, Math.round(this.candSum / 90));
-    let tries = this.initial ? 400 : 8;
-    let made = 0;
-    while (this.cars.length < desired && tries-- > 0 && made < (this.initial ? 200 : 3)) if (this.spawn(px, py, frustum)) made++;
-    if (this.initial && this.candidates.length) this.initial = false;
+    if (this.enabled && this.capCars > 0) {
+      const desired = Math.min(this.maxCars, Math.round(this.candSum / 90));
+      let tries = this.initial ? 400 : 8;
+      let made = 0;
+      while (this.cars.length < desired && tries-- > 0 && made < (this.initial ? this.capCars : 2)) if (this.spawn(px, py, frustum)) made++;
+      if (this.initial && this.candidates.length) this.initial = false;
+    }
 
-    // Buckets per lane, sorted by u.
+    // Buckets per lane, sorted by u; id lookup (exempt flags are last frame's).
     for (const list of this.buckets.values()) list.length = 0;
+    this.byId.clear();
     for (const c of this.cars) {
+      this.byId.set(c.id, c);
       let l = this.buckets.get(c.lane);
       if (!l) this.buckets.set(c.lane, (l = []));
       l.push(c);
     }
     for (const l of this.buckets.values()) if (l.length > 1) l.sort((a, b) => a.u - b.u);
 
-    const pt = { x: 0, y: 0, hx: 0, hy: 0 };
+    const pt = this.pt;
     const signalAt = this.world.signalStateAt;
+    const st = this.stats;
+    st.waitingRed = 0;
+    st.waitingJunction = 0;
+    st.stationary = 0;
     for (const c of this.cars) {
+      if (c.dead) continue;
       const e = this.edges[c.lane >> 1];
       const remain = e.len - c.u;
-      if (c.next < 0 && remain < 60) c.next = this.chooseNext(c.lane);
+      if (c.next < 0 && remain < 70) c.next = this.chooseNext(c.lane);
       const v0 = (e.limit / 3.6) * c.vWant;
       const A = 1.7;
       const B = 2.6;
@@ -648,6 +1317,15 @@ export class CarTraffic {
         return A * (1 - Math.pow(c.v / Math.max(1, v0), 4) - (sStar / Math.max(0.05, gap)) ** 2);
       };
       let acc = A * (1 - Math.pow(c.v / Math.max(1, v0), 4));
+      const wt: { why: Wait; ref: number } = { why: Wait.None, ref: 0 };
+      const lim = (a: number, w: Wait, ref = 0) => {
+        if (a < acc) {
+          acc = a;
+          wt.why = w;
+          wt.ref = ref;
+        }
+      };
+      const commitDist = Math.max(2.5, (c.v * c.v) / (2 * 2.5)) + 1.5;
       // Slow for the turn at the end of the lane.
       if (c.next >= 0 && remain < 50) {
         const turn = Math.abs(this.turnAngle(c.lane, c.next));
@@ -661,47 +1339,57 @@ export class CarTraffic {
       const list = this.buckets.get(c.lane)!;
       let gap = Infinity;
       let vLead = 0;
+      let leadId = 0;
+      // Approaching a narrower exit, cars in the other lanes merge into ours: follow them too.
+      const merging = c.next >= 0 && remain < 30 && this.lanesIn(c.next) < this.lanesIn(c.lane);
       for (let k = list.indexOf(c) + 1; k < list.length; k++) {
         const o = list[k];
-        if (o.laneIdx !== c.laneIdx && this.lanesIn(c.lane) > 1) continue;
+        if (o.dead || (o.laneIdx !== c.laneIdx && this.lanesIn(c.lane) > 1 && !(merging && o.next === c.next))) continue;
         gap = o.u - c.u - (o.len + c.len) / 2;
         vLead = o.v;
+        leadId = o.id;
         break;
       }
       if (gap === Infinity && c.next >= 0) {
         const nl = this.buckets.get(c.next);
         if (nl) {
           for (const o of nl) {
-            if (o.laneIdx !== Math.min(c.laneIdx, this.lanesIn(c.next) - 1) && this.lanesIn(c.next) > 1) continue;
+            if (o.dead || (o.laneIdx !== Math.min(c.laneIdx, this.lanesIn(c.next) - 1) && this.lanesIn(c.next) > 1)) continue;
             gap = remain + o.u - (o.len + c.len) / 2;
             vLead = o.v;
+            leadId = o.id;
             break;
           }
         }
       }
-      if (gap < 120) acc = Math.min(acc, idm(gap, vLead, 2.2));
-      // Buses (AI and player) ahead on the path.
+      if (gap < 120) lim(idm(gap, vLead, 2.2), Wait.Car, leadId);
+      // Anything else in our path: crossing cars, buses, the player.
       let busBlock = false;
-      if (c.ghost <= 0) {
-        const look = 6 + c.v * 2.2;
-        for (let d = c.len / 2 + 1; d <= look; d += 2.5) {
-          this.sampleAhead(c, d, pt);
-          const hit = bg.nearest(pt.x, pt.y, 2.1);
-          if (hit >= 0) {
-            acc = Math.min(acc, idm(d - c.len / 2 - 0.6, bg.pv[hit] * 0.8, 1.5));
-            busBlock = bg.pv[hit] < 1;
-            break;
-          }
+      const look = 5 + c.v * 2;
+      for (let d = c.len / 2 + 1; d <= look; d += 2) {
+        this.sampleAhead(c, d, pt);
+        const hc = this.carNear(pt.x, pt.y, 1.7, c.id, pt.z);
+        if (hc >= 0) {
+          lim(idm(d - c.len / 2 - 0.5, this.grid.pv[hc] * 0.6, 1.6), Wait.Car, this.grid.pid[hc]);
+          break;
         }
-      } else c.ghost -= dt;
+        const hb = bg.nearest(pt.x, pt.y, 2.1, undefined, pt.z);
+        if (hb >= 0) {
+          lim(idm(d - c.len / 2 - 0.6, bg.pv[hb] * 0.8, 1.5), bg.pid[hb] === -1 ? Wait.Player : Wait.Bus, bg.pid[hb]);
+          busBlock = bg.pv[hb] < 1;
+          break;
+        }
+      }
       // Stuck behind a stopped bus on a multi-lane road: move over and overtake.
       if (busBlock && c.v < 1.5) c.busWait += dt;
       else c.busWait = Math.max(0, c.busWait - dt);
       if (c.busWait > 2.5 && this.lanesIn(c.lane) > 1) {
-        c.laneIdx = (c.laneIdx + 1) % this.lanesIn(c.lane);
+        const to = (c.laneIdx + 1) % this.lanesIn(c.lane);
+        // Only into a gap.
+        if (!list.some((o) => o !== c && !o.dead && o.laneIdx === to && Math.abs(o.u - c.u) < c.len + 6)) c.laneIdx = to;
         c.busWait = 0;
       }
-      // Signals.
+      // Mid-block signals (pedestrian lights).
       const sig = e.sig[c.lane & 1];
       if (c.sigI < sig.length) {
         const sgap = sig[c.sigI] - c.u;
@@ -713,94 +1401,167 @@ export class CarTraffic {
           if (c.sigTimer <= 0 || c.sigState === null) {
             c.sigTimer = 0.3;
             const xy = e.sigXY[c.lane & 1];
-            c.sigState = signalAt.call(this.world, xy[2 * c.sigI], xy[2 * c.sigI + 1], time);
+            this.at(c.lane, sig[c.sigI], 0, this.pt2);
+            c.sigState = signalAt.call(this.world, xy[2 * c.sigI], xy[2 * c.sigI + 1], time, this.pt2.hx, this.pt2.hy);
           }
-          const stopDist = (c.v * c.v) / (2 * 3);
-          if (c.sigState === 'red' || (c.sigState === 'amber' && sgap > stopDist + 2)) acc = Math.min(acc, idm(sgap, 0, 0.8));
+          if (c.sigState === 'red' || (c.sigState === 'amber' && sgap > (c.v * c.v) / (2 * 3) + 2)) lim(idm(sgap, 0, 0.8), Wait.Red);
         }
       }
-      // Unsignalised junctions: side roads give way to the main road.
-      const endId = this.endNode(c.lane);
-      const endN = this.nodes[endId];
-      if ((!signalAt || !e.sig[c.lane & 1].length) && endN.deg >= 3 && remain < 16) {
-        const minor = e.rank + 0.01 < endN.rank;
-        if (!minor) {
-          // Main-road traffic marks the junction busy as it passes.
-          endN.until = time + 1.6;
-          endN.holder = c.lane;
-        } else if (c.claimed !== endId) {
-          if (endN.until < time) {
-            c.claimed = endId;
-          } else acc = Math.min(acc, idm(Math.max(0.1, remain - 4), 0, 0.5));
+      // Busway crossings: give way to any bus on the busway.
+      const xs = e.xs[c.lane & 1];
+      while (c.xsI < xs.length && xs[c.xsI] < c.u - 6) c.xsI++;
+      if (c.xsI < xs.length && c.xsCommit !== c.xsI) {
+        const xgap = xs[c.xsI] - c.u;
+        if (xgap < 45 && xgap > -6) {
+          const q = e.xsXY[c.lane & 1];
+          const k = c.xsI * 5;
+          const bus = this.busOnBusway(q[k], q[k + 1], q[k + 2], q[k + 3], q[k + 4]);
+          if (bus !== -2) lim(idm(Math.max(0.05, xgap), 0, 0.5), bus === -1 ? Wait.Player : Wait.Crossing, bus);
+          else if (xgap < 2) c.xsCommit = c.xsI; // keep looking until we are on it
+        }
+      }
+      // Junction at the end of the lane.
+      const N = this.endNode(c.lane);
+      const nd = this.nodes[N];
+      const sd = this.stopD[c.lane];
+      if (sd > 0 && nd.deg >= 3) {
+        if (!nd.sig && e.rank + 0.01 >= nd.rank && remain < 25) this.markMajor(N, time, c.lane);
+        if (!c.holds.some((h) => h.node === N) && c.next >= 0) {
+          const stopAt = remain - sd;
+          if (stopAt < commitDist + 30) {
+            this.blockRef = 0;
+            const res = this.canGo(c, c.lane, c.next, stopAt, time, 0);
+            if (res !== Wait.None) lim(idm(Math.max(0.05, stopAt), 0, 0.6), res, this.blockRef);
+            else if (stopAt <= commitDist) this.commit(c, c.lane, c.next, stopAt, time, 0);
+          }
         }
       }
       acc = Math.max(-7, Math.min(A, acc));
       c.braking = acc < -0.6 || c.v < 0.2;
       c.v = Math.max(0, c.v + acc * dt);
-      if (c.v < 0.1) c.stuck += dt;
-      else c.stuck = 0;
-      if (c.stuck > 30) {
-        c.ghost = 3;
-        c.stuck = 0;
-      }
       c.u += c.v * dt;
+      // Release junctions we have cleared; keep the others reserved while we are on our way through.
+      for (let k = c.holds.length - 1; k >= 0; k--) {
+        const h = c.holds[k];
+        if (h.d >= 0) h.d += c.v * dt;
+        const hn = this.nodes[h.node];
+        if (h.d > hn.boxR + c.len) {
+          this.leave(h.node, c.id);
+          c.holds.splice(k, 1);
+        } else this.enter(h.node, c.id, h.inX, h.inY, h.outX, h.outY, h.cls, time + 3);
+      }
       // Advance onto the next lane.
       let guard = 0;
       while (c.u > this.edges[c.lane >> 1].len && guard++ < 4) {
         const over = c.u - this.edges[c.lane >> 1].len;
+        const passed = this.endNode(c.lane);
         if (c.next < 0) c.next = this.chooseNext(c.lane);
         if (c.next < 0) {
-          c.lane = -1;
+          this.kill(c);
           break;
         }
+        for (const h of c.holds) if (h.node === passed && h.d < 0) h.d = 0;
         c.lane = c.next;
-        c.next = -1;
+        c.next = c.next2;
+        c.next2 = -1;
         c.u = over;
         c.sigI = 0;
         c.sigState = null;
-        c.claimed = -1;
+        c.xsI = 0;
+        c.xsCommit = -1;
         c.laneIdx = Math.min(c.laneIdx, this.lanesIn(c.lane) - 1);
       }
-      if (c.lane < 0) continue;
+      if (c.dead) continue;
       const target = this.laneOffset(c.lane, c.laneIdx);
       c.lat += Math.max(-dt * 1.2, Math.min(dt * 1.2, target - c.lat));
       this.at(c.lane, c.u, c.lat, pt);
       c.x = pt.x;
       c.y = pt.y;
+      c.z = pt.z;
       const h = Math.atan2(pt.hx, pt.hy);
       c.heading += wrapAngle(h - c.heading) * Math.min(1, dt * 7);
+      // Grade pitch, eased so cars do not snap over polyline kinks.
+      c.pitch += (Math.atan(pt.g) - c.pitch) * Math.min(1, dt * 5);
+      // Waiting legitimately? (Red light, the player, or queued behind someone who is.)
+      const why = wt.why;
+      c.exempt =
+        why === Wait.Red ||
+        why === Wait.Player ||
+        // Queued behind someone who is (also across a junction: its exit is full of such a queue).
+        ((why === Wait.Car || (why === Wait.Junction && wt.ref > 0)) && (this.byId.get(wt.ref)?.exempt ?? false)) ||
+        ((why === Wait.Bus || why === Wait.Crossing) && !!busExempt[wt.ref]);
+      if (why === Wait.Red) st.waitingRed++;
+      if (why === Wait.Junction) st.waitingJunction++;
+      if (c.v < 0.3) st.stationary++;
+      // Safety valve: a car that has not moved for a long time without a good reason goes away.
+      if (c.v < 0.3 && !c.exempt && why !== Wait.None) c.idle += dt;
+      else c.idle = 0;
+      if (c.idle > (c.visible ? 45 : 25)) {
+        this.note(`stuck lane ${c.lane} u ${c.u.toFixed(1)}/${e.len.toFixed(1)} why ${wt.why} ref ${wt.ref} end ${N} sig ${nd.sig}`);
+        this.kill(c);
+        st.stuckDespawns++;
+      }
     }
 
-    // Car grid for the buses, then render.
+    // Car grid (for buses, the probes above and overlap checks).
     const g = this.grid;
     g.clear();
     for (const c of this.cars) {
-      if (c.lane < 0) continue;
+      if (c.dead) continue;
       const hx = Math.sin(c.heading);
       const hy = Math.cos(c.heading);
-      g.add(c.x + hx * c.len * 0.3, c.y + hy * c.len * 0.3, c.v, c.id);
-      g.add(c.x - hx * c.len * 0.3, c.y - hy * c.len * 0.3, c.v, c.id);
+      const dz = Math.tan(c.pitch) * c.len * 0.3;
+      g.add(c.x + hx * c.len * 0.3, c.y + hy * c.len * 0.3, c.v, c.id, c.z + dz);
+      g.add(c.x - hx * c.len * 0.3, c.y - hy * c.len * 0.3, c.v, c.id, c.z - dz);
     }
-    this.render(frustum, cam, hours);
+    // Safety valve: vehicles that overlap are removed (the one behind; cars give way to buses).
+    for (const c of this.cars) {
+      if (c.dead) continue;
+      const hx = Math.sin(c.heading);
+      const hy = Math.cos(c.heading);
+      for (const f of [0.3, -0.3]) {
+        const qx = c.x + hx * c.len * f;
+        const qy = c.y + hy * c.len * f;
+        const oc = this.carNear(qx, qy, 1.2, c.id, c.z);
+        if (oc >= 0) {
+          const o = this.byId.get(g.pid[oc]);
+          if (o && !o.dead) {
+            const ahead = (o.x - c.x) * hx + (o.y - c.y) * hy > 0;
+            this.note(`car-car lanes ${c.lane}/${o.lane} u ${c.u.toFixed(1)}/${o.u.toFixed(1)} v ${c.v.toFixed(1)}/${o.v.toFixed(1)} holds ${c.holds.map((h) => h.node)}/${o.holds.map((h) => h.node)} end ${this.endNode(c.lane)}/${this.endNode(o.lane)}`);
+            this.kill(ahead ? c : o);
+            st.overlapDespawns++;
+            break;
+          }
+        }
+        const ob = bg.nearest(qx, qy, 1.6, undefined, c.z);
+        if (ob >= 0 && bg.pid[ob] >= 0) {
+          this.note(`car-bus lane ${c.lane} u ${c.u.toFixed(1)} v ${c.v.toFixed(1)} bus v ${bg.pv[ob].toFixed(1)} holds ${c.holds.map((h) => h.node)} end ${this.endNode(c.lane)}`);
+          this.kill(c);
+          st.overlapDespawns++;
+          break;
+        }
+      }
+    }
 
     const cost = performance.now() - t0;
     this.costEma += (cost - this.costEma) * 0.05;
     this.costTimer -= dt;
     if (this.costTimer <= 0) {
       this.costTimer = 1;
-      if (this.costEma > 0.8 && this.maxCars > 50) this.maxCars -= 4;
-      else if (this.costEma < 0.45 && this.maxCars < MAX_CARS) this.maxCars += 2;
+      if (this.costEma > 0.6 && this.maxCars > 20) this.maxCars -= 4;
+      else if (this.costEma < 0.35 && this.maxCars < this.capCars) this.maxCars += 2;
+      if (this.maxCars > this.capCars) this.maxCars = this.capCars;
     }
   }
 
-  private sampleAhead(c: Car, d: number, out: { x: number; y: number; hx: number; hy: number }): void {
+  private sampleAhead(c: Car, d: number, out: LanePt): void {
     const e = this.edges[c.lane >> 1];
     const u = c.u + d;
     if (u <= e.len || c.next < 0) this.at(c.lane, Math.min(u, e.len), c.lat, out);
     else this.at(c.next, Math.min(u - e.len, this.edges[c.next >> 1].len), this.laneOffset(c.next, Math.min(c.laneIdx, this.lanesIn(c.next) - 1)), out);
   }
 
-  private render(frustum: THREE.Frustum, cam: THREE.Vector3, hours: number): void {
+  render(frustum: THREE.Frustum, cam: THREE.Vector3, hours: number): void {
     const night = hours < 6.6 || hours > 17.9 ? 1 : 0;
     if (night !== this.lastNight) {
       this.lastNight = night;
@@ -808,17 +1569,22 @@ export class CarTraffic {
     }
     for (const m of this.models) m.count = 0;
     for (const c of this.cars) {
-      if (c.lane < 0) continue;
+      c.visible = false;
+      if (c.dead || !this.enabled) continue;
       const dx = c.x - cam.x;
       const dz = -c.y - cam.z;
       if (dx * dx + dz * dz > VIEW * VIEW) continue;
-      this.sphere.center.set(c.x, 1, -c.y);
+      this.sphere.center.set(c.x, c.z + 1, -c.y);
       this.sphere.radius = 3.2;
       if (!frustum.intersectsSphere(this.sphere)) continue;
+      c.visible = true;
       const m = this.models[c.model];
+      if (m.count >= CAPACITY) continue;
       const i = m.count++;
-      this.v3.set(c.x, 0, -c.y);
-      this.q.setFromAxisAngle(this.up, -c.heading);
+      // On the road at its height, yawed then pitched to the grade.
+      this.v3.set(c.x, c.z, -c.y);
+      this.euler.set(c.pitch, -c.heading, 0);
+      this.q.setFromEuler(this.euler);
       this.m4.compose(this.v3, this.q, this.one);
       m.mesh.setMatrixAt(i, this.m4);
       m.mesh.setColorAt(i, c.color);

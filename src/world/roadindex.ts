@@ -9,13 +9,16 @@ export interface Nearest {
   /** Unit direction of the segment (map coords, along the way). */
   dx: number;
   dy: number;
-  /** Closest point. */
+  /** Closest point and the road height there. */
   px: number;
   py: number;
+  z: number;
 }
 
 export class RoadIndex {
   readonly seg: Float32Array;
+  /** Height at both ends of each segment. */
+  readonly segZ: Float32Array;
   readonly segRoad: Int32Array;
   readonly segHW: Float32Array;
   readonly grid: IdGrid;
@@ -31,6 +34,7 @@ export class RoadIndex {
     let n = 0;
     for (const r of roads) if (include(r)) n += (r.pts.length >> 1) - 1;
     this.seg = new Float32Array(n * 4);
+    this.segZ = new Float32Array(n * 2);
     this.segRoad = new Int32Array(n);
     this.segHW = new Float32Array(n);
     this.stamp = new Uint32Array(n);
@@ -47,6 +51,8 @@ export class RoadIndex {
         const bx = r.pts[i + 2];
         const by = r.pts[i + 3];
         this.seg.set([ax, ay, bx, by], k * 4);
+        this.segZ[2 * k] = r.z[i >> 1];
+        this.segZ[2 * k + 1] = r.z[(i >> 1) + 1];
         this.segRoad[k] = ri;
         this.segHW[k] = hw;
         this.grid.addBox(k, Math.min(ax, bx) - hw, Math.min(ay, by) - hw, Math.max(ax, bx) + hw, Math.max(ay, by) + hw);
@@ -88,6 +94,36 @@ export class RoadIndex {
     return best;
   }
 
+  /** Height of segment k at the projection of (x, y). */
+  private segZAt(k: number, x: number, y: number): number {
+    const s = this.seg;
+    const ax = s[4 * k];
+    const ay = s[4 * k + 1];
+    const dx = s[4 * k + 2] - ax;
+    const dy = s[4 * k + 3] - ay;
+    const l2 = dx * dx + dy * dy;
+    let t = l2 > 0 ? ((x - ax) * dx + (y - ay) * dy) / l2 : 0;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    return this.segZ[2 * k] + (this.segZ[2 * k + 1] - this.segZ[2 * k]) * t;
+  }
+
+  /** As penetration(), but only roads whose surface there is within dz of z. */
+  penetrationZ(x: number, y: number, z: number, dz: number, skip = -1, filter?: (road: number) => boolean): number {
+    let best = -Infinity;
+    const g = ++this.gen;
+    this.grid.query(x, y, x, y, (k) => {
+      if (this.stamp[k] === g) return;
+      this.stamp[k] = g;
+      const ri = this.segRoad[k];
+      if (ri === skip || (filter && !filter(ri))) return;
+      const v = this.segHW[k] - this.segDist(k, x, y);
+      if (v <= best) return;
+      if (Math.abs(this.segZAt(k, x, y) - z) > dz) return;
+      best = v;
+    });
+    return best;
+  }
+
   /** Distance from (x, y) to the nearest carriageway edge (negative inside). */
   clearance(x: number, y: number, radius: number, filter?: (road: number) => boolean): number {
     let best = Infinity;
@@ -120,7 +156,7 @@ export class RoadIndex {
         const l = Math.hypot(dx, dy) || 1;
         let t = ((x - ax) * dx + (y - ay) * dy) / (l * l);
         t = t < 0 ? 0 : t > 1 ? 1 : t;
-        best = { road: ri, seg: k, dist: d, dx: dx / l, dy: dy / l, px: ax + dx * t, py: ay + dy * t };
+        best = { road: ri, seg: k, dist: d, dx: dx / l, dy: dy / l, px: ax + dx * t, py: ay + dy * t, z: this.segZ[2 * k] + (this.segZ[2 * k + 1] - this.segZ[2 * k]) * t };
       }
     });
     return best;
@@ -165,5 +201,5 @@ export function roadRank(r: Road): number {
 
 /** Height of a road's surface above ground. */
 export function roadHeight(r: Road): number {
-  return 0.02 + roadRank(r) * 0.005 + (r.bridge ? 0.05 : 0);
+  return 0.02 + roadRank(r) * 0.005;
 }

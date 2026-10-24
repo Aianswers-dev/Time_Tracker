@@ -67,6 +67,11 @@ export interface Telemetry {
   view: CameraModeName;
   /** Seconds since the simulation started (player physics clock). */
   time: number;
+  /** Road height under the rear axle (m AHD), grade (rad, + = nose up), in a tunnel, wheels off the ground. */
+  z: number;
+  grade: number;
+  inTunnel: boolean;
+  airborne: boolean;
 }
 
 export const telemetry: Telemetry = {
@@ -99,6 +104,10 @@ export const telemetry: Telemetry = {
   gear: 'D',
   view: 'cab',
   time: 0,
+  z: 0,
+  grade: 0,
+  inTunnel: false,
+  airborne: false,
 };
 
 /** The player's physics/controls instances (set on their first update with player input). */

@@ -3,3 +3,4 @@ dist
 tools/data/raw
 *.log
 .DS_Store
+__pycache__/

@@ -1,15 +1,16 @@
-/** Brisbane River and creeks: an animated reflective surface below ground level. */
+/** Brisbane River, creeks and the bay: an animated reflective surface at the water level. */
 import * as THREE from 'three';
 import type { Ctx } from './ctx';
-import { GroundGeo, WATER_Y, triangulate, waterPolys } from './ground';
+import { FlatGeo, triangulate, waterPolys } from './ground';
 import { patch } from './shaders';
 
 export function buildWater(ctx: Ctx): void {
-  const g = new GroundGeo();
+  const g = new FlatGeo();
+  const level = ctx.data.terrain.waterLevel;
   for (const w of waterPolys(ctx)) {
     if (w.outer.length < 6) continue;
     const { coords, tris } = triangulate(w.outer, w.holes);
-    g.flat(coords, tris, WATER_Y, 0);
+    g.add(coords, tris, level);
   }
   const mat = new THREE.MeshStandardMaterial({ color: 0x3e4733, roughness: 0.1, metalness: 0.0, envMapIntensity: 1.0 });
   patch(mat, {
@@ -36,9 +37,11 @@ export function buildWater(ctx: Ctx): void {
         '#include <emissivemap_fragment>',
         `#include <emissivemap_fragment>
         {
-          // murky brown-green body colour, a touch lighter toward the banks of the eye
           vec2 wp = vec2(vGPos.x, -vGPos.z);
           diffuseColor.rgb *= 0.85 + 0.3 * texture2D(uWaterN, wp / 400.0).b;
+          // at night: moonlit sky and city glow on the water, a touch brighter at grazing angles
+          float graze = 1.0 - abs(dot(normalize(vViewPosition), normal));
+          totalEmissiveRadiance += uNight * (vec3(0.007, 0.010, 0.015) + vec3(0.03, 0.024, 0.018) * graze * graze);
         }`,
       ],
     ],
