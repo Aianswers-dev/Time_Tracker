@@ -95,6 +95,10 @@ const LEVEL = 3.5;
 const PICK_R = 40;
 /** Junctions closer than this (centres, m) along a road run coordinated. */
 const COORD_R = 70;
+/** Weekly bus trips through a phase that count as much as a residential lane (CLASS_W 1) in its green share. */
+const BUS_TRIPS_W = 300;
+/** Shortest green of a phase (s). */
+const MIN_GREEN = 10;
 /** Bus-route links: consecutive junctions along a route closer than this run one cycle, offset for the bus flow. */
 const ROUTE_COORD_R = 400;
 /** An approach chord ends where the path comes this close to the junction centre. */
@@ -445,7 +449,7 @@ export class SignalModel {
       const sum = w.reduce((a, b) => a + b, 0);
       let start = 0;
       for (let pi = 0; pi < P; pi++) {
-        const green = Math.max(10, (usable * w[pi]) / sum);
+        const green = Math.max(MIN_GREEN, (usable * w[pi]) / sum);
         phases.push({ start, green });
         start += green + clear;
       }
@@ -473,6 +477,7 @@ export class SignalModel {
    * heaviest road feeding the link; a group is a maximum spanning tree.
    * Consecutive junctions along a bus route up to ROUTE_COORD_R apart that
    * run the same cycle are linked the same way: a green wave for the buses.
+   * The bus trips through each phase also weigh towards its green share.
    */
   private coordinate(routes: readonly Route[]): void {
     const J = this.junctions;
@@ -530,6 +535,8 @@ export class SignalModel {
     const p = { x: 0, y: 0, z: 0 };
     const q = { x: 0, y: 0, z: 0 };
     const flows = new Map<string, Link>();
+    // Bus trips through each junction, by phase.
+    const busT = new Map<number, number[]>();
     for (const r of routes) {
       if (r.cum.length < 2) continue;
       // Visits: junction, and the route distance nearest its centre.
@@ -560,6 +567,13 @@ export class SignalModel {
         const arm = this.approachArm(v.j, ad.x, ad.y, ad.dx, ad.dy);
         return arm >= 0 ? j.arms[arm].phase : -1;
       };
+      const ph = visits.map(phaseOf);
+      visits.forEach((v, i) => {
+        if (ph[i] < 0) return;
+        let t = busT.get(v.j);
+        if (!t) busT.set(v.j, (t = new Array<number>(J[v.j].phases.length).fill(0)));
+        t[ph[i]] += r.trips;
+      });
       for (let i = 1; i < visits.length; i++) {
         const a = visits[i - 1];
         const b = visits[i];
@@ -568,8 +582,8 @@ export class SignalModel {
         // (a long link joins junctions that run the same cycle anyway: one with
         // more phases would stretch a whole corridor's cycle)
         if (dab >= COORD_R && J[a.j].cycle !== J[b.j].cycle) continue;
-        const pa = phaseOf(a);
-        const pb = phaseOf(b);
+        const pa = ph[i - 1];
+        const pb = ph[i];
         if (pa < 0 || pb < 0) continue;
         // (routes add up per direction and phase pair)
         const fk = `${a.j},${b.j},${pa},${pb}`;
@@ -579,9 +593,28 @@ export class SignalModel {
       }
     }
     for (const f of flows.values()) offer(f);
+    const armW = (r: SignalArm) => (CLASS_W[r.kind] ?? 0.8) * (r.oneway ? r.lanes : r.lanes / 2 + 0.5);
+
+    // ---- greens: the buses through a junction count towards their phase's
+    // share (bus priority, as on a busway approach), within the same cycle
+    for (const [k, bt] of busT) {
+      const j = J[k];
+      const P = j.phases.length;
+      const usable = j.cycle - P * (SIGNAL_AMBER + SIGNAL_ALL_RED + MIN_GREEN);
+      if (usable <= 0) continue;
+      const w = new Array<number>(P).fill(0);
+      for (const a of j.arms) if (a.incoming && a.phase >= 0) w[a.phase] = Math.max(w[a.phase], armW(a));
+      const ws = w.map((v, i) => Math.sqrt(v + bt[i] / BUS_TRIPS_W));
+      const sum = ws.reduce((t, v) => t + v, 0);
+      let st = 0;
+      j.phases.forEach((phase, i) => {
+        phase.start = st;
+        phase.green = MIN_GREEN + (usable * ws[i]) / sum;
+        st += phase.green + SIGNAL_AMBER + SIGNAL_ALL_RED;
+      });
+    }
 
     // ---- elsewhere: the heaviest road feeding the link (straight on preferred)
-    const armW = (r: SignalArm) => (CLASS_W[r.kind] ?? 0.8) * (r.oneway ? r.lanes : r.lanes / 2 + 0.5);
     const flow = (ai: number, bi: number): Link | null => {
       const a = J[ai];
       const b = J[bi];
