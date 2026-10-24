@@ -5,7 +5,7 @@ import * as THREE from 'three';
 import type { BusType, MapData, Road, Route } from '../types';
 import { pointAlong, projectOnto } from '../data/coords';
 import { drivable, roadIndexFor, speedLimitOf } from './roadIndex';
-import { trackFor, useTrackWalls, type RouteTrack, type TrackSample, type TrackWalls } from './track';
+import { TRACK_STEP, trackFor, useTrackWalls, type RouteTrack, type TrackSample, type TrackWalls } from './track';
 import { computeTurns, shortStreet, type TurnHint } from './turns';
 import { busTypeForRoute, isStationStop, stopDisplayName, stopNumber } from './routeMeta';
 import { flagAtlas, partsGroup, plateGeometry, poleParts, signMaterial, SIGN_H, SIGN_W } from './stops3d';
@@ -352,18 +352,18 @@ export class RouteGuide {
     return { x: this.tmp.x, y: this.tmp.y, heading: this.tmp.heading, z: this.track.zAt(ss) };
   }
 
-  /** Start of the stretch where the front of the bus counts as being at stop i. */
+  /** Start of the stretch where the front of the bus counts as being at stop i (at a platform: the front door alongside it). */
   private zoneFrom(i: number): number {
     const z = this.places[i]?.zone;
     const s = this.route.stops[i].s;
-    return z ? Math.min(z.s0, s) - 2 : s - 15;
+    return z ? z.s0 + 1.5 : s - 15;
   }
 
-  /** End of the stretch where the front of the bus counts as being at stop i. */
+  /** End of the stretch where the front of the bus counts as being at stop i (the front door still about at the platform). */
   private zoneTo(i: number): number {
     const z = this.places[i]?.zone;
     const s = this.route.stops[i].s;
-    return z ? Math.max(z.s1, s) + 4 : s + 18;
+    return z ? z.s1 + 3 : s + 18;
   }
 
   /** Route distance of the front of the bus at the start (first stop; front bay of a platform). */
@@ -507,6 +507,14 @@ export class RouteGuide {
     st.routeDistance = pr.dist;
     st.progress = Math.min(1, st.s / Math.max(1, this.route.length));
     const stops = this.route.stops;
+    // Where the front is for stop i: at a platform on the lane (it can run well off the GTFS line through a
+    // station hall), and alongside it within `near`; at a kerbside stop on the route line.
+    let lane: { s: number; dist: number } | null = null;
+    const at = (i: number): { s: number; dist: number; near: number } => {
+      if (!this.places[i]?.zone) return { s: st.s, dist: pr.dist, near: 14 };
+      lane ??= this.track.project(frontX, frontY, st.s - 40, st.s + 40);
+      return { s: lane.s, dist: lane.dist, near: 3.5 };
+    };
 
     if (!this.initialised) {
       this.initialised = true;
@@ -551,7 +559,7 @@ export class RouteGuide {
       this.departBoarded = true;
       st.canBoard = false;
       this.pax.start(this.departIndex, hours);
-      this.paxS = st.s;
+      this.paxS = at(this.departIndex).s;
     }
 
     // Off-route with hysteresis.
@@ -597,7 +605,8 @@ export class RouteGuide {
     if (next >= 0) {
       const ns = stops[next];
       // Kerbside: front within ~15 m of the flag. Platform: alongside any bay.
-      st.atStop = st.s >= this.zoneFrom(next) && st.s <= this.zoneTo(next) && pr.dist < 14;
+      const a = at(next);
+      st.atStop = a.s >= this.zoneFrom(next) && a.s <= this.zoneTo(next) && a.dist < a.near;
       st.canServe = st.atStop && Math.abs(speed) < 0.5;
       // (A stop at the same spot as the one just served waits for its passengers to finish.)
       if (st.canServe && doorsOpen && st.shiftStarted && !this.pax.busy) {
@@ -607,13 +616,14 @@ export class RouteGuide {
         this.dwellIndex = next;
         this.emit('served', `Served ${stopDisplayName(this.data.stops[ns.stop].name)}`, delta);
         this.pax.start(next, hours);
-        this.paxS = st.s;
+        this.paxS = a.s;
       }
     }
     // Passengers move while the doors are fully open and the bus is held at the stop.
     const pi = this.pax.stopIndex;
     if (pi >= 0) {
-      if (Math.abs(st.s - this.paxS) > 4 || pr.dist > 14) this.pax.depart();
+      const a = at(pi);
+      if (Math.abs(a.s - this.paxS) > 4 || a.dist > 14) this.pax.depart();
       else {
         const doors = !doorsOpen ? 'shut' : !cab ? 'open' : !cab.doorsWanted ? 'closing' : cab.doorOpen > 0.98 ? 'open' : 'opening';
         this.pax.update(dt, doors, Math.abs(speed) < 0.3, cab?.kneel ?? 0, st.shiftStarted);
@@ -709,12 +719,17 @@ export class RouteGuide {
       const z = surf.road < 0 && Math.abs(surf.z - hint) > LEVEL_GAP ? hint : surf.z;
       this.lastZ = z;
       session.playerZ = z;
-      const hit = idx.nearest(frontX, frontY, 14, this.motionHeading, 0.6, drivable, z) ?? idx.nearest(frontX, frontY, 10, undefined, 0, drivable, z);
-      const ri = hit ? hit.road : surf.road;
+      // On the route: the road its lane is matched to (not a side street at a junction, nor the road under a
+      // bridge or over a tunnel); off it, the nearest road at our level.
+      const onRoad = st.offRoute ? -1 : this.track.road[Math.max(0, Math.min(this.track.n - 1, Math.round(st.s / TRACK_STEP)))];
+      const hit = onRoad >= 0 ? null : (idx.nearest(frontX, frontY, 14, this.motionHeading, 0.6, drivable, z) ?? idx.nearest(frontX, frontY, 10, undefined, 0, drivable, z));
+      const ri = onRoad >= 0 ? onRoad : hit ? hit.road : surf.road;
       if (ri >= 0) {
         const road = this.data.roads[ri];
-        st.speedLimit = speedLimitOf(road);
-        st.roadName = road.name ? shortStreet(road.name) : road.bus ? 'Busway' : '';
+        st.speedLimit = onRoad >= 0 ? this.track.limitAt(st.s) : speedLimitOf(road);
+        // (Route numbers tagged as the name are not street names; an unnamed link on the route keeps the street.)
+        const name = road.name && !/^[\d;\s]+$/.test(road.name) ? shortStreet(road.name) : '';
+        st.roadName = name || (road.bus ? 'Busway' : onRoad >= 0 ? st.roadName : '');
         st.roadLevel = road.tunnel ? 'tunnel' : road.bridge ? elevatedKind(road, this.heights) : null;
       } else {
         st.roadLevel = null;
