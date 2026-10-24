@@ -1,6 +1,7 @@
 /** Build context shared by the world modules. */
 import * as THREE from 'three';
 import type { MapData } from '../types';
+import type { TerrainField } from './terrain';
 import type { Mask } from './util';
 
 export interface RawPoly {
@@ -48,6 +49,8 @@ export interface Ctx {
   /** Inner ground rectangle (map bounds + pad), map coords. */
   R: [number, number, number, number];
   mask: Mask;
+  /** Natural and rendered terrain heights. */
+  field: TerrainField;
   tex: Textures;
   /** Non-residential building cover, 0..1, for paving vs lawn and footpath style. */
   density: { tex: THREE.DataTexture; data: Float32Array; x0: number; y0: number; cell: number; nx: number; ny: number };

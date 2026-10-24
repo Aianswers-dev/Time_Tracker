@@ -241,6 +241,8 @@ interface Inst {
   y: number;
   sp: SpName;
   s: number;
+  /** Base height when known (street trees stand on the verge); otherwise the terrain. */
+  z?: number;
 }
 
 export async function buildTrees(
@@ -318,7 +320,7 @@ export async function buildTrees(
         if (mask.near(x, y, 1.5, MASK_BUILDING | MASK_WATER | MASK_POOL | MASK_RAIL)) continue;
         let sp = pickSpecies(hash2(x, y, 6), T_STREET);
         if (newFarm(x, y) && h < 0.4) sp = 'jacaranda';
-        list.push({ x, y, sp, s: hash2(x, y, 8) * 0.7 });
+        list.push({ x, y, sp, s: hash2(x, y, 8) * 0.7, z: c.z + 0.1 });
       }
     }
     if (++k % 2000 === 0) await yieldFrame();
@@ -333,6 +335,13 @@ export async function buildTrees(
   }
   progress(0.6);
   await yieldFrame();
+
+  // nothing grows in open cuttings
+  {
+    let w = 0;
+    for (let i = 0; i < list.length; i++) if (!ctx.field.isHole(list[i].x, list[i].y)) list[w++] = list[i];
+    list.length = w;
+  }
 
   // ---- build instanced chunks
   const tplHi = [broadleaf(1), palm(1), conifer(1)];
@@ -372,7 +381,7 @@ export async function buildTrees(
         const hgt = sp.h[0] + (sp.h[1] - sp.h[0]) * it.s;
         const wid = sp.w[0] + (sp.w[1] - sp.w[0]) * (it.s * 0.7 + hash2(it.x, it.y, 11) * 0.3);
         q.setFromAxisAngle(up, hash2(it.x, it.y, 12) * Math.PI * 2);
-        pos.set(it.x, 0, -it.y);
+        pos.set(it.x, it.z ?? ctx.field.renAt(it.x, it.y) - 0.2, -it.y);
         scl.set(wid, hgt, wid);
         m4.compose(pos, q, scl);
         hi.setMatrixAt(i, m4);

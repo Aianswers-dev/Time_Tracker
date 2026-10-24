@@ -2,7 +2,7 @@
 // chevrons, next-stop highlight) and runs the shift logic: serving stops,
 // timetable adherence, off-route detection, turn hints and the end summary.
 import * as THREE from 'three';
-import type { MapData, Route } from '../types';
+import type { MapData, Road, Route } from '../types';
 import { pointAlong, projectOnto } from '../data/coords';
 import { drivable, roadIndexFor, speedLimitOf } from './roadIndex';
 import { trackFor, type RouteTrack, type TrackSample } from './track';
@@ -13,7 +13,8 @@ import { buildPlatforms, type PlatformZone } from './platforms';
 import { NextStopMarker, Ribbon } from './ribbon';
 import { brighten } from './util';
 import { session } from './session';
-import { heightAt } from './height';
+import { LEVEL_GAP, heightAt, heightsOf } from './height';
+import type { Heights } from '../data/height';
 
 export const enum StopStatus {
   Pending = 0,
@@ -97,6 +98,14 @@ export interface GuideState {
   speedLimit: number;
   speeding: boolean;
   roadName: string;
+  /**
+   * The bus is in a tunnel, on a viaduct, or on a bridge over the river (for
+   * the HUD), else null. Short culverts and bridges already named "… Bridge"
+   * get no tag.
+   */
+  roadLevel: 'tunnel' | 'viaduct' | 'bridge' | null;
+  /** Grade along the direction of travel (rise/run; + = uphill). */
+  grade: number;
   distanceDriven: number;
   collisions: number;
   speedingSeconds: number;
@@ -121,10 +130,12 @@ interface StopPlace {
   station: boolean;
   /** Busway platform zone (serve at any bay along it), or null for a kerbside stop. */
   zone: PlatformZone | null;
+  /** Road height at the place (m AHD). */
+  z: number;
 }
 
-function frame(x: number, y: number, heading: number, out: THREE.Object3D): void {
-  out.position.set(x, heightAt(x, y), -y);
+function frame(x: number, y: number, heading: number, out: THREE.Object3D, z: number): void {
+  out.position.set(x, z, -y);
   out.rotation.set(0, -heading, 0);
 }
 
@@ -155,6 +166,8 @@ export class RouteGuide {
   /** Stop that was served and whose departure delta is still pending. */
   private dwellIndex = -1;
   private finishTimer = -1;
+  private lastZ = 0;
+  private readonly heights: Heights;
   private endWait = 0;
   private turnIdx = 0;
   private sigIdx = 0;
@@ -169,6 +182,7 @@ export class RouteGuide {
     opts: RouteGuideOptions = {},
   ) {
     this.busLength = opts.busLength ?? 13;
+    this.heights = heightsOf(data);
     this.track = trackFor(route, data);
     this.turns = computeTurns(data, route);
     this.color = brighten(route.color, 0.32);
@@ -203,6 +217,8 @@ export class RouteGuide {
       speedLimit: 50,
       speeding: false,
       roadName: '',
+      roadLevel: null,
+      grade: 0,
       distanceDriven: 0,
       collisions: 0,
       speedingSeconds: 0,
@@ -214,16 +230,18 @@ export class RouteGuide {
     // The flag stands a few metres ahead of the stop (the world puts a shelter at the stop itself).
     this.places = this.track.stops.map((ts) => {
       const z = ts.zone;
-      this.track.sample(z ? (z.s0 + z.s1) / 2 : ts.s + 3, this.tmp);
+      const at = z ? (z.s0 + z.s1) / 2 : ts.s + 3;
+      this.track.sample(at, this.tmp);
       const lx = -this.tmp.hy;
       const ly = this.tmp.hx;
       const kerb = z ? this.track.kerbAt((z.s0 + z.s1) / 2) : ts.kerb;
       const off = kerb + (z ? 1.4 : 0.6);
-      return { x: this.tmp.x + lx * off, y: this.tmp.y + ly * off, heading: this.tmp.heading, kerb, station: ts.station, zone: z };
+      return { x: this.tmp.x + lx * off, y: this.tmp.y + ly * off, heading: this.tmp.heading, kerb, station: ts.station, zone: z, z: this.track.zAt(at) };
     });
     // Seed the projection window at the start stop (loop routes start where they end).
     const s0 = this.startS();
     this.state.s = s0;
+    this.lastZ = this.track.zAt(s0);
     this.segI = pointAlong(route.pts, route.cum, s0).i;
     this.group.name = 'route-guide';
     scene.add(this.group);
@@ -255,7 +273,7 @@ export class RouteGuide {
       const plate = new THREE.Mesh(plateGeometry(atlas.uv[i]), signMat);
       plate.position.set(SIGN_W / 2 + 0.03, 3.15 - SIGN_H / 2 - 0.05, 0);
       g.add(plate);
-      frame(p.x, p.y, p.heading, g);
+      frame(p.x, p.y, p.heading, g, p.z);
       this.group.add(g);
     });
   }
@@ -263,12 +281,12 @@ export class RouteGuide {
   // -------------------------------------------------------------------------
 
   /** Where the player's bus should start: map x/y of the FRONT of the bus and heading. */
-  startPose(): { x: number; y: number; heading: number } {
+  startPose(): { x: number; y: number; heading: number; z: number } {
     const s = this.startS();
     const kerb = this.track.kerbAt(s);
     const pull = Math.max(0, kerb - 1.7);
     this.track.sample(s, this.tmp, pull);
-    return { x: this.tmp.x, y: this.tmp.y, heading: this.tmp.heading };
+    return { x: this.tmp.x, y: this.tmp.y, heading: this.tmp.heading, z: this.track.zAt(s) };
   }
 
   /** Start of the stretch where the front of the bus counts as being at stop i. */
@@ -387,7 +405,11 @@ export class RouteGuide {
     return { s: bs, dist: bd, i: bi };
   }
 
-  update(dt: number, frontX: number, frontY: number, doorsOpen: boolean, speed: number, heading?: number, hours = 12): GuideState {
+  /**
+   * Advance the shift. `frontZ` (optional) is the road height under the front
+   * of the bus; it picks the level where roads stack (tunnel under a street).
+   */
+  update(dt: number, frontX: number, frontY: number, doorsOpen: boolean, speed: number, heading?: number, hours = 12, frontZ?: number): GuideState {
     const st = this.state;
     this.time += dt;
     // Motion heading for limit lookup and rejoin checks.
@@ -406,6 +428,11 @@ export class RouteGuide {
 
     const prevS = st.s;
     const pr = this.project(frontX, frontY);
+    // On the street under the route (or above its tunnel) is not on the route.
+    if (frontZ !== undefined) {
+      const dz = Math.abs(frontZ - this.track.zAt(pr.s));
+      if (dz > LEVEL_GAP) pr.dist = Math.max(pr.dist, 35 + dz);
+    }
     st.s = pr.s;
     st.routeDistance = pr.dist;
     st.progress = Math.min(1, st.s / Math.max(1, this.route.length));
@@ -505,8 +532,8 @@ export class RouteGuide {
         st.nextStopStation = isStationStop(s.name);
         st.nextStopDue = stops[next].t - this.departT;
         const p = this.places[next];
-        if (p.zone) this.marker.setStop(p.zone.s1 + 1, p.x, p.y, p.zone.s0 - 1);
-        else this.marker.setStop(stops[next].s, p.x, p.y);
+        if (p.zone) this.marker.setStop(p.zone.s1 + 1, p.x, p.y, p.zone.s0 - 1, p.z);
+        else this.marker.setStop(stops[next].s, p.x, p.y, undefined, p.z);
       } else {
         st.nextStopName = '';
         st.nextStopNumber = '';
@@ -572,13 +599,30 @@ export class RouteGuide {
     if (this.limitTimer <= 0) {
       this.limitTimer = 0.25;
       const idx = roadIndexFor(this.data);
-      const hit = idx.nearest(frontX, frontY, 14, this.motionHeading, 0.6, drivable) ?? idx.nearest(frontX, frontY, 10, undefined, 0, drivable);
-      if (hit) {
-        const road = this.data.roads[hit.road];
+      // Our level: the physics' height if given, else the route's, else where we last were.
+      const hint = frontZ ?? (!st.offRoute ? this.track.zAt(st.s) : this.lastZ);
+      const surf = this.heights.surfaceAt(frontX, frontY, hint);
+      // No road at our level right under the front (wide station, lane hugging a platform): keep our level.
+      const z = surf.road < 0 && Math.abs(surf.z - hint) > LEVEL_GAP ? hint : surf.z;
+      this.lastZ = z;
+      session.playerZ = z;
+      const hit = idx.nearest(frontX, frontY, 14, this.motionHeading, 0.6, drivable, z) ?? idx.nearest(frontX, frontY, 10, undefined, 0, drivable, z);
+      const ri = hit ? hit.road : surf.road;
+      if (ri >= 0) {
+        const road = this.data.roads[ri];
         st.speedLimit = speedLimitOf(road);
         st.roadName = road.name ? shortStreet(road.name) : road.bus ? 'Busway' : '';
-      } else if (!st.offRoute) {
-        st.speedLimit = this.track.limitAt(st.s);
+        st.roadLevel = road.tunnel ? 'tunnel' : road.bridge ? elevatedKind(road, this.heights) : null;
+      } else {
+        st.roadLevel = null;
+        if (!st.offRoute) st.speedLimit = this.track.limitAt(st.s);
+      }
+      // Grade along the way we are going.
+      if (!st.offRoute) st.grade = this.track.gradeAt(st.s, 8) * (speed < -0.2 ? -1 : 1);
+      else {
+        const hx = Math.sin(this.motionHeading) * 8;
+        const hy = Math.cos(this.motionHeading) * 8;
+        st.grade = (heightAt(frontX + hx, frontY + hy, z) - heightAt(frontX - hx, frontY - hy, z)) / 16;
       }
     }
     const kmh = Math.abs(speed) * 3.6;
@@ -639,7 +683,10 @@ export class RouteGuide {
   }
 
   dispose(): void {
-    if (session.guide === this) session.guide = null;
+    if (session.guide === this) {
+      session.guide = null;
+      session.playerZ = null;
+    }
     removeEventListener('keydown', this.onKey);
     this.ribbon.dispose();
     this.marker.dispose();
@@ -648,4 +695,23 @@ export class RouteGuide {
       if (o instanceof THREE.Mesh) o.geometry.dispose();
     });
   }
+}
+
+const elevated = new WeakMap<Road, 'viaduct' | 'bridge' | null>();
+/** What kind of elevated road this is, for the HUD tag (cached per road). */
+function elevatedKind(road: Road, H: Heights): 'viaduct' | 'bridge' | null {
+  let v = elevated.get(road);
+  if (v === undefined) {
+    const p = road.pts;
+    let len = 0;
+    let wet = false;
+    for (let i = 0; i < p.length; i += 2) {
+      if (i) len += Math.hypot(p[i] - p[i - 2], p[i + 1] - p[i - 1]);
+      if (H.ground(p[i], p[i + 1]) < H.waterLevel) wet = true;
+    }
+    for (let i = 0; i + 3 < p.length && !wet; i += 2) wet = H.ground((p[i] + p[i + 2]) / 2, (p[i + 1] + p[i + 3]) / 2) < H.waterLevel;
+    v = len < 40 || /\bbridge\b/i.test(road.name ?? '') ? null : wet ? 'bridge' : 'viaduct';
+    elevated.set(road, v);
+  }
+  return v;
 }

@@ -2,7 +2,6 @@
 import * as THREE from 'three';
 import type { RouteTrack, TrackSample } from './track';
 import { smoothstep } from './util';
-import { heightAt } from './height';
 
 const CHEVRONS = 46;
 const SPACING = 5.5;
@@ -61,7 +60,7 @@ export class Ribbon {
   private readonly q = new THREE.Quaternion();
   private readonly pos = new THREE.Vector3();
   private readonly one = new THREE.Vector3(1, 1, 1);
-  private readonly up = new THREE.Vector3(0, 1, 0);
+  private readonly euler = new THREE.Euler();
   private phase = 0;
   visible = true;
   private fade = 1;
@@ -114,8 +113,10 @@ export class Ribbon {
       }
       this.alpha.setX(i, a * this.fade);
       this.track.sample(ss, this.tmp);
-      this.pos.set(this.tmp.x, heightAt(this.tmp.x, this.tmp.y) + 0.09, -this.tmp.y);
-      this.q.setFromAxisAngle(this.up, -this.tmp.heading);
+      // On the road surface, tilted to the grade (tunnels, viaducts, hills).
+      this.pos.set(this.tmp.x, this.track.zAt(ss) + 0.09, -this.tmp.y);
+      this.euler.set(Math.atan(this.track.gradeAt(ss, 2)), -this.tmp.heading, 0, 'YXZ');
+      this.q.setFromEuler(this.euler);
       this.m4.compose(this.pos, this.q, this.one);
       this.mesh.setMatrixAt(i, this.m4);
     }
@@ -229,7 +230,7 @@ export class NextStopMarker {
    * Place the marker at (x, y) and the painted bay ending at route distance s.
    * `from` starts the bay earlier (a whole platform: it repeats every ~18 m, one per bay).
    */
-  setStop(s: number | null, x: number, y: number, from?: number): void {
+  setStop(s: number | null, x: number, y: number, from?: number, z = 0): void {
     if (s === null) {
       this.group.visible = false;
       this.bay.visible = false;
@@ -238,7 +239,7 @@ export class NextStopMarker {
     }
     this.group.visible = true;
     this.bay.visible = true;
-    this.group.position.set(x, heightAt(x, y), -y);
+    this.group.position.set(x, z, -y);
     if (s === this.stopS) return;
     this.stopS = s;
     // Bay strip hugging the kerb, from 16 m before the flag to 2 m past it (or the whole platform).
@@ -258,7 +259,7 @@ export class NextStopMarker {
       const ly = this.tmp.hx;
       const inner = kb - 0.25 - w;
       const outer = kb - 0.25;
-      const h = heightAt(this.tmp.x, this.tmp.y) + 0.085;
+      const h = this.track.zAt(ss) + 0.085;
       pos.push(this.tmp.x + lx * inner, h, -(this.tmp.y + ly * inner));
       pos.push(this.tmp.x + lx * outer, h, -(this.tmp.y + ly * outer));
       // Texture runs along v from the far end (s1) at the top; one repeat per bay.

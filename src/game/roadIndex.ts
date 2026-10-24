@@ -13,6 +13,8 @@ export interface RoadHit {
   dy: number;
   /** +1 if the query point is left of the segment direction, -1 if right. */
   side: number;
+  /** Road surface height at the projection (m AHD). */
+  z: number;
 }
 
 /** Posted limit in km/h: OSM tag or a Brisbane-ish default for the road class. */
@@ -57,7 +59,7 @@ export class RoadIndex {
   private readonly cellItems: Int32Array;
   private readonly stamp: Uint32Array;
   private stampId = 1;
-  private readonly hit: RoadHit = { road: -1, seg: -1, dist: 0, px: 0, py: 0, dx: 0, dy: 0, side: 1 };
+  private readonly hit: RoadHit = { road: -1, seg: -1, dist: 0, px: 0, py: 0, dx: 0, dy: 0, side: 1, z: 0 };
 
   constructor(readonly data: MapData) {
     let n = 0;
@@ -115,6 +117,8 @@ export class RoadIndex {
    * Nearest road segment within `maxDist`. When `heading` is given, only
    * segments whose direction is within acos(minCos) of it are accepted
    * (two-way roads in either direction, one-way roads only forwards).
+   * With `zRef`, roads more than `maxDz` above or below it are ignored (a
+   * street under a viaduct is not "the road" for a bus on the viaduct).
    * The returned object is reused between calls.
    */
   nearest(
@@ -124,6 +128,8 @@ export class RoadIndex {
     heading?: number,
     minCos = 0.8,
     accept?: (road: Road) => boolean,
+    zRef?: number,
+    maxDz = 2.5,
   ): RoadHit | null {
     const roads = this.data.roads;
     const hx = heading !== undefined ? Math.sin(heading) : 0;
@@ -144,6 +150,7 @@ export class RoadIndex {
     let bdx = 0;
     let bdy = 0;
     let bside = 1;
+    let bz = 0;
     for (let cy = cy0; cy <= cy1; cy++) {
       for (let cx = cx0; cx <= cx1; cx++) {
         const c = cy * this.nx + cx;
@@ -171,7 +178,11 @@ export class RoadIndex {
             if (road.oneway ? dot < minCos : Math.abs(dot) < minCos) continue;
           }
           if (accept && !accept(road)) continue;
+          const v = this.sseg[s];
+          const zz = road.z ? road.z[v] + (road.z[v + 1] - road.z[v]) * (t / len) : 0;
+          if (zRef !== undefined && Math.abs(zz - zRef) > maxDz) continue;
           best = d;
+          bz = zz;
           bestSeg = s;
           bpx = px;
           bpy = py;
@@ -191,6 +202,7 @@ export class RoadIndex {
     h.dx = bdx;
     h.dy = bdy;
     h.side = bside;
+    h.z = bz;
     return h;
   }
 }

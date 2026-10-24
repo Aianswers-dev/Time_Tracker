@@ -171,6 +171,9 @@ function classify(b: Building, area: number, cx: number, cy: number, dens: numbe
 }
 
 /** Walls along a CCW ring from y0 to y1 (absolute heights). */
+/** Ground height of the building being built: facade v coordinates are heights above it. */
+let gBase = 0;
+
 function walls(g: BGeo, ring: ArrayLike<number>, y0: number, y1: number, L: Look, seed: number, u0: number): void {
   const n = ring.length >> 1;
   let u = u0;
@@ -183,10 +186,10 @@ function walls(g: BGeo, ring: ArrayLike<number>, y0: number, y1: number, L: Look
     const by = ring[2 * j + 1];
     const len = Math.hypot(bx - ax, by - ay);
     if (len < 0.05) continue;
-    const a = g.v(ax, y0, ay, u, y0, L.wall, L.style, seed, L.flags, st);
-    const b = g.v(bx, y0, by, u + len, y0, L.wall, L.style, seed, L.flags, st);
-    const c = g.v(bx, y1, by, u + len, y1, L.wall, L.style, seed, L.flags, st);
-    const d = g.v(ax, y1, ay, u, y1, L.wall, L.style, seed, L.flags, st);
+    const a = g.v(ax, y0, ay, u, y0 - gBase, L.wall, L.style, seed, L.flags, st);
+    const b = g.v(bx, y0, by, u + len, y0 - gBase, L.wall, L.style, seed, L.flags, st);
+    const c = g.v(bx, y1, by, u + len, y1 - gBase, L.wall, L.style, seed, L.flags, st);
+    const d = g.v(ax, y1, ay, u, y1 - gBase, L.wall, L.style, seed, L.flags, st);
     g.setNormal(a, d, (by - ay) / len, 0, (bx - ax) / len);
     g.idx.push3(a, b, c);
     g.idx.push3(a, c, d);
@@ -280,9 +283,9 @@ function boxRoof(g: BGeo, o: ReturnType<typeof obb>, eave: number, roofH: number
       [c3, c0, r0],
     ];
     for (const [a, b, r] of ends) {
-      const ia = g.v(a[0], eave, a[1], 0, eave, L.wall, L.style, seed, L.flags, st);
-      const ib = g.v(b[0], eave, b[1], hw * 2, eave, L.wall, L.style, seed, L.flags, st);
-      const ir = g.v(r[0], top, r[1], hw, top, L.wall, L.style, seed, L.flags, st);
+      const ia = g.v(a[0], eave, a[1], 0, eave - gBase, L.wall, L.style, seed, L.flags, st);
+      const ib = g.v(b[0], eave, b[1], hw * 2, eave - gBase, L.wall, L.style, seed, L.flags, st);
+      const ir = g.v(r[0], top, r[1], hw, top - gBase, L.wall, L.style, seed, L.flags, st);
       const mx = (a[0] + b[0]) / 2 - cx;
       const my = (a[1] + b[1]) / 2 - cy;
       faceTri(g, ia, ib, ir, [a[0], eave, a[1], b[0], eave, b[1], r[0], top, r[1]], mx, 0, -my);
@@ -349,6 +352,8 @@ export async function buildBuildings(ctx: Ctx, progress: (f: number) => void): P
     box.set([x0, y0, x1, y1], bi * 4);
     grid.addBox(bi, x0, y0, x1, y1);
     const area = Math.abs(signedArea(ring));
+    // masts and spires mapped as tiny tall buildings read as white needles: skip them
+    if (area < 30 && b.height > 25) continue;
     const [cx, cy] = centroid(ring);
     const dens = densityAt(ctx, cx, cy);
     const seed = Math.floor(hash1(bi * 7 + 3) * 255);
@@ -363,26 +368,32 @@ export async function buildBuildings(ctx: Ctx, progress: (f: number) => void): P
       chunks.set(key, g);
     }
     const m = b.minHeight;
+    // base at the footprint centroid; walls reach down to the lowest ground under the footprint
+    const base = b.z;
+    let minG = base;
+    for (let v = 0; v < ring.length; v += 2) minG = Math.min(minG, ctx.field.natAt(ring[v], ring[v + 1]));
+    const bottom = minG - 0.4;
+    gBase = base;
     if (L.style === Style.Canopy) {
-      const top = b.height;
-      const bot = Math.max(m, top - 0.6);
+      const top = base + b.height;
+      const bot = Math.max(base + m, top - 0.6);
       walls(g, ring, bot, top, L, seed, seed);
       flatCap(g, ring, top, L.roof, L, seed, true, 0);
       flatCap(g, ring, bot, 0x555555, L, seed, false, F_SOFFIT);
     } else if (L.pitched && L.roofH > 0) {
       const o = obb(ring);
       const nv = ring.length >> 1;
-      const eave = Math.max(m + 1, L.wallTop);
-      walls(g, ring, m, eave, L, seed, seed);
+      const eave = base + Math.max(m + 1, L.wallTop);
+      walls(g, ring, m > 0.4 ? base + m : bottom, eave, L, seed, seed);
       if (o.fill > 0.78 && nv <= 10) {
         boxRoof(g, o, eave, L.roofH, b.roof === 'g' || (L.style !== Style.House && b.roof !== 'h' && b.roof !== 'p'), L, seed);
       } else if (!(nv <= 14 && polyRoof(g, ring, eave, Math.min(L.roofH, 1.6), L, seed))) {
         flatCap(g, ring, eave, L.roof, L, seed, true, 0);
       }
     } else {
-      walls(g, ring, m, b.height, L, seed, seed);
-      flatCap(g, ring, b.height, L.roof, L, seed, true, 0);
-      if (m > 0.4) flatCap(g, ring, m, 0x4a4a4a, L, seed, false, F_SOFFIT);
+      walls(g, ring, m > 0.4 ? base + m : bottom, base + b.height, L, seed, seed);
+      flatCap(g, ring, base + b.height, L.roof, L, seed, true, 0);
+      if (m > 0.4) flatCap(g, ring, base + m, 0x4a4a4a, L, seed, false, F_SOFFIT);
     }
     if (bi % 4000 === 0) {
       progress(bi / n);

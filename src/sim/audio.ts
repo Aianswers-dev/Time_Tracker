@@ -38,6 +38,44 @@ interface OneShot extends Envelope {
 
 const clamp = (v: number, a: number, b: number) => (v < a ? a : v > b ? b : v);
 
+/** Stereo impulse response of a concrete bus tunnel: early slap-back reflections and a ~1.6 s tail. */
+function tunnelIR(ctx: Ctx): AudioBuffer {
+  const sr = ctx.sampleRate;
+  const len = Math.floor(sr * 1.8);
+  const buf = ctx.createBuffer(2, len, sr);
+  let seed = 4242;
+  const rnd = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed / 0x3fffffff - 1;
+  };
+  for (let c = 0; c < 2; c++) {
+    const d = buf.getChannelData(c);
+    for (let i = 0; i < len; i++) {
+      const t = i / sr;
+      // Diffuse tail, darker as it decays (one-pole smoothing grows with time).
+      d[i] = rnd() * Math.exp(-t / 0.42) * 0.35;
+    }
+    let y = 0;
+    for (let i = 0; i < len; i++) {
+      const a = Math.min(0.92, 0.25 + (i / len) * 0.9);
+      y = y * a + d[i] * (1 - a);
+      d[i] = y * 2.2;
+    }
+    // Early reflections off the side walls and ceiling (slightly different per ear).
+    for (const [ms, g] of [
+      [11 + c * 3, 0.55],
+      [23 + c * 2, 0.4],
+      [37 - c * 4, 0.3],
+      [58 + c * 5, 0.22],
+      [83 - c * 3, 0.16],
+    ]) {
+      const k = Math.floor((ms / 1000) * sr);
+      if (k < len) d[k] += g * (c ? -1 : 1);
+    }
+  }
+  return buf;
+}
+
 function makeNoise(ctx: Ctx, seconds = 2.5): AudioBuffer {
   const len = Math.floor(ctx.sampleRate * seconds);
   const buf = ctx.createBuffer(1, len, ctx.sampleRate);
@@ -324,6 +362,7 @@ export class BusAudio {
   private brakeSqOsc: OscillatorNode | null = null;
   private brakeSqGain: GainNode | null = null;
   private hornGain: GainNode | null = null;
+  private reverbSend: GainNode | null = null;
 
   private hornOn = false;
   private beepPhase = 0;
@@ -421,6 +460,14 @@ export class BusAudio {
     this.master.connect(comp);
     this.mix = ctx.createGain();
     this.mix.connect(this.master);
+    // Tunnel acoustics: a send from the whole mix into a synthetic concrete-tube reverb.
+    const verb = ctx.createConvolver();
+    verb.buffer = tunnelIR(ctx);
+    this.reverbSend = ctx.createGain();
+    this.reverbSend.gain.value = 0;
+    const verbOut = ctx.createGain();
+    verbOut.gain.value = 0.9;
+    this.mix.connect(this.reverbSend).connect(verb).connect(verbOut).connect(this.master);
     this.engineBus = ctx.createBiquadFilter();
     this.engineBus.type = 'lowpass';
     this.engineBus.frequency.value = 2500;
@@ -505,6 +552,8 @@ export class BusAudio {
     });
     // Rear engine: from the cab it is ten metres behind a bulkhead.
     this.engineBus?.frequency.setTargetAtTime(cab ? 1400 : 5200, now, 0.2);
+    // In a tunnel the engine and tyres bounce back off the walls.
+    this.reverbSend?.gain.setTargetAtTime(t.inTunnel ? 0.55 : 0, now, t.inTunnel ? 0.35 : 0.6);
 
     // Road.
     const vn = v / 22;

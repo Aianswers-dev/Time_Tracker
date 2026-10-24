@@ -89,6 +89,35 @@
   text-overflow: ellipsis;
   margin-top: 1px;
 }
+.bbh-lvl,
+.bbh-slope {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 15px;
+  letter-spacing: 0.06em;
+  vertical-align: 1px;
+}
+.bbh-lvl {
+  text-transform: uppercase;
+  color: #10202e;
+  background: #9fc3e0;
+}
+.bbh-slope {
+  color: #ffd9a0;
+  background: rgba(255, 190, 90, 0.16);
+  font-variant-numeric: tabular-nums;
+}
+.bbh-slope.up {
+  color: #ffc58a;
+}
+.bbh-lvl:empty,
+.bbh-slope:empty {
+  display: none;
+}
 .bbh-progress {
   grid-column: 1 / -1;
   margin-top: 9px;

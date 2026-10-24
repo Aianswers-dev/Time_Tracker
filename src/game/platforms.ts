@@ -6,7 +6,7 @@ import * as THREE from 'three';
 import { RoadKind, type MapData, type Platform, type Route } from '../types';
 import { pointAlong } from '../data/coords';
 import { roadIndexFor } from './roadIndex';
-import { heightAt } from './height';
+import { LEVEL_GAP, heightAt, heightsOf } from './height';
 
 export const PLATFORM_HEIGHT = 0.3;
 const CANOPY_HEIGHT = 3.8;
@@ -37,6 +37,12 @@ export interface PlatformGeom {
   kerbs: KerbChain[];
   /** Back edges (not facing a busway) for canopy posts: [x0, y0, x1, y1, ...]. */
   back: number[];
+  /**
+   * Height plane of the platform's road edge: z = z0 + slope * ((x, y) - (px, py)) . (tx, ty),
+   * fitted to the busway beside the main kerb (platforms carry no heights of their own;
+   * King George Square and Queen Street come out underground).
+   */
+  plane: { px: number; py: number; tx: number; ty: number; z0: number; slope: number };
   /** Bounding box for quick tests. */
   x0: number;
   y0: number;
@@ -78,8 +84,10 @@ const geomCache = new WeakMap<MapData, PlatformGeom[]>();
 export function platformGeoms(data: MapData): PlatformGeom[] {
   const cached = geomCache.get(data);
   if (cached) return cached;
+  heightsOf(data);
   const idx = roadIndexFor(data);
   const isBus = (r: { bus: boolean; kind: RoadKind }) => r.bus || r.kind === RoadKind.Busway;
+  const busTunnel = (r: { bus: boolean; kind: RoadKind; tunnel: boolean }) => isBus(r) && r.tunnel;
   const out: PlatformGeom[] = [];
   (data.platforms ?? []).forEach((pl, index) => {
     const p = pl.pts;
@@ -213,7 +221,48 @@ export function platformGeoms(data: MapData): PlatformGeom[] {
       y0 = Math.min(y0, outline[i + 1]);
       y1 = Math.max(y1, outline[i + 1]);
     }
-    out.push({ index, name: pl.name, num, covered: pl.covered, underground: pl.underground, outline, kerbs: chains, back, x0, y0, x1, y1 });
+    // Height: fit a line to the busway height beside the longest kerb.
+    let plane = { px: (x0 + x1) / 2, py: (y0 + y1) / 2, tx: 1, ty: 0, z0: heightAt((x0 + x1) / 2, (y0 + y1) / 2), slope: 0 };
+    const main = chains.reduce<KerbChain | null>((a, c) => (!a || c.len > a.len ? c : a), null);
+    if (main) {
+      const ds: number[] = [];
+      const zs: number[] = [];
+      // Underground platforms take the tunnel busway's height (falling back to any busway).
+      for (const accept of pl.underground ? [busTunnel, isBus] : [isBus]) {
+        for (let k = 0; k <= 6; k++) {
+          const d = (main.len * k) / 6;
+          const q = chainAt(main, d);
+          const hit = idx.nearest(q.x + main.outX * 2, q.y + main.outY * 2, 25, undefined, 0, accept);
+          if (!hit) continue;
+          ds.push(d);
+          zs.push(hit.z);
+        }
+        if (zs.length) break;
+      }
+      if (zs.length) {
+        const n2 = zs.length;
+        const md = ds.reduce((a, b) => a + b, 0) / n2;
+        const mz = zs.reduce((a, b) => a + b, 0) / n2;
+        let num2 = 0;
+        let den = 0;
+        for (let k = 0; k < n2; k++) {
+          num2 += (ds[k] - md) * (zs[k] - mz);
+          den += (ds[k] - md) ** 2;
+        }
+        const slope = den > 1e-6 ? Math.max(-0.12, Math.min(0.12, num2 / den)) : 0;
+        const p0 = chainAt(main, 0);
+        const tl = Math.hypot(main.pts[main.pts.length - 2] - main.pts[0], main.pts[main.pts.length - 1] - main.pts[1]) || 1;
+        plane = {
+          px: p0.x,
+          py: p0.y,
+          tx: (main.pts[main.pts.length - 2] - main.pts[0]) / tl,
+          ty: (main.pts[main.pts.length - 1] - main.pts[1]) / tl,
+          z0: mz - slope * md,
+          slope,
+        };
+      }
+    }
+    out.push({ index, name: pl.name, num, covered: pl.covered, underground: pl.underground, outline, kerbs: chains, back, plane, x0, y0, x1, y1 });
   });
   geomCache.set(data, out);
   return out;
@@ -283,8 +332,12 @@ export function matchStopPlatform(data: MapData, route: Route, stopIndex: number
   let best: PlatformZone | null = null;
   let bestScore = Infinity;
   const step = 2;
+  const zr = heightsOf(data).routeZ(route, rs.s);
   for (const g of geoms) {
     if (stop.x < g.x0 - 70 || stop.x > g.x1 + 70 || stop.y < g.y0 - 70 || stop.y > g.y1 + 70) continue;
+    // Same level only (an underground station under a street stop is not it).
+    const pl = g.plane;
+    if (Math.abs(pl.z0 + pl.slope * ((stop.x - pl.px) * pl.tx + (stop.y - pl.py) * pl.ty) - zr) > LEVEL_GAP) continue;
     // Walk the route around the stop and cast to the left.
     const from = Math.max(0, rs.s - 110);
     const to = Math.min(route.length, rs.s + 110);
@@ -405,8 +458,18 @@ export function buildPlatforms(scene: THREE.Scene, data: MapData): void {
   const posts: THREE.Matrix4[] = [];
   const flags: { x: number; y: number; h: number; label: string; heading: number }[] = [];
   const m4 = new THREE.Matrix4();
-  const quad = (arr: number[], ax: number, ay: number, bx: number, by: number, cx: number, cy: number, dx: number, dy: number, h: number) => {
-    arr.push(ax, h, -ay, bx, h, -by, cx, h, -cy, ax, h, -ay, cx, h, -cy, dx, h, -dy);
+  // A flat quad draped on the platform's height plane, `dh` above it.
+  let zf = (_x: number, _y: number) => 0;
+  const quad = (arr: number[], ax: number, ay: number, bx: number, by: number, cx: number, cy: number, dx: number, dy: number, dh: number) => {
+    const ha = zf(ax, ay) + dh;
+    const hb = zf(bx, by) + dh;
+    const hc = zf(cx, cy) + dh;
+    const hd = zf(dx, dy) + dh;
+    arr.push(ax, ha, -ay, bx, hb, -by, cx, hc, -cy, ax, ha, -ay, cx, hc, -cy, dx, hd, -dy);
+  };
+  const drape = (geo: THREE.BufferGeometry, dh: number) => {
+    const a = geo.getAttribute('position');
+    for (let i = 0; i < a.count; i++) a.setY(i, a.getY(i) + zf(a.getX(i), -a.getZ(i)) + dh);
   };
   for (const g of geoms) {
     let cx = 0;
@@ -417,21 +480,24 @@ export function buildPlatforms(scene: THREE.Scene, data: MapData): void {
     }
     cx /= g.outline.length / 2;
     cy /= g.outline.length / 2;
-    const base = heightAt(cx, cy);
+    const pl = g.plane;
+    zf = (x: number, y: number) => pl.z0 + pl.slope * ((x - pl.px) * pl.tx + (y - pl.py) * pl.ty);
     const shape = ringShape(g.outline);
     if (shape) {
       const slab = new THREE.ExtrudeGeometry(shape, { depth: PLATFORM_HEIGHT, bevelEnabled: false });
       slab.rotateX(-Math.PI / 2);
-      slab.translate(0, base, 0);
-      slabs.push(slab.index ? slab.toNonIndexed() : slab);
+      const sn = slab.index ? slab.toNonIndexed() : slab;
+      drape(sn, 0);
+      slabs.push(sn);
       if (g.covered) {
         const roof = new THREE.ExtrudeGeometry(shape, { depth: 0.18, bevelEnabled: false });
         roof.rotateX(-Math.PI / 2);
-        roof.translate(0, base + CANOPY_HEIGHT, 0);
-        roofs.push(roof.index ? roof.toNonIndexed() : roof);
+        const rn = roof.index ? roof.toNonIndexed() : roof;
+        drape(rn, CANOPY_HEIGHT);
+        roofs.push(rn);
       }
     }
-    const top = base + PLATFORM_HEIGHT + 0.004;
+    const top = PLATFORM_HEIGHT + 0.004;
     for (const k of g.kerbs) {
       // Tactile strip just in from the edge (the platform is on the left of travel).
       for (let i = 0; i + 1 < k.cum.length; i++) {
@@ -449,13 +515,13 @@ export function buildPlatforms(scene: THREE.Scene, data: MapData): void {
       for (let b = 0; b < nb; b++) {
         const front = k.len - b * bl - 1.2;
         const q = chainAt(k, front);
-        flags.push({ x: q.x - k.outX * 0.45, y: q.y - k.outY * 0.45, h: base + PLATFORM_HEIGHT, label: k.bays[b], heading: Math.atan2(q.tx, q.ty) });
+        flags.push({ x: q.x - k.outX * 0.45, y: q.y - k.outY * 0.45, h: zf(q.x, q.y) + PLATFORM_HEIGHT, label: k.bays[b], heading: Math.atan2(q.tx, q.ty) });
         const d = chainAt(k, k.len - b * bl);
         const ox = k.outX;
         const oy = k.outY;
         const tx = d.tx * 0.07;
         const ty = d.ty * 0.07;
-        const h = heightAt(d.x, d.y) + 0.05;
+        const h = 0.05;
         quad(lines, d.x + ox * 0.2 - tx, d.y + oy * 0.2 - ty, d.x + ox * 3.0 - tx, d.y + oy * 3.0 - ty, d.x + ox * 3.0 + tx, d.y + oy * 3.0 + ty, d.x + ox * 0.2 + tx, d.y + oy * 0.2 + ty, h);
         if (b === nb - 1) {
           const e = chainAt(k, 0);
@@ -468,7 +534,7 @@ export function buildPlatforms(scene: THREE.Scene, data: MapData): void {
         const ay = k.pts[2 * i + 1];
         const bx = k.pts[2 * i + 2];
         const by = k.pts[2 * i + 3];
-        const h = heightAt(ax, ay) + 0.05;
+        const h = 0.05;
         quad(lines, ax + k.outX * 0.2, ay + k.outY * 0.2, bx + k.outX * 0.2, by + k.outY * 0.2, bx + k.outX * 0.32, by + k.outY * 0.32, ax + k.outX * 0.32, ay + k.outY * 0.32, h);
       }
     }
@@ -489,7 +555,9 @@ export function buildPlatforms(scene: THREE.Scene, data: MapData): void {
           ny = -ny;
         }
         for (let d = 2; d < len - 1; d += 7.5) {
-          m4.makeTranslation(ax + ex * d + nx * 0.5, base + PLATFORM_HEIGHT + (CANOPY_HEIGHT - PLATFORM_HEIGHT) / 2, -(ay + ey * d + ny * 0.5));
+          const px = ax + ex * d + nx * 0.5;
+          const py = ay + ey * d + ny * 0.5;
+          m4.makeTranslation(px, zf(px, py) + PLATFORM_HEIGHT + (CANOPY_HEIGHT - PLATFORM_HEIGHT) / 2, -py);
           posts.push(m4.clone());
         }
       }
@@ -534,13 +602,15 @@ export function buildPlatforms(scene: THREE.Scene, data: MapData): void {
     const strips: number[] = [];
     for (const g of geoms) {
       if (!g.covered) continue;
+      const pl = g.plane;
+      zf = (x: number, y: number) => pl.z0 + pl.slope * ((x - pl.px) * pl.tx + (y - pl.py) * pl.ty);
       for (const k of g.kerbs) {
         for (let i = 0; i + 1 < k.cum.length; i++) {
           const ax = k.pts[2 * i] - k.outX * 1.6;
           const ay = k.pts[2 * i + 1] - k.outY * 1.6;
           const bx = k.pts[2 * i + 2] - k.outX * 1.6;
           const by = k.pts[2 * i + 3] - k.outY * 1.6;
-          const h = heightAt(ax, ay) + CANOPY_HEIGHT - 0.02;
+          const h = CANOPY_HEIGHT - 0.02;
           quad(strips, ax, ay, bx, by, bx - k.outX * 0.15, by - k.outY * 0.15, ax - k.outX * 0.15, ay - k.outY * 0.15, h);
         }
       }

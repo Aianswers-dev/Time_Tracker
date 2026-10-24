@@ -9,8 +9,9 @@ import { buildFurniture } from './furniture';
 import { buildHouses } from './houses';
 import { buildTrees } from './trees';
 import type { Ctx, Extras } from './ctx';
-import { INNER_PAD, buildGround, buildOuter, makeGroundMaterial } from './ground';
+import { INNER_PAD, buildPools } from './ground';
 import { buildRoads } from './roads';
+import { TerrainField, buildTerrain, makeLandcover, makeTerrainMaterial } from './terrain';
 import { U } from './shaders';
 import { SkySystem } from './sky';
 import { makeAsphaltTexture, makeGlowTexture, makeNoiseTexture, makeTrackTexture, makeWaterNormal } from './textures';
@@ -130,17 +131,22 @@ export async function buildWorld(
   const root = new THREE.Group();
   root.name = 'world';
   scene.add(root);
-  const ctx: Ctx = { scene, renderer, data, extras, outerTex: outer, R, mask, tex, density, root, cull: [], tick: [] };
+  const field = new TerrainField(data);
+  const ctx: Ctx = { scene, renderer, data, extras, outerTex: outer, R, mask, field, tex, density, root, cull: [], tick: [] };
 
   const sky = new SkySystem(scene, renderer);
-  await step(0.08, 'Laying the ground…');
-  const groundMat = makeGroundMaterial(ctx);
-  await buildGround(ctx, groundMat);
-  buildOuter(ctx, groundMat);
-  buildWater(ctx);
+  await step(0.08, 'Shaping the hills…');
+  const land = makeLandcover(data, R);
+  const terrainMat = makeTerrainMaterial(ctx, land, false);
+  const outerMat = makeTerrainMaterial(ctx, land, true);
+  const stripMat = makeTerrainMaterial(ctx, land, false, 0.0006);
 
-  await step(0.16, 'Paving roads…');
-  const roads = await buildRoads(ctx, [], (f) => onProgress(0.16 + f * 0.24, 'Paving roads…'));
+  await step(0.12, 'Paving roads…');
+  const roads = await buildRoads(ctx, field, stripMat, (f) => onProgress(0.12 + f * 0.24, 'Paving roads…'));
+  await step(0.36, 'Shaping the hills…');
+  await buildTerrain(ctx, field, terrainMat, outerMat);
+  buildWater(ctx);
+  buildPools(ctx, field);
 
   await step(0.4, 'Raising buildings…');
   const bidx = await buildBuildings(ctx, (f) => onProgress(0.4 + f * 0.3, 'Raising buildings…'));
@@ -177,9 +183,19 @@ export async function buildWorld(
       U.uTime.value += dt;
       sigClock += dt;
       U.uSignalTime.value = sigClock + sigOffset;
-      sky.update(camera, hours);
       camera.getWorldPosition(camPos);
-      U.uInTunnel.value = camPos.y < 5 && roads.tunnels.penetration(camPos.x, -camPos.z) > -0.4 ? 1 : 0;
+      // underground: the camera is below the ground surface here (open cuttings don't count)
+      const mx = camPos.x;
+      const my = -camPos.z;
+      const depth = field.isHole(mx, my) ? 0 : field.renAt(mx, my) - camPos.y;
+      const under = Math.min(1, Math.max(0, (depth - 1.5) / 3));
+      U.uUnder.value = under;
+      U.uInTunnel.value = under > 0.5 ? 1 : 0;
+      sky.update(camera, hours);
+      if (under > 0) {
+        sky.sun.intensity *= 1 - 0.85 * under;
+        sky.hemi.intensity *= 1 - 0.55 * under;
+      }
       for (const c of ctx.cull) {
         const dx = c.x - camPos.x;
         const dz = c.z - camPos.z;

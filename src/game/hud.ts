@@ -71,6 +71,8 @@ export class Hud {
   private lastProgress = -1;
   private turnKey = '';
   private offAngle = NaN;
+  private gradeShown = false;
+  private gradeText = '';
   private readonly toasts: HTMLDivElement;
 
   // Slots
@@ -88,7 +90,7 @@ export class Hud {
     root.innerHTML = `
       <div class="bbh-panel bbh-route">
         <span class="bbh-badge" data-e="badge"></span>
-        <div style="min-width:0"><div class="bbh-to">Route to</div><div class="bbh-hs" data-t="hs"></div><div class="bbh-road" data-t="road"></div></div>
+        <div style="min-width:0"><div class="bbh-to">Route to</div><div class="bbh-hs" data-t="hs"></div><div class="bbh-road"><span data-t="road"></span><span class="bbh-lvl" data-t="lvl"></span><span class="bbh-slope" data-e="slope"></span></div></div>
         <div class="bbh-progress" data-e="progress"><b data-e="bar"></b></div>
       </div>
       <div class="bbh-panel bbh-turn" data-e="turn"><div class="bbh-arrow" data-e="tarrow"></div><div class="bbh-ttext"><div class="bbh-dist" data-t="tdist"></div><div class="bbh-txt" data-t="ttext"></div></div></div>
@@ -194,6 +196,19 @@ export class Hud {
 
     // Route card.
     s.road.set(g.roadName ? `on ${g.roadName}` : '');
+    s.lvl.set(g.roadLevel === 'tunnel' ? 'Tunnel' : g.roadLevel === 'viaduct' ? 'Viaduct' : g.roadLevel === 'bridge' ? 'Bridge' : '');
+    // Gradient over 4 % (with a little hysteresis so it does not flicker).
+    const pct = Math.abs(g.grade) * 100;
+    const showGrade = pct > (this.gradeShown ? 3 : 4);
+    this.gradeShown = showGrade;
+    const gtxt = showGrade ? `${g.grade > 0 ? '▲' : '▼'} ${Math.round(pct)}%` : '';
+    if (gtxt !== this.gradeText) {
+      this.gradeText = gtxt;
+      const ge = this.els.slope;
+      ge.textContent = gtxt;
+      ge.classList.toggle('up', g.grade > 0);
+      ge.title = showGrade ? `${g.grade > 0 ? 'Uphill' : 'Downhill'} grade ${Math.round(pct)}%` : '';
+    }
     const prog = Math.round(g.progress * 1000) / 10;
     if (prog !== this.lastProgress) {
       this.lastProgress = prog;

@@ -67,6 +67,13 @@ export class MeshGeo {
     this.tri(a, b, c, fx, fy, fz);
     this.tri(a, c, d, fx, fy, fz);
   }
+  /** Override the normal of some vertices (e.g. smooth ground strips). */
+  setNormal(v: number, nx: number, ny: number, nz: number): void {
+    const n = this.nrm.arr;
+    n[3 * v] = nx;
+    n[3 * v + 1] = ny;
+    n[3 * v + 2] = nz;
+  }
   /** Quad facing up. */
   up(a: number, b: number, c: number, d: number): void {
     this.quad(a, b, c, d, 0, 1, 0);

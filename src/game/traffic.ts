@@ -14,6 +14,7 @@ import { brighten, rng } from './util';
 import { CarTraffic, Wait, type BusJunction } from './cars';
 import { TRAFFIC_CAPS, defaultTrafficLevel, type TrafficLevel } from './trafficLevel';
 import { makeBody, type Body } from './bodies';
+import { LEVEL_GAP, heightAt } from './height';
 import { session } from './session';
 import { buildPlatforms } from './platforms';
 
@@ -117,8 +118,10 @@ export class Traffic {
   private tmp: TrackSample = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
   private tmp2: TrackSample = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
   private playerBody = makeBody(12);
+  private lastPlayerZ: number | undefined;
   private aheadX = new Float32Array(LOOK_MAX);
   private aheadY = new Float32Array(LOOK_MAX);
+  private aheadZ = new Float32Array(LOOK_MAX);
   private playerSpec: BusSpec | null = null;
   private markersOut: MapMarker[] = [];
   private costEma = 0.5;
@@ -307,8 +310,9 @@ export class Traffic {
     const d = Math.hypot(dx, dy);
     if (d > this.radius) return false;
     if (this.initial ? d < 45 : d < 120) return false;
+    const zs = c.track.zAt(s);
     if (!this.initial && d < 500) {
-      this.sphere.center.set(this.tmp.x, 2, -this.tmp.y);
+      this.sphere.center.set(this.tmp.x, zs + 2, -this.tmp.y);
       this.sphere.radius = 14;
       if (this.frustum.intersectsSphere(this.sphere)) return false;
     }
@@ -318,7 +322,7 @@ export class Traffic {
     for (const o of this.active) {
       const b = o.body;
       for (let k = 0; k < b.n; k++) {
-        if (Math.abs(b.x[k] - this.tmp.x) < 26 && Math.abs(b.y[k] - this.tmp.y) < 26 && Math.hypot(b.x[k] - this.tmp.x, b.y[k] - this.tmp.y) < 26) return false;
+        if (Math.abs(b.x[k] - this.tmp.x) < 26 && Math.abs(b.y[k] - this.tmp.y) < 26 && Math.abs(b.z[k] - zs) <= LEVEL_GAP && Math.hypot(b.x[k] - this.tmp.x, b.y[k] - this.tmp.y) < 26) return false;
       }
     }
     const type = busTypeForRoute(r);
@@ -370,7 +374,8 @@ export class Traffic {
         speed: 0,
         steer: 0,
         wheelSpin: this.rand() * 6,
-        sections: spec.sections.map(() => ({ x: 0, y: 0, heading: 0 })),
+        z: 0,
+        sections: spec.sections.map(() => ({ x: 0, y: 0, heading: 0, z: 0, pitch: 0 })),
         roll: 0,
         pitch: 0,
       },
@@ -404,10 +409,12 @@ export class Traffic {
       b.track.sample(b.s - k * step, this.tmp, b.pull);
       body.x[k] = this.tmp.x;
       body.y[k] = this.tmp.y;
+      body.z[k] = b.track.zAt(b.s - k * step);
       if (k === 0) body.heading = this.tmp.heading;
     }
     body.fx = body.x[0];
     body.fy = body.y[0];
+    body.fz = body.z[0];
     body.speed = b.v;
   }
 
@@ -416,6 +423,7 @@ export class Traffic {
     if (!this.playerSpec || this.playerSpec.sections.length !== n) this.playerSpec = this.buses.specFor(n >= 3 ? 'metro' : 'rigid');
     const spec = this.playerSpec;
     const body = this.playerBody;
+    const z0 = this.playerZ(p);
     let k = 0;
     for (let i = 0; i < n && i < spec.sections.length; i++) {
       const sec = p.sections[i];
@@ -424,11 +432,14 @@ export class Traffic {
       const hy = Math.cos(sec.heading);
       const front = ss.axleFromFront;
       const rear = ss.length - ss.axleFromFront;
+      const sz = sec.z ?? z0;
+      const tg = Math.tan(sec.pitch ?? 0);
       const m = Math.min(5, Math.max(2, Math.ceil(ss.length / 3.5)));
       for (let j = 0; j < m && k < body.x.length; j++) {
         const t = front - ((front + rear) * j) / (m - 1);
         body.x[k] = sec.x + hx * t;
         body.y[k] = sec.y + hy * t;
+        body.z[k] = sz + tg * t;
         k++;
       }
     }
@@ -437,6 +448,18 @@ export class Traffic {
     body.speed = p.speed;
     body.fx = body.x[0];
     body.fy = body.y[0];
+    body.fz = body.z[0];
+  }
+
+  /**
+   * The player's road height: the pose's own z when physics provides it,
+   * otherwise the surface under the bus, kept on the level it was last on.
+   */
+  private playerZ(p: BusPose): number {
+    if (p.z !== undefined) return (this.lastPlayerZ = p.z);
+    const z = heightAt(p.x, p.y, session.playerZ ?? this.lastPlayerZ);
+    this.lastPlayerZ = z;
+    return z;
   }
 
   /**
@@ -496,7 +519,7 @@ export class Traffic {
       const cx = body.x[mid];
       const cy = body.y[mid];
       const dist = Math.hypot(cx - cam.x, -cy - cam.z);
-      this.sphere.center.set(cx, 2, -cy);
+      this.sphere.center.set(cx, body.z[mid] + 2, -cy);
       this.sphere.radius = b.len / 2 + 3;
       const vis = dist < VIEW_DIST && this.frustum.intersectsSphere(this.sphere);
       if (vis !== b.visible) {
@@ -598,7 +621,8 @@ export class Traffic {
         if (Math.abs(o.body.fx - fx) > o.len + 6 || Math.abs(o.body.fy - fy) > o.len + 6) continue;
         const body = o.body;
         let hit = false;
-        for (let q = 0; q < body.n && !hit; q++) hit = Math.hypot(body.x[q] - fx, body.y[q] - fy) < 1.6;
+        const fz = a.body.fz;
+        for (let q = 0; q < body.n && !hit; q++) hit = Math.hypot(body.x[q] - fx, body.y[q] - fy) < 1.6 && Math.abs(body.z[q] - fz) <= LEVEL_GAP;
         if (hit) {
           a.dead = true;
           this.stats.overlapDespawns++;
@@ -776,10 +800,12 @@ export class Traffic {
     const ns = Math.min(LOOK_MAX, Math.floor((look - 1.5) / 2.5) + 1);
     const ax = this.aheadX;
     const ay = this.aheadY;
+    const az = this.aheadZ;
     for (let k = 0; k < ns; k++) {
       tr.sample(b.s + 1.5 + k * 2.5, this.tmp2, b.pull);
       ax[k] = this.tmp2.x;
       ay[k] = this.tmp2.y;
+      az[k] = tr.zAt(b.s + 1.5 + k * 2.5);
     }
     let bestGap = Infinity;
     let bestV = 0;
@@ -798,7 +824,8 @@ export class Traffic {
         for (let q = 0; q < o.n; q++) {
           const ex = o.x[q] - ax[k];
           const ey = o.y[q] - ay[k];
-          if (ex * ex + ey * ey < 3.4) {
+          // Only what is on our level (not the street under a viaduct).
+          if (ex * ex + ey * ey < 3.4 && Math.abs(o.z[q] - az[k]) <= LEVEL_GAP) {
             bestGap = d;
             bestV = Math.max(0, o.speed * Math.cos(rel));
             bestId = id;
@@ -813,10 +840,10 @@ export class Traffic {
     for (let k = 0; k < ns; k++) {
       const d = 1.5 + k * 2.5;
       if (d >= bestGap) break;
-      const car = this.cars.carAt(ax[k], ay[k], 1.9);
+      const car = this.cars.carAt(ax[k], ay[k], 1.9, az[k]);
       if (car >= 0) {
         bestGap = d;
-        bestV = Math.max(0, this.cars.probe(ax[k], ay[k], 1.9));
+        bestV = Math.max(0, this.cars.probe(ax[k], ay[k], 1.9, az[k]));
         bestId = car;
         bestKind = Wait.Car;
         break;
@@ -883,11 +910,12 @@ export class Traffic {
     b.track.sample(j.s + j.boxR + 4, this.tmp2, 0);
     const x = this.tmp2.x;
     const y = this.tmp2.y;
-    if (this.cars.slowCarNear(x, y, 1.8)) return Wait.Junction;
+    const z = b.track.zAt(j.s + j.boxR + 4);
+    if (this.cars.slowCarNear(x, y, 1.8, z)) return Wait.Junction;
     for (const o of this.active) {
       if (o === b || o.dead || o.v > 2) continue;
       const body = o.body;
-      for (let q = 0; q < body.n; q++) if (Math.hypot(body.x[q] - x, body.y[q] - y) < 2.2) return Wait.Junction;
+      for (let q = 0; q < body.n; q++) if (Math.hypot(body.x[q] - x, body.y[q] - y) < 2.2 && Math.abs(body.z[q] - z) <= LEVEL_GAP) return Wait.Junction;
     }
     return Wait.None;
   }
@@ -909,9 +937,14 @@ export class Traffic {
     const steer = Math.max(-spec.maxSteer, Math.min(spec.maxSteer, 2 * wrapAngle(this.tmp2.heading - heading)));
     p.steer += (steer - p.steer) * Math.min(1, dt * 8);
     p.wheelSpin += (b.v * dt) / 0.48;
+    const zr = b.track.zAt(rearS);
+    const wb = Math.max(1, frontAxleS - rearS);
+    p.z = zr;
     p.sections[0].x = p.x;
     p.sections[0].y = p.y;
     p.sections[0].heading = heading;
+    p.sections[0].z = zr;
+    p.sections[0].pitch = Math.atan2(b.track.zAt(frontAxleS) - zr, wb);
     // Trailing sections follow the path behind their hitches.
     let frontS = b.s;
     for (let i = 1; i < spec.sections.length; i++) {
@@ -927,6 +960,9 @@ export class Traffic {
       sec.x = this.tmp.x;
       sec.y = this.tmp.y;
       sec.heading = h;
+      const za = b.track.zAt(axleS);
+      sec.z = za;
+      sec.pitch = Math.atan2(b.track.zAt(hitchS) - za, Math.max(1, hitchS - axleS));
       frontS = curFront;
     }
     // Gentle body motion.
@@ -944,6 +980,8 @@ export class Traffic {
   resolve(pose: BusPose, spec: BusSpec): { hit: boolean; impact: number } {
     const out = { hit: false, impact: 0 };
     const R = spec.width / 2;
+    // Vehicles on another level (viaduct above, tunnel below) are not in the way.
+    const z0 = this.playerZ(pose);
     for (let iter = 0; iter < 3; iter++) {
       let best = 0;
       let bnx = 0;
@@ -958,15 +996,19 @@ export class Traffic {
         const hy = Math.cos(sec.heading);
         const front = ss.axleFromFront - 0.2;
         const rear = ss.length - ss.axleFromFront - 0.2;
+        const sz = sec.z ?? z0;
+        const tg = Math.tan(sec.pitch ?? 0);
         const m = Math.max(2, Math.ceil((front + rear) / 2.2) + 1);
         for (let j = 0; j < m; j++) {
           const t = front - ((front + rear) * j) / (m - 1);
           const px = sec.x + hx * t;
           const py = sec.y + hy * t;
+          const pz = sz + tg * t;
           for (const b of this.active) {
             const body = b.body;
             if (Math.abs(body.fx - px) > b.len + 4 || Math.abs(body.fy - py) > b.len + 4) continue;
             for (let k = 0; k < body.n; k++) {
+              if (Math.abs(body.z[k] - pz) > LEVEL_GAP) continue;
               const dx = px - body.x[k];
               const dy = py - body.y[k];
               const d = Math.hypot(dx, dy);
@@ -981,7 +1023,7 @@ export class Traffic {
               }
             }
           }
-          const ci = this.cars.grid.nearest(px, py, R + 1.0);
+          const ci = this.cars.grid.nearest(px, py, R + 1.0, undefined, pz);
           if (ci >= 0) {
             const g = this.cars.grid;
             const dx = px - g.px[ci];

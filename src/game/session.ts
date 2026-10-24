@@ -19,4 +19,6 @@ export const session: {
   hours: number | null;
   /** Traffic density chosen in the menu (Traffic picks it up on its next update). */
   trafficLevel: TrafficLevel | null;
-} = { traffic: null, guide: null, world: null, hours: null, trafficLevel: null };
+  /** The guide's estimate of the player's road height (m AHD), for level checks when the pose has no z. */
+  playerZ: number | null;
+} = { traffic: null, guide: null, world: null, hours: null, trafficLevel: null, playerZ: null };

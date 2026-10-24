@@ -6,6 +6,7 @@ import { pointAlong, wrapAngle } from '../data/coords';
 import { drivable, roadIndexFor, speedLimitOf } from './roadIndex';
 import { isStationStop } from './routeMeta';
 import { matchStopPlatform, type PlatformZone } from './platforms';
+import { LEVEL_GAP, heightsOf } from './height';
 
 export const TRACK_STEP = 4;
 
@@ -111,6 +112,8 @@ export class RouteTrack {
   readonly limit: Uint8Array;
   /** Index of the road under each sample, or -1. */
   readonly road: Int32Array;
+  /** Road surface height (m AHD) at each sample, from the route's own heights (tunnels, viaducts). */
+  readonly z: Float32Array;
   readonly stops: TrackStop[];
   readonly signals: TrackSignal[];
   /** Every 40 m: [s, x, y] triples, for quick "is this route near me" tests. */
@@ -121,6 +124,7 @@ export class RouteTrack {
     readonly data: MapData,
   ) {
     const idx = roadIndexFor(data);
+    const H = heightsOf(data);
     const L = route.length;
     const n = Math.max(2, Math.floor(L / TRACK_STEP) + 2);
     this.n = n;
@@ -134,6 +138,7 @@ export class RouteTrack {
     const known = new Uint8Array(n);
     this.limit = new Uint8Array(n);
     this.road = new Int32Array(n).fill(-1);
+    this.z = new Float32Array(n);
     for (let i = 0; i < n; i++) {
       const s = Math.min(L, i * TRACK_STEP);
       const p = pointAlong(route.pts, route.cum, s);
@@ -150,7 +155,10 @@ export class RouteTrack {
       nx[i] = -dy;
       ny[i] = dx;
       const heading = Math.atan2(dx, dy);
-      const hit = idx.nearest(p.x, p.y, 14, heading, 0.8, drivable);
+      const zr = H.routeZ(route, s);
+      this.z[i] = zr;
+      // Only roads at the route's level count (not the street under a viaduct).
+      const hit = idx.nearest(p.x, p.y, 14, heading, 0.8, drivable, zr);
       if (hit) {
         const road = data.roads[hit.road];
         const dC = (hit.px - p.x) * nx[i] + (hit.py - p.y) * ny[i];
@@ -292,6 +300,8 @@ export class RouteTrack {
             const along = (sig[2 * k] - bx[i]) * ny[i] - (sig[2 * k + 1] - by[i]) * nx[i];
             const sAlong = i * TRACK_STEP + along;
             if (Math.abs(along) > TRACK_STEP * 0.75) continue;
+            // Signals are on the streets: ignore them from a tunnel or viaduct.
+            if (Math.abs(H.surfaceAt(sig[2 * k], sig[2 * k + 1]).z - this.z[i]) > LEVEL_GAP) continue;
             seen.add(k);
             found.push({ s: sAlong, x: sig[2 * k], y: sig[2 * k + 1] });
           }
@@ -330,6 +340,18 @@ export class RouteTrack {
       out.y += out.hy * s;
     }
     return out;
+  }
+
+  /** Road height (m AHD) at route distance s. */
+  zAt(s: number): number {
+    const f = Math.max(0, Math.min(this.n - 1.0001, s / TRACK_STEP));
+    const i = Math.floor(f);
+    return this.z[i] + (this.z[i + 1] - this.z[i]) * (f - i);
+  }
+
+  /** Grade (rise over run) at route distance s, over +-`half` metres. */
+  gradeAt(s: number, half = 8): number {
+    return (this.zAt(s + half) - this.zAt(s - half)) / (2 * half);
   }
 
   vmaxAt(s: number): number {

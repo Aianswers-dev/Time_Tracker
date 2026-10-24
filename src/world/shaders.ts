@@ -35,6 +35,8 @@ export const U = {
   uSignalTime: { value: 0 },
   /** 1 when the camera is inside a road tunnel. */
   uInTunnel: { value: 0 },
+  /** 0..1 how far underground the camera is (tunnel haze instead of sky fog). */
+  uUnder: { value: 0 },
 };
 
 export type SharedUniforms = typeof U;
@@ -88,6 +90,7 @@ if (vWDist > uCompress.x) {
 
 const FRAG_PARS = /* glsl */ `
 uniform float uFogHeight;
+uniform float uUnder;
 varying float vWDist;
 varying vec3 vWDir;
 varying vec3 vWView;
@@ -108,6 +111,7 @@ float w_fogFactor() {
   float hp = hc + vWDir.y;
   float hAvg = max(0.0, (hc + hp) * 0.5);
   float dens = fogDensity * exp(-hAvg / uFogHeight) * W_FOGMUL;
+  dens = mix(dens, 0.012, uUnder);
   float fd = dens * vWDist;
   return 1.0 - exp(-fd * fd);
 }
@@ -121,7 +125,8 @@ const FRAG_FOG = /* glsl */ `
   #ifdef W_FOG_FADE
   gl_FragColor.rgb *= 1.0 - wf;
   #else
-  gl_FragColor.rgb = mix(gl_FragColor.rgb, w_outputColor(w_fogColor(normalize(vWDir))), wf);
+  vec3 wfc = mix(w_fogColor(normalize(vWDir)), vec3(0.035, 0.032, 0.028), uUnder);
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, w_outputColor(wfc), wf);
   #endif
 }
 #endif
@@ -143,6 +148,8 @@ export interface PatchOptions {
   projectAnchor?: string;
   /** Additive materials fade to black in fog instead of mixing toward the fog colour. */
   fogFade?: boolean;
+  /** Pull fragments toward the camera by this fraction of their distance (wins near-coplanar ties). */
+  depthBias?: number;
 }
 
 function replaceOnce(src: string, find: string, repl: string, key: string): string {
@@ -175,10 +182,18 @@ export function patch<T extends THREE.Material>(mat: T, o: PatchOptions): T {
     }
     for (const [a, b] of o.fragment ?? []) fs = replaceOnce(fs, a, b, o.key);
     fs = replaceOnce(fs, '#include <fog_fragment>', FRAG_FOG, o.key);
+    if (o.depthBias) {
+      fs = replaceOnce(
+        fs,
+        '#include <logdepthbuf_fragment>',
+        `#if defined( USE_LOGDEPTHBUF )\n gl_FragDepth = vIsPerspective == 0.0 ? gl_FragCoord.z : log2( vFragDepth * ${(1 - o.depthBias).toFixed(5)} ) * logDepthBufFC * 0.5;\n#endif`,
+        o.key,
+      );
+    }
     shader.vertexShader = vs;
     shader.fragmentShader = fs;
   };
-  mat.customProgramCacheKey = () => `w-${o.key}-${fogMul}-${o.compress !== false}-${!!o.fogFade}`;
+  mat.customProgramCacheKey = () => `w-${o.key}-${fogMul}-${o.compress !== false}-${!!o.fogFade}-${o.depthBias ?? 0}`;
   return mat;
 }
 

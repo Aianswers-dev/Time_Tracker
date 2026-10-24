@@ -15,7 +15,7 @@ import { RoadKind, type BusPose, type MapData, type WorldHandle } from '../types
 import { wrapAngle } from '../data/coords';
 import { speedLimitOf } from './roadIndex';
 import { PointGrid, type Body } from './bodies';
-import { heightAt } from './height';
+import { LEVEL_GAP, heightsOf } from './height';
 import { TRACK_STEP, type RouteTrack } from './track';
 import { rng } from './util';
 
@@ -54,8 +54,8 @@ interface Edge {
   weight: number;
   /** Priority class at junctions. */
   rank: number;
-  /** Vertical layer (bridges above, tunnels below): vehicles on different layers never meet. */
-  layer: number;
+  /** Road height (m AHD) at each vertex of `pts`: vehicles on different levels never meet. */
+  z: Float32Array;
   mx: number;
   my: number;
   /** Mid-block signals (pedestrian lights): stop-line distance along the directed lane, per direction. */
@@ -64,7 +64,7 @@ interface Edge {
   sigXY: [number[], number[]];
   /** Busway crossings: give-way line distance along the directed lane, per direction. */
   xs: [number[], number[]];
-  /** Crossing point x, y and busway direction bx, by for each entry of `xs`. */
+  /** Crossing point x, y, busway direction bx, by and height z for each entry of `xs` (5 numbers each). */
   xsXY: [number[], number[]];
 }
 
@@ -81,6 +81,8 @@ interface Occupant {
 interface Node {
   x: number;
   y: number;
+  /** Road height at the node (m AHD). */
+  z: number;
   out: number[];
   /** Edges touching this node. */
   edges: number[];
@@ -122,6 +124,9 @@ interface Car {
   vWant: number;
   x: number;
   y: number;
+  /** Road height (m AHD) and grade pitch (radians, + = nose up). */
+  z: number;
+  pitch: number;
   heading: number;
   len: number;
   braking: boolean;
@@ -295,6 +300,16 @@ function lampGeometry(L: number, W: number, y: number, front: boolean): THREE.Bu
   return mergeGeometries(quads)!;
 }
 
+/** A point on a lane: position, unit direction of travel, road height and grade (rise / run along travel). */
+interface LanePt {
+  x: number;
+  y: number;
+  hx: number;
+  hy: number;
+  z: number;
+  g: number;
+}
+
 export class CarTraffic {
   private edges: Edge[] = [];
   private nodes: Node[] = [];
@@ -327,15 +342,17 @@ export class CarTraffic {
   private q = new THREE.Quaternion();
   private v3 = new THREE.Vector3();
   private one = new THREE.Vector3(1, 1, 1);
-  private up = new THREE.Vector3(0, 1, 0);
+  private euler = new THREE.Euler(0, 0, 0, 'YXZ');
   private headMat: THREE.MeshBasicMaterial;
   private tailMat: THREE.MeshBasicMaterial;
   private tailDay = new THREE.Color(0x5a0a0a);
   private tailNight = new THREE.Color(0xff2a1a);
   private tailBrake = new THREE.Color(0xff5040);
   private lastNight = -1;
-  private pt = { x: 0, y: 0, hx: 0, hy: 0 };
-  private pt2 = { x: 0, y: 0, hx: 0, hy: 0 };
+  private pt: LanePt = { x: 0, y: 0, hx: 0, hy: 0, z: 0, g: 0 };
+  /** The car whose queue fills a junction exit (set by canGo when it returns Junction for that reason). */
+  private blockRef = 0;
+  private pt2: LanePt = { x: 0, y: 0, hx: 0, hy: 0, z: 0, g: 0 };
   readonly stats: CarStats = { overlapDespawns: 0, stuckDespawns: 0, waitingRed: 0, waitingJunction: 0, stationary: 0 };
   /** Recent safety-valve events (diagnostics). */
   readonly events: string[] = [];
@@ -392,7 +409,10 @@ export class CarTraffic {
   private buildGraph(): void {
     const roads = this.data.roads;
     const key = (x: number, y: number) => Math.round(x * 2) * 100003 + Math.round(y * 2);
-    const uses = new Map<number, number>();
+    // Vertex uses per position *and level*: a viaduct passing over a street at
+    // the same x/y is not a junction with it.
+    const uses = new Map<number, { z: number; n: number }[]>();
+    const useAt = (kk: number, z: number) => uses.get(kk)?.find((u) => Math.abs(u.z - z) < LEVEL_GAP);
     const included: number[] = [];
     roads.forEach((r, i) => {
       // Never bus-only roads, busways or service roads (stations, platforms, car parks).
@@ -400,18 +420,26 @@ export class CarTraffic {
       included.push(i);
       for (let k = 0; k < r.pts.length; k += 2) {
         const kk = key(r.pts[k], r.pts[k + 1]);
-        uses.set(kk, (uses.get(kk) ?? 0) + (k === 0 || k === r.pts.length - 2 ? 1 : 2));
+        const add = k === 0 || k === r.pts.length - 2 ? 1 : 2;
+        const u = useAt(kk, r.z[k / 2]);
+        if (u) u.n += add;
+        else {
+          let l = uses.get(kk);
+          if (!l) uses.set(kk, (l = []));
+          l.push({ z: r.z[k / 2], n: add });
+        }
       }
     });
-    const nodeOf = new Map<number, number>();
-    const node = (x: number, y: number): number => {
+    const nodeOf = new Map<number, number[]>();
+    const node = (x: number, y: number, z: number): number => {
       const kk = key(x, y);
-      let n = nodeOf.get(kk);
-      if (n === undefined) {
-        n = this.nodes.length;
-        this.nodes.push({ x, y, out: [], edges: [], deg: 0, until: -1, holder: -1, rank: 0, sig: false, boxR: 4, occ: [] });
-        nodeOf.set(kk, n);
-      }
+      let l = nodeOf.get(kk);
+      if (!l) nodeOf.set(kk, (l = []));
+      const hit = l.find((n) => Math.abs(this.nodes[n].z - z) < LEVEL_GAP);
+      if (hit !== undefined) return hit;
+      const n = this.nodes.length;
+      this.nodes.push({ x, y, z, out: [], edges: [], deg: 0, until: -1, holder: -1, rank: 0, sig: false, boxR: 4, occ: [] });
+      l.push(n);
       return n;
     };
     for (const ri of included) {
@@ -420,16 +448,17 @@ export class CarTraffic {
       let start = 0;
       const nv = p.length / 2;
       for (let v = 1; v < nv; v++) {
-        const split = v === nv - 1 || (uses.get(key(p[2 * v], p[2 * v + 1])) ?? 0) >= 3;
+        const split = v === nv - 1 || (useAt(key(p[2 * v], p[2 * v + 1]), r.z[v])?.n ?? 0) >= 3;
         if (!split) continue;
         const pts = p.slice(start * 2, v * 2 + 2);
+        const zs = r.z.slice(start, v + 1);
         start = v;
         const cum = new Float32Array(pts.length / 2);
         for (let k = 1; k < cum.length; k++) cum[k] = cum[k - 1] + Math.hypot(pts[2 * k] - pts[2 * k - 2], pts[2 * k + 1] - pts[2 * k - 1]);
         const len = cum[cum.length - 1];
         if (len < 1) continue;
-        const a = node(pts[0], pts[1]);
-        const b = node(pts[pts.length - 2], pts[pts.length - 1]);
+        const a = node(pts[0], pts[1], zs[0]);
+        const b = node(pts[pts.length - 2], pts[pts.length - 1], zs[zs.length - 1]);
         const e: Edge = {
           pts,
           cum,
@@ -443,7 +472,7 @@ export class CarTraffic {
           kind: r.kind,
           weight: len * (CLASS_W[r.kind] ?? 0.3) * (r.link ? 0.3 : 1),
           rank: (CLASS_W[r.kind] ?? 0.3) * (r.link ? 0.5 : 1),
-          layer: r.layer + (r.bridge ? 1 : 0) - (r.tunnel ? 1 : 0),
+          z: zs,
           mx: (pts[0] + pts[pts.length - 2]) / 2,
           my: (pts[1] + pts[pts.length - 1]) / 2,
           sig: [[], []],
@@ -522,10 +551,13 @@ export class CarTraffic {
       if (!l) edgeGrid.set(gk, (l = []));
       l.push(i);
     });
+    const H = heightsOf(this.data);
     for (let k = 0; k < sg.length; k += 2) {
       const sx = sg[k];
       const sy = sg[k + 1];
-      const jn = this.nearestJunction(sx, sy, 30);
+      // Signals stand at street level: they control only roads at that level.
+      const sz = H.surfaceAt(sx, sy).z;
+      const jn = this.nearestJunction(sx, sy, 30, sz);
       if (jn >= 0 && Math.hypot(this.nodes[jn].x - sx, this.nodes[jn].y - sy) < this.nodes[jn].boxR + 14) {
         this.nodes[jn].sig = true;
         continue;
@@ -537,7 +569,7 @@ export class CarTraffic {
           for (const ei of edgeGrid.get((gx + ox) * 1000 + gy + oy) ?? []) {
             const e = this.edges[ei];
             const pr = this.project(e, sx, sy);
-            if (pr.d > 7) continue;
+            if (pr.d > 7 || Math.abs(this.zAlong(e, pr.s) - sz) > LEVEL_GAP) continue;
             const fwd = pr.s - 6;
             if (fwd > 0 && fwd < e.len) {
               e.sig[0].push(fwd);
@@ -582,6 +614,8 @@ export class CarTraffic {
         const ay = p[i + 1];
         const bx = p[i + 2];
         const by = p[i + 3];
+        const za = r.z[i / 2];
+        const zb = r.z[i / 2 + 1];
         const blen = Math.hypot(bx - ax, by - ay);
         if (blen < 0.1) continue;
         const gx0 = Math.floor(Math.min(ax, bx) / 200) - 1;
@@ -605,17 +639,21 @@ export class CarTraffic {
                 const t = ((ax - cx) * ey - (ay - cy) * ex) / den;
                 const s = ((ax - cx) * dy - (ay - cy) * dx) / den;
                 if (t < 0 || t > 1 || s < 0 || s > 1) continue;
+                // Only where the two really meet (not a busway viaduct or tunnel crossing the street).
+                const zc = e.z[k / 2] + (e.z[k / 2 + 1] - e.z[k / 2]) * t;
+                const zw = za + (zb - za) * s;
+                if (Math.abs(zc - zw) >= 1.5) continue;
                 const along = e.cum[k / 2] + t * Math.hypot(dx, dy);
                 const X = cx + dx * t;
                 const Y = cy + dy * t;
                 const fwd = along - 5;
                 if (fwd > 0) {
                   e.xs[0].push(fwd);
-                  e.xsXY[0].push(X, Y, ex / blen, ey / blen);
+                  e.xsXY[0].push(X, Y, ex / blen, ey / blen, zw);
                 }
                 if (!e.oneway && e.len - along - 5 > 0) {
                   e.xs[1].push(e.len - along - 5);
-                  e.xsXY[1].push(X, Y, ex / blen, ey / blen);
+                  e.xsXY[1].push(X, Y, ex / blen, ey / blen, zw);
                 }
               }
             }
@@ -628,13 +666,14 @@ export class CarTraffic {
         const order = e.xs[d].map((s, i) => [s, i] as const).sort((x, y) => x[0] - y[0]);
         e.xs[d] = order.map(([s]) => s);
         const xy: number[] = [];
-        for (const [, i] of order) xy.push(...e.xsXY[d].slice(i * 4, i * 4 + 4));
+        for (const [, i] of order) xy.push(...e.xsXY[d].slice(i * 5, i * 5 + 5));
         e.xsXY[d] = xy;
       }
     }
   }
 
-  private nearestJunction(x: number, y: number, r: number): number {
+  /** Nearest junction node within r of (x, y) on the level of z (any level without z), or -1. */
+  private nearestJunction(x: number, y: number, r: number, z?: number): number {
     let best = -1;
     let bd = r;
     const gx = Math.floor(x / 50);
@@ -642,6 +681,7 @@ export class CarTraffic {
     for (let ox = -1; ox <= 1; ox++) {
       for (let oy = -1; oy <= 1; oy++) {
         for (const n of this.nodeGrid.get((gx + ox) * 4096 + gy + oy) ?? []) {
+          if (z !== undefined && Math.abs(this.nodes[n].z - z) > LEVEL_GAP) continue;
           const d = Math.hypot(this.nodes[n].x - x, this.nodes[n].y - y);
           if (d < bd) {
             bd = d;
@@ -673,8 +713,22 @@ export class CarTraffic {
     return { s: bs, d: best };
   }
 
+  /** Road height at distance s along an edge (from its `a` end). */
+  private zAlong(e: Edge, s: number): number {
+    const c = e.cum;
+    let lo = 0;
+    let hi = c.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (c[mid] <= s) lo = mid;
+      else hi = mid;
+    }
+    const t = Math.max(0, Math.min(1, (s - c[lo]) / Math.max(1e-6, c[hi] - c[lo])));
+    return e.z[lo] + (e.z[hi] - e.z[lo]) * t;
+  }
+
   /** Point on a directed lane at distance u, shifted `lat` to the left. */
-  private at(lane: number, u: number, lat: number, out: { x: number; y: number; hx: number; hy: number }): void {
+  private at(lane: number, u: number, lat: number, out: LanePt): void {
     const e = this.edges[lane >> 1];
     const rev = (lane & 1) === 1;
     const s = Math.max(0, Math.min(e.len, rev ? e.len - u : u));
@@ -701,6 +755,10 @@ export class CarTraffic {
     out.y = p[2 * lo + 1] + (p[2 * hi + 1] - p[2 * lo + 1]) * t + hx * lat;
     out.hx = hx;
     out.hy = hy;
+    const z = e.z;
+    out.z = z[lo] + (z[hi] - z[lo]) * t;
+    const g = (z[hi] - z[lo]) / l;
+    out.g = rev ? -g : g;
   }
 
   /**
@@ -868,9 +926,9 @@ export class CarTraffic {
     nd.holder = holder;
   }
 
-  /** A slow car within r of (x, y) (an exit that is not clear). */
-  slowCarNear(x: number, y: number, r: number): boolean {
-    const i = this.grid.nearest(x, y, r);
+  /** A slow car within r of (x, y) on the level of z (an exit that is not clear). */
+  slowCarNear(x: number, y: number, r: number, z?: number): boolean {
+    const i = this.grid.nearest(x, y, r, undefined, z);
     return i >= 0 && this.grid.pv[i] < 2;
   }
 
@@ -880,7 +938,8 @@ export class CarTraffic {
     if (cached) return cached;
     const best = new Map<number, { i: number; d: number }>();
     for (let i = 0; i < track.n; i++) {
-      const n = this.nearestJunction(track.x[i], track.y[i], 7);
+      // Only junctions on the route's level (not the street under a busway viaduct).
+      const n = this.nearestJunction(track.x[i], track.y[i], 7, track.z[i]);
       if (n < 0) continue;
       const d = Math.hypot(this.nodes[n].x - track.x[i], this.nodes[n].y - track.y[i]);
       const cur = best.get(n);
@@ -1006,12 +1065,12 @@ export class CarTraffic {
     const d = Math.hypot(pt.x - px, pt.y - py);
     if (d > this.radius || d < (this.initial ? 35 : 130)) return false;
     if (!this.initial && d < 420) {
-      this.sphere.center.set(pt.x, 1, -pt.y);
+      this.sphere.center.set(pt.x, pt.z + 1, -pt.y);
       this.sphere.radius = 4;
       if (frustum.intersectsSphere(this.sphere)) return false;
     }
-    if (this.busGrid.nearest(pt.x, pt.y, 10) >= 0) return false;
-    if (this.grid.nearest(pt.x, pt.y, 10) >= 0) return false;
+    if (this.busGrid.nearest(pt.x, pt.y, 10, undefined, pt.z) >= 0) return false;
+    if (this.grid.nearest(pt.x, pt.y, 10, undefined, pt.z) >= 0) return false;
     for (const c of this.cars) if (c.lane === lane && Math.abs(c.u - u) < 12) return false;
     const roll = this.rand();
     const model = roll < 0.22 ? 0 : roll < 0.47 ? 1 : roll < 0.68 ? 2 : roll < 0.85 ? 3 : roll < 0.93 ? 4 : 5;
@@ -1032,6 +1091,8 @@ export class CarTraffic {
       vWant: 0.88 + this.rand() * 0.2,
       x: pt.x,
       y: pt.y,
+      z: pt.z,
+      pitch: Math.atan(pt.g),
       heading: Math.atan2(pt.hx, pt.hy),
       len: this.models[model].len,
       braking: false,
@@ -1067,15 +1128,15 @@ export class CarTraffic {
     c.holds.length = 0;
   }
 
-  /** Grid index of the nearest other car within r on the same road layer, or -1. */
-  private carOnLayer(x: number, y: number, r: number, skip: number, layer: number): number {
+  /** Grid index of the nearest other (live) car within r of (x, y) on the level of z, or -1. */
+  private carNear(x: number, y: number, r: number, skip: number, z: number): number {
     const g = this.grid;
     let best = -1;
     let bd = r * r;
     g.query(x, y, r, (i) => {
-      if (g.pid[i] === skip) return false;
+      if (g.pid[i] === skip || Math.abs(g.pz[i] - z) > LEVEL_GAP) return false;
       const o = this.byId.get(g.pid[i]);
-      if (!o || o.dead || o.lane < 0 || this.edges[o.lane >> 1].layer !== layer) return false;
+      if (!o || o.dead) return false;
       const d = (g.px[i] - x) ** 2 + (g.py[i] - y) ** 2;
       if (d < bd) {
         bd = d;
@@ -1086,9 +1147,9 @@ export class CarTraffic {
     return best;
   }
 
-  /** Speed of a car within r of (x, y), or -1 if none. */
-  probe(x: number, y: number, r: number): number {
-    const i = this.grid.nearest(x, y, r);
+  /** Speed of a car within r of (x, y) (on the level of z, if given), or -1 if none. */
+  probe(x: number, y: number, r: number, z?: number): number {
+    const i = this.grid.nearest(x, y, r, undefined, z);
     return i < 0 ? -1 : this.grid.pv[i];
   }
 
@@ -1097,9 +1158,9 @@ export class CarTraffic {
     return this.byId.get(id)?.exempt ?? false;
   }
 
-  /** Car id of the car within r of (x, y), or -1. */
-  carAt(x: number, y: number, r: number): number {
-    const i = this.grid.nearest(x, y, r);
+  /** Car id of the car within r of (x, y) (on the level of z, if given), or -1. */
+  carAt(x: number, y: number, r: number, z?: number): number {
+    const i = this.grid.nearest(x, y, r, undefined, z);
     return i < 0 ? -1 : this.grid.pid[i];
   }
 
@@ -1127,12 +1188,15 @@ export class CarTraffic {
       for (const o of nb) {
         if (o === c || o.dead) continue;
         if (this.lanesIn(next) > 1 && o.laneIdx !== idx) continue;
-        if (o.u < room && o.v < 2) return Wait.Junction;
+        if (o.u < room && o.v < 2) {
+          this.blockRef = o.id;
+          return Wait.Junction;
+        }
       }
     }
     const ne = this.edges[next >> 1];
     this.at(next, Math.min(ne.len, nd.boxR + 3), this.laneOffset(next, idx), this.pt2);
-    const hb = this.busGrid.nearest(this.pt2.x, this.pt2.y, 2.6);
+    const hb = this.busGrid.nearest(this.pt2.x, this.pt2.y, 2.6, undefined, this.pt2.z);
     if (hb >= 0 && this.busGrid.pv[hb] < 2) return Wait.Junction;
     // A link too short to stop on: the junction after it must be enterable too.
     if (depth === 0 && this.shortLink(next, nd.boxR, c.len)) {
@@ -1162,11 +1226,12 @@ export class CarTraffic {
     return nd.deg >= 3 && e.len - this.stopD[lane] < boxR + len;
   }
 
-  /** Index of a bus (or -1 = player) on the busway near a crossing at (X, Y) along (bx, by), else -2. */
-  private busOnBusway(X: number, Y: number, bx: number, by: number): number {
+  /** Index of a bus (or -1 = player) on the busway near a crossing at (X, Y, Z) along (bx, by), else -2. */
+  private busOnBusway(X: number, Y: number, bx: number, by: number, Z: number): number {
     const g = this.busGrid;
     let found = -2;
     g.query(X, Y, 26, (i) => {
+      if (Math.abs(g.pz[i] - Z) > LEVEL_GAP) return false;
       const dx = g.px[i] - X;
       const dy = g.py[i] - Y;
       const along = dx * bx + dy * by;
@@ -1192,9 +1257,9 @@ export class CarTraffic {
     const py = player.y;
     const bg = this.busGrid;
     bg.clear();
-    for (let k = 0; k < playerBody.n; k++) bg.add(playerBody.x[k], playerBody.y[k], Math.max(0, Math.abs(playerBody.speed)), -1);
+    for (let k = 0; k < playerBody.n; k++) bg.add(playerBody.x[k], playerBody.y[k], Math.max(0, Math.abs(playerBody.speed)), -1, playerBody.z[k]);
     busBodies.forEach((b, i) => {
-      for (let k = 0; k < b.n; k++) bg.add(b.x[k], b.y[k], b.speed, i);
+      for (let k = 0; k < b.n; k++) bg.add(b.x[k], b.y[k], b.speed, i, b.z[k]);
     });
 
     this.candTimer -= dt;
@@ -1303,12 +1368,12 @@ export class CarTraffic {
       const look = 5 + c.v * 2;
       for (let d = c.len / 2 + 1; d <= look; d += 2) {
         this.sampleAhead(c, d, pt);
-        const hc = this.carOnLayer(pt.x, pt.y, 1.7, c.id, e.layer);
+        const hc = this.carNear(pt.x, pt.y, 1.7, c.id, pt.z);
         if (hc >= 0) {
           lim(idm(d - c.len / 2 - 0.5, this.grid.pv[hc] * 0.6, 1.6), Wait.Car, this.grid.pid[hc]);
           break;
         }
-        const hb = bg.nearest(pt.x, pt.y, 2.1);
+        const hb = bg.nearest(pt.x, pt.y, 2.1, undefined, pt.z);
         if (hb >= 0) {
           lim(idm(d - c.len / 2 - 0.6, bg.pv[hb] * 0.8, 1.5), bg.pid[hb] === -1 ? Wait.Player : Wait.Bus, bg.pid[hb]);
           busBlock = bg.pv[hb] < 1;
@@ -1349,8 +1414,8 @@ export class CarTraffic {
         const xgap = xs[c.xsI] - c.u;
         if (xgap < 45 && xgap > -6) {
           const q = e.xsXY[c.lane & 1];
-          const k = c.xsI * 4;
-          const bus = this.busOnBusway(q[k], q[k + 1], q[k + 2], q[k + 3]);
+          const k = c.xsI * 5;
+          const bus = this.busOnBusway(q[k], q[k + 1], q[k + 2], q[k + 3], q[k + 4]);
           if (bus !== -2) lim(idm(Math.max(0.05, xgap), 0, 0.5), bus === -1 ? Wait.Player : Wait.Crossing, bus);
           else if (xgap < 2) c.xsCommit = c.xsI; // keep looking until we are on it
         }
@@ -1364,8 +1429,9 @@ export class CarTraffic {
         if (!c.holds.some((h) => h.node === N) && c.next >= 0) {
           const stopAt = remain - sd;
           if (stopAt < commitDist + 30) {
+            this.blockRef = 0;
             const res = this.canGo(c, c.lane, c.next, stopAt, time, 0);
-            if (res !== Wait.None) lim(idm(Math.max(0.05, stopAt), 0, 0.6), res);
+            if (res !== Wait.None) lim(idm(Math.max(0.05, stopAt), 0, 0.6), res, this.blockRef);
             else if (stopAt <= commitDist) this.commit(c, c.lane, c.next, stopAt, time, 0);
           }
         }
@@ -1411,20 +1477,24 @@ export class CarTraffic {
       this.at(c.lane, c.u, c.lat, pt);
       c.x = pt.x;
       c.y = pt.y;
+      c.z = pt.z;
       const h = Math.atan2(pt.hx, pt.hy);
       c.heading += wrapAngle(h - c.heading) * Math.min(1, dt * 7);
+      // Grade pitch, eased so cars do not snap over polyline kinks.
+      c.pitch += (Math.atan(pt.g) - c.pitch) * Math.min(1, dt * 5);
       // Waiting legitimately? (Red light, the player, or queued behind someone who is.)
       const why = wt.why;
       c.exempt =
         why === Wait.Red ||
         why === Wait.Player ||
-        (why === Wait.Car && (this.byId.get(wt.ref)?.exempt ?? false)) ||
+        // Queued behind someone who is (also across a junction: its exit is full of such a queue).
+        ((why === Wait.Car || (why === Wait.Junction && wt.ref > 0)) && (this.byId.get(wt.ref)?.exempt ?? false)) ||
         ((why === Wait.Bus || why === Wait.Crossing) && !!busExempt[wt.ref]);
       if (why === Wait.Red) st.waitingRed++;
       if (why === Wait.Junction) st.waitingJunction++;
       if (c.v < 0.3) st.stationary++;
       // Safety valve: a car that has not moved for a long time without a good reason goes away.
-      if (c.v < 0.3 && !c.exempt) c.idle += dt;
+      if (c.v < 0.3 && !c.exempt && why !== Wait.None) c.idle += dt;
       else c.idle = 0;
       if (c.idle > (c.visible ? 45 : 25)) {
         this.note(`stuck lane ${c.lane} u ${c.u.toFixed(1)}/${e.len.toFixed(1)} why ${wt.why} ref ${wt.ref} end ${N} sig ${nd.sig}`);
@@ -1440,8 +1510,9 @@ export class CarTraffic {
       if (c.dead) continue;
       const hx = Math.sin(c.heading);
       const hy = Math.cos(c.heading);
-      g.add(c.x + hx * c.len * 0.3, c.y + hy * c.len * 0.3, c.v, c.id);
-      g.add(c.x - hx * c.len * 0.3, c.y - hy * c.len * 0.3, c.v, c.id);
+      const dz = Math.tan(c.pitch) * c.len * 0.3;
+      g.add(c.x + hx * c.len * 0.3, c.y + hy * c.len * 0.3, c.v, c.id, c.z + dz);
+      g.add(c.x - hx * c.len * 0.3, c.y - hy * c.len * 0.3, c.v, c.id, c.z - dz);
     }
     // Safety valve: vehicles that overlap are removed (the one behind; cars give way to buses).
     for (const c of this.cars) {
@@ -1451,7 +1522,7 @@ export class CarTraffic {
       for (const f of [0.3, -0.3]) {
         const qx = c.x + hx * c.len * f;
         const qy = c.y + hy * c.len * f;
-        const oc = this.carOnLayer(qx, qy, 1.2, c.id, this.edges[c.lane >> 1].layer);
+        const oc = this.carNear(qx, qy, 1.2, c.id, c.z);
         if (oc >= 0) {
           const o = this.byId.get(g.pid[oc]);
           if (o && !o.dead) {
@@ -1462,7 +1533,7 @@ export class CarTraffic {
             break;
           }
         }
-        const ob = bg.nearest(qx, qy, 1.6);
+        const ob = bg.nearest(qx, qy, 1.6, undefined, c.z);
         if (ob >= 0 && bg.pid[ob] >= 0) {
           this.note(`car-bus lane ${c.lane} u ${c.u.toFixed(1)} v ${c.v.toFixed(1)} bus v ${bg.pv[ob].toFixed(1)} holds ${c.holds.map((h) => h.node)} end ${this.endNode(c.lane)}`);
           this.kill(c);
@@ -1483,7 +1554,7 @@ export class CarTraffic {
     }
   }
 
-  private sampleAhead(c: Car, d: number, out: { x: number; y: number; hx: number; hy: number }): void {
+  private sampleAhead(c: Car, d: number, out: LanePt): void {
     const e = this.edges[c.lane >> 1];
     const u = c.u + d;
     if (u <= e.len || c.next < 0) this.at(c.lane, Math.min(u, e.len), c.lat, out);
@@ -1503,15 +1574,17 @@ export class CarTraffic {
       const dx = c.x - cam.x;
       const dz = -c.y - cam.z;
       if (dx * dx + dz * dz > VIEW * VIEW) continue;
-      this.sphere.center.set(c.x, 1, -c.y);
+      this.sphere.center.set(c.x, c.z + 1, -c.y);
       this.sphere.radius = 3.2;
       if (!frustum.intersectsSphere(this.sphere)) continue;
       c.visible = true;
       const m = this.models[c.model];
       if (m.count >= CAPACITY) continue;
       const i = m.count++;
-      this.v3.set(c.x, heightAt(c.x, c.y), -c.y);
-      this.q.setFromAxisAngle(this.up, -c.heading);
+      // On the road at its height, yawed then pitched to the grade.
+      this.v3.set(c.x, c.z, -c.y);
+      this.euler.set(c.pitch, -c.heading, 0);
+      this.q.setFromEuler(this.euler);
       this.m4.compose(this.v3, this.q, this.one);
       m.mesh.setMatrixAt(i, this.m4);
       m.mesh.setColorAt(i, c.color);

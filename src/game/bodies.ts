@@ -4,16 +4,19 @@ export interface Body {
   /** Sample points along the body centreline (map x/y), front first. */
   x: Float32Array;
   y: Float32Array;
+  /** Road height (m AHD) at each sample point. */
+  z: Float32Array;
   n: number;
   heading: number;
   speed: number;
   /** Front point. */
   fx: number;
   fy: number;
+  fz: number;
 }
 
 export function makeBody(n: number): Body {
-  return { x: new Float32Array(n), y: new Float32Array(n), n, heading: 0, speed: 0, fx: 0, fy: 0 };
+  return { x: new Float32Array(n), y: new Float32Array(n), z: new Float32Array(n), n, heading: 0, speed: 0, fx: 0, fy: 0, fz: 0 };
 }
 
 /** Uniform hash grid of points, rebuilt every frame (no allocation after warm-up). */
@@ -22,6 +25,8 @@ export class PointGrid {
   private next: Int32Array;
   px: Float32Array;
   py: Float32Array;
+  /** Height per point (m AHD): points on another level never meet. */
+  pz: Float32Array;
   /** Payload per point (e.g. speed). */
   pv: Float32Array;
   /** Owner id per point. */
@@ -39,6 +44,7 @@ export class PointGrid {
     this.next = new Int32Array(capacity);
     this.px = new Float32Array(capacity);
     this.py = new Float32Array(capacity);
+    this.pz = new Float32Array(capacity);
     this.pv = new Float32Array(capacity);
     this.pid = new Int32Array(capacity);
   }
@@ -52,7 +58,7 @@ export class PointGrid {
     this.count = 0;
   }
 
-  add(x: number, y: number, v: number, id: number): void {
+  add(x: number, y: number, v: number, id: number, z = 0): void {
     if (this.count >= this.px.length) {
       const cap = this.px.length * 2;
       const grow = <T extends Float32Array | Int32Array>(a: T, C: new (n: number) => T): T => {
@@ -63,12 +69,14 @@ export class PointGrid {
       this.next = grow(this.next, Int32Array);
       this.px = grow(this.px, Float32Array);
       this.py = grow(this.py, Float32Array);
+      this.pz = grow(this.pz, Float32Array);
       this.pv = grow(this.pv, Float32Array);
       this.pid = grow(this.pid, Int32Array);
     }
     const i = this.count++;
     this.px[i] = x;
     this.py[i] = y;
+    this.pz[i] = z;
     this.pv[i] = v;
     this.pid[i] = id;
     const k = this.key(Math.floor(x / this.cell), Math.floor(y / this.cell));
@@ -94,8 +102,12 @@ export class PointGrid {
     }
   }
 
-  /** Index of the nearest point within r of (x, y) whose id != skip, or -1. */
-  nearest(x: number, y: number, r: number, skip = -2147483648): number {
+  /**
+   * Index of the nearest point within r of (x, y) whose id != skip, or -1.
+   * With `z`, points more than `maxDz` above or below are ignored (other level).
+   */
+  nearest(x: number, y: number, r: number, skip = -2147483648, z = NaN, maxDz = 2.5): number {
+    const lv = z === z;
     const c0x = Math.floor((x - r) / this.cell);
     const c1x = Math.floor((x + r) / this.cell);
     const c0y = Math.floor((y - r) / this.cell);
@@ -105,7 +117,7 @@ export class PointGrid {
     for (let cy = c0y; cy <= c1y; cy++) {
       for (let cx = c0x; cx <= c1x; cx++) {
         for (let i = this.head[this.key(cx, cy)]; i >= 0; i = this.next[i]) {
-          if (this.pid[i] === skip) continue;
+          if (this.pid[i] === skip || (lv && Math.abs(this.pz[i] - z) > maxDz)) continue;
           const dx = this.px[i] - x;
           const dy = this.py[i] - y;
           const d = dx * dx + dy * dy;

@@ -2,6 +2,7 @@
 import { RoadKind, type MapData, type Route } from '../types';
 import { pointAlong, wrapAngle } from '../data/coords';
 import { drivable, roadIndexFor } from './roadIndex';
+import { heightsOf } from './height';
 
 export type TurnKind = 'left' | 'right' | 'slight-left' | 'slight-right' | 'sharp-left' | 'sharp-right' | 'uturn';
 
@@ -41,12 +42,13 @@ export function shortStreet(name: string): string {
 
 function streetAt(data: MapData, route: Route, s: number, offsets: number[]): string | null {
   const idx = roadIndexFor(data);
+  const H = heightsOf(data);
   const votes = new Map<string, number>();
   for (const o of offsets) {
     const ss = s + o;
     if (ss < 0 || ss > route.length) continue;
     const p = pointAlong(route.pts, route.cum, ss);
-    const hit = idx.nearest(p.x, p.y, 12, p.heading, 0.85, drivable);
+    const hit = idx.nearest(p.x, p.y, 12, p.heading, 0.85, drivable, H.routeZ(route, ss));
     if (!hit) continue;
     const road = data.roads[hit.road];
     const name = road.name ?? (road.kind === RoadKind.Busway || road.bus ? 'the busway' : null);
