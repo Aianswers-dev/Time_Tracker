@@ -73,6 +73,19 @@ SMALL_WATER_TUNNEL = 8.0  # m under the level of creeks and ponds
 CLR_ROAD = 5.5  # deck surface above a road surface below (4.6-5 m clearance + deck)
 CLR_RAIL = 7.0  # above rail (overhead wires)
 CLR_PED = 4.5  # above pedestrian streets, and service over service (car-park ramps over lanes)
+# Over a tunnel the renderer builds a tube (src/world/roads.ts TUBE_H 5.8 m, +0.6
+# for motorways) with a roof: anything above must clear tube + roof (audit #1,
+# #5), plus a margin for the output simplification (ZTOL on both ways).
+TUBE_H = 5.8
+CLR_TUBE = TUBE_H + 0.6 + 0.2
+CLR_TUBE_MWY = CLR_TUBE + 0.6
+FOOT_GAP = 0.9  # m: a way whose carriageway comes this close to a tunnel's (in plan) is over its tube
+FOOT_CONNECTED = 30.0  # m: ... unless the network joins them closer than this (a junction, a portal)
+FOOT_SHORT_PORTAL = 15.0  # m: and not near the portals of short underpasses (they start at grade)
+FOOT_PORTAL = 30.0  # m: near-parallel ways this close to a tube's portal run beside it, not over it
+STATION_CAP = 0.025  # bus roads alongside a bus platform: 1:40, an accessible platform's limit (sat review #7)
+STATION_REACH = 10.0  # m from the platform
+COUPLE = 6.0  # weight (x node length) tying adjacent parallel carriageways at grade together (M1 #7)
 SMALL_WATER_DECK = 3.5  # deck above creeks, ponds and bank-side river viaducts
 RIVER_SPAN = 80.0  # a tidal water crossing this long (m) ...
 RIVER_SHORE = 35.0  # ... reaching this far (and a quarter of its span) from land is a river bridge
@@ -281,6 +294,21 @@ class Graph:
         log(f"graph {n} nodes ({int((self.osm >= 0).sum())} OSM), {len(self.ei)} edges, {len(split)} tunnel/bridge nodes "
             f"shared with a crossing way split apart, built in {time.time() - t:.1f}s")
 
+    def level_stations(self, lines: list[Line], zones) -> None:
+        """Bus roads alongside a platform climb at most STATION_CAP (the radar
+        surface humps under station roofs: Roma St 5.9 %, sat review #7)."""
+        bus = np.asarray([ln.kind == 7 or bool(ln.meta.get("bus")) for ln in lines])[self.eline]
+        e = np.flatnonzero(bus)
+        mid = shapely.points(0.5 * (self.x[self.ei[e]] + self.x[self.ej[e]]), 0.5 * (self.y[self.ei[e]] + self.y[self.ej[e]]))
+        qi, _ = shapely.STRtree(list(zones)).query(mid, predicate="dwithin", distance=STATION_REACH)
+        e = np.unique(e[qi])
+        self.ecap[e] = np.minimum(self.ecap[e], STATION_CAP)
+        self.ncap = np.full(self.n, 1.0)
+        np.minimum.at(self.ncap, self.ei, self.ecap)
+        np.minimum.at(self.ncap, self.ej, self.ecap)
+        self.adj = self._adj(self.ecap * self.elen)
+        log(f"{len(e)} bus road edges alongside platforms held to {100 * STATION_CAP:.1f} %")
+
     def _adj(self, w: np.ndarray, mask: np.ndarray | None = None):
         """Symmetric adjacency; overlapping ways that repeat an edge keep the smallest weight."""
         i, j = self.ei, self.ej
@@ -382,6 +410,111 @@ def find_crossings(g: Graph, lines: list[Line]):
     return a, b, ta, tb, px, py
 
 
+def _half_widths(lines: list[Line]) -> np.ndarray:
+    return np.asarray([2.1 if ln.kind == RAIL else 0.5 * float(ln.meta.get("w", 6.0)) for ln in lines])
+
+
+def find_footprints(g: Graph, lines: list[Line], skip: np.ndarray, near_portal: np.ndarray | None = None):
+    """Ways over a tunnel's tube without crossing its centreline (a street along
+    a tunnel, a service loop over a busway tube: audit #1, #5): every pair of a
+    tunnel edge and a non-tunnel edge whose carriageways come within FOOT_GAP in
+    plan, at their closest points. skip: tunnel nodes to leave out (near the
+    portals of underpasses). Returns (ea, eb, ta, tb, px, py, minor) with ea the
+    upper (non-tunnel) edge, as find_crossings. Left out: pairs the network
+    joins within FOOT_CONNECTED (a junction, a portal approach), and ways side
+    by side rather than over: near-parallel, and carriageways apart or within
+    FOOT_PORTAL of the tube's portal (near_portal: tunnel nodes): the open
+    approach of one twin tube beside the other's tube wall at a staggered
+    portal, whose OSM centrelines are often closer than our carriageway widths
+    (the Cultural Centre Tunnel and Clem7 were dug 11 m deep by such pairs).
+    minor: the upper way is an unnamed service way or path, which
+    gives way (it leaves the output if it intrudes, audit #1) rather than
+    pushing a busway or motorway down."""
+    t = time.time()
+    ehw = _half_widths(lines)[g.eline]
+    tun = np.flatnonzero(g.etunnel & (g.ekind != RAIL) & ~(skip[g.ei] & skip[g.ej]))
+    oth = np.flatnonzero(~g.etunnel)
+    segs = shapely.linestrings(np.stack([np.stack([g.x[g.ei], g.y[g.ei]], -1), np.stack([g.x[g.ej], g.y[g.ej]], -1)], 1))
+    tree = shapely.STRtree(segs[oth])
+    qi, qj = tree.query(segs[tun], predicate="dwithin", distance=ehw[tun] + float(ehw.max()) + FOOT_GAP)
+    eb, ea = tun[qi], oth[qj]
+    d = shapely.distance(segs[eb], segs[ea])
+    keep = (d > 1e-6) & (d < ehw[eb] + ehw[ea] + FOOT_GAP)
+    shared = (g.ei[ea] == g.ei[eb]) | (g.ei[ea] == g.ej[eb]) | (g.ej[ea] == g.ei[eb]) | (g.ej[ea] == g.ej[eb])
+    keep &= ~shared
+    ea, eb = ea[keep], eb[keep]
+    c = shapely.get_coordinates(shapely.shortest_line(segs[eb], segs[ea])).reshape(-1, 2, 2)
+
+    def param(e, p):
+        dx, dy = g.x[g.ej[e]] - g.x[g.ei[e]], g.y[g.ej[e]] - g.y[g.ei[e]]
+        l2 = np.maximum(dx * dx + dy * dy, 1e-12)
+        return np.clip(((p[:, 0] - g.x[g.ei[e]]) * dx + (p[:, 1] - g.y[g.ei[e]]) * dy) / l2, 0.0, 1.0)
+
+    tb = param(eb, c[:, 0])
+    ta = param(ea, c[:, 1])
+    ua = np.stack([g.x[g.ej[ea]] - g.x[g.ei[ea]], g.y[g.ej[ea]] - g.y[g.ei[ea]]], 1)
+    ub = np.stack([g.x[g.ej[eb]] - g.x[g.ei[eb]], g.y[g.ej[eb]] - g.y[g.ei[eb]]], 1)
+    cos = np.abs((ua * ub).sum(1)) / np.maximum(np.hypot(*ua.T) * np.hypot(*ub.T), 1e-9)
+    portal = np.zeros(len(ea), bool) if near_portal is None else (near_portal[g.ei[eb]] | near_portal[g.ej[eb]])
+    beside = (cos > 0.85) & ((d[keep] >= ehw[ea] + ehw[eb] - 0.5) | portal)
+    near = _net_distance(g, g.metric_adj, g.ei[ea], g.ej[ea], g.ei[eb], g.ej[eb], ta, tb, FOOT_CONNECTED) < FOOT_CONNECTED
+    ok = ~near & ~beside
+    ea, eb, ta, tb, c = ea[ok], eb[ok], ta[ok], tb[ok], c[ok]
+    minor_line = np.asarray([ln.kind in MINOR and not ln.meta.get("n") and not ln.meta.get("bus") and not ln.bridge for ln in lines])
+    minor = minor_line[g.eline[ea]]
+    log(f"{len(ea)} footprint pairs (ways over a tunnel's tube off its centreline; {int(minor.sum())} of minor ways), "
+        f"{int(near.sum())} joined nearby and {int((beside & ~near).sum())} side by side left out, in {time.time() - t:.1f}s")
+    return ea, eb, ta, tb, c[:, 1, 0], c[:, 1, 1], minor
+
+
+def coupling_rows(g: Graph, lines: list[Line]):
+    """Adjacent parallel carriageways at grade (a bus lane beside the general
+    lanes, the two sides of a dual carriageway): rows (i, j0, j1, t, w) tying
+    node i to the point at t on edge (j0, j1) of the other way (M1 #7)."""
+    t0 = time.time()
+    hw = _half_widths(lines)
+    lvl = np.asarray([ln.level for ln in lines])
+    ok_line = np.asarray([ln.kind <= 7 and not ln.bridge and not ln.tunnel for ln in lines])
+    e_ok = ok_line[g.eline]
+    nodes = np.flatnonzero(g.surface & ~g.portal & ~g.abutment)
+    # a representative edge (direction, line) per node
+    first = np.full(g.n, -1)
+    ok_e = np.flatnonzero(e_ok)
+    first[g.ei[ok_e]] = ok_e
+    first[g.ej[ok_e]] = ok_e
+    nodes = nodes[first[nodes] >= 0]
+    en = first[nodes]
+    ln_i = g.eline[en]
+    segs = shapely.linestrings(np.stack([np.stack([g.x[g.ei[ok_e]], g.y[g.ei[ok_e]]], -1), np.stack([g.x[g.ej[ok_e]], g.y[g.ej[ok_e]]], -1)], 1))
+    tree = shapely.STRtree(segs)
+    pts = shapely.points(g.x[nodes], g.y[nodes])
+    reach = hw[ln_i] + float(hw.max()) + 1.0
+    qi, qj = tree.query(pts, predicate="dwithin", distance=reach)
+    e = ok_e[qj]
+    i = nodes[qi]
+    li, lj = ln_i[qi], g.eline[e]
+    d = shapely.distance(pts[qi], segs[qj])
+    good = (li != lj) & (lvl[li] == lvl[lj]) & (d < hw[li] + hw[lj] + 1.0) & (d > 0.5)
+    good &= (g.ei[e] != i) & (g.ej[e] != i)
+    ui = np.stack([g.x[g.ej[en[qi]]] - g.x[g.ei[en[qi]]], g.y[g.ej[en[qi]]] - g.y[g.ei[en[qi]]]], 1)
+    uj = np.stack([g.x[g.ej[e]] - g.x[g.ei[e]], g.y[g.ej[e]] - g.y[g.ei[e]]], 1)
+    cos = np.abs((ui * uj).sum(1)) / np.maximum(np.hypot(*ui.T) * np.hypot(*uj.T), 1e-9)
+    good &= cos > 0.94
+    dx, dy = uj[:, 0], uj[:, 1]
+    tt = np.clip(((g.x[i] - g.x[g.ei[e]]) * dx + (g.y[i] - g.y[g.ei[e]]) * dy) / np.maximum(dx * dx + dy * dy, 1e-12), 0, 1)
+    good &= (tt > 0.0) & (tt < 1.0) | (np.hypot(*uj.T) < 12.0)
+    i, e, tt, d = i[good], e[good], tt[good], d[good]
+    # the nearest such edge per node
+    order = np.lexsort((d, i))
+    i, e, tt = i[order], e[order], tt[order]
+    firsts = np.ones(len(i), bool)
+    firsts[1:] = i[1:] != i[:-1]
+    i, e, tt = i[firsts], e[firsts], tt[firsts]
+    w = COUPLE * g.nlen[i]
+    log(f"{len(i)} nodes tied to an adjacent parallel carriageway in {time.time() - t0:.1f}s")
+    return i, g.ei[e], g.ej[e], tt, w
+
+
 # ---------------------------------------------------------------------------
 # Solve
 
@@ -451,24 +584,35 @@ def _bending_rows(g: Graph, lines: list[Line]):
     return key[:, 0], key[:, 1], key[:, 2]
 
 
+def _net_distance(g: Graph, adj, a0, a1, b0, b1, ta, tb, limit: float) -> np.ndarray:
+    """Network distance (in the metric of adj) between the points at ta on edges
+    (a0, a1) and at tb on edges (b0, b1) (inf when further than limit)."""
+    out = np.full(len(a0), np.inf)
+    if not len(a0):
+        return out
+    wa = np.asarray(adj[a0, a1]).ravel()  # length of the first edge in this metric
+    wb = np.asarray(adj[b0, b1]).ravel()
+    src = np.unique(np.concatenate([a0, a1]))
+    pos = np.full(g.n, -1)
+    pos[src] = np.arange(len(src))
+    for c0 in range(0, len(src), 64):
+        chunk = src[c0 : c0 + 64]
+        d = csgraph.dijkstra(adj, directed=False, indices=chunk, limit=limit)
+        for va, fa in ((a0, ta), (a1, 1.0 - ta)):
+            r = pos[va] - c0
+            k = np.flatnonzero((r >= 0) & (r < len(chunk)))
+            if not len(k):
+                continue
+            rr = r[k]
+            best = np.minimum(d[rr, b0[k]] + tb[k] * wb[k], d[rr, b1[k]] + (1.0 - tb[k]) * wb[k]) + fa[k] * wa[k]
+            out[k] = np.minimum(out[k], best)
+    return out
+
+
 def _grade_distance(g: Graph, a0, a1, b0, b1, ta, tb, limit: float) -> np.ndarray:
     """Grade-metric network distance between the crossing points on edges (a0, a1) and (b0, b1)
     (inf when further than limit)."""
-    out = np.full(len(a0), np.inf)
-    src = np.unique(np.concatenate([a0, a1]))
-    pos = {int(v): k for k, v in enumerate(src)}
-    wa = g.adj[a0, a1].A1  # grade length of the upper edge
-    wb = g.adj[b0, b1].A1
-    for c0 in range(0, len(src), 64):
-        chunk = src[c0 : c0 + 64]
-        d = csgraph.dijkstra(g.adj, directed=False, indices=chunk, limit=limit)
-        for k in range(len(a0)):
-            for va, fa in ((a0[k], ta[k]), (a1[k], 1.0 - ta[k])):
-                r = pos[int(va)] - c0
-                if 0 <= r < len(chunk):
-                    best = min(d[r, b0[k]] + tb[k] * wb[k], d[r, b1[k]] + (1.0 - tb[k]) * wb[k]) + fa * wa[k]
-                    out[k] = min(out[k], best)
-    return out
+    return _net_distance(g, g.adj, a0, a1, b0, b1, ta, tb, limit)
 
 
 def _system(g: Graph, lines: list[Line], alpha: np.ndarray, target: np.ndarray):
@@ -488,6 +632,14 @@ def _system(g: Graph, lines: list[Line], alpha: np.ndarray, target: np.ndarray):
     vals = np.stack([ci, cj, ck], 1).ravel()
     D = sparse.csr_matrix((vals, (rows, cols)), shape=(len(i), n))
     H = (D.T @ sparse.diags(wb) @ D).tocsr() + sparse.diags(alpha)
+    # adjacent parallel carriageways: w (z_i - z_on_the_other)^2
+    ci_, j0, j1, t, w = coupling_rows(g, lines)
+    m = len(ci_)
+    rows = np.repeat(np.arange(m), 3)
+    cols = np.stack([ci_, j0, j1], 1).ravel()
+    vals = np.stack([np.ones(m), -(1.0 - t), -t], 1).ravel()
+    C = sparse.csr_matrix((vals, (rows, cols)), shape=(m, n))
+    H = H + (C.T @ sparse.diags(w) @ C).tocsr()
     return H.tocsr(), alpha * target
 
 
@@ -549,16 +701,19 @@ class WaterInfo:
         return np.where(ok, self.dist[j, i], 0.0)
 
 
-def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5, box=None) -> dict:
+def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5, box=None, stations=None) -> dict:
     """Give every line a dense polyline (dxy) with heights (dz, m AHD).
 
-    ground: callable (x, y) -> terrain height (m AHD), vectorised
-    water:  WaterInfo of the same terrain
+    ground:   callable (x, y) -> terrain height (m AHD), vectorised
+    water:    WaterInfo of the same terrain
+    stations: shapely geometries of the bus platforms (their busways stay level)
     Returns a stats dict for the report.
     """
     t0 = time.time()
     g = Graph(lines)
     n = g.n
+    if stations:
+        g.level_stations(lines, stations)
     T = np.asarray(ground(g.x, g.y), dtype=np.float64)
     wl = water.level(g.x, g.y)
     inwater = np.isfinite(wl)
@@ -568,6 +723,8 @@ def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5,
     # ---- direct bounds that do not depend on other ways ------------------
     Lb = np.full(n, -np.inf)
     Ub = np.full(n, np.inf)
+    foot_skip = np.zeros(n, bool)
+    foot_portal = np.zeros(n, bool)
     # tunnels: PORTAL_DEPTH below the ground at a portal, deepening to COVER at the cap
     tun = g.tunnel | g.portal
     if tun.any():
@@ -584,6 +741,8 @@ def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5,
         pdepth = np.where(comp_len[tlab] < SHORT_TUNNEL, 0.0, g.portal_depth)
         depth = np.minimum(COVER, pdepth + g.ncap * d_portal)
         Ub[tun] = T[tun] - depth[tun]
+        foot_skip = (comp_len[tlab] < SHORT_TUNNEL) & (d_portal < FOOT_SHORT_PORTAL)
+        foot_portal = g.tunnel & (d_portal < FOOT_PORTAL)
     # the river itself (wide tidal water), not tidal creeks
     river_tunnel = g.tunnel & inwater & (wl <= tidal_level + 0.1) & (water.shore_dist(g.x, g.y) >= RIVER_TUNNEL_SHORE)
     Ub[river_tunnel] = np.minimum(Ub[river_tunnel], RIVER_TUNNEL_Z)
@@ -640,6 +799,14 @@ def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5,
 
     # ---- crossings ---------------------------------------------------------
     ea, eb, ta, tb, cx_, cy_ = find_crossings(g, lines)
+    fa, fb, fta, ftb, fx, fy, fminor = find_footprints(g, lines, foot_skip, foot_portal)
+    # minor unnamed ways over a tube are checked after the solve, not obeyed
+    soft = (fa[fminor], fb[fminor], fta[fminor], ftb[fminor], fx[fminor], fy[fminor])
+    fa, fb, fta, ftb, fx, fy = (v[~fminor] for v in (fa, fb, fta, ftb, fx, fy))
+    nxing = len(ea)
+    ea, eb, ta, tb = (np.concatenate(v) for v in ((ea, fa), (eb, fb), (ta, fta), (tb, ftb)))
+    cx_, cy_ = np.concatenate([cx_, fx]), np.concatenate([cy_, fy])
+    foot = np.arange(len(ea)) >= nxing
     lvl = np.asarray([ln.level for ln in lines])
     la, lb = g.eline[ea], g.eline[eb]
     up_bridge = g.ebridge[ea]
@@ -650,6 +817,10 @@ def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5,
     clr = np.where(g.ekind[eb] == RAIL, CLR_RAIL, np.where(g.ekind[eb] == 8, CLR_PED, CLR_ROAD))
     clr = np.where(lower_low & (g.ekind[ea] == RAIL), CLR_RAIL, clr)
     clr = np.where(np.isin(g.ekind[ea], MINOR) & np.isin(g.ekind[eb], MINOR), CLR_PED, clr)
+    # over a tunnel: its tube and roof (whatever the kinds)
+    tube = low_tunnel & (g.ekind[eb] != RAIL)
+    clr = np.where(tube, np.maximum(clr, np.where(g.ekind[eb] == 0, CLR_TUBE_MWY, CLR_TUBE)), clr)
+    clr_full = clr.copy()
     # Two ways that also meet at a junction nearby can only be as far apart
     # vertically as the grade caps allow along the network between the two
     # crossing points (mapping artefacts at at-grade landings, tunnels that
@@ -726,13 +897,19 @@ def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5,
     # Where the mover still cannot make the clearance (a deck that has to come
     # down to a portal or junction nearby), the other way gives way too: the
     # road under a deck dips, the street over a tunnel humps.
+    # A deck's bound follows the way under it down as well as up: the first
+    # pass asked for the clearance over that way's reference height, which
+    # its own constraints may have lowered since (Victoria Bridge humped 3-4 m
+    # over the expressway ramps: sat review #8).
     REPAIR = 3.0
-    L2, U2 = L.copy(), U.copy()
+    U2 = U.copy()
+    Lkeep = Lb.copy()  # direct bounds and what the ways over lowered tunnels had to give
     for rp in range(2):
         za, zb = at(z, ea, ta), at(z, eb, tb)
         short = za - zb < clr - 0.2
         sel = raise_up
-        need = np.maximum(need, np.where(sel, np.minimum(zb + clr, need + REPAIR), need))
+        need = np.where(sel, np.minimum(zb + clr + 0.2, need + REPAIR), need)
+        L2 = Lkeep.copy()
         for ends in (g.ei[ea[sel]], g.ej[ea[sel]]):
             np.maximum.at(L2, ends, need[sel])
         give = sel & short
@@ -744,6 +921,7 @@ def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5,
             np.minimum.at(U2, ends, lim[sel])
         give = sel & short
         for ends in (g.ei[ea[give]], g.ej[ea[give]]):
+            np.maximum.at(Lkeep, ends, np.minimum(zb[give] + clr[give], za[give] + REPAIR))
             np.maximum.at(L2, ends, np.minimum(zb[give] + clr[give], za[give] + REPAIR))
         Lp, Up, bad = spread(L2, U2)
         target[g.bridge] = np.maximum(Tg[g.bridge], Lp[g.bridge])
@@ -792,6 +970,30 @@ def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5,
     short = (gap < clr - 0.3) & inside
     stats["crossings"] = (int(inside.sum()), int(short.sum()), float(np.min((gap - clr)[inside])) if inside.any() else 0.0,
                           float(np.percentile((clr - gap)[short], 50)) if short.any() else 0.0)
+    # Ways still inside a tunnel's tube (the grade caps could not make the
+    # clearance, as at a portal): minor unnamed ones leave the output (the
+    # service loop over the Roma St busway tube, audit #1); the rest are reported.
+    intr = tube & (gap < clr_full - 0.3) & (gap > -1.0)
+    drops: dict[int, tuple] = {}
+    for k in np.flatnonzero(intr):
+        ln = lines[int(la[k])]
+        if ln.emit and ln.kind in MINOR and not ln.bridge and not ln.meta.get("n") and not ln.meta.get("bus"):
+            drops.setdefault(int(la[k]), (ln.id, ln.kind, round(float(gap[k]), 1), round(float(cx_[k])), round(float(cy_[k]))))
+    sa, sb, sta, stb, sx, sy = soft
+    sgap = at(z, sa, sta) - at(z, sb, stb)
+    sclr = np.where(g.ekind[sb] == 0, CLR_TUBE_MWY, CLR_TUBE)
+    for k in np.flatnonzero((sgap < sclr - 0.3) & (sgap > -1.0)):
+        ln = lines[int(g.eline[sa[k]])]
+        if ln.emit:
+            drops.setdefault(int(g.eline[sa[k]]), (ln.id, ln.kind, round(float(sgap[k]), 1), round(float(sx[k])), round(float(sy[k]))))
+    for li in drops:
+        lines[li].emit = False
+    stats["tube_drops"] = list(drops.values())
+    rest = intr & inside & ~np.isin(la, list(drops))
+    stats["tube_short"] = (int(rest.sum()), int((rest & foot).sum()), [
+        (lines[int(la[k])].name or "?", lines[int(lb[k])].name or "?", "footprint" if foot[k] else "crossing", round(float(gap[k]), 1),
+         round(float(clr_full[k]), 1), round(float(cx_[k])), round(float(cy_[k])))
+        for k in np.flatnonzero(rest)[np.argsort((gap - clr_full)[rest])][:12]])
     worst = np.argsort(gap - clr)[:10]
     stats["worst_crossings"] = [
         (lines[int(g.eline[ea[w]])].name or "?", lines[int(g.eline[eb[w]])].name or "?", round(float(gap[w]), 1), round(float(clr[w]), 1), round(float(cx_[w])), round(float(cy_[w])))
@@ -823,6 +1025,122 @@ def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5,
 
 # ---------------------------------------------------------------------------
 # Output helpers
+
+
+OPEN_SPAN_DZ = 2.5  # m: a surface way this far above a tunnel road passes over it
+
+
+def _resample(xy: np.ndarray, z: np.ndarray, step: float):
+    seg = np.hypot(*np.diff(xy, axis=0).T)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    s = np.linspace(0.0, cum[-1], max(2, int(math.ceil(cum[-1] / step)) + 1))
+    return np.stack([np.interp(s, cum, xy[:, 0]), np.interp(s, cum, xy[:, 1])], 1), np.interp(s, cum, z), s
+
+
+def open_cutting_spans(lines: list[Line], ground) -> dict[int, list[tuple[float, float]]]:
+    """Stretches of surface ways that pass over a tunnel where its cutting is
+    open beside them (the ground lower than the tube roof): bridge pieces, so
+    they get a deck and parapets instead of an asphalt ribbon over the cutting
+    (audit #8). Returns {line index: [(s0, s1) along ln.dxy]}."""
+    from scipy.spatial import cKDTree
+
+    t0 = time.time()
+    P, Z, HW, H = [], [], [], []
+    for ln in lines:
+        if not ln.tunnel or ln.bridge or ln.kind == RAIL or ln.dxy is None or len(ln.dxy) < 2:
+            continue
+        xy, z, _ = _resample(ln.dxy, ln.dz, 1.0)
+        P.append(xy)
+        Z.append(z)
+        HW.append(np.full(len(z), 0.5 * float(ln.meta.get("w", 6.0))))
+        H.append(np.full(len(z), TUBE_H + (0.6 if ln.kind == 0 else 0.0)))
+    if not P:
+        return {}
+    TP, TZ, THW, TH = np.concatenate(P), np.concatenate(Z), np.concatenate(HW), np.concatenate(H)
+    topen = np.asarray(ground(TP[:, 0], TP[:, 1])) < TZ + TH - 1.2
+    tree = cKDTree(TP)
+    hwmax = float(THW.max())
+    out: dict[int, list[tuple[float, float]]] = {}
+    for li, ln in enumerate(lines):
+        if not ln.emit or ln.tunnel or ln.bridge or ln.kind == RAIL or ln.dxy is None or len(ln.dxy) < 2:
+            continue
+        hw = 0.5 * float(ln.meta.get("w", 6.0))
+        if not any(tree.query_ball_point(ln.dxy, r=hw + hwmax + 4.0 + 0.5 * MAX_SEG, return_length=True)):
+            continue
+        xy, z, s = _resample(ln.dxy, ln.dz, 1.0)
+        over = np.zeros(len(z), bool)
+        beside = np.zeros(len(z), bool)
+        for k, idx in enumerate(tree.query_ball_point(xy, r=hw + hwmax + 4.0)):
+            if not idx:
+                continue
+            idx = np.asarray(idx)
+            d = np.hypot(TP[idx, 0] - xy[k, 0], TP[idx, 1] - xy[k, 1])
+            up = z[k] - TZ[idx] > OPEN_SPAN_DZ
+            over[k] = bool(np.any(up & (d <= THW[idx] + 1.0)))
+            beside[k] = bool(np.any(up & topen[idx] & (d > hw - 0.5) & (d <= hw + 0.5 * THW[idx] + 4.0)))
+        if not over.any():
+            continue
+        spans: list[list[float]] = []
+        k = 0
+        while k < len(over):
+            if not over[k]:
+                k += 1
+                continue
+            k1 = k
+            while k1 + 1 < len(over) and over[k1 + 1]:
+                k1 += 1
+            if beside[max(0, k - 8) : k1 + 9].any():
+                a, b = max(0.0, s[k] - 1.0), min(s[-1], s[k1] + 1.0)
+                if spans and a - spans[-1][1] < 3.0:
+                    spans[-1][1] = b
+                else:
+                    spans.append([a, b])
+            k = k1 + 1
+        spans = [sp for sp in spans if sp[1] - sp[0] >= 3.0]
+        if spans:
+            # a piece shorter than 3 m left at either end joins the span
+            if spans[0][0] < 3.0:
+                spans[0][0] = 0.0
+            if s[-1] - spans[-1][1] < 3.0:
+                spans[-1][1] = float(s[-1])
+            out[li] = [(a, b) for a, b in spans]
+    n = sum(len(v) for v in out.values())
+    log(f"{n} spans of {len(out)} surface ways over open tunnel cuttings become bridge pieces ({time.time() - t0:.1f}s):")
+    for li, sp in out.items():
+        ln = lines[li]
+        x, y = ln.dxy[len(ln.dxy) // 2]
+        log(f"    way {ln.id} {ln.name or 'kind %d' % ln.kind!r}: {', '.join('%.0f m' % (b - a) for a, b in sp)} near ({x:.0f}, {y:.0f})")
+    return out
+
+
+def split_spans(ln: Line, spans: list[tuple[float, float]]):
+    """ln's dense polyline cut at the span ends: [(xy, z, dense node per vertex or -1, is span)]."""
+    dn = np.asarray(ln.dnodes) if ln.dnodes is not None and len(ln.dnodes) == len(ln.dxy) else np.full(len(ln.dxy), -1)
+    if not spans:
+        return [(ln.dxy, ln.dz, dn, False)]
+    seg = np.hypot(*np.diff(ln.dxy, axis=0).T)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    cuts = sorted({float(c) for sp in spans for c in sp if 0.05 < c < cum[-1] - 0.05})
+    xs, zs, ds, ss = list(ln.dxy), list(ln.dz), list(dn), list(cum)
+    for c in cuts:
+        k = int(np.searchsorted(ss, c))
+        if abs(ss[k - 1] - c) < 0.05 or (k < len(ss) and abs(ss[k] - c) < 0.05):
+            continue
+        f = (c - ss[k - 1]) / (ss[k] - ss[k - 1])
+        xs.insert(k, xs[k - 1] + (xs[k] - xs[k - 1]) * f)
+        zs.insert(k, zs[k - 1] + (zs[k] - zs[k - 1]) * f)
+        ds.insert(k, -1)
+        ss.insert(k, c)
+    X, Zz, D, S = np.asarray(xs), np.asarray(zs), np.asarray(ds), np.asarray(ss)
+    bounds = [0.0] + cuts + [float(S[-1])]
+    out = []
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        sel = np.flatnonzero((S >= a - 0.05) & (S <= b + 0.05))
+        if len(sel) < 2:
+            continue
+        mid = 0.5 * (a + b)
+        out.append((X[sel], Zz[sel], D[sel], any(sa <= mid <= sb for sa, sb in spans)))
+    return out
 
 
 def clip_polyline(xy: np.ndarray, z: np.ndarray, box: tuple[float, float, float, float]):
@@ -1005,7 +1323,7 @@ def build(lines: list[Line], water_out: list[dict], buildings: list[dict], areas
 
     water = [(ring(w["p"]), [ring(h) for h in w.get("h", [])]) for w in water_out]
     woods = [(ring(a["p"]), [ring(h) for h in a.get("h", [])]) for a in areas if a.get("k") == 2]
-    blds = [(ring(b["p"]), b["h"]) for b in buildings if not b.get("pt")]
+    blds = [(ring(b["p"]), b["h"]) for b in buildings if not b.get("pt") and not b.get("_br")]
     # The radar surface also sees bridge decks and trusses (the Story Bridge
     # reads 10+ m high at its landings): their footprints are cleaned like
     # buildings, so the ground under and beside a bridge is the real ground.
@@ -1022,38 +1340,50 @@ def build(lines: list[Line], water_out: list[dict], buildings: list[dict], areas
     ground, level_grid, _ = BT.clean(fine, water, blds, woods)
     log(f"terrain cleaned in {time.time() - t0:.1f}s")
     wi = WaterInfo(ground, level_grid)
-    stats = solve(lines, ground.sample, wi, BT.WATER_LEVEL, box)
+    zones = []
+    for pl in platforms or []:
+        pts = np.asarray(pl["p"], dtype=np.float64).reshape(-1, 2) * 0.1
+        if pl.get("a") and len(pts) >= 3:
+            zones.append(shapely.Polygon(pts).buffer(0))
+        elif len(pts) >= 2:
+            zones.append(shapely.LineString(pts).buffer(2.0))
+    stats = solve(lines, ground.sample, wi, BT.WATER_LEVEL, box, stations=zones)
 
     roads: list[dict] = []
     rail: list[dict] = []
-    runs = []  # (line, xy, z) as emitted
+    runs = []  # (line, xy, z, bridge piece) as emitted
     junction = junction_nodes(lines, stats["graph"])
-    for ln in lines:
+    spans = open_cutting_spans(lines, ground.sample)
+    for li, ln in enumerate(lines):
         if not ln.emit:
             continue
-        for xy, z, src in clip_polyline(ln.dxy, ln.dz, box):
-            if polyline_length(xy) < 1:
-                continue
-            # junctions stay exact output vertices, so connected ways agree on their height
-            must = np.zeros(len(xy), bool)
-            must[src >= 0] = junction[ln.dnodes[src[src >= 0]]]
-            keep = simplify3d(xy, z, 0.5 if ln.kind == RAIL else 0.25, ZTOL, must)
-            xy, z = xy[keep], z[keep]
-            rec: dict = {}
-            for k, v in ln.meta.items():
-                rec[k] = v
-                if k == "p":
-                    rec["p"] = flat(xy)
-                    rec["z"] = [q(v) for v in z]
-            rec["_ln"] = ln
-            (rail if ln.kind == RAIL else roads).append(rec)
-            runs.append((ln, xy, np.rint(z * 10) / 10))
+        for pxy, pz, pdn, piece_bridge in split_spans(ln, spans.get(li, [])):
+            for xy, z, src in clip_polyline(pxy, pz, box):
+                if polyline_length(xy) < 1:
+                    continue
+                # junctions stay exact output vertices, so connected ways agree on their height
+                must = np.zeros(len(xy), bool)
+                dn = np.where(src >= 0, pdn[np.maximum(src, 0)], -1)
+                must[dn >= 0] = junction[dn[dn >= 0]]
+                keep = simplify3d(xy, z, 0.5 if ln.kind == RAIL else 0.25, ZTOL, must)
+                xy, z = xy[keep], z[keep]
+                rec: dict = {}
+                for k, v in ln.meta.items():
+                    rec[k] = v
+                    if k == "p":
+                        rec["p"] = flat(xy)
+                        rec["z"] = [q(v) for v in z]
+                if piece_bridge:
+                    rec["b"] = 1
+                rec["_ln"] = ln
+                (rail if ln.kind == RAIL else roads).append(rec)
+                runs.append((ln, xy, np.rint(z * 10) / 10, piece_bridge))
     check = check_output(lines, stats, runs)
 
     t = time.time()
     segs = []
-    for ln, xy, z in runs:
-        if ln.bridge or ln.tunnel:
+    for ln, xy, z, piece_bridge in runs:
+        if ln.bridge or ln.tunnel or piece_bridge:
             continue
         segs.append((xy, z, 2.0 if ln.kind == RAIL else 0.5 * float(ln.meta.get("w", 6.0)) + 0.5))
     platforms, buildings, bays, bay_segs = stations.build(roads, platforms or [], buildings)
@@ -1064,6 +1394,7 @@ def build(lines: list[Line], water_out: list[dict], buildings: list[dict], areas
     BT.write(burned, BT.outer_grid(coarse, burned),
              {"roads": "inner grid has the at-grade roads and rail burned in (cuttings, embankments); ground under bridges and over tunnels is natural"})
     building_bases(buildings, burned)
+    buildings = stations.bridge_bases(buildings, roads, rail)
     buildings = stations.roof_bases(buildings, roads, platforms)
     report(stats, check)
     log(f"elevation stage done in {time.time() - t0:.1f}s")
@@ -1116,7 +1447,7 @@ def check_output(lines: list[Line], stats: dict, runs) -> dict:
     worst_err = 0.0
     out_grade: dict[str, float] = {}
     group = {k: nm for nm, ks in KIND_GROUPS for k in ks}
-    for ln, xy, z in runs:
+    for ln, xy, z, _ in runs:
         seg = np.hypot(*np.diff(xy, axis=0).T)
         cum = np.concatenate([[0.0], np.cumsum(seg)])
         long_ = seg >= 10.0
@@ -1166,6 +1497,13 @@ def report(stats: dict, check: dict) -> None:
     log(f"grade-separated crossings in the map: {nc}; short of clearance by > 0.3 m: {short} (median shortfall {med:.1f} m, worst {mn:+.1f} m); conflicting nodes {stats['conflicts']}")
     for row in stats["worst_crossings"]:
         log("    short:", row)
+    log(f"minor unnamed ways dropped from the output for running inside a tunnel tube: {len(stats.get('tube_drops', []))}")
+    for row in stats.get("tube_drops", []):
+        log("    dropped (osm id, kind, gap, x, y):", row)
+    ns, nf, rows = stats.get("tube_short", (0, 0, []))
+    log(f"ways still less than tube + roof above a tunnel: {ns} ({nf} off the centreline)")
+    for row in rows:
+        log("    inside tube:", row)
     log(
         f"junctions shared by 2+ output ways: {check['junctions']}, max height disagreement {check['junction_spread_max']:.2f} m "
         f"({check['junctions_over_0.15m']} over 0.15 m); output vs solve max {check['output_vs_solve_max']:.2f} m"

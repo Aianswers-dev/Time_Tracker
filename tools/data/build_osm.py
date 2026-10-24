@@ -349,7 +349,7 @@ class Handler(osmium.SimpleHandler):
                 for p in getattr(poly, "geoms", [poly]):
                     if not isinstance(p, Polygon) or p.area < 6:
                         continue
-                    self.add_building(tags, p)
+                    self.add_building(tags, p, a.orig_id())
             return
 
         for poly in polys:
@@ -394,13 +394,20 @@ class Handler(osmium.SimpleHandler):
         entry["_id"] = osm_id
         self.platforms.append(entry)
 
-    def add_building(self, tags, p: Polygon):
+    def add_building(self, tags, p: Polygon, osm_id: int = 0):
+        btype = tags.get("building") or tags.get("building:part") or "yes"
+        # a bridge's outline (a footbridge or enclosed walkway over a road):
+        # stations.bridge_bases lifts it clear of what passes under it, or
+        # drops it; extruded from the street it stands in the road (the PA
+        # Hospital footbridge across the busway, M2 #13)
+        is_bridge = btype == "bridge" or tags.get("man_made") == "bridge"
         h = num(tags.get("height")) or num(tags.get("building:height"))
         levels = num(tags.get("building:levels"))
         mh = num(tags.get("min_height"))
         min_level = num(tags.get("building:min_level"))
-        btype = tags.get("building") or tags.get("building:part") or "yes"
         kind = BUILDING_KIND.get(btype, 0)
+        if h is None and is_bridge:
+            h = 3.2  # above its soffit: deck and an enclosed walkway's walls
         if h is None:
             if levels is not None:
                 h = levels * 3.2 + (1.0 if kind != 1 else 0.6)
@@ -433,6 +440,16 @@ class Handler(osmium.SimpleHandler):
             b["n"] = nm
         if tags.get("amenity") == "bus_station" or tags.get("public_transport") == "station":
             b["_st"] = 1  # station outline (a canopy source for stations.py); dropped before writing
+        # for stations.drop_shelters (keys starting with "_" are dropped before writing)
+        if tags.get("amenity") == "shelter" or tags.get("shelter_type") == "public_transport" or btype in ("train_station", "transportation"):
+            b["_sh"] = 1
+        layer = num(tags.get("layer")) or 0
+        if layer >= 1 and not mh:
+            b["_up"] = 1  # on an upper level (a deck, a viaduct station) with no min_height
+        if is_bridge:
+            b["_br"] = 1
+            b.pop("k", None)
+        b["_id"] = osm_id
         self.buildings.append(b)
 
 
@@ -573,7 +590,8 @@ def main():
     for r in roads + rail:
         r.pop("_ln", None)
     for b in buildings:
-        b.pop("_st", None)
+        for k in ("_st", "_sh", "_up", "_id", "_br"):
+            b.pop(k, None)
     # keep only the names of roads that survived clipping, in order of first use
     remap: dict[int, int] = {}
     names: list[str] = []

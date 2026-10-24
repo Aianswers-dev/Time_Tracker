@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import collections
 import csv
+import heapq
 import io
 import math
 import os
@@ -64,7 +65,7 @@ STEP = 2.0  # m: bay sampling
 SYNTH_LEN = 60.0  # m: default length of a synthesised platform
 SYNTH_FACE = 3.6  # m: default face beyond the busway edge (one stopping lane)
 SYNTH_DEPTH = 4.0
-CANOPY_CLEAR = 4.9  # m: canopy roof top above the road / platform under it
+CANOPY_CLEAR = 5.6  # m: canopy roof top above the road / platform under it (its 0.6 m slab clears 5 m: M2 #26)
 CANOPY_SECTION = 20.0  # m: canopy sections along a grade
 STATION_W = 15.0  # m: face to face across a two-sided busway station at most (imagery: 14-15 m)
 
@@ -582,34 +583,64 @@ def tighten_stations(platforms: list[dict], net: BusNet) -> int:
 
 
 def drop_shelters(platforms: list[dict], buildings: list[dict]) -> list[dict]:
-    """Buildings that duplicate a platform footprint (shelters mapped as generic buildings)."""
+    """Buildings that duplicate a platform (its shelter or canopy mapped as a
+    building, extruded from the ground as a solid block over the platform:
+    Herston, Stones Corner, PA Hospital, M2 review #13): the platform is marked
+    covered and draws its own canopy instead. Dropped are
+    - any building mostly (70 %) on a platform,
+    - shelters, station buildings and station outlines (amenity=bus_station:
+      Stones Corner's duplicates its two platform roofs) 15 % on a platform,
+    - generic buildings (building=yes) 60 % on a platform (2 m around it),
+    - upper-level buildings (layer >= 1, no min_height) 30 % on one: they
+      stand on the viaduct or deck, not on the street under it."""
     if not platforms:
         return buildings
     pp = [shapely.Polygon(ring(p["p"])).buffer(0) for p in platforms]
     tree = shapely.STRtree(pp)
     keep = []
-    dropped = 0
+    dropped = []
     for b in buildings:
-        if b.get("k") == 8:
+        if b.get("_br"):  # bridge outlines: bridge_bases
             keep.append(b)
             continue
         poly = shapely.Polygon(ring(b["p"])).buffer(0)
-        if poly.is_empty or poly.area > 2500:
+        if b.get("k") == 8:
+            # a roof that is the platform's own canopy (QUT KG platforms are
+            # mapped as building=roof too, M2 #17): platforms.ts draws it
+            hit = [int(i) for i in tree.query(poly, predicate="intersects")] if not poly.is_empty and poly.area <= 2500 else []
+            if hit and sum(poly.intersection(pp[i].buffer(1.0)).area for i in hit) >= 0.7 * poly.area:
+                dropped.append((b.get("_id"), "roof = platform canopy", round(poly.area)))
+                for i in hit:
+                    platforms[i]["cv"] = 1
+                continue
             keep.append(b)
             continue
-        cov = 0.0
-        hit = []
-        for i in tree.query(poly, predicate="intersects"):
-            a = poly.intersection(pp[int(i)].buffer(1.0)).area
-            cov += a
-            hit.append(int(i))
-        if cov >= 0.7 * poly.area:
-            dropped += 1
-            for i in hit:
-                platforms[i]["cv"] = 1
+        if poly.is_empty or poly.area > (5000 if b.get("_sh") else 2500):
+            keep.append(b)
             continue
-        keep.append(b)
-    log(f"dropped {dropped} shelter buildings duplicating platforms")
+        hit = [int(i) for i in tree.query(poly.buffer(3.0), predicate="intersects")]
+        if not hit:
+            keep.append(b)
+            continue
+        cov1 = sum(poly.intersection(pp[i].buffer(1.0)).area for i in hit) / poly.area
+        cov2 = sum(poly.intersection(pp[i].buffer(2.0)).area for i in hit) / poly.area
+        why = None
+        if cov1 >= 0.7 and poly.area <= 2500:
+            why = "on a platform"
+        elif (b.get("_sh") or b.get("_st")) and cov2 >= 0.15:
+            why = "shelter/station building over a platform"
+        elif not b.get("k") and cov2 >= 0.6:
+            why = "generic building over a platform"
+        elif b.get("_up") and cov2 >= 0.3:
+            why = "upper-level building at a platform"
+        if why is None:
+            keep.append(b)
+            continue
+        dropped.append((b.get("_id"), why, round(poly.area)))
+        for i in hit:
+            if poly.distance(pp[i]) < 2.0:
+                platforms[i]["cv"] = 1
+    log(f"dropped {len(dropped)} buildings duplicating platforms: {dropped}")
     return keep
 
 
@@ -679,8 +710,38 @@ def smoothstep(u):
     return u * u * (3 - 2 * u)
 
 
-def bays_for_kerb(P: np.ndarray, o: np.ndarray, pl: dict, net: BusNet, simplify3d) -> tuple[list[dict], list]:
-    """Bay carriageways between one kerb and its busway."""
+def _conflicts(bxy: np.ndarray, bz: np.ndarray, half: float, net: BusNet, chain_ids, placed) -> np.ndarray:
+    """Bay samples whose carriageway would overlap another bus road (not the
+    host chain) or another kerb's bay at about the same level: inside an
+    underground station (Queen St, KGS) the bays would otherwise cross the
+    other lanes, a level crossing in a tunnel (audit)."""
+    other = ~np.isin(net.rid, list(chain_ids))
+    bad = np.zeros(len(bxy), bool)
+    for m, (x, y) in enumerate(bxy):
+        d, t, _, _ = net.project(x, y)
+        zz = net.za + (net.zb - net.za) * t
+        level = np.abs(zz - bz[m]) < 3.0
+        if np.any(other & (d < net.hw + half - 0.3) & level):
+            bad[m] = True
+            continue
+        # a bay merges into its own busway but stays on its side of the
+        # centreline (KGS: the second strip crossed the INB's centreline)
+        if np.any(~other & (d < 1.05) & level):  # samples are 2 m apart
+            bad[m] = True
+            continue
+        for qxy, qz, qh in placed:
+            dd = np.hypot(qxy[:, 0] - x, qxy[:, 1] - y)
+            k = int(np.argmin(dd))
+            if dd[k] < qh + half - 0.3 and abs(float(qz[k]) - float(bz[m])) < 3.0:
+                bad[m] = True
+                break
+    return bad
+
+
+def bays_for_kerb(P: np.ndarray, o: np.ndarray, pl: dict, net: BusNet, simplify3d, placed=None) -> tuple[list[dict], list]:
+    """Bay carriageways between one kerb and its busway. placed: (xy, z, half
+    width) samples of the bays of earlier kerbs, which these must not overlap."""
+    placed = [] if placed is None else placed
     line = shapely.LineString(P)
     L = line.length
     if L < 4:
@@ -744,6 +805,8 @@ def bays_for_kerb(P: np.ndarray, o: np.ndarray, pl: dict, net: BusNet, simplify3
     pos, zv, nv, _ = ch.at(sv)
     out = []
     burn = []
+    mine = []
+    chain_ids = {int(r) for r in ch.segr}
     for k in range(nstrip):
         edge = Ev - k * Wk  # this strip's outer edge
         alive = edge > hwv + 0.05
@@ -759,10 +822,24 @@ def bays_for_kerb(P: np.ndarray, o: np.ndarray, pl: dict, net: BusNet, simplify3
         # extend one sample each way so the strip ends inside the busway
         i0 = max(0, i0 - 1)
         i1 = min(len(sv) - 1, i1 + 1)
+        # stop short of other lanes and other kerbs' bays
+        cc = edge[i0 : i1 + 1] - 0.5 * Wk
+        bad = _conflicts(pos[i0 : i1 + 1] + nv[i0 : i1 + 1] * (sgn * cc)[:, None], zv[i0 : i1 + 1], 0.5 * Wk, net, chain_ids, placed)
+        if bad.any():
+            free = np.flatnonzero(~bad) + i0
+            if len(free) < 2:
+                continue
+            runs = np.split(free, np.flatnonzero(np.diff(free) > 1) + 1)
+            mid_i = int(np.argmin(np.abs(sv - 0.5 * (sa + sb))))
+            run = min(runs, key=lambda r_: (0 if r_[0] <= mid_i <= r_[-1] else 1, -len(r_)))
+            if len(run) < 5:
+                continue
+            i0, i1 = int(run[0]), int(run[-1])
         sl = slice(i0, i1 + 1)
         c = edge[sl] - 0.5 * Wk
         bxy = pos[sl] + nv[sl] * (sgn * c)[:, None]
         bz = zv[sl]
+        mine.append((bxy, bz, 0.5 * Wk))
         flags = [ch.flags_at(v) for v in sv[sl]]
         # split where the busway changes structure
         cut = [0] + [m for m in range(1, len(flags)) if flags[m] != flags[m - 1]] + [len(flags)]
@@ -792,6 +869,7 @@ def bays_for_kerb(P: np.ndarray, o: np.ndarray, pl: dict, net: BusNet, simplify3
             out.append(rec)
             if not b_f and not t_f:
                 burn.append((pxy, pz, 0.5 * (Wk + 0.2) + 0.5))
+    placed.extend(mine)
     # platform pad: the slab footprint at the busway height, burned flat
     if not net.bri[j] and not net.tun[j]:
         kxy = K[order] - o * 2.0
@@ -851,6 +929,70 @@ def inherit_maxspeed(roads: list[dict]) -> int:
         if votes:
             r["ms"] = max(votes.items(), key=lambda kv: kv[1])[0]
             n += 1
+    # still untagged: the limit of the bus ways joined at its ends (the INB
+    # stub #3854 between a 50 and the 40 km/h tunnel, M2 review #11): the lower
+    # of the two ends, or the one end's for a way under 150 m
+    ends: dict[tuple[int, int], list[int]] = collections.defaultdict(list)
+    for i, r in enumerate(roads):
+        if "ms" in r and (r.get("bus") or r["k"] == 7):
+            ends[(r["p"][0], r["p"][1])].append(int(r["ms"]))
+            ends[(r["p"][-2], r["p"][-1])].append(int(r["ms"]))
+    for i, r in enumerate(roads):
+        if "ms" in r or not (r.get("bus") or r["k"] == 7):
+            continue
+        v0 = ends.get((r["p"][0], r["p"][1]), [])
+        v1 = ends.get((r["p"][-2], r["p"][-1]), [])
+        L = float(np.hypot(*np.diff(ring(r["p"]), axis=0).T).sum())
+        if v0 and v1:
+            r["ms"] = min(min(v0), min(v1))
+        elif (v0 or v1) and L < 150.0:
+            r["ms"] = min(v0 or v1)
+        else:
+            continue
+        n += 1
+    # the rest: the limit of the nearest tagged bus way along the bus network
+    # (no busway in OSM here is signed above 60, so an untagged section of the
+    # SE or Eastern Busway between 50 and 60 km/h sections should not read the
+    # HUD's 80 km/h busway default: Boggo Road, PA Hospital, M2 review #11).
+    # Bus-station and layover limits under 40 do not spread.
+    node_ways: dict[tuple[int, int], list[int]] = collections.defaultdict(list)
+    bus = [i for i, r in enumerate(roads) if (r.get("bus") or r["k"] == 7) and not r.get("bay")]
+    length = {}
+    for i in bus:
+        p = roads[i]["p"]
+        node_ways[(p[0], p[1])].append(i)
+        node_ways[(p[-2], p[-1])].append(i)
+        length[i] = float(np.hypot(*np.diff(ring(p), axis=0).T).sum())
+    heap = []
+    for i in bus:
+        r = roads[i]
+        if "ms" in r and int(r["ms"]) >= 40:
+            p = r["p"]
+            heap.append((0.0, int(r["ms"]), (p[0], p[1])))
+            heap.append((0.0, int(r["ms"]), (p[-2], p[-1])))
+    heapq.heapify(heap)
+    reach: dict[tuple[int, int], tuple[float, int]] = {}
+    while heap:
+        d, ms, e = heapq.heappop(heap)
+        if e in reach:
+            continue
+        reach[e] = (d, ms)
+        for i in node_ways[e]:
+            p = roads[i]["p"]
+            if "ms" in roads[i]:
+                continue
+            f = (p[-2], p[-1]) if (p[0], p[1]) == e else (p[0], p[1])
+            if f not in reach:
+                heapq.heappush(heap, (d + length[i], ms, f))
+    for i in bus:
+        r = roads[i]
+        if "ms" in r:
+            continue
+        p = r["p"]
+        cand = [reach[e] for e in ((p[0], p[1]), (p[-2], p[-1])) if e in reach]
+        if cand:
+            r["ms"] = min(cand)[1]
+            n += 1
     return n
 
 
@@ -859,7 +1001,7 @@ def build(roads: list[dict], platforms: list[dict], buildings: list[dict]):
     import elevation  # simplify3d
 
     nms = inherit_maxspeed(roads)
-    log(f"{nms} untagged bus ways take the speed limit of the road beside them")
+    log(f"{nms} untagged bus ways take the speed limit of the road beside them or the bus ways they join")
     net = BusNet(roads)
     stops = gtfs_station_stops()
     plats = normalise_platforms(platforms, net, buildings, stops)
@@ -868,11 +1010,12 @@ def build(roads: list[dict], platforms: list[dict], buildings: list[dict]):
     bays: list[dict] = []
     burn = []
     nk = 0
+    placed: list = []
     for pl in plats:
         poly = ring(pl["p"])
         for P, o in kerb_chains(poly, net):
             nk += 1
-            recs, segs = bays_for_kerb(P, o, pl, net, elevation.simplify3d)
+            recs, segs = bays_for_kerb(P, o, pl, net, elevation.simplify3d, placed)
             bays.extend(recs)
             burn.extend(segs)
     for pl in plats:
@@ -883,6 +1026,63 @@ def build(roads: list[dict], platforms: list[dict], buildings: list[dict]):
 
 # ---------------------------------------------------------------------------
 # Canopy roofs
+
+
+BRIDGE_CLEAR_ROAD = 5.3  # m: footbridge soffit above a road or busway under it
+BRIDGE_CLEAR_RAIL = 6.5  # m: ... above rail (overhead wires)
+
+
+def bridge_bases(buildings: list[dict], roads: list[dict], rail: list[dict]) -> list[dict]:
+    """Bridge outlines mapped as buildings (building=bridge: footbridges and
+    enclosed walkways, the PA Hospital footbridge across the busway, M2 #13):
+    min height so the soffit clears the highest road or track under the
+    outline, the top a walkway above it. Bridge outlines with nothing under
+    them are dropped (their height is unknown). Runs after building_bases."""
+    lines = []
+    for r in roads:
+        if r.get("t") or r["k"] > 8:
+            continue
+        lines.append((ring(r["p"]), np.asarray(r["z"], dtype=np.float64) * 0.1, 0.5 * float(r.get("w", 6)), BRIDGE_CLEAR_ROAD))
+    for r in rail:
+        if r.get("t"):
+            continue
+        lines.append((ring(r["p"]), np.asarray(r["z"], dtype=np.float64) * 0.1, 2.0, BRIDGE_CLEAR_RAIL))
+    if not any(b.get("_br") for b in buildings):
+        return buildings
+    geoms = [shapely.LineString(p) for p, _, _, _ in lines]
+    tree = shapely.STRtree(geoms)
+    out = []
+    lifted = []
+    dropped = []
+    for b in buildings:
+        if not b.get("_br"):
+            out.append(b)
+            continue
+        poly = shapely.Polygon(ring(b["p"])).buffer(0)
+        need = -np.inf
+        for i in tree.query(poly, predicate="dwithin", distance=8.0):
+            p, z, hw, clr = lines[int(i)]
+            if not poly.intersects(geoms[int(i)].buffer(hw)):
+                continue
+            # the road's height where it is under the outline, sampled every 2 m
+            L = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(p, axis=0).T))])
+            s = np.arange(0.0, L[-1] + 0.01, 2.0)
+            xs, ys, zs = np.interp(s, L, p[:, 0]), np.interp(s, L, p[:, 1]), np.interp(s, L, z)
+            inside = shapely.dwithin(poly, shapely.points(np.stack([xs, ys], 1)), hw)
+            if inside.any():
+                need = max(need, float(zs[inside].max()) + clr)
+        if not np.isfinite(need):
+            dropped.append(b.get("_id"))
+            continue
+        base = 0.1 * float(b["z"])
+        m = max(need - base, float(b.get("m", 0)))
+        nb = dict(b)
+        nb["m"] = round(m, 1)
+        nb["h"] = round(max(float(b["h"]), m + 3.2) if float(b["h"]) > m + 2.0 else m + float(b["h"]), 1)
+        out.append(nb)
+        lifted.append((b.get("_id"), round(m, 1)))
+    log(f"bridge outlines: {len(lifted)} lifted over the roads under them {lifted}, {len(dropped)} with nothing under them dropped")
+    return out
 
 
 def roof_bases(buildings: list[dict], roads: list[dict], platforms: list[dict]) -> list[dict]:
@@ -902,7 +1102,7 @@ def roof_bases(buildings: list[dict], roads: list[dict], platforms: list[dict]) 
             out.append(b)
             continue
         poly = shapely.Polygon(ring(b["p"])).buffer(0)
-        if poly.is_empty or poly.area > 8000 or float(b["h"]) > 8:  # stadium roofs and the like keep theirs
+        if poly.is_empty or poly.area > 30000 or float(b["h"]) > 8:  # stadium roofs and the like keep theirs
             out.append(b)
             continue
         hits = [int(i) for i in tree.query(poly, predicate="intersects") if not net.tun[int(i)]]
