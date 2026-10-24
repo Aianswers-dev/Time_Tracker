@@ -278,9 +278,9 @@ export async function buildWorld(
         console.info(`[world] calls ${renderer.info.render.calls} tris ${renderer.info.render.triangles}`);
       }
     },
-    signalStateAt(x: number, y: number, timeSeconds: number, dirX?: number, dirY?: number) {
+    signalStateAt(x: number, y: number, timeSeconds: number, dirX?: number, dirY?: number, z?: number) {
       sigOffset = timeSeconds - sigClock;
-      return signals.stateAt(x, y, timeSeconds, dirX, dirY);
+      return signals.stateAt(x, y, timeSeconds, dirX, dirY, z);
     },
   };
 }

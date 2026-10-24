@@ -709,6 +709,8 @@ function signalGrid(data: MapData): Map<number, number[]> {
     g = new Map();
     const s = data.signals;
     for (let i = 0; i < s.length; i += 2) {
+      // (signals on paths and cycleways only control no road traffic: src/data/signals.ts)
+      if (data.signalRoad && data.signalRoad[i / 2] < 0) continue;
       const key = (Math.floor(s[i] / 40) + 1000) * 4096 + Math.floor(s[i + 1] / 40) + 1000;
       let a = g.get(key);
       if (!a) g.set(key, (a = []));
