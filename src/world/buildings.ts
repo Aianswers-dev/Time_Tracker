@@ -9,7 +9,7 @@ import { type Ctx, densityAt } from './ctx';
 import { F_HIGHSET, F_PITCHED, F_ROOF, F_SOFFIT, F_TILE, Style, makeBuildingMaterial } from './facade';
 import { triangulate } from './ground';
 import type { RoadIndex } from './roadindex';
-import type { RI } from './roads';
+import { type RI, roadAt } from './roads';
 import { IdGrid, centroid, f32, hash1, i8, obb, oriented, pointInRing, ringBounds, signedArea, smoothstep, u32, u8, yieldFrame } from './util';
 
 export const CHUNK = 800;
@@ -387,6 +387,45 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
     }
     return any ? need : null;
   };
+  /**
+   * Columns under a building lifted over a road in the open (Normanby's sports centre, the Convention
+   * Centre over the busway): a square concrete pier every ~9 m along each edge of every carriageway that
+   * passes under the outline, standing beside it (never on another carriageway or a platform), from the
+   * ground to the soffit at `top`.
+   */
+  const PIER: Look = { style: Style.Canopy, wall: 0xc4beb2, roof: 0xc4beb2, flags: 0, storey: 3.4, pitched: false, wallTop: 0, roofH: 0 };
+  const piers = (g: BGeo, ring: ArrayLike<number>, x0: number, y0: number, x1: number, y1: number, base: number, top: (x: number, y: number) => number, seed: number): void => {
+    const r = Math.hypot(x1 - x0, y1 - y0) / 2;
+    const near = new Set<number>();
+    roads.index.roadsNear((x0 + x1) / 2, (y0 + y1) / 2, r + 10, (road) => {
+      if (traffic(road)) near.add(road);
+    });
+    const placed: number[] = [];
+    for (const road of near) {
+      const ri = roads.infos[road];
+      for (let s = 4; s < ri.len - 2; s += 9) {
+        const c = roadAt(ri, s);
+        if (c.z > base + 2 || ctx.field.natAt(c.x, c.y) - c.z > 4.6) continue;
+        for (const side of [1, -1]) {
+          const o = ri.hw + 0.9;
+          const px = c.x + c.nx * side * o;
+          const py = c.y + c.ny * side * o;
+          if (!pointInRing(px, py, ring) || roads.index.penetration(px, py) > -0.6) continue;
+          if (data.platforms.some((p) => p.area && pointInRing(px, py, p.pts))) continue;
+          if (placed.some((_, q) => q % 2 === 0 && Math.hypot(placed[q] - px, placed[q + 1] - py) < 4)) continue;
+          const t = top(px, py);
+          const b = Math.min(c.z, ctx.field.natAt(px, py)) - 0.3;
+          if (t < b + 2.5) continue;
+          placed.push(px, py);
+          const tx = -c.ny;
+          const ty = c.nx;
+          const h = 0.35;
+          const sq = [px - tx * h - c.nx * h, py - ty * h - c.ny * h, px + tx * h - c.nx * h, py + ty * h - c.ny * h, px + tx * h + c.nx * h, py + ty * h + c.ny * h, px - tx * h + c.nx * h, py - ty * h + c.ny * h];
+          walls(g, oriented(sq, true), b, t, PIER, seed, 0);
+        }
+      }
+    }
+  };
   const nx = Math.ceil((R[2] - R[0]) / CHUNK);
   const ny = Math.ceil((R[3] - R[1]) / CHUNK);
   const chunks = new Map<number, BGeo>();
@@ -438,6 +477,8 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
       else foot = (e: number) => Math.max(bottom, need[e]);
     }
     gBase = base;
+    // the underside over a road is light concrete (it only sees the ground's bounce light)
+    const soffitCol = need ? 0xd8d2c6 : 0x4a4a4a;
     if (L.style === Style.Canopy) {
       const top = base + b.height;
       const bot = Math.max(base + m, top - 0.6);
@@ -449,7 +490,7 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
       const nv = ring.length >> 1;
       const eave = base + Math.max(m + 1, L.wallTop);
       walls(g, ring, m > 0.4 ? base + m : foot, eave, L, seed, seed);
-      if (m <= 0.4 && soffit > -Infinity) flatCap(g, ring, soffit, 0x4a4a4a, L, seed, false, F_SOFFIT);
+      if (m <= 0.4 && soffit > -Infinity) flatCap(g, ring, soffit, soffitCol, L, seed, false, F_SOFFIT);
       if (o.fill > 0.78 && nv <= 10) {
         boxRoof(g, o, eave, L.roofH, b.roof === 'g' || (L.style !== Style.House && b.roof !== 'h' && b.roof !== 'p'), L, seed);
       } else if (!(nv <= 14 && polyRoof(g, ring, eave, Math.min(L.roofH, 1.6), L, seed))) {
@@ -458,8 +499,12 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
     } else {
       walls(g, ring, m > 0.4 ? base + m : foot, base + b.height, L, seed, seed);
       flatCap(g, ring, base + b.height, L.roof, L, seed, true, 0);
-      if (m > 0.4) flatCap(g, ring, base + m, 0x4a4a4a, L, seed, false, F_SOFFIT);
-      else if (soffit > -Infinity) flatCap(g, ring, soffit, 0x4a4a4a, L, seed, false, F_SOFFIT);
+      if (m > 0.4) flatCap(g, ring, base + m, soffitCol, L, seed, false, F_SOFFIT);
+      else if (soffit > -Infinity) flatCap(g, ring, soffit, soffitCol, L, seed, false, F_SOFFIT);
+    }
+    if (need && L.style !== Style.Canopy) {
+      const top = m > 0.4 ? base + m : soffit;
+      if (top > -Infinity) piers(g, ring, x0, y0, x1, y1, base, () => top, seed);
     }
     if (bi % 4000 === 0) {
       progress(bi / n);
