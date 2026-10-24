@@ -311,9 +311,24 @@ async function main() {
     return;
   }
 
+  // Resolution governor: a GPU that cannot hold ~55 fps for 3 s running steps the
+  // pixel ratio down by 0.25, never below the screen's own pixels. A lone hitch
+  // (GC, shader compile) does not count: the average has to stay slow.
+  let frameTime = 1 / 60;
+  let slow = 0;
   const frame = () => {
     requestAnimationFrame(frame);
-    tick(Math.min(0.05, clock.getDelta()), true);
+    const dt = clock.getDelta();
+    tick(Math.min(0.05, dt), true);
+    if (document.hidden || dt > 0.25) return;
+    frameTime += (dt - frameTime) * 0.05;
+    slow = frameTime > 1 / 55 ? slow + dt : 0;
+    const ratio = renderer.getPixelRatio();
+    if (slow > 3 && ratio > 1) {
+      renderer.setPixelRatio(Math.max(1, ratio - 0.25));
+      console.info(`[render] ${Math.round(1 / frameTime)} fps: pixel ratio ${renderer.getPixelRatio()}`);
+      slow = 0;
+    }
   };
   frame();
 }
