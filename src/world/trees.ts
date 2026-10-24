@@ -524,10 +524,22 @@ export async function buildTrees(
   progress(0.6);
   await yieldFrame();
 
-  // nothing grows in open cuttings
+  let bridgeTrees = 0;
+  // nothing grows in open cuttings, or on a bridge (OSM man_made=bridge outlines: the decks
+  // drawn beside a carriageway, such as the Eleanor Schonell and Victoria Bridge paths)
   {
+    const bridges = (ctx.extras?.bridges ?? []).map((b) => ({ p: b.p, bb: ringBounds(b.p) }));
+    const onBridge = (x: number, y: number) => bridges.some((b) => x >= b.bb[0] && x <= b.bb[2] && y >= b.bb[1] && y <= b.bb[3] && pointInRing(x, y, b.p));
     let w = 0;
-    for (let i = 0; i < list.length; i++) if (!ctx.field.isHole(list[i].x, list[i].y)) list[w++] = list[i];
+    for (let i = 0; i < list.length; i++) {
+      const t = list[i];
+      if (ctx.field.isHole(t.x, t.y)) continue;
+      if (onBridge(t.x, t.y)) {
+        bridgeTrees++;
+        continue;
+      }
+      list[w++] = t;
+    }
     list.length = w;
   }
 
@@ -786,7 +798,7 @@ export async function buildTrees(
   const debug = location.search.includes('world=debug') ? { rebuilds: 0, lastMs: 0, maxMs: 0, counts: [] as number[][] } : null;
   if (debug) (window as unknown as { __trees: typeof debug }).__trees = debug;
   console.info(
-    `[world] trees by roads (${Math.round(fitT1 - fitT0)} ms): ${stats.lifted} crowns lifted, ${stats.narrowed} narrowed, ${stats.palms} swapped for palms, ${stats.dropped} left out`,
+    `[world] trees by roads (${Math.round(fitT1 - fitT0)} ms): ${stats.lifted} crowns lifted, ${stats.narrowed} narrowed, ${stats.palms} swapped for palms, ${stats.dropped} left out, ${bridgeTrees} off bridges`,
   );
   progress(1);
   return list.length;
