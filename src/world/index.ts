@@ -218,7 +218,8 @@ export async function buildWorld(
       const mx = camPos.x;
       const my = -camPos.z;
       const groundH = field.renAt(mx, my);
-      const depth = field.isHole(mx, my) ? 0 : groundH - camPos.y;
+      const inCut = field.inCut(mx, my);
+      const depth = inCut ? 0 : groundH - camPos.y;
       const under = Math.min(1, Math.max(0, (depth - 1.5) / 3));
       U.uUnder.value = under;
       U.uInTunnel.value = under > 0.5 ? 1 : 0;
@@ -237,7 +238,7 @@ export async function buildWorld(
       }
       for (const t of ctx.tick) t(dt, camera);
       // underground culling (last frame's hidden meshes were restored above)
-      underground = !field.isHole(mx, my) && camPos.y < field.floorAt(mx, my) - 0.3 && depth > 0.5;
+      underground = !inCut && camPos.y < field.floorAt(mx, my) - 0.3 && depth > 0.5;
       if (underground) {
         let pd = Infinity;
         let px = 0;

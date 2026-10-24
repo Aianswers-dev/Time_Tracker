@@ -377,6 +377,52 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     }
   }
 
+  // Road ends per node (direction pointing away from the node, into the road), so a road that simply
+  // continues as another way can share one mitred side line with it: no wedge of ground left between
+  // the two roads' cuttings or shoulders on the outside of the bend.
+  const roadEnds = new Map<number, { i: number; dx: number; dy: number; z: number }[]>();
+  for (const ri of infos) {
+    if (ri.n < 2) continue;
+    const p = ri.r.pts;
+    for (const atEnd of [0, 1]) {
+      const v = atEnd ? ri.n - 1 : 0;
+      const u = atEnd ? ri.n - 2 : 1;
+      const dx = p[2 * u] - p[2 * v];
+      const dy = p[2 * u + 1] - p[2 * v + 1];
+      const l = Math.hypot(dx, dy);
+      if (l < 1e-6) continue;
+      const k = nodeKey(p[2 * v], p[2 * v + 1]);
+      let l2 = roadEnds.get(k);
+      if (!l2) roadEnds.set(k, (l2 = []));
+      l2.push({ i: ri.i, dx: dx / l, dy: dy / l, z: ri.z[v] });
+    }
+  }
+  /** At a plain two-way join (one road continuing as another), the mitred side normal at this road's start/end. */
+  const endMiter = (ri: RI, atEnd: boolean): [number, number] | null => {
+    const p = ri.r.pts;
+    const v = atEnd ? ri.n - 1 : 0;
+    const k = nodeKey(p[2 * v], p[2 * v + 1]);
+    if (nodes.get(k)?.deg !== 2) return null;
+    const l = roadEnds.get(k);
+    if (!l || l.length !== 2) return null;
+    const self = l.find((e) => e.i === ri.i && (l[0].i !== l[1].i || (atEnd ? e === l[1] : e === l[0])));
+    const other = self && l.find((e) => e !== self);
+    if (!self || !other || Math.abs(self.z - other.z) > 0.5) return null;
+    // forward tangent through the node, in this road's direction
+    const tx = atEnd ? other.dx - self.dx : self.dx - other.dx;
+    const ty = atEnd ? other.dy - self.dy : self.dy - other.dy;
+    const tl = Math.hypot(tx, ty);
+    if (tl < 1e-6) return null;
+    const mnx = -ty / tl;
+    const mny = tx / tl;
+    // this road's own normal at the end
+    const fx = atEnd ? -self.dx : self.dx;
+    const fy = atEnd ? -self.dy : self.dy;
+    const cos = mnx * -fy + mny * fx;
+    if (cos < 0.6) return null; // a sharp bend: leave it
+    return [mnx / cos, mny / cos];
+  };
+
   const nx = Math.ceil((R[2] - R[0]) / ROAD_CHUNK);
   const layers = new Map<number, Layer>();
   const layerFor = (x: number, y: number): Layer => {
@@ -405,6 +451,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   // the Story Bridge truss carries its own piers (landmarks.ts)
   const story = storyOutline(ctx);
   const otherAt = (x: number, y: number, z: number, self: number, dz = 2.5) => index.penetrationZ(x, y, z, dz, self);
+  /** Ground height for strips and wall tops that meet the terrain: the settled ground, never below the natural one. */
+  const groundAt = (x: number, y: number) => Math.max(field.natAt(x, y), field.settledAt(x, y));
 
   for (let ri0 = 0; ri0 < infos.length; ri0++) {
     const ri = infos[ri0];
@@ -764,6 +812,10 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const e0 = new Float32Array(n);
     const zE = new Float32Array(n);
     const P = ss.map((s) => roadAt(ri, s));
+    const m0 = endMiter(ri, false);
+    const m1 = endMiter(ri, true);
+    if (m0 && ss[0] === 0) P[0] = { ...P[0], nx: m0[0], ny: m0[1] };
+    if (m1 && ss[n - 1] === ri.len) P[n - 1] = { ...P[n - 1], nx: m1[0], ny: m1[1] };
     for (let k = 0; k < n; k++) {
       const c = P[k];
       const fw = foot[k];
@@ -813,8 +865,9 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         }
       }
       const B = P[kb];
-      const fx = side * A.nx;
-      const fy = side * A.ny;
+      const fl = Math.hypot(A.nx, A.ny) || 1; // (a mitred end normal is longer than 1)
+      const fx = (side * A.nx) / fl;
+      const fy = (side * A.ny) / fl;
       if (t === 1) {
         // graded shoulder to the natural ground
         const wa = shoulderW(k);
@@ -837,10 +890,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         field.clampQuad([a0x, a0y, zE[k], b0x, b0y, zE[kb], b1x, b1y, b1z, a1x, a1y, a1z], 0.25);
         k = kb - 1;
       } else if (t === 2 || t === 4) {
-        cutSeg(L, A, B, side, ss[k], ss[k + 1], foot[k], foot[k + 1], e0[k], e0[k + 1], hw, t === 2);
-        // ends of a walled cutting: carry the ground cap on past the end, over the carved cells there
-        if (t === 2 && (k === 0 || type[k - 1] !== 2)) cutEndCap(L, P[k], P[k + 1], side, e0[k] + 0.6);
-        if (t === 2 && (k + 2 >= n || type[k + 1] !== 2)) cutEndCap(L, P[k + 1], P[k], side, e0[k + 1] + 0.6);
+        const ends = t === 2 ? (k === 0 || type[k - 1] !== 2 ? 1 : 0) | (k + 2 >= n || type[k + 1] !== 2 ? 2 : 0) : 0;
+        cutSeg(L, A, B, side, ss[k], ss[k + 1], foot[k], foot[k + 1], e0[k], e0[k + 1], hw, t === 2, ends);
       } else if (t === 3) {
         // high fill: retaining wall from a parapet down to the ground
         const [w0x, w0y] = at(A, e0[k] + 0.1);
@@ -887,31 +938,47 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     eB: number,
     hw: number,
     wall: boolean,
+    ends = 0,
   ): void {
     const g = L.strip;
     const st = L.struct;
     const at = (c: typeof A, off: number) => [c.x + c.nx * side * off, c.y + c.ny * side * off] as const;
-    const fx = side * A.nx;
-    const fy = side * A.ny;
+    const fl = Math.hypot(A.nx, A.ny) || 1; // (a mitred end normal is longer than 1)
+    const fx = (side * A.nx) / fl;
+    const fy = (side * A.ny) / fl;
     const cutA = wall ? eA + 0.6 : eA + 3.5;
     const cutB = wall ? eB + 0.6 : eB + 3.5;
     const [c0x, c0y] = at(A, 0);
     const [c1x, c1y] = at(B, 0);
     const [w0x, w0y] = at(A, cutA);
     const [w1x, w1y] = at(B, cutB);
-    field.holeQuad([c0x, c0y, 0, c1x, c1y, 0, w1x, w1y, 0, w0x, w0y, 0], 0.3);
+    // exact carve: the ground outside the quad stays, with an earth face down to the road at its edge
+    field.holeQuad([c0x, c0y, A.z, c1x, c1y, B.z, w1x, w1y, B.z, w0x, w0y, A.z], 0.3, false, 0);
     const [f0x, f0y] = at(A, footA > 0 ? eA : hw);
     const [f1x, f1y] = at(B, footB > 0 ? eB : hw);
     const z0 = A.z + (footA > 0 ? KERB_H : -0.02);
     const z1 = B.z + (footB > 0 ? KERB_H : -0.02);
+    // an open cut's floor runs on under the earth face at the carve edge
+    const [g0x, g0y] = wall ? [w0x, w0y] : at(A, cutA + 0.5);
+    const [g1x, g1y] = wall ? [w1x, w1y] : at(B, cutB + 0.5);
     const j0 = L.foot.vert(f0x, z0, f0y, 0.5, sA, 4);
     const j1 = L.foot.vert(f1x, z1, f1y, 0.5, sB, 4);
-    const j2 = L.foot.vert(w1x, z1, w1y, 0.5, sB, 4);
-    const j3 = L.foot.vert(w0x, z0, w0y, 0.5, sA, 4);
+    const j2 = L.foot.vert(g1x, z1, g1y, 0.5, sB, 4);
+    const j3 = L.foot.vert(g0x, z0, g0y, 0.5, sA, 4);
     L.foot.quad(j0, j1, j2, j3, 0, 1, 0);
+    if (footA > 0 || footB > 0) {
+      // footpath runs start and end between samples: a floor at road level from the kerb covers the rest
+      const [h0x, h0y] = at(A, hw);
+      const [h1x, h1y] = at(B, hw);
+      const b0 = L.foot.vert(h0x, A.z - 0.03, h0y, 0.5, sA, 4);
+      const b1 = L.foot.vert(h1x, B.z - 0.03, h1y, 0.5, sB, 4);
+      const b2 = L.foot.vert(g1x, B.z - 0.03, g1y, 0.5, sB, 4);
+      const b3 = L.foot.vert(g0x, A.z - 0.03, g0y, 0.5, sA, 4);
+      L.foot.quad(b0, b1, b2, b3, 0, 1, 0);
+    }
     if (!wall) return;
-    const ga = field.natAt(...at(A, cutA + 0.5));
-    const gb = field.natAt(...at(B, cutB + 0.5));
+    const ga = groundAt(...at(A, cutA + 0.5));
+    const gb = groundAt(...at(B, cutB + 0.5));
     const T = 0.45;
     const [o0x, o0y] = at(A, cutA + T);
     const [o1x, o1y] = at(B, cutB + T);
@@ -927,58 +994,34 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const u2 = st.vert(w1x, topB, w1y, ...CONC);
     const u3 = st.vert(w0x, topA, w0y, ...CONC);
     st.quad(u0, u1, u2, u3, 0, 1, 0);
-    const q0 = st.vert(o0x, ga - 1, o0y, ...WALL);
-    const q1 = st.vert(o1x, gb - 1, o1y, ...WALL);
+    // outer face down to the road: the wall is a solid box (its back is in the ground)
+    const q0 = st.vert(o0x, z0 - 0.2, o0y, ...WALL);
+    const q1 = st.vert(o1x, z1 - 0.2, o1y, ...WALL);
     st.quad(q0, q1, u1, u0, fx, 0, -fy);
+    // close the box where the wall starts or ends
+    const endFace = (wx: number, wy: number, ox: number, oy: number, zb: number, top: number, dx: number, dy: number) => {
+      const e0 = st.vert(wx, zb - 0.2, wy, ...WALL);
+      const e1 = st.vert(ox, zb - 0.2, oy, ...WALL);
+      const e2 = st.vert(ox, top, oy, ...WALL);
+      const e3 = st.vert(wx, top, wy, ...WALL);
+      st.quad(e0, e1, e2, e3, dx, 0, -dy);
+    };
+    const ux = B.x - A.x;
+    const uy = B.y - A.y;
+    if (ends & 1) endFace(w0x, w0y, o0x, o0y, z0, topA, -ux, -uy);
+    if (ends & 2) endFace(w1x, w1y, o1x, o1y, z1, topB, ux, uy);
     const cols = [T, 6 + T, 16 + T];
     let prevA = -1;
     let prevB = -1;
     for (const o of cols) {
       const [ax, ay] = at(A, cutA + o);
       const [bx, by] = at(B, cutB + o);
-      const ia = g.vert(ax, field.natAt(ax, ay), ay);
-      const ib = g.vert(bx, field.natAt(bx, by), by);
+      const ia = g.vert(ax, groundAt(ax, ay), ay);
+      const ib = g.vert(bx, groundAt(bx, by), by);
       if (prevA >= 0) g.quad(prevA, prevB, ib, ia, 0, 1, 0);
       prevA = ia;
       prevB = ib;
     }
-  }
-
-  /**
-   * Ground cap continuing 15 m past the end of a walled cutting (`c` is the end
-   * sample, `prev` the one before it), tapering away from the road so it never
-   * hangs over the shoulder that takes over there.
-   */
-  function cutEndCap(L: Layer, c: ReturnType<typeof roadAt>, prev: ReturnType<typeof roadAt>, side: number, cut: number): void {
-    const g = L.strip;
-    let ox = c.x - prev.x;
-    let oy = c.y - prev.y;
-    const ol = Math.hypot(ox, oy) || 1;
-    ox /= ol;
-    oy /= ol;
-    const T = 0.45;
-    // carved cells reach up to a cell diagonal (14 m) past the end; taper only
-    // slightly so the cap still meets the shoulder strip that takes over
-    const rows: [number, number][] = [
-      [0, cut + T],
-      [15, cut + T + 2.5],
-    ];
-    const cols = [0, 6, 16];
-    const grid: number[][] = rows.map(([d, inner]) =>
-      cols.map((o) => {
-        const x = c.x + ox * d + c.nx * side * (inner + o);
-        const y = c.y + oy * d + c.ny * side * (inner + o);
-        return g.vert(x, field.natAt(x, y), y);
-      }),
-    );
-    for (let q = 0; q + 1 < cols.length; q++) g.quad(grid[0][q], grid[0][q + 1], grid[1][q + 1], grid[1][q], 0, 1, 0);
-    // short skirt under the inner edge
-    const sk = rows.map(([d, inner]) => {
-      const x = c.x + ox * d + c.nx * side * inner;
-      const y = c.y + oy * d + c.ny * side * inner;
-      return g.vert(x, field.natAt(x, y) - 1.5, y);
-    });
-    g.quad(grid[0][0], grid[1][0], sk[1], sk[0], -side * c.nx, 0, side * c.ny);
   }
 
   /** Raised kerb + footpath strip (heights follow the road). */
@@ -1291,9 +1334,15 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         if (k > 0 && (segOpen[k - 1] || shared[k - 1] || shared[k]) !== isOpen) nose(k);
         if (!cov[k] && !cov[k + 1]) {
           // approach in an open cutting
-          cutSeg(L, A, B, side, ss[k], ss[k + 1], 0, 0, hw + 0.3, hw + 0.3, hw, !isOpen);
-          if (!isOpen && k === 0) cutEndCap(L, A, B, side, hw + 0.9);
-          if (!isOpen && k + 2 === ss.length) cutEndCap(L, B, A, side, hw + 0.9);
+          // walls start/end where the neighbouring segment is open on this side (a covered one has its headwall)
+          const wallAt = (q: number) => q >= 0 && q + 1 < ss.length && !(segOpen[q] || shared[q] || shared[q + 1]);
+          const ends = isOpen ? 0 : (k === 0 || (!cov[k - 1] && !wallAt(k - 1)) ? 1 : 0) | (k + 2 === ss.length || (!cov[k + 2] && !wallAt(k + 1)) ? 2 : 0);
+          // mitred at a plain join with the next road, like earthworks()
+          const m0 = k === 0 ? endMiter(ri, false) : null;
+          const m1 = k + 2 === ss.length ? endMiter(ri, true) : null;
+          const Am = m0 ? { ...A, nx: m0[0], ny: m0[1] } : A;
+          const Bm = m1 ? { ...B, nx: m1[0], ny: m1[1] } : B;
+          cutSeg(L, Am, Bm, side, ss[k], ss[k + 1], 0, 0, hw + 0.3, hw + 0.3, hw, !isOpen, ends);
           continue;
         }
         // where this tube meets another one, run on a little so the two overlap
