@@ -118,6 +118,8 @@ function idm(v: number, v0: number, gap: number, vLead: number, s0: number): num
 
 /** Time gap (s) at which the player's bus claims the main road through an unsignalised junction. */
 const MAJOR_GAP = 6;
+/** How far past a route's stop line a signalised junction's first node may lie and still be on that line's light (m). */
+const FAR_LINE = 70;
 
 export class Traffic {
   private active: AiBus[] = [];
@@ -807,18 +809,25 @@ export class Traffic {
       const jAsk: (SignalAsk | null)[] = jl.map(() => null);
       // (A bus waits for the light where the player does, not at the node's own box edge 10-20 m on.)
       const jLine = jl.map((j) => j.stopS);
-      const mids = track.signals.filter((sg) => {
+      const mids = track.signals.filter((sg, i) => {
         const q = this.signalAsk(track, sg);
         const ji = model.junctionAt(q.x, q.y, q.dx, q.dy, q.z);
         if (ji < 0) return true;
         let managed = false;
+        const nextS = track.signals[i + 1]?.s ?? Infinity;
         jl.forEach((j, k) => {
-          if (!j.sig || Math.abs(j.s - sg.s) >= 30 || this.cars.signalJunction(j.node, j.inX, j.inY) !== ji) return;
+          // The junction's nodes by its stop line, and (where the line is drawn well back, as at the
+          // north end of Victoria Bridge) its first node further on, with no other node or light
+          // between: otherwise the bus would cross the line on this light and then wait inside the
+          // junction on another arm's light at that node.
+          const prev = k > 0 ? jl[k - 1].s + jl[k - 1].boxR : -Infinity;
+          const d = j.s - sg.s;
+          const near = Math.abs(d) < 30 || (d > 0 && d < FAR_LINE && !j.inside && prev <= sg.s && nextS > j.s + 30);
+          if (!j.sig || !near || this.cars.signalJunction(j.node, j.inX, j.inY) !== ji) return;
           managed = true;
           if (jAsk[k]) return;
           jAsk[k] = q;
           // (Not for a junction's second node, nor back inside the box of the junction before.)
-          const prev = k > 0 ? jl[k - 1].s + jl[k - 1].boxR : -Infinity;
           if (!j.inside) jLine[k] = Math.min(j.stopS, Math.max(sg.s, prev));
         });
         return !managed;
