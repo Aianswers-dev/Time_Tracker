@@ -213,6 +213,12 @@ export const STATIONS: StationDef[] = [
     medianLights: true,
     // The QPAC - Museum overpass (Melbourne Street Overpass outline) with its white oval canopy.
     overbridges: [{ x: -461, y: -531, ax: 0.52, ay: -0.854, len: [-60, 60], w: 8, glass: 0xdfe6e6, frame: 0xd9d9d4, towers: false, roofW: 15, roofLen: [-28, 28], open: true, clear: 6.8 }],
+    // its dark-framed glass lift shafts beside the deck (OSM elevators 10290775677, 13417295247; photo
+    // Cultural_Centre_busway_front)
+    towers: [
+      { x: -458.2, y: -549.2, w: 3.2, d: 3.2, h: 10.4, heading: 2.595, frame: 0x2b2f33, lift: true },
+      { x: -481.4, y: -511.2, w: 3.2, d: 3.2, h: 10.4, heading: 2.595, frame: 0x2b2f33, lift: true },
+    ],
     ownRoofs: 60,
   },
   {
