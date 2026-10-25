@@ -473,9 +473,10 @@ export const STATIONS: StationDef[] = [
     canopyDepth: 4.5,
     median: 'fence',
     // lift towers on the landings behind both platforms (platform outlines), joined across the busway
+    // charcoal frames, grey panels, green-tinted glass (photo Langlands_Park_busway_station)
     // (imagery hats about 13.7 m square centred (2579.4,-3281.6) and (2578.2,-3318.5), on the platforms'
     // landings; OSM elevators (2579,-3287), (2579,-3320))
-    overbridges: [{ x: 2579, y: -3303.3, ax: 0, ay: 1, len: [-19.2, 25.7], w: 3.6, glass: 0x8fb3ad, frame: 0x4a3b30, towers: true, towerW: 7.5, towerHat: [3.1, 3.1], clear: 6.2 }],
+    overbridges: [{ x: 2579, y: -3303.3, ax: 0, ay: 1, len: [-19.2, 25.7], w: 3.6, glass: 0x8fb3ad, frame: 0x3a3c3f, towers: true, towerW: 7.5, towerHat: [3.1, 3.1], clear: 6.2 }],
     // the bronze entrance canopy with "Langlands Park" lettering on Old Cleveland Rd
     entrances: [{ x: 2556, y: -3326, fx: 0, fy: -1, len: 18, d: 5, h: 3.4 }],
     ownRoofs: 40,
