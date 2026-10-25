@@ -147,6 +147,9 @@ function playerEta(d: number, v: number): number {
  */
 const JOIN_D = 3.1;
 const JOIN_IN = 1.2;
+/** A bus giving way where its lane comes in waits where the two are still this far apart (m), up to JOIN_BACK (m) back. */
+const JOIN_CLEAR = 3.9;
+const JOIN_BACK = 12;
 /** Two lanes this far apart in heading (cos) are not one coming in to the other (a crossing). */
 const JOIN_COS = 0.64;
 /** Grid cell (m) for finding the player's lane near a point. */
@@ -1275,9 +1278,15 @@ export class Traffic {
       let k = i;
       while (k < n && d[k] < JOIN_D && d[k] > JOIN_IN) k++;
       if (k < n && d[k] <= JOIN_IN) {
-        // (Where it gets within JOIN_D, between the two samples.)
+        // Where it gets within JOIN_D, between the two samples; the bus waits a little before that,
+        // where it is still JOIN_CLEAR off (its corner angled in towards the player's lane, the
+        // player's bus off-tracking on a curve: M1/1 s 994 touched a 60/1 waiting at 2.8 m).
         const f = d[i - 1] < Infinity ? (d[i - 1] - JOIN_D) / Math.max(1e-6, d[i - 1] - d[i]) : 0;
         let a0 = (i - 1 + Math.min(1, f)) * TRACK_STEP;
+        let q0 = i - 1;
+        while (q0 > 0 && d[q0] < JOIN_CLEAR && d[q0 - 1] < Infinity && (i - q0) * TRACK_STEP < JOIN_BACK) q0--;
+        if (d[q0] >= JOIN_CLEAR && d[q0 + 1] < JOIN_CLEAR) a0 = (q0 + Math.min(1, (d[q0] - JOIN_CLEAR) / Math.max(1e-6, d[q0] - d[q0 + 1]))) * TRACK_STEP;
+        else if (d[q0] < JOIN_CLEAR) a0 = Math.min(a0, q0 * TRACK_STEP);
         let sig = false;
         for (let q = 0; q < jl.length; q++) {
           const j = jl[q];
