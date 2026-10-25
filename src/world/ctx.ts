@@ -38,6 +38,25 @@ export interface Cullable {
   z: number;
   /** Visible while the camera is closer than this (metres, horizontal). */
   range: number;
+  /** Measure to the nearest point of this box (three.js x0, z0, x1, z1) instead of to (x, z). */
+  box?: [number, number, number, number];
+  /** Hidden while the camera is closer than this (a nearer level of detail shows instead). */
+  min?: number;
+}
+
+/** Horizontal box (three.js x0, z0, x1, z1) around points given in three.js x, z pairs, padded by `pad`. */
+export function boxAround(xz: ArrayLike<number>, pad = 0): [number, number, number, number] {
+  let x0 = Infinity;
+  let z0 = Infinity;
+  let x1 = -Infinity;
+  let z1 = -Infinity;
+  for (let i = 0; i + 1 < xz.length; i += 2) {
+    x0 = Math.min(x0, xz[i]);
+    x1 = Math.max(x1, xz[i]);
+    z0 = Math.min(z0, xz[i + 1]);
+    z1 = Math.max(z1, xz[i + 1]);
+  }
+  return [x0 - pad, z0 - pad, x1 + pad, z1 + pad];
 }
 
 export interface Ctx {
