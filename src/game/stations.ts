@@ -1632,6 +1632,50 @@ function buildConcourse(c: Ctx, b: StationBuild, o: ConcourseDef): void {
         1,
       );
     }
+    // long faces (photo RBWH_busway_station): a bay of raked green glass fins at one end, grey
+    // horizontal louvres over the rest of the upper storey
+    if (Math.abs(fx * nx + fy * ny) > 0.5 * Math.hypot(fx, fy)) {
+      const fl = Math.hypot(fx, fy) || 1;
+      const ux = fx / fl;
+      const uy = fy / fl;
+      const ex = e[0] - a[0];
+      const ey = e[1] - a[1];
+      const el = Math.hypot(ex, ey) || 1;
+      const nf = Math.max(4, Math.round((el * 0.28) / 1.3));
+      glass.paint(0x4f9a76);
+      for (let i = 0; i <= nf; i++) {
+        const t = 0.05 + (0.28 * i) / nf;
+        const px = a[0] + ex * t + ux * 0.1;
+        const py = a[1] + ey * t + uy * 0.1;
+        const qx = px + ux * 0.75 + (ex / el) * 0.55;
+        const qy = py + uy * 0.75 + (ey / el) * 0.55;
+        glass.face(
+          [
+            [px, py, z0 + 0.6],
+            [qx, qy, z0 + 0.6],
+            [qx, qy, z1 - 1.2],
+            [px, py, z1 - 1.2],
+          ],
+          -(ey / el),
+          ex / el,
+          0,
+        );
+      }
+      geo.paint(0x9ea4a8, Pat.Louvre, 0.35);
+      const l0 = 0.42;
+      const l1 = 0.95;
+      geo.face(
+        [
+          [a[0] + ex * l0 + ux * 0.12, a[1] + ey * l0 + uy * 0.12, z0 + 2.5],
+          [a[0] + ex * l1 + ux * 0.12, a[1] + ey * l1 + uy * 0.12, z0 + 2.5],
+          [a[0] + ex * l1 + ux * 0.12, a[1] + ey * l1 + uy * 0.12, z1 - 1.2],
+          [a[0] + ex * l0 + ux * 0.12, a[1] + ey * l0 + uy * 0.12, z1 - 1.2],
+        ],
+        fx,
+        fy,
+        0,
+      );
+    }
     // lettering on the long faces
     if (Math.abs(fx * nx + fy * ny) > 0.5 * Math.hypot(fx, fy) && b.def.name) {
       const fl = Math.hypot(fx, fy) || 1;

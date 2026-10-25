@@ -554,7 +554,9 @@ export const STATIONS: StationDef[] = [
     ownRoofs: 190,
     // The two lift towers at the platforms' east ends (OSM 53118 / 53116, ~10 m square) joined by a
     // glazed overbridge across the busway (photo: Herston_busway_station_and_Northern_Busway).
-    overbridges: [{ x: 185.05, y: 2120.2, ax: 0.15, ay: 0.989, len: [-17, 17], w: 3.6, glass: 0x8fb3ad, frame: 0x2b2f33, towers: true, towerW: 9, clear: 6.2 }],
+    // Dark teal steel with white louvres and thin flat white hats (photo: Overbridge,_lifts_and_stairs_at_
+    // north_portal_of_Herston_Bus_Station).
+    overbridges: [{ x: 185.05, y: 2120.2, ax: 0.15, ay: 0.989, len: [-17, 17], w: 3.6, glass: 0x8fb3ad, frame: 0x1f4d52, towers: true, towerW: 9, towerHat: [1.6, 1.6], clear: 6.2 }],
     ownBuildings: [
       [187, 2132],
       [183, 2108],
