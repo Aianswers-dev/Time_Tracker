@@ -107,6 +107,18 @@ def num(v: str | None) -> float | None:
         return None
 
 
+FEET = re.compile(r"(\d+)\s*'\s*(?:(\d+)\s*\")?")
+
+
+def maxheight_m(v: str | None) -> float:
+    """A maxheight tag in metres ("1.93", "2.1 m", "6'8\""), or 0 when absent or not a number."""
+    if not v:
+        return 0.0
+    f = FEET.search(v)
+    h = (int(f.group(1)) * 12 + int(f.group(2) or 0)) * 0.0254 if f else num(v)
+    return h if h and 1.5 <= h <= 6.0 else 0.0
+
+
 def is_bus_platform(tags) -> bool:
     """Bus platforms and their shelters; excludes railway platforms."""
     if tags.get("public_transport") != "platform" and tags.get("highway") != "platform":
@@ -286,6 +298,7 @@ class Handler(osmium.SimpleHandler):
                     tunnel=tunnel == "yes", layer=int(layer), has_layer=layer_tag is not None,
                     link=hw.endswith("_link"), emit=True, meta=road,
                     name=tags.get("bridge:name") or label or tags.get("ref") or "", reversed=rev,
+                    maxheight=maxheight_m(tags.get("maxheight")),
                 )
             )
         elif rw in ("rail", "light_rail", "subway", "narrow_gauge") and tags.get("service") not in ("yard", "siding", "spur"):
