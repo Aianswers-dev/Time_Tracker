@@ -1780,7 +1780,9 @@ export class Traffic {
    * box, or a car on a conflicting movement due sooner than the bus clears it. At a light, a
    * vehicle already in the box on a movement across ours: an oncoming bus going straight on
    * went on the green the player's bus stood at the line for to turn right, and the bus pulled
-   * out into it (199/0 s 1448). Infinity when there is none.
+   * out into it (199/0 s 1448). On the main road at a junction with no light, the same: a car
+   * from the side road went while the bus stood at a stop 20 m short of it, and the bus pulled
+   * away into it (199/0 s 375, node 7563). Infinity when there is none.
    */
   giveWayAhead(track: RouteTrack, s: number, range: number): number {
     const time = this.simTime;
@@ -1788,11 +1790,10 @@ export class Traffic {
       if (j.stopS < s - 1) continue;
       if (j.stopS - s > range) break;
       if (j.inside) continue;
-      if (j.sig && this.cars.signalFor(j.node, j.inX, j.inY, time, j.outX, j.outY) !== null) {
+      if (j.sig ? this.cars.signalFor(j.node, j.inX, j.inY, time, j.outX, j.outY) !== null : !j.minor) {
         if (!this.cars.boxClear(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time)) return j.stopS - s;
         continue;
       }
-      if (!j.sig && !j.minor) continue;
       if (
         this.cars.giveWayBusy(j.node, true, time) ||
         !this.cars.boxClear(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time) ||
