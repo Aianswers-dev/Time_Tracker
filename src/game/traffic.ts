@@ -153,6 +153,12 @@ const JOIN_COS = 0.64;
 const JOIN_CELL = 8;
 /** A bus merging in front of the player's bus has its tail in the lane this many seconds (s) before the player's front gets there. */
 const MERGE_GAP = 2.5;
+/**
+ * An AI bus stops for the player's bus coming the other way once its centreline is this close (m, squared)
+ * to the AI's path: touching distance, a little over the 2.5 m bodies (oncoming AI buses only from 1.8 m,
+ * so that the next lane never stops them). An articulated bus's tail cuts in on a bend.
+ */
+const ONCOMING_PLAYER_R2 = 2.6 * 2.6;
 
 /**
  * Where a bus's lane comes in to the player's lane: on the bus's track it is alongside from a0
@@ -1113,7 +1119,7 @@ export class Traffic {
       if (other && other.obstacle === b.id && other.id < b.id) return;
       // Two 2.5 m wide bodies touch with their centrelines 2.5 m apart: look
       // wider than that, except at oncoming traffic in the next lane.
-      const r2 = Math.abs(rel) > 2.4 ? 3.4 : 2.8 * 2.8;
+      const r2 = Math.abs(rel) > 2.4 ? (other ? 3.4 : ONCOMING_PLAYER_R2) : 2.8 * 2.8;
       for (let k = 0; k < ns; k++) {
         const d = 1.5 + k * 2.5;
         if (d - 2.5 > bestGap) return;
