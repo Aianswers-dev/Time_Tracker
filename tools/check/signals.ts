@@ -3,10 +3,11 @@
  *
  *   npx -y tsx tools/check/signals.ts [--routes [--walls]] [--verbose]
  *
- * 1. Every signalised junction: every incoming arm, asked from its stop line
- *    the way a vehicle arrives (signalStateAt with direction and level), sees
- *    green within one cycle, and no two arms that cross or merge (not roughly
- *    opposite) are green at the same time.
+ * 1. Every signalised junction: every controlled incoming arm (one a signal
+ *    node faces), asked from its stop line the way a vehicle arrives
+ *    (signalStateAt with direction and level), sees green within one cycle,
+ *    and no two arms that cross or merge (not roughly opposite) are green at
+ *    the same time. Arms no signal faces have no light.
  * 2. Every lane of the AI car graph into a signalised node sees green within
  *    a cycle (the same lookup the AI cars and buses use).
  * 3. With --routes: every route's track signals (both directions), asked the
@@ -44,12 +45,14 @@ let dead = 0;
 let conflicts = 0;
 let controlled = 0;
 let elsewhere = 0;
+let free = 0;
 const phaseCount = new Map<number, number>();
 for (const j of model.junctions) {
   phaseCount.set(j.phases.length, (phaseCount.get(j.phases.length) ?? 0) + 1);
   if (!j.phases.length) continue;
   controlled++;
-  const inc = j.arms.filter((a) => a.incoming);
+  const inc = j.arms.filter((a) => a.incoming && a.phase >= 0);
+  free += j.arms.length - inc.length - j.arms.filter((a) => !a.incoming).length;
   const green = new Array(inc.length).fill(0);
   // Sample each arm on its own road short of the stop line; where that point
   // is another junction's (a road passing a wide junction's centre on its way
@@ -92,7 +95,7 @@ for (const j of model.junctions) {
     }
   });
 }
-console.log(`junctions: ${controlled} controlled (phases: ${[...phaseCount].sort().map(([k, v]) => `${k}:${v}`).join(' ')}), ${arms} incoming arms (${elsewhere} sampled from the centre), ${dead} never green, ${conflicts} conflicting-green samples`);
+console.log(`junctions: ${controlled} controlled (phases: ${[...phaseCount].sort().map(([k, v]) => `${k}:${v}`).join(' ')}), ${arms} controlled incoming arms (${elsewhere} sampled from the centre), ${free} with no signal facing them, ${dead} never green, ${conflicts} conflicting-green samples`);
 if (dead || conflicts) fail++;
 
 // ---- 2. AI car graph

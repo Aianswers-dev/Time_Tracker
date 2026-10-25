@@ -18,7 +18,7 @@ import { PointGrid, type Body } from './bodies';
 import { LEVEL_GAP, heightsOf } from './height';
 import { TRACK_STEP, type RouteTrack } from './track';
 import { rng } from './util';
-import { signalsFor } from '../data/signals';
+import { nodeFacing, signalsFor } from '../data/signals';
 
 const VIEW = 600;
 /** Reservation id the player's bus holds junction boxes with (AI buses use -id, cars +id). */
@@ -102,6 +102,8 @@ interface Node {
   rank: number;
   /** A traffic signal controls this junction. */
   sig: boolean;
+  /** The directed signal nodes that make it signalised: [x, y, fx, fy, ...], f the way the traffic each faces heads. */
+  faces: number[] | null;
   /** Junction box radius from the node, metres. */
   boxR: number;
   occ: Occupant[];
@@ -118,10 +120,24 @@ interface PlayerApproach {
   inY: number;
   cls: Turn;
   eta: number;
+  /** Close enough that cars in the next lane do not turn across its lane in front of it. */
+  near: boolean;
 }
 
-/** An oncoming car turning right across the player's bus waits when the bus is this close (s). */
-const ONCOMING_GAP = 4.5;
+/**
+ * An oncoming vehicle turning right across the player's bus goes only when the
+ * bus is further off than its own time to clear the bus's path plus this (s).
+ * (A flat 4.5 s let a car waiting at the line pull out with the bus a few
+ * metres short: from rest it takes about 4.5 s to clear.)
+ */
+const ONCOMING_MARGIN = 1.5;
+/** Car acceleration (m/s^2). */
+const CAR_A = 1.7;
+
+/** Seconds to cover `d` m from speed `v`: holding it, or accelerating at `a` from rest, whichever is sooner (an upper bound). */
+export function clearTime(v: number, d: number, a: number): number {
+  return Math.min(d / Math.max(v, 0.1), Math.sqrt((2 * Math.max(0, d)) / a));
+}
 
 interface Hold {
   node: number;
@@ -177,8 +193,8 @@ interface Car {
   dead: boolean;
 }
 
-/** Links between two nodes of one signalised junction shorter than this are inside it. */
-const INSIDE_LINK = 40;
+/** Links between two nodes of one signalised junction shorter than this are inside it (a big junction spans 70 m). */
+const INSIDE_LINK = 60;
 
 /** A junction on an AI bus route (for the shared reservations). */
 export interface BusJunction {
@@ -489,7 +505,7 @@ export class CarTraffic {
       const hit = l.find((n) => Math.abs(this.nodes[n].z - z) < LEVEL_GAP);
       if (hit !== undefined) return hit;
       const n = this.nodes.length;
-      this.nodes.push({ x, y, z, out: [], edges: [], deg: 0, until: -1, holder: -1, rank: 0, sig: false, boxR: 4, occ: [], pc: null });
+      this.nodes.push({ x, y, z, out: [], edges: [], deg: 0, until: -1, holder: -1, rank: 0, sig: false, faces: null, boxR: 4, occ: [], pc: null });
       l.push(n);
       return n;
     };
@@ -606,19 +622,26 @@ export class CarTraffic {
     const H = heightsOf(this.data);
     // Every graph node of a signalised junction is controlled (a dual-carriageway
     // crossing is several nodes, and a light is not always nearest its own node):
-    // the nodes on the junction's level close to one of its signal nodes.
+    // the nodes on the junction's level close to one of its signal nodes, or to
+    // its centre (in the middle of a big junction whose stop lines stand well
+    // back, so a path through it meets no unsignalised node between two of its
+    // nodes, and is inside it at the second: below).
     for (const j of signalsFor(this.data).junctions) {
       if (!j.phases.length) continue;
-      for (const k of j.nodes) {
-        const sx = sg[2 * k];
-        const sy = sg[2 * k + 1];
+      for (const k of [...j.nodes, -1]) {
+        const sx = k < 0 ? j.x : sg[2 * k];
+        const sy = k < 0 ? j.y : sg[2 * k + 1];
+        const near = k < 0 ? 6 : 10;
+        const f = k < 0 ? null : nodeFacing(this.data, k);
         const gx = Math.floor(sx / 50);
         const gy = Math.floor(sy / 50);
         for (let ox = -1; ox <= 1; ox++) {
           for (let oy = -1; oy <= 1; oy++) {
             for (const n of this.nodeGrid.get((gx + ox) * 4096 + gy + oy) ?? []) {
               const nd = this.nodes[n];
-              if (Math.abs(nd.z - j.z) <= LEVEL_GAP && Math.hypot(nd.x - sx, nd.y - sy) < nd.boxR + 10) nd.sig = true;
+              if (Math.abs(nd.z - j.z) > LEVEL_GAP || Math.hypot(nd.x - sx, nd.y - sy) >= nd.boxR + near) continue;
+              nd.sig = true;
+              if (f) (nd.faces ??= []).push(f.x, f.y, f.fx, f.fy);
             }
           }
         }
@@ -1039,12 +1062,38 @@ export class CarTraffic {
     return signalsFor(this.data).junctionAt(nd.x - dirX * 10, nd.y - dirY * 10, dirX, dirY, nd.z);
   }
 
-  /** Signal state for a vehicle travelling (dirX, dirY) into junction `node`, or null if unsignalised. */
-  signalFor(node: number, dirX: number, dirY: number, time: number): 'green' | 'amber' | 'red' | null {
+  /**
+   * Signal state for a vehicle travelling (dirX, dirY) into junction `node`
+   * (and on out (outX, outY), if given), or null if unsignalised. A node
+   * signalised by a signal standing further on, that the movement turns away
+   * from before reaching it (a slip lane, a busway branching off before the
+   * stop line), has no light for it: the guide shows the player none there.
+   */
+  signalFor(node: number, dirX: number, dirY: number, time: number, outX?: number, outY?: number): 'green' | 'amber' | 'red' | null {
     const nd = this.nodes[node];
     if (!nd.sig || !this.world.signalStateAt) return null;
+    if (outX !== undefined && outY !== undefined && this.turnsOffBefore(nd, dirX, dirY, outX, outY)) return null;
     // Asked from a point on the approach, on the node's level (src/data/signals.ts).
     return this.world.signalStateAt(nd.x - dirX * 10, nd.y - dirY * 10, time, dirX, dirY, nd.z);
+  }
+
+  /** Do all the signals facing this movement into `nd` stand further on, off its way out? */
+  private turnsOffBefore(nd: Node, inX: number, inY: number, outX: number, outY: number): boolean {
+    const f = nd.faces;
+    if (!f) return false;
+    let facing = false;
+    for (let k = 0; k < f.length; k += 4) {
+      if (f[k + 2] * inX + f[k + 3] * inY <= 0.5) continue;
+      const rx = f[k] - nd.x;
+      const ry = f[k + 1] - nd.y;
+      // (one at or before the node is the light we stop for here)
+      if (rx * inX + ry * inY < nd.boxR) return false;
+      // (heading on past it: the node lies on our way out)
+      const on = rx * outX + ry * outY;
+      if (on > 0 && (Math.abs(rx * outY - ry * outX) < 5 || on > 0.9 * Math.hypot(rx, ry))) return false;
+      facing = true;
+    }
+    return facing;
   }
 
   /** Is the box clear of movements that conflict with this one? (Expired holders are dropped.) */
@@ -1093,12 +1142,23 @@ export class CarTraffic {
   /**
    * The player's bus is heading into `node` (lane point (x, y), direction (inX, inY), movement cls,
    * there in `eta` s), until `until`: cars on the same approach do not turn across its lane in front
-   * of it, and oncoming cars do not turn right across its path when it is close.
+   * of it (when `near`), and oncoming vehicles do not turn right across its path when it is close.
    */
-  claimApproach(node: number, x: number, y: number, inX: number, inY: number, cls: Turn, eta: number, until: number): void {
+  claimApproach(node: number, x: number, y: number, inX: number, inY: number, cls: Turn, eta: number, until: number, near: boolean): void {
     const nd = this.nodes[node];
-    if (nd.pc) Object.assign(nd.pc, { until, x, y, inX, inY, cls, eta });
-    else nd.pc = { until, x, y, inX, inY, cls, eta };
+    if (nd.pc) Object.assign(nd.pc, { until, x, y, inX, inY, cls, eta, near });
+    else nd.pc = { until, x, y, inX, inY, cls, eta, near };
+  }
+
+  /**
+   * Would a vehicle coming into `node` along (inX, inY) and turning `cls` cut
+   * across the player's bus coming the other way, which it would not clear
+   * in `clearT` s (plus a margin)?
+   */
+  playerOncoming(node: number, inX: number, inY: number, cls: Turn, time: number, clearT: number): boolean {
+    const pc = this.nodes[node].pc;
+    if (!pc || pc.until <= time || cls !== Turn.Right || pc.cls === Turn.Right) return false;
+    return inX * pc.inX + inY * pc.inY < -0.8 && pc.eta < clearT + ONCOMING_MARGIN;
   }
 
   /** Main-road vehicle approaching an unsignalised junction: mark it busy. */
@@ -1178,11 +1238,16 @@ export class CarTraffic {
       });
     });
     out.sort((a, b) => a.s - b.s);
+    // Inside: the route's last signalised node before, within INSIDE_LINK, was the same junction's.
     out.forEach((j, k) => {
-      const p = out[k - 1];
-      if (!p?.sig || !j.sig || j.s - p.s >= INSIDE_LINK) return;
-      const jp = this.signalJunction(p.node, p.inX, p.inY);
-      j.inside = jp >= 0 && jp === this.signalJunction(j.node, j.inX, j.inY);
+      if (!j.sig) return;
+      for (let q = k - 1; q >= 0 && j.s - out[q].s < INSIDE_LINK; q--) {
+        const p = out[q];
+        if (!p.sig) continue;
+        const jp = this.signalJunction(p.node, p.inX, p.inY);
+        j.inside = jp >= 0 && jp === this.signalJunction(j.node, j.inX, j.inY);
+        return;
+      }
     });
     this.busJunctions.set(track, out);
     return out;
@@ -1410,7 +1475,7 @@ export class CarTraffic {
       // On a short link between two nodes of one junction we are already in it:
       // its light was ours at the first node (asked again here with the link's
       // direction it would be some other arm's).
-      const st = this.insideLane[lane] ? null : this.signalFor(N, inX, inY, time);
+      const st = this.insideLane[lane] ? null : this.signalFor(N, inX, inY, time, outX, outY);
       if (st === 'red') return Wait.Red;
       if (st === 'amber' && stopAt > (c.v * c.v) / (2 * 3.5)) return Wait.Red;
     } else {
@@ -1425,8 +1490,8 @@ export class CarTraffic {
       const dot = inX * pc.inX + inY * pc.inY;
       if (dot > 0.8) {
         const side = (c.x - pc.x) * pc.inY - (c.y - pc.y) * pc.inX;
-        if ((side > 1.8 && cls === Turn.Left && pc.cls !== Turn.Left) || (side < -1.8 && cls === Turn.Right && pc.cls !== Turn.Right)) return Wait.Player;
-      } else if (dot < -0.8 && cls === Turn.Right && pc.cls !== Turn.Right && pc.eta < ONCOMING_GAP) return Wait.Player;
+        if (pc.near && ((side > 1.8 && cls === Turn.Left && pc.cls !== Turn.Left) || (side < -1.8 && cls === Turn.Right && pc.cls !== Turn.Right))) return Wait.Player;
+      } else if (this.playerOncoming(N, inX, inY, cls, time, clearTime(c.v, Math.max(0, stopAt) + 2 * nd.boxR + c.len, CAR_A))) return Wait.Player;
     }
     // The player's bus in (or about to enter) the box: waiting for it is legitimate.
     if (!this.boxClear(N, c.id, inX, inY, outX, outY, cls, time)) return this.boxBy === PLAYER_HOLD ? Wait.Player : Wait.Junction;
@@ -1572,7 +1637,7 @@ export class CarTraffic {
       const remain = e.len - c.u;
       if (c.next < 0 && remain < 70) c.next = this.chooseNext(c.lane);
       const v0 = (e.limit / 3.6) * c.vWant;
-      const A = 1.7;
+      const A = CAR_A;
       const B = 2.6;
       const T = 1.15;
       const idm = (gap: number, vLead: number, s0: number) => {
