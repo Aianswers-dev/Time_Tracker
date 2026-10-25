@@ -71,10 +71,19 @@ const SWEEP_MARGIN = 0.85;
 const BUS_LO = 0.25;
 const BUS_HI = 3.4;
 /**
- * On a two-way road a lane keeps at least this far left of the centre line (opposing lanes ~3 m apart),
- * except inside a junction box (up to the stop lines), where turning paths cross.
+ * On a two-way road a lane keeps at least this far left of the centre line (opposing lanes 3.3 m apart:
+ * two buses 2.55 m wide pass 0.75 m apart), except inside a junction box (up to the stop lines), where
+ * turning paths cross. So does a one-way carriageway's lane from the line midway between it and the
+ * other direction's carriageway, where they run close (a busway's split).
  */
-const OWN_MIN = 1.5;
+const OWN_MIN = 1.65;
+/** How much nearer a wall than WALL_CLEAR a lane may run to keep OWN_MIN from the centre line. */
+const OWN_OVER = 0.3;
+/**
+ * Where a bus's sweep on a bend would still hit a wall, its lane may give up as much of OWN_MIN, up to
+ * OWN_GIVE (opposing lanes 3 m apart at the least).
+ */
+const OWN_GIVE = 0.15;
 /**
  * Nor does it run more than OPP_IN inside a one-way carriageway heading against it (within acos(OPP_DOT)
  * of the opposite way): a dual carriageway's other half, mapped as its own way.
@@ -113,6 +122,8 @@ const WALL_SLOPE = 0.35;
 const PULL_SLOPE = 0.6;
 /** Samples either side whose wall bounds a lane sample also keeps to. */
 const WALL_SPREAD = 1;
+/** The most sideways slope (to the GTFS normal's frame) the wall band follows the road lane at. */
+const BAND_SKEW = 0.5;
 
 export interface TrackSignal {
   /** Stop line distance along the route. */
@@ -535,6 +546,8 @@ interface RoadNodes {
   deadStart: Uint8Array;
   deadEnd: Uint8Array;
   cum: Float32Array[];
+  /** A one-way road's start (2i) and end (2i + 1) at a split: the two-way road it carries on from (-1 if none). */
+  split: Int32Array;
 }
 const roadNodesCache = new WeakMap<MapData, RoadNodes>();
 function roadNodes(data: MapData): RoadNodes {
@@ -552,8 +565,50 @@ function roadNodes(data: MapData): RoadNodes {
     }
   }
   const n = data.roads.length;
+  // A two-way road carrying on as its two one-way carriageways (one in, one out, both ahead of it, as a
+  // dual carriageway or a busway's split is mapped) is no junction either: no paths cross there.
+  const ends = new Map<number, number[]>();
+  data.roads.forEach((r, i) => {
+    const nv = r.pts.length / 2;
+    if (nv < 2) return;
+    for (const e of [0, 1]) {
+      const q = endKey(r.pts[e ? 2 * nv - 2 : 0], r.pts[e ? 2 * nv - 1 : 1]);
+      if (deg.get(q) !== 3) continue;
+      const l = ends.get(q);
+      if (l) l.push(i, e);
+      else ends.set(q, [i, e]);
+    }
+  });
+  const split = new Set<number>();
+  const splitOf = new Int32Array(2 * n).fill(-1);
+  for (const [q, l] of ends) {
+    if (l.length !== 6) continue;
+    // Each road's direction away from the node.
+    const away = (k: number): [number, number] => {
+      const p = data.roads[l[k]].pts;
+      const nv = p.length / 2;
+      const [a, b] = l[k + 1] ? [nv - 1, nv - 2] : [0, 1];
+      const dx = p[2 * b] - p[2 * a];
+      const dy = p[2 * b + 1] - p[2 * a + 1];
+      const d = Math.hypot(dx, dy) || 1;
+      return [dx / d, dy / d];
+    };
+    const two = [0, 2, 4].filter((k) => !data.roads[l[k]].oneway);
+    const one = [0, 2, 4].filter((k) => data.roads[l[k]].oneway);
+    if (two.length !== 1 || one.length !== 2 || [0, 2, 4].some((k) => data.roads[l[k]].kind === RoadKind.Pedestrian)) continue;
+    if (l[one[0] + 1] === l[one[1] + 1]) continue;
+    const [tx, ty] = away(two[0]);
+    if (
+      !one.every((k) => {
+        const [ux, uy] = away(k);
+        return ux * tx + uy * ty < -OPP_DOT;
+      })
+    ) continue;
+    split.add(q);
+    for (const k of one) splitOf[2 * l[k] + l[k + 1]] = l[two[0]];
+  }
   const turns = turnBoxes(data);
-  const out: RoadNodes = { junctions: new Array(n), box: new Array(n), turn: new Array(n), deadStart: new Uint8Array(n), deadEnd: new Uint8Array(n), cum: new Array(n) };
+  const out: RoadNodes = { junctions: new Array(n), box: new Array(n), turn: new Array(n), deadStart: new Uint8Array(n), deadEnd: new Uint8Array(n), cum: new Array(n), split: splitOf };
   data.roads.forEach((r, i) => {
     const p = r.pts;
     const nv = p.length / 2;
@@ -564,7 +619,7 @@ function roadNodes(data: MapData): RoadNodes {
     const ts: number[] = [];
     for (let k = 0; k < nv; k++) {
       const q = endKey(p[2 * k], p[2 * k + 1]);
-      if ((deg.get(q) ?? 0) < 3) continue;
+      if ((deg.get(q) ?? 0) < 3 || split.has(q)) continue;
       js.push(cum[k]);
       bs.push(Math.max(JUNCTION_BOX_MIN, Math.min(JUNCTION_BOX_MAX, (wide.get(q) ?? 0) / 2 + 2)));
       ts.push(turns.box.get(q) ?? 0);
@@ -593,6 +648,66 @@ function ownHalfFree(nodes: RoadNodes, ri: number, along: number, turning = fals
   for (let q = 0; q < js.length; q++) if (Math.abs(js[q] - along) < (turning ? Math.max(bs[q], ts[q]) : bs[q])) return true;
   const cum = nodes.cum[ri];
   return (nodes.deadStart[ri] === 1 && along < 20) || (nodes.deadEnd[ri] === 1 && along > cum[cum.length - 1] - 20);
+}
+
+/**
+ * The line between a lane's one-way carriageway (road ri) and the nearest one running against it on its
+ * right within `reach` (a dual carriageway's or a busway's other half, mapped as its own way), the two
+ * directions' centre line: how far along the normal (-ty, tx) from (x, y) it crosses (+ = left), NaN with
+ * no such carriageway. (tx, ty) is the lane's way. Past the carriageway's end at a split, the two-way road
+ * it carries on from is that line.
+ */
+function midlineAcross(data: MapData, nodes: RoadNodes, ri: number, x: number, y: number, z: number, tx: number, ty: number, reach = 12): number {
+  const nxv = -ty;
+  const nyv = tx;
+  /** Where (x, y) + n t meets a + d u (d a unit direction): [t, u], or null nearly parallel. */
+  const across = (ax: number, ay: number, dx: number, dy: number): [number, number] | null => {
+    const det = dx * nyv - nxv * dy;
+    if (Math.abs(det) < 0.5) return null;
+    return [(dx * (ay - y) - dy * (ax - x)) / det, (nxv * (ay - y) - nyv * (ax - x)) / det];
+  };
+  const p = data.roads[ri].pts;
+  const nv = p.length / 2;
+  // Our carriageway: its nearest piece's line, on past its ends (as the lane's road centre is found).
+  let own = NaN;
+  let ownD = Infinity;
+  let past = -1;
+  const opp: number[] = [];
+  roadIndexFor(data).forEachNear(x, y, reach, (rj, ax, ay, dx, dy, len, d, zz) => {
+    if (Math.abs(zz - z) > LEVEL_GAP) return;
+    if (rj === ri) {
+      const c = across(ax, ay, dx, dy);
+      if (!c || d >= ownD) return;
+      ownD = d;
+      own = c[0];
+      const atStart = Math.abs(ax - p[0]) + Math.abs(ay - p[1]) < 0.05;
+      const atEnd = Math.abs(ax + dx * len - p[2 * nv - 2]) + Math.abs(ay + dy * len - p[2 * nv - 1]) < 0.05;
+      past = c[1] < 0 && atStart ? 0 : c[1] > len && atEnd ? 1 : -1;
+      return;
+    }
+    const r = data.roads[rj];
+    if (!r.oneway || r.kind === RoadKind.Pedestrian || dx * tx + dy * ty > -OPP_DOT) return;
+    const c = across(ax, ay, dx, dy);
+    if (c && c[1] >= -0.5 && c[1] <= len + 0.5 && Math.abs(c[0]) <= reach) opp.push(c[0]);
+  });
+  if (Number.isNaN(own)) return NaN;
+  const two = past >= 0 ? nodes.split[2 * ri + past] : -1;
+  if (two >= 0) {
+    const q = data.roads[two].pts;
+    let best = NaN;
+    for (let k = 0; 2 * k + 3 < q.length; k++) {
+      const ex = q[2 * k + 2] - q[2 * k];
+      const ey = q[2 * k + 3] - q[2 * k + 1];
+      const len = Math.hypot(ex, ey);
+      if (len < 1e-3) continue;
+      const c = across(q[2 * k], q[2 * k + 1], ex / len, ey / len);
+      if (c && c[1] >= -0.5 && c[1] <= len + 0.5 && Math.abs(c[0]) <= reach && !(Math.abs(c[0]) >= Math.abs(best))) best = c[0];
+    }
+    return best;
+  }
+  let near = -Infinity;
+  for (const t of opp) if (t <= own + 0.25 && t > near) near = t;
+  return near > -Infinity ? (own + near) / 2 : NaN;
 }
 
 function projectOnRoad(r: Road, cum: Float32Array, x: number, y: number): number {
@@ -1078,6 +1193,8 @@ export class RouteTrack {
     const WG = W ? wallGrid(W) : null;
     const wallStart = new Int32Array(n + 1);
     const wallPos: number[] = [];
+    /** Where along the route (from the sample) each end in wallPos is. */
+    const wallAl: number[] = [];
     const wallSeen = W ? new Int32Array(W.count) : new Int32Array(0);
     const cands: RoadCand[][] = [];
     // Where the GTFS shape turns sharply (and SHAPE_SHARP_SPAN either side): one-way bus ramps cutting
@@ -1190,6 +1307,10 @@ export class RouteTrack {
               const lb = l0 + (l1 - l0) * u1;
               if (Math.min(la, lb) > reach || Math.max(la, lb) < -reach) continue;
               wallPos.push(Math.min(la, lb), Math.max(la, lb));
+              const aa = a0 + da * u0;
+              const ab = a0 + da * u1;
+              if (la <= lb) wallAl.push(aa, ab);
+              else wallAl.push(ab, aa);
             }
           }
         }
@@ -1198,6 +1319,8 @@ export class RouteTrack {
     wallStart[n] = wallPos.length;
     /** The matched road's lane offset from its own centreline (+ = left). */
     const fromC = new Float32Array(n);
+    /** How square our normal crosses the matched road (a sideways metre along it is cosR across the road). */
+    const cosR = new Float32Array(n).fill(1);
     for (let i = 0; i < n; i++) {
       const c = picks[i];
       if (!c) continue;
@@ -1211,6 +1334,7 @@ export class RouteTrack {
       const oy = c.py - by[i];
       const dC = Math.abs(cosN) > 0.5 ? (ox * rnx + oy * rny) / cosN : ox * nx[i] + oy * ny[i];
       if (Math.abs(cosN) < 0.9) skew[i] = 1;
+      cosR[i] = Math.max(0.5, Math.abs(cosN));
       fromC[i] = laneFromCentre(road);
       roadC[i] = dC;
       kerbBase[i] = dC + halfWidthLeft(road);
@@ -1391,85 +1515,105 @@ export class RouteTrack {
     // drive (a carriageway or station bay: platform bays are open in the collider), else the nearest
     // such gap, staying on the side chosen just before; where none fits (a junction hall, a tight
     // turnaround), the middle of the gap the carriageway is in.
+    // (Measured straight across the GTFS normal, each wall piece over the strip a sample stands for; and
+    // `skewed`, in the frame of the lane's road lane, which runs at a slope to the normal's where the shape
+    // is skewed to the road: there a parapet beside the lane spans the sideways change over the strip,
+    // and across the normal bounds the lane by its nearest end. The lane keeps the first, with room to
+    // spare where the shape is skewed, but may use the second to keep its own half.)
     const spans: [number, number][] = [];
-    let prev = NaN;
-    for (let i = 0; i < n; i++) {
-      const h = home[i];
-      // Sideways spans blocked by walls here, merged where they overlap.
-      spans.length = 0;
-      for (let k = wallStart[i]; k < wallStart[i + 1]; k += 2) spans.push([wallPos[k], wallPos[k + 1]]);
-      if (!spans.length || !TW) {
-        prev = NaN;
-        continue;
-      }
-      spans.sort((p1, p2) => p1[0] - p2[0]);
-      const obLo: number[] = [];
-      const obHi: number[] = [];
-      for (const [a, b] of spans) {
-        if (obLo.length && a <= obHi[obHi.length - 1]) obHi[obHi.length - 1] = Math.max(obHi[obHi.length - 1], b);
-        else {
-          obLo.push(a);
-          obHi.push(b);
+    const band = (skewed: boolean, lo: Float32Array, hi: Float32Array): void => {
+      let prev = NaN;
+      for (let i = 0; i < n; i++) {
+        const h = home[i];
+        // Sideways spans blocked by walls here, merged where they overlap.
+        const ia = Math.max(0, i - 1);
+        const ib = Math.min(n - 1, i + 1);
+        const slope = skewed && ib > ia ? Math.max(-BAND_SKEW, Math.min(BAND_SKEW, (home[ib] - home[ia]) / ((ib - ia) * TRACK_STEP))) : 0;
+        const clear = WALL_CLEAR * Math.sqrt(1 + slope * slope);
+        spans.length = 0;
+        for (let k = wallStart[i]; k < wallStart[i + 1]; k += 2) {
+          const a = wallPos[k] - wallAl[k] * slope;
+          const b = wallPos[k + 1] - wallAl[k + 1] * slope;
+          spans.push(a <= b ? [a, b] : [b, a]);
         }
-      }
-      const z = this.z[i];
-      const at = (t: number) => TW.drivable(bx[i] + nx[i] * t, by[i] + ny[i] * t, z);
-      // Gap g lies between blocked span g - 1 and span g.
-      const gapLo = (g: number) => (g > 0 ? obHi[g - 1] + WALL_CLEAR : -Infinity);
-      const gapHi = (g: number) => (g < obLo.length ? obLo[g] - WALL_CLEAR : Infinity);
-      const fits = (g: number, ref: number) => {
-        const a = gapLo(g);
-        const b = gapHi(g);
-        return a <= b && at(Math.max(a, Math.min(b, ref)));
-      };
-      let gi = 0;
-      while (gi < obLo.length && obHi[gi] < h) gi++;
-      let pick = -1;
-      if (fits(gi, h)) pick = gi;
-      else {
-        const ref = Number.isNaN(prev) ? h : prev;
-        let best = Infinity;
-        for (let g = 0; g <= obLo.length; g++) {
-          if (g === gi || !fits(g, ref)) continue;
+        if (!spans.length || !TW) {
+          prev = NaN;
+          continue;
+        }
+        spans.sort((p1, p2) => p1[0] - p2[0]);
+        const obLo: number[] = [];
+        const obHi: number[] = [];
+        for (const [a, b] of spans) {
+          if (obLo.length && a <= obHi[obHi.length - 1]) obHi[obHi.length - 1] = Math.max(obHi[obHi.length - 1], b);
+          else {
+            obLo.push(a);
+            obHi.push(b);
+          }
+        }
+        const z = this.z[i];
+        const at = (t: number) => TW.drivable(bx[i] + nx[i] * t, by[i] + ny[i] * t, z);
+        // Gap g lies between blocked span g - 1 and span g.
+        const gapLo = (g: number) => (g > 0 ? obHi[g - 1] + clear : -Infinity);
+        const gapHi = (g: number) => (g < obLo.length ? obLo[g] - clear : Infinity);
+        const fits = (g: number, ref: number) => {
           const a = gapLo(g);
           const b = gapHi(g);
-          const d = ref < a ? a - ref : ref > b ? ref - b : 0;
-          if (d < best && d < 12) {
-            best = d;
-            pick = g;
+          return a <= b && at(Math.max(a, Math.min(b, ref)));
+        };
+        let gi = 0;
+        while (gi < obLo.length && obHi[gi] < h) gi++;
+        let pick = -1;
+        if (fits(gi, h)) pick = gi;
+        else {
+          const ref = Number.isNaN(prev) ? h : prev;
+          let best = Infinity;
+          for (let g = 0; g <= obLo.length; g++) {
+            if (g === gi || !fits(g, ref)) continue;
+            const a = gapLo(g);
+            const b = gapHi(g);
+            const d = ref < a ? a - ref : ref > b ? ref - b : 0;
+            if (d < best && d < 12) {
+              best = d;
+              pick = g;
+            }
           }
         }
-      }
-      if (pick >= 0) {
-        lo[i] = gapLo(pick);
-        hi[i] = gapHi(pick);
-      } else {
-        // No gap a bus fits with room to spare: the middle of the drivable gap nearest the road lane.
-        let g = gi;
-        for (let d = 0; d <= obLo.length; d++) {
-          const cand = [gi - d, gi + d].find((k) => k > 0 && k < obLo.length && at((obHi[k - 1] + obLo[k]) / 2));
-          if (cand !== undefined) {
-            g = cand;
-            break;
+        if (pick >= 0) {
+          lo[i] = gapLo(pick);
+          hi[i] = gapHi(pick);
+        } else {
+          // No gap a bus fits with room to spare: the middle of the drivable gap nearest the road lane.
+          let g = gi;
+          for (let d = 0; d <= obLo.length; d++) {
+            const cand = [gi - d, gi + d].find((k) => k > 0 && k < obLo.length && at((obHi[k - 1] + obLo[k]) / 2));
+            if (cand !== undefined) {
+              g = cand;
+              break;
+            }
           }
+          const a = g > 0 ? obHi[g - 1] : h - 3;
+          const b = g < obLo.length ? obLo[g] : h + 3;
+          const m = Number.isFinite(a) && Number.isFinite(b) ? (a + b) / 2 : h;
+          const half = Math.max(0, (b - a) / 2 - clear);
+          lo[i] = m - half;
+          hi[i] = m + half;
         }
-        const a = g > 0 ? obHi[g - 1] : h - 3;
-        const b = g < obLo.length ? obLo[g] : h + 3;
-        const m = Number.isFinite(a) && Number.isFinite(b) ? (a + b) / 2 : h;
-        const half = Math.max(0, (b - a) / 2 - WALL_CLEAR);
-        lo[i] = m - half;
-        hi[i] = m + half;
+        if (Math.max(lo[i] - h, h - hi[i], 0) > BAND_REACH) {
+          lo[i] = -Infinity;
+          hi[i] = Infinity;
+          prev = NaN;
+          continue;
+        }
+        prev = Math.max(lo[i], Math.min(hi[i], h));
       }
-      if (Math.max(lo[i] - h, h - hi[i], 0) > BAND_REACH) {
-        lo[i] = -Infinity;
-        hi[i] = Infinity;
-        prev = NaN;
-        continue;
-      }
-      prev = Math.max(lo[i], Math.min(hi[i], h));
-    }
-    // On a two-way road the walls may narrow the lane's room but not push it over the centre line while
-    // they leave room on its own side (outside junction boxes and platform lead-ins).
+    };
+    band(false, lo, hi);
+    const loS = new Float32Array(n).fill(-Infinity);
+    const hiS = new Float32Array(n).fill(Infinity);
+    band(true, loS, hiS);
+    // On a two-way road (or a one-way carriageway beside the other direction's) the walls may narrow the
+    // lane's room but not push it over the centre line while they leave room on its own side (outside
+    // junction boxes and platform lead-ins).
     const floor = new Float32Array(n).fill(-Infinity);
     if (TW) {
       const nodes = roadNodes(data);
@@ -1477,12 +1621,22 @@ export class RouteTrack {
         const ri = this.road[i];
         if (!known[i] || ri < 0 || skew[i] & 14) continue;
         const r = data.roads[ri];
-        if (r.oneway || r.width < 6) continue;
-        const along = projectOnRoad(r, nodes.cum[ri], bx[i] + nx[i] * roadC[i], by[i] + ny[i] * roadC[i]);
-        if (!ownHalfFree(nodes, ri, along)) floor[i] = roadC[i] + Math.min(OWN_MIN, fromC[i]);
+        if (!r.oneway && r.width < 6) continue;
+        const cx = bx[i] + nx[i] * roadC[i];
+        const cy = by[i] + ny[i] * roadC[i];
+        const along = projectOnRoad(r, nodes.cum[ri], cx, cy);
+        if (ownHalfFree(nodes, ri, along)) continue;
+        // (Our normal's metres, across the road at a skew.)
+        const own = Math.min(OWN_MIN, fromC[i]) / cosR[i];
+        if (!r.oneway) floor[i] = roadC[i] + own;
+        else {
+          // A one-way carriageway keeps as far from the centre line between it and the other direction's.
+          const mid = midlineAcross(data, nodes, ri, cx, cy, this.z[i], ny[i], -nx[i]);
+          if (!Number.isNaN(mid)) floor[i] = roadC[i] + mid + own;
+        }
       }
     }
-    this.keepInside(lo, hi, home, skew, floor);
+    this.keepInside(lo, hi, home, skew, floor, hiS);
     this.bandLo = lo;
     this.bandHi = hi;
     for (let i = 0; i < n; i++) {
@@ -1777,7 +1931,7 @@ export class RouteTrack {
    * Clamp the lane offsets into [lo, hi] (walled stretches), smoothing the
    * steps that creates without leaving the bounds; kerb distances follow.
    */
-  private keepInside(lo: Float32Array, hi: Float32Array, home: Float32Array, skew: Uint8Array, floor: Float32Array): void {
+  private keepInside(lo: Float32Array, hi: Float32Array, home: Float32Array, skew: Uint8Array, floor: Float32Array, hiS: Float32Array): void {
     const n = this.n;
     const off = this.offset;
     let any = false;
@@ -1789,11 +1943,13 @@ export class RouteTrack {
     const D = WALL_SPREAD;
     const lo0 = Float32Array.from(lo);
     const hi0 = Float32Array.from(hi);
+    const hiS0 = Float32Array.from(hiS);
     for (let i = 0; i < n; i++) {
       for (let j = Math.max(0, i - D); j <= Math.min(n - 1, i + D); j++) {
         // In the lane's own road frame (home), like the slope below.
         lo[i] = Math.max(lo[i], lo0[j] - home[j] + home[i]);
         hi[i] = Math.min(hi[i], hi0[j] - home[j] + home[i]);
+        hiS[i] = Math.min(hiS[i], hiS0[j] - home[j] + home[i]);
       }
     }
     // Approach and leave a walled stretch gently: relative to the lane's own road
@@ -1806,15 +1962,22 @@ export class RouteTrack {
       const step = stepAt(i);
       hi[i] = Math.min(hi[i], hi[i - 1] - home[i - 1] + home[i] + step);
       lo[i] = Math.max(lo[i], lo[i - 1] - home[i - 1] + home[i] - step);
+      hiS[i] = Math.min(hiS[i], hiS[i - 1] - home[i - 1] + home[i] + step);
     }
     for (let i = n - 2; i >= 0; i--) {
       const step = stepAt(i);
       hi[i] = Math.min(hi[i], hi[i + 1] - home[i + 1] + home[i] + step);
       lo[i] = Math.max(lo[i], lo[i + 1] - home[i + 1] + home[i] - step);
+      hiS[i] = Math.min(hiS[i], hiS[i + 1] - home[i + 1] + home[i] + step);
     }
-    // Not over the centre line unless the walls leave no room on the lane's own side (then as far over as
-    // they allow, not midway).
-    for (let i = 0; i < n; i++) if (hi[i] < Infinity || lo[i] > -Infinity) lo[i] = Math.max(lo[i], Math.min(hi[i], floor[i]));
+    // Not over the centre line unless the walls leave no room on the lane's own side, measured in the lane's
+    // frame (hiS) and even OWN_OVER nearer than WALL_CLEAR (then as far over as they allow, not midway): a
+    // bus nearer a wall is better than two meeting head on.
+    for (let i = 0; i < n; i++) {
+      if (hi[i] === Infinity && lo[i] === -Infinity) continue;
+      if (floor[i] > hi[i]) hi[i] = Math.min(floor[i], Math.max(hi[i], hiS[i] + OWN_OVER));
+      lo[i] = Math.max(lo[i], Math.min(hi[i], floor[i]));
+    }
     const clamp = () => {
       for (let i = 0; i < n; i++) {
         // Bounds that cannot both be met (neighbours' walls, the slope limit): midway.
@@ -1829,10 +1992,14 @@ export class RouteTrack {
       if (Math.abs(off[i] - before[i]) < 0.01) continue;
       for (let j = Math.max(0, i - 6); j <= Math.min(n - 1, i + 6); j++) near[j] = 1;
     }
+    // (The shift, not the offsets: where the lane's road bends away from the GTFS shape, smoothing its
+    // offsets would cut the bend.)
+    const shift = new Float32Array(n);
     for (let k = 0; k < 4; k++) {
-      const sm = boxSmooth(off, 2);
+      for (let i = 0; i < n; i++) shift[i] = off[i] - before[i];
+      const sm = boxSmooth(shift, 2);
       // (Not alongside a platform: smoothing would round the lane off the platform edge.)
-      for (let i = 0; i < n; i++) if (near[i] && !(skew[i] & 4)) off[i] = sm[i];
+      for (let i = 0; i < n; i++) if (near[i] && !(skew[i] & 4)) off[i] = before[i] + sm[i];
       clamp();
     }
     for (let i = 0; i < n; i++) {
@@ -2330,6 +2497,9 @@ export class RouteTrack {
     for (let d = 0; d <= SPREAD; d++) bump[d] = 0.5 * (1 + Math.cos((Math.PI * d) / (SPREAD + 1)));
     const pushL = new Float32Array(n);
     const pushR = new Float32Array(n);
+    // How far each sample's buses are into a wall (the lane may give up as much of its own half there, at
+    // most OWN_GIVE).
+    const hard = new Float32Array(n);
     const drive = (spec: ReturnType<typeof specFor>): void => {
       const secs = spec.sections;
       // How far behind the front axle each section's tail is (it is only placed once driven that far).
@@ -2412,6 +2582,7 @@ export class RouteTrack {
           if (j < 0) continue;
           const need = this.bodyPush(W, G, cx, cy, this.z[j], hx, hy, sc.length / 2, spec.width / 2 + SWEEP_MARGIN);
           if (!need) continue;
+          if (Math.abs(need) - SWEEP_MARGIN > hard[j]) hard[j] = Math.abs(need) - SWEEP_MARGIN;
           // The section's sideways push, as the lane's sideways (+ = left of the lane).
           const a = Math.max(0, j - 1);
           const b = Math.min(n - 1, j + 1);
@@ -2463,6 +2634,7 @@ export class RouteTrack {
     const data = this.data;
     const nodes = roadNodes(data);
     const own = new Int32Array(n).fill(-1);
+    const vMid = new Float32Array(n).fill(NaN);
     // (Not on a bend tighter than BEND, where a Metro's sweep needs more than its half of the road and two
     // buses could not pass anyway.)
     const BEND = 30;
@@ -2482,7 +2654,13 @@ export class RouteTrack {
       for (let q = Math.max(0, k - 3); q <= Math.min(n - 1, k + 3) && !tight; q++) tight = bendR(q) < BEND;
       if (tight) continue;
       const r = data.roads[ri];
-      if (r.oneway || r.width < 6) continue;
+      if (r.oneway) {
+        // (A one-way carriageway: from the line between it and the other direction's, if near.)
+        if (ownHalfFree(nodes, ri, projectOnRoad(r, nodes.cum[ri], X0[k], Y0[k]))) continue;
+        vMid[k] = midlineAcross(data, nodes, ri, X0[k], Y0[k], this.z[k], ny0[k], -nx0[k]);
+        continue;
+      }
+      if (r.width < 6) continue;
       const p = r.pts;
       let best = 12;
       for (let q = 0; 2 * q + 3 < p.length; q++) {
@@ -2521,13 +2699,19 @@ export class RouteTrack {
       }
       return lat;
     };
-    const fits = (k: number, v: number): boolean => {
+    const give = new Float32Array(n);
+    const fits = (k: number, v: number, half = true): boolean => {
       const qx = X0[k] + nx0[k] * v;
       const qy = Y0[k] + ny0[k] * v;
       if (!TW.drivable(qx, qy, this.z[k])) return false;
-      if (own[k] >= 0) {
+      // (With `half`, keeping the lane's own half too.)
+      if (half && own[k] >= 0) {
         const lat = sideOf(k, qx, qy);
-        if (lat < OWN_MIN && lat < sideOf(k, this.x[k], this.y[k]) - 1e-3) return false;
+        if (lat < OWN_MIN - give[k] && lat < sideOf(k, this.x[k], this.y[k]) - 1e-3) return false;
+      }
+      if (half && !Number.isNaN(vMid[k])) {
+        const vNow = (this.x[k] - X0[k]) * nx0[k] + (this.y[k] - Y0[k]) * ny0[k];
+        if (v - vMid[k] < OWN_MIN - give[k] && v < vNow - 1e-3) return false;
       }
       const dNew = this.wallDist(W, G, qx, qy, this.z[k]);
       return !(dNew < WALL_CLEAR - 0.6 && dNew < this.wallDist(W, G, this.x[k], this.y[k], this.z[k]));
@@ -2543,8 +2727,14 @@ export class RouteTrack {
     for (let pass = 0; pass < 10; pass++) {
       pushL.fill(0);
       pushR.fill(0);
+      hard.fill(0);
       for (const spec of specs) drive(spec);
       if (!need0) need0 = needNow();
+      for (let k = 0; k < n; k++) {
+        let g = 0;
+        for (let j = Math.max(0, k - SPREAD); j <= Math.min(n - 1, k + SPREAD); j++) g = Math.max(g, hard[j]);
+        give[k] = Math.min(OWN_GIVE, g);
+      }
       // Each sample's push: from walls one side, or halfway between where both sides press.
       const push = new Float32Array(n);
       for (let j = 0; j < n; j++) {
@@ -2601,14 +2791,22 @@ export class RouteTrack {
         let held = false;
         for (let k = 0; k < n; k++) {
           if (Math.abs(Dn[k] - D[k]) < 1e-3) continue;
-          let ok = fits(k, Dn[k]);
-          if (ok) {
-            for (let q = Math.max(1, k - 1); q <= Math.min(n - 2, k + 1) && ok; q++) {
-              if (radius(q, Dn) < Math.min(R_OK, radius(q, D)) - 1e-6) ok = false;
+          const bendsOk = (): boolean => {
+            for (let q = Math.max(1, k - 1); q <= Math.min(n - 2, k + 1); q++) if (radius(q, Dn) < Math.min(R_OK, radius(q, D)) - 1e-6) return false;
+            return true;
+          };
+          const fit = fits(k, Dn[k]);
+          let ok = fit && bendsOk();
+          if (ok) continue;
+          // (Held by its own half alone: as far as that allows.)
+          const full = Dn[k];
+          if (!fit && fits(k, full, false)) {
+            for (const f of [0.5, 0.25]) {
+              Dn[k] = D[k] + (full - D[k]) * f;
+              if ((ok = fits(k, Dn[k]) && bendsOk())) break;
             }
           }
-          if (ok) continue;
-          Dn[k] = D[k];
+          if (!ok) Dn[k] = D[k];
           held = true;
         }
         if (!held) break;
@@ -2809,10 +3007,12 @@ export class RouteTrack {
         if (TW.pointInBuilding(x + lx * 1.5, y + ly * 1.5, z + 1.5)) bad += 2;
         if (TW.pointInBuilding(x - lx * 1.5, y - ly * 1.5, z + 1.5)) bad += 2;
       }
-      // (Over the centre line into the oncoming lane outweighs a wall's clearance.)
+      // (Over the centre line into the oncoming lane outweighs a wall's clearance. A corner may use OWN_GIVE
+      // of OWN_MIN, as a sweep may: held to all of it, some corners at junction boxes go unsolved.)
       if (own[i] >= 0) {
         const lat = sideOf(i, x, y, ux, uy);
-        if (lat < OWN_MIN) bad += 4 + (OWN_MIN - lat) * 2;
+        const least = OWN_MIN - OWN_GIVE;
+        if (lat < least) bad += 4 + (least - lat) * 2;
       }
       // (So does running on a one-way carriageway the other way, outside the junction box of a sharp turn
       // where the stretch may use it.)
