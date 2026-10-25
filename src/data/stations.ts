@@ -576,6 +576,8 @@ export const STATIONS: StationDef[] = [
       [187, 2132],
       [183, 2108],
     ],
+    // the flat entrance canopy with "Herston" lettering against the south tower's east face (same photo)
+    entrances: [{ x: 190.4, y: 2107.7, fx: 0.988, fy: -0.153, len: 8, d: 4.4, h: 3.2 }],
   },
   {
     key: 'rbwh',
