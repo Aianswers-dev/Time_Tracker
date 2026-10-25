@@ -422,6 +422,12 @@ export class CarTraffic {
   private ring: Int8Array = new Int8Array(0);
   /** Stop-line distance from the end node for each directed lane (0 = uncontrolled). */
   private stopD: Float32Array = new Float32Array(0);
+  /**
+   * Per directed lane: at its end node (unsignalised) it gives way to the other arms. A lower class
+   * of road than the junction's best, or the stem of a T-junction of equal roads (the T-intersection
+   * rule: the road that ends gives way to the one that goes on).
+   */
+  private minorIn: Uint8Array = new Uint8Array(0);
   /** Junction nodes (3+ arms) on a coarse grid, for mapping bus routes onto them. */
   private nodeGrid = new Map<number, number[]>();
   private busJunctions = new WeakMap<RouteTrack, BusJunction[]>();
@@ -606,6 +612,28 @@ export class CarTraffic {
       let l = this.nodeGrid.get(gk);
       if (!l) this.nodeGrid.set(gk, (l = []));
       l.push(n);
+    }
+    // Who gives way at an unsignalised junction: a lesser road; at a T of equal roads, its stem (two
+    // arms within 50° of straight on, clearly straighter than any other pair, the third off to the side).
+    this.minorIn = new Uint8Array(this.edges.length * 2);
+    for (let lane = 0; lane < this.edges.length * 2; lane++) {
+      const nd = this.nodes[this.endNode(lane)];
+      if (this.edges[lane >> 1].rank + 0.01 < nd.rank) this.minorIn[lane] = 1;
+    }
+    for (let n = 0; n < this.nodes.length; n++) {
+      const nd = this.nodes[n];
+      const es = nd.edges;
+      if (es.length !== 3 || es.some((ei) => this.edges[ei].a === this.edges[ei].b)) continue;
+      const d = es.map((ei) => this.armDir(ei, n, 10));
+      const dot = (i: number, j: number) => d[i][0] * d[j][0] + d[i][1] * d[j][1];
+      // (Arm k against the pair of the other two.)
+      const pd = [dot(1, 2), dot(2, 0), dot(0, 1)];
+      const stem = pd.indexOf(Math.min(...pd));
+      const other = Math.min(pd[(stem + 1) % 3], pd[(stem + 2) % 3]);
+      if (pd[stem] > -0.64 || other < pd[stem] + 0.25 || Math.max(pd[(stem + 1) % 3], pd[(stem + 2) % 3]) > 0.8) continue;
+      const ek = this.edges[es[stem]];
+      if (ek.rank > Math.max(this.edges[es[(stem + 1) % 3]].rank, this.edges[es[(stem + 2) % 3]].rank) + 0.01) continue;
+      this.minorIn[ek.b === n ? es[stem] * 2 : es[stem] * 2 + 1] = 1;
     }
     // Stop lines per directed lane, where the world paints them: clear of the
     // widest *other* road at the junction.
@@ -1417,7 +1445,7 @@ export class CarTraffic {
       let hw = 0;
       for (const ei of nd.edges) if (ei !== arrive) hw = Math.max(hw, this.edges[ei].width / 2);
       const stop = Math.max(3.5, Math.min(18, hw + 2.5));
-      const rank = arrive >= 0 && bestDot > 0.6 ? this.edges[arrive].rank : nd.rank;
+      const minor = arrive >= 0 && bestDot > 0.6 && this.minorIn[this.edges[arrive].b === n ? arrive * 2 : arrive * 2 + 1] === 1;
       out.push({
         node: n,
         x: nd.x,
@@ -1431,7 +1459,7 @@ export class CarTraffic {
         cls: classify(turn),
         boxR: nd.boxR,
         sig: nd.sig,
-        minor: rank + 0.01 < nd.rank,
+        minor,
         inside: false,
       });
     });
@@ -1449,6 +1477,17 @@ export class CarTraffic {
     });
     this.busJunctions.set(track, out);
     return out;
+  }
+
+  /** Unit direction from `node` to the point `d` m out along edge `ei` (steadier than its first segment). */
+  private armDir(ei: number, node: number, d: number): [number, number] {
+    const e = this.edges[ei];
+    this.at(e.a === node ? ei * 2 : ei * 2 + 1, Math.min(d, e.len), 0, this.pt2);
+    const nd = this.nodes[node];
+    const dx = this.pt2.x - nd.x;
+    const dy = this.pt2.y - nd.y;
+    const l = Math.hypot(dx, dy) || 1;
+    return [dx / l, dy / l];
   }
 
   private edgeDirFrom(ei: number, node: number): [number, number] {
@@ -1674,7 +1713,6 @@ export class CarTraffic {
     const nd = this.nodes[N];
     const [inX, inY] = this.laneEndDir(lane);
     const [outX, outY] = this.laneStartDir(next);
-    const e0 = this.edges[lane >> 1];
     const cls = classify(wrapAngle(Math.atan2(outX, outY) - Math.atan2(inX, inY)));
     if (nd.sig) {
       // On a short link between two nodes of one junction we are already in it:
@@ -1687,7 +1725,7 @@ export class CarTraffic {
       // No light for this movement (an arm no signal faces, a slip lane): give way to the cars that have one.
       if (!inside && st === null && this.conflictEta(N, inX, inY, outX, outY, cls, cls === Turn.Left ? GAP_LEFT : GAP_ACROSS) < Infinity) return Wait.Junction;
     } else {
-      if (e0.rank + 0.01 < nd.rank && nd.until > time && nd.holder !== lane) return nd.holder === PLAYER_HOLD ? Wait.Player : Wait.Junction;
+      if (this.minorIn[lane] && nd.until > time && nd.holder !== lane) return nd.holder === PLAYER_HOLD ? Wait.Player : Wait.Junction;
     }
     // The player's bus coming up on the same approach in the next lane: a car that would turn across
     // its lane in front of it (left from the lane on its right, right from the lane on its left) waits.
@@ -2002,7 +2040,7 @@ export class CarTraffic {
       const nd = this.nodes[N];
       const sd = this.stopD[c.lane];
       if (sd > 0 && nd.deg >= 3) {
-        if (!nd.sig && e.rank + 0.01 >= nd.rank && remain < 25) this.markMajor(N, time, c.lane);
+        if (!nd.sig && !this.minorIn[c.lane] && remain < 25) this.markMajor(N, time, c.lane);
         if (!c.holds.some((h) => h.node === N) && c.next >= 0) {
           // (To the stop line from our front, not our middle: waiting with the nose 2 m over it put
           // it in the near lane of a narrow road, the player's bus there passing a metre off it.)
