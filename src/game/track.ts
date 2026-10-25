@@ -95,8 +95,9 @@ const OWN_GIVE = 0.15;
  * In a junction box the lane keeps no half of the road it is on, but it keeps its side of the two-way roads
  * it comes from and goes on into, their centre lines carried on into the box, while it heads within
  * TURN_ALONG of them: OWN_MIN where it goes through the box straight on (turning less than TURN_STRAIGHT
- * radians), TURN_LEFT_MIN where it turns left (a bus swings wide into a narrow street), and not at all where
- * it turns right (across the oncoming lanes, which the junction's right of way keeps apart).
+ * radians), TURN_LEFT_MIN where it turns left (a bus swings wide into a narrow street) and TURN_RIGHT_MIN
+ * (within TURN_RIGHT_ALONG) where it turns right, across the oncoming lanes. The wall sweep holds to this;
+ * the corner solve only turning left, and only where its own half was too tight (see regularize).
  */
 const TURN_ALONG = (50 * Math.PI) / 180;
 /**
@@ -121,6 +122,11 @@ const TURN_LEFT_MIN = 0.0;
 const TURN_LEFT_ALONG = (50 * Math.PI) / 180;
 const TURN_RIGHT_MIN = 1.0;
 const TURN_RIGHT_ALONG = (15 * Math.PI) / 180;
+/**
+ * A corner the guard leaves tighter than this (m) even using the junction box is solved again without it there:
+ * in a narrow street a bus swings across the centre line rather than kink.
+ */
+const TURN_GUARD_R = 6.5;
 /**
  * Nor does it run more than OPP_IN inside a one-way carriageway heading against it (within acos(OPP_DOT)
  * of the opposite way): a dual carriageway's other half, mapped as its own way.
@@ -749,7 +755,7 @@ function midlineAcross(data: MapData, nodes: RoadNodes, ri: number, x: number, y
 
 /**
  * The centre lines a junction box's samples keep their side of (TURN_ALONG): for each sample with free[k],
- * the segment own[j] of road[j] at the nearest sample j before it and after it, within reach samples, whose
+ * the segment nearest it of road[j] at the nearest sample j before it and after it, within reach samples, whose
  * own half is kept (own[j] >= 0, free[j] unset), facing the lane's way there. Per sample two lines
  * (x, y, dx, dy each; NaN where none) and how far left of them it keeps (by the turn the lane makes through
  * the box: from just before it to just after it).
@@ -759,7 +765,19 @@ function turnLines(data: MapData, road: Int32Array, own: Int32Array, free: Uint8
   const out = new Float32Array(10 * n).fill(NaN);
   const put = (k: number, slot: number, j: number): void => {
     const p = data.roads[road[j]].pts;
-    const q = own[j];
+    // (Its segment nearest sample k: the road's own curve into the node.)
+    let q = own[j];
+    let best = Infinity;
+    for (let g = 0; 2 * g + 3 < p.length; g++) {
+      const gx = p[2 * g + 2] - p[2 * g];
+      const gy = p[2 * g + 3] - p[2 * g + 1];
+      const t = Math.max(0, Math.min(1, ((X[k] - p[2 * g]) * gx + (Y[k] - p[2 * g + 1]) * gy) / (gx * gx + gy * gy || 1e-9)));
+      const d = Math.hypot(X[k] - p[2 * g] - gx * t, Y[k] - p[2 * g + 1] - gy * t);
+      if (d < best) {
+        best = d;
+        q = g;
+      }
+    }
     let ex = p[2 * q + 2] - p[2 * q];
     let ey = p[2 * q + 3] - p[2 * q + 1];
     const el = Math.hypot(ex, ey);
@@ -2680,7 +2698,9 @@ export class RouteTrack {
    * Where a bus on the lane would stand in a building (a footprint mapped over
    * the kerb, a lane offset towards the shops), move the lane sideways to the
    * nearest place clear of it that is still on the road, easing in and out.
-   * (Between samples too: a corner between two is passed by the body.)
+   * (Between samples too: a corner between two is passed by the body. And the
+   * body itself, its front axle on the lane and its rear a wheelbase back: the
+   * front overhang swings out of a bend over the kerb, the rear cuts in.)
    */
   private nudgeOffBuildings(TW: TrackWalls): void {
     const inB = TW.pointInBuilding;
@@ -2733,6 +2753,66 @@ export class RouteTrack {
       if (!w) continue;
       for (const k of [i, i + 1]) if (Math.abs(w) > Math.abs(want[k])) want[k] = w;
       any = true;
+    }
+    // The body: the first section of the route's bus (and a rigid bus), outline BODY_MARGIN clear.
+    const BODY_MARGIN = 0.15;
+    const specs = busTypeForRoute(this.route) === 'metro' ? [specFor('metro'), specFor('rigid')] : [specFor('rigid')];
+    for (const spec of specs) {
+      const sc = spec.sections[0];
+      const wb = spec.wheelbase;
+      const L = sc.length / 2 + BODY_MARGIN;
+      const H = spec.width / 2 + BODY_MARGIN;
+      const co = sc.axleFromFront - sc.length / 2;
+      // (Samples the body spans either side of the front axle's.)
+      const back = Math.ceil((sc.length - sc.axleFromFront + wb) / TRACK_STEP);
+      const ahead = Math.ceil((sc.axleFromFront - wb) / TRACK_STEP);
+      /** The body with its front axle at (fx, fy) and rear axle at (rx, ry) touches a building. */
+      const hits = (fx: number, fy: number, rx: number, ry: number, z: number): boolean => {
+        const hl = Math.hypot(fx - rx, fy - ry) || 1;
+        const hx = (fx - rx) / hl;
+        const hy = (fy - ry) / hl;
+        const cx = rx + hx * co;
+        const cy = ry + hy * co;
+        for (let u = -L; u <= L + 1e-6; u += 0.5) {
+          if (inB(cx + hx * u - hy * H, cy + hy * u + hx * H, z + 1.5)) return true;
+          if (inB(cx + hx * u + hy * H, cy + hy * u - hx * H, z + 1.5)) return true;
+        }
+        for (let v = -H + 0.5; v < H; v += 0.5) {
+          if (inB(cx + hx * L - hy * v, cy + hy * L + hx * v, z + 1.5)) return true;
+          if (inB(cx - hx * L - hy * v, cy - hy * L + hx * v, z + 1.5)) return true;
+        }
+        return false;
+      };
+      for (let i = 1; i < n; i++) {
+        // The rear axle: a wheelbase back along the lane's chords.
+        let j = i;
+        let left = wb;
+        while (j > 0 && left > Math.hypot(X[j] - X[j - 1], Y[j] - Y[j - 1])) {
+          left -= Math.hypot(X[j] - X[j - 1], Y[j] - Y[j - 1]);
+          j--;
+        }
+        if (j === 0) continue;
+        const sl = Math.hypot(X[j] - X[j - 1], Y[j] - Y[j - 1]) || 1;
+        const rx = X[j] + ((X[j - 1] - X[j]) * left) / sl;
+        const ry = Y[j] + ((Y[j - 1] - Y[j]) * left) / sl;
+        const z = this.z[i];
+        if (!hits(X[i], Y[i], rx, ry, z)) continue;
+        const lx = lxs[i];
+        const ly = lys[i];
+        let w = 0;
+        for (let d = 0.25; d <= 3 && !w; d += 0.25) {
+          for (const g of [1, -1]) {
+            const ox = lx * d * g;
+            const oy = ly * d * g;
+            if (!TW.drivable(X[i] + ox, Y[i] + oy, z) || hits(X[i] + ox, Y[i] + oy, rx + ox, ry + oy, z)) continue;
+            w = (d + 0.25) * g;
+            break;
+          }
+        }
+        if (!w) continue;
+        for (let k = Math.max(0, i - back); k <= Math.min(n - 1, i + ahead); k++) if (Math.abs(w) > Math.abs(want[k])) want[k] = w;
+        any = true;
+      }
     }
     if (!any) return;
     // Ease: each way, no more than 0.3 m sideways per metre along.
@@ -3285,6 +3365,8 @@ export class RouteTrack {
       if (ri >= 0 && ownHalfFree(nodes, ri, projectOnRoad(data.roads[ri], nodes.cum[ri], X[i], Y[i]), true)) tFree[i] = 1;
     }
     const tLines = turnLines(data, this.road, own, tFree, X, Y);
+    /** Samples of a corner too tight with the guard (TURN_GUARD_R), which do without it. */
+    const noGuard = new Uint8Array(n);
     /** Whether the stretch being solved may use the junction box its turn needs. */
     let relax = false;
     /** How far left of the matched road's centre line (x, y) is, facing (ux, uy); Infinity in a junction or near a dead end. */
@@ -3339,7 +3421,10 @@ export class RouteTrack {
         const least = OWN_MIN - OWN_GIVE;
         if (lat < least) bad += 4 + (least - lat) * 2;
       }
-      if (tFree[i]) {
+      // (A left turn solved using its junction box swings wide in it, not into the oncoming lanes of the
+      // roads it turns from and into: unless that kinks it, TURN_GUARD_R. A right turn or a corner on the
+      // way through may use the box as before.)
+      if (tFree[i] && !noGuard[i] && relax && tLines[10 * i + 8] === Math.fround(TURN_LEFT_MIN)) {
         const lat = turnSide(tLines, i, x, y, ux, uy);
         if (lat < -OWN_GIVE) bad += 4 + (-OWN_GIVE - lat) * 2;
       }
@@ -3629,6 +3714,12 @@ export class RouteTrack {
         if (tight < R_OK) {
           relax = true;
           solveWindow(A, B);
+          tight = Infinity;
+          for (let i = A + 1; i < B; i++) tight = Math.min(tight, this.radiusAt(i));
+          if (tight < TURN_GUARD_R) {
+            noGuard.fill(1, A, B + 1);
+            solveWindow(A, B);
+          }
           relax = false;
         }
       }
