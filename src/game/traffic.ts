@@ -123,6 +123,20 @@ function idm(v: number, v0: number, gap: number, vLead: number, s0: number): num
 const MAJOR_GAP = 6;
 /** ...and how far ahead (s) oncoming right-turners see it coming (a bus from rest needs 6-7 s to clear its path). */
 const CLAIM_GAP = 9;
+/** The player's bus pulling away (m/s^2), as its claims time it, up to `PLAYER_A_V` m/s. */
+const PLAYER_A = 1.5;
+const PLAYER_A_V = 8;
+/** Stopped this close (m) behind its stop line on a green, the player's bus is about to go: it claims the junction. */
+const LAUNCH_D = 4;
+/** ...through the junction's nodes this far (m) ahead. */
+const LAUNCH_R = 60;
+
+/** Seconds until the player's bus gets d m ahead: at its speed, or picking up speed from a crawl. */
+function playerEta(d: number, v: number): number {
+  const a = PLAYER_A * Math.min(1, Math.max(0, (PLAYER_A_V - v) / 5));
+  if (a <= 0) return d / Math.max(v, 1);
+  return (Math.sqrt(v * v + 2 * a * d) - v) / a;
+}
 /** How far past a route's stop line a signalised junction's first node may lie and still be on that line's light (m). */
 const FAR_LINE = 70;
 
@@ -766,7 +780,12 @@ export class Traffic {
     // ramp had already committed and pulled out in front).
     const ahead = Math.max(30, v * MAJOR_GAP);
     const claim = Math.max(ahead, v * CLAIM_GAP);
-    for (let k = lo; k < jl.length && jl[k].s - s < claim + 10; k++) {
+    // Stopped at the stop line of a green: about to pull away. (A right turn across our path from
+    // the other side, starting on the same green, would otherwise be on its way before we move.)
+    // (The line it waits at for the light: the route's, often well before the node's own box edge.)
+    const line = this.signalPlan(g.track).jLine;
+    let launch = false;
+    for (let k = lo; k < jl.length && jl[k].s - s < Math.max(claim, LAUNCH_R) + 10; k++) {
       const j = jl[k];
       if (j.s + j.boxR + len < s) continue;
       if (!j.sig && !j.minor && v > 1 && j.s - s < ahead) this.cars.markMajor(j.node, time, PLAYER_HOLD);
@@ -775,13 +794,15 @@ export class Traffic {
       const light = j.sig && !j.inside ? this.cars.signalFor(j.node, j.inX, j.inY, time, j.outX, j.outY) : null;
       // (Not on the way to a red light we can still stop at: the other way's green is its own.)
       const red = light === 'red' && !inBox && !committed;
+      // (Not to turn right across the oncoming flow: that it waits for.)
+      if (v <= 1 && light === 'green' && j.cls !== Turn.Right && Math.abs(line[k] - s) < LAUNCH_D) launch = true;
       // Right of way: in the box, our light (or the light we entered the junction on), or the main road.
       // (On an arm with no light, or from a side road, the autopilot gives way instead.)
       const prio = inBox || (j.sig ? j.inside || light !== null : !j.minor);
       // (Cars in the next lane do not turn across ours in front of us, crossing ones not across our path.)
-      if (inBox || (v > 1 && !red && j.s - s < claim)) {
+      if (inBox || (!red && ((v > 1 && j.s - s < claim) || (launch && j.s - s < LAUNCH_R)))) {
         g.track.sample(j.stopS, this.tmp);
-        const eta = inBox ? 0 : (j.s - s) / Math.max(v, 1);
+        const eta = inBox ? 0 : playerEta(j.s - s, v);
         this.cars.claimApproach(j.node, this.tmp.x, this.tmp.y, j.inX, j.inY, j.outX, j.outY, j.cls, eta, time + 0.5, inBox || j.s - s < ahead, prio);
       }
       if (inBox || committed) this.cars.enter(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time + 0.5);
@@ -1138,7 +1159,9 @@ export class Traffic {
       if (st === null && this.cars.conflictEta(j.node, j.inX, j.inY, j.outX, j.outY, j.cls, j.cls === Turn.Left ? GAP_LEFT : GAP_ACROSS) < Infinity) return Wait.Junction;
     } else if (this.cars.giveWayBusy(j.node, j.minor, time)) return Wait.Junction;
     // (Not across the player's bus where it has right of way, nor turning right across it, as the cars do.)
-    if (this.cars.playerConflict(j.node, j.inX, j.inY, j.outX, j.outY, j.cls, time, clearTime(b.v, Math.max(0, stopAt) + 2 * j.boxR + b.len, BUS_A))) return Wait.Player;
+    // (Clear of the box: from a line drawn well back, as at the busway junctions, the node is further than a box on.)
+    const clearD = Math.max(Math.max(0, stopAt) + 2 * j.boxR, j.s - b.s + j.boxR) + b.len;
+    if (this.cars.playerConflict(j.node, j.inX, j.inY, j.outX, j.outY, j.cls, time, clearTime(b.v, clearD, BUS_A))) return Wait.Player;
     if (!this.cars.boxClear(j.node, -b.id, j.inX, j.inY, j.outX, j.outY, j.cls, time)) return this.cars.boxBlocker === PLAYER_HOLD ? Wait.Player : Wait.Junction;
     // Room on the far side for the whole bus to get out of the box (it never
     // stops with its tail across the junction). Waiting for a queue that is
