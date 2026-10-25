@@ -1042,10 +1042,11 @@ function buildUndergroundPlatform(c: Ctx, b: StationBuild, g: PlatformGeom, top:
         0,
         0,
       );
-      geo.paint(STAINLESS);
+      // mullions: stainless at KGS, dark frames at Queen St (photos: Vision_Australia_..._Queen_Street_bus_station)
+      geo.paint(kgs ? STAINLESS : 0x2a2b2d);
       geo.box(ax, ay, top(ax, ay), top(ax, ay) + 2.7, a.tx, a.ty, 0.035, 0.05);
       // bulkhead over the glass up to the hall ceiling
-      geo.paint(kgs ? 0xd9d9d4 : 0x9a9488);
+      geo.paint(kgs ? 0xd9d9d4 : 0x6f695f);
       geo.face(
         [
           [ax, ay, top(ax, ay) + 2.7],
