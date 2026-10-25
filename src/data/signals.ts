@@ -182,6 +182,55 @@ function project(r: Road, g: RoadGeo, x: number, y: number): { s: number; d: num
   return { s: bs, d: best, z: bz };
 }
 
+/**
+ * The incoming arm (of a junction centred at (cx, cy)) a vehicle at (x, y)
+ * travelling (dirX, dirY) arrives on: the arm pointing back along its travel,
+ * where it stands breaking near ties. -1 if none.
+ */
+function pickArm(arms: readonly Pick<SignalArm, 'ux' | 'uy' | 'incoming'>[], cx: number, cy: number, x: number, y: number, dirX?: number, dirY?: number): number {
+  let best = -1;
+  let bd = -Infinity;
+  const hasDir = dirX !== undefined && dirY !== undefined && (dirX !== 0 || dirY !== 0);
+  let bx = x - cx;
+  let by = y - cy;
+  const bl = Math.hypot(bx, by);
+  if (bl > 1e-3) {
+    bx /= bl;
+    by /= bl;
+  }
+  // Where we stand counts too once we are clearly out on an arm, but only to
+  // break ties between arms that point about the way we came (a skewed
+  // junction): the centre of a wide or multi-node junction can lie well off
+  // the road, and then where we stand says little.
+  const w = hasDir ? Math.max(0, Math.min(1, (bl - 4) / 8)) * 0.6 : 1;
+  let top = -Infinity;
+  if (hasDir) for (const a of arms) if (a.incoming) top = Math.max(top, -(a.ux * dirX! + a.uy * dirY!));
+  arms.forEach((a, i) => {
+    if (!a.incoming) return;
+    // The arm pointing back along our travel, and the arm we stand on.
+    const h = hasDir ? -(a.ux * dirX! + a.uy * dirY!) : 0;
+    if (h < top - TIE) return;
+    const d = h + (bl > 1e-3 ? w * (a.ux * bx + a.uy * by) : -i * 1e-3);
+    if (d > bd) {
+      bd = d;
+      best = i;
+    }
+  });
+  return best;
+}
+
+/**
+ * Where a signal node's light is asked from: 2 m before the node along the
+ * traffic it faces (fx, fy), or, for a node far out on a big junction's
+ * approach, nearer the centre (so that it is still this junction's).
+ */
+function nodeAsk(cx: number, cy: number, x: number, y: number, fx: number, fy: number): { x: number; y: number } {
+  const ax = x - fx * 2 - cx;
+  const ay = y - fy * 2 - cy;
+  const c = Math.min(1, 30 / (Math.hypot(ax, ay) || 1));
+  return { x: cx + ax * c, y: cy + ay * c };
+}
+
 /** Unit direction (vertex order) of the road's segment nearest (x, y). */
 function segmentDir(r: Road, x: number, y: number): [number, number] {
   const p = r.pts;
@@ -469,9 +518,10 @@ export class SignalModel {
       const x = sig[2 * m];
       const y = sig[2 * m + 1];
       const [rx, ry] = segmentDir(roads[ri], x, y);
-      arms.forEach((a, i) => {
-        if (a.incoming && -(a.ux * rx + a.uy * ry) * d > FACE && (x - cx) * a.ux + (y - cy) * a.uy > -6) controlled.add(i);
-      });
+      // (the arm its traffic is asked on, as approachDir and stateAt ask it)
+      const q = nodeAsk(cx, cy, x, y, rx * d, ry * d);
+      const i = pickArm(arms, cx, cy, q.x, q.y, rx * d, ry * d);
+      if (i >= 0 && -(arms[i].ux * rx + arms[i].uy * ry) * d > FACE) controlled.add(i);
     }
     // Phases: pair opposite controlled arms (straight through each other), the rest alone.
     // Signals nobody can see (every approach is inside a tunnel, e.g. in an
@@ -841,35 +891,7 @@ export class SignalModel {
   /** The incoming arm a vehicle at (x, y) travelling (dirX, dirY) arrives on (-1 if the junction has none). */
   approachArm(ji: number, x: number, y: number, dirX?: number, dirY?: number): number {
     const j = this.junctions[ji];
-    let best = -1;
-    let bd = -Infinity;
-    const hasDir = dirX !== undefined && dirY !== undefined && (dirX !== 0 || dirY !== 0);
-    let bx = x - j.x;
-    let by = y - j.y;
-    const bl = Math.hypot(bx, by);
-    if (bl > 1e-3) {
-      bx /= bl;
-      by /= bl;
-    }
-    // Where we stand counts too once we are clearly out on an arm, but only to
-    // break ties between arms that point about the way we came (a skewed
-    // junction): the centre of a wide or multi-node junction can lie well off
-    // the road, and then where we stand says little.
-    const w = hasDir ? Math.max(0, Math.min(1, (bl - 4) / 8)) * 0.6 : 1;
-    let top = -Infinity;
-    if (hasDir) for (const a of j.arms) if (a.incoming) top = Math.max(top, -(a.ux * dirX! + a.uy * dirY!));
-    j.arms.forEach((a, i) => {
-      if (!a.incoming) return;
-      // The arm pointing back along our travel, and the arm we stand on.
-      const h = hasDir ? -(a.ux * dirX! + a.uy * dirY!) : 0;
-      if (h < top - TIE) return;
-      const d = h + (bl > 1e-3 ? w * (a.ux * bx + a.uy * by) : -i * 1e-3);
-      if (d > bd) {
-        bd = d;
-        best = i;
-      }
-    });
-    return best;
+    return pickArm(j.arms, j.x, j.y, x, y, dirX, dirY);
   }
 
   /**
@@ -877,12 +899,12 @@ export class SignalModel {
    * signal node at (x, y), and the point to ask stateAt from. Where the path
    * comes up to one of the junction's signal nodes facing its way (within
    * 9 m, its last 12 m heading within 60 degrees of the node's facing), that
-   * chord, asked from just before the node: the arm that node controls,
-   * however the path turns before the centre of a wide junction. Else the chord over the 15 m before the path's
-   * point nearest the junction centre, whatever the path does after it (a
-   * stop line or signal node on the exit arm doesn't matter), asked 12 m
-   * before the junction. `at(s, out)` samples the path; `s` is the path
-   * distance of the signal. Null when no junction.
+   * node's facing, asked from just before it: the arm the node controls
+   * (however the path turns before the centre of a wide junction). Else the
+   * chord over the 15 m before the path's point nearest the junction centre,
+   * whatever the path does after it (a stop line or signal node on the exit
+   * arm doesn't matter), asked 12 m before the junction. `at(s, out)` samples
+   * the path; `s` is the path distance of the signal. Null when no junction.
    */
   approachDir(x: number, y: number, z: number | undefined, at: (s: number, out: { x: number; y: number }) => unknown, s: number): { dx: number; dy: number; x: number; y: number } | null {
     const ji = this.junctionAt(x, y, undefined, undefined, z);
@@ -902,12 +924,9 @@ export class SignalModel {
           const dx = (p.x - b.x) / l;
           const dy = (p.y - b.y) / l;
           if (dx * f[k + 2] + dy * f[k + 3] <= FACE) continue;
-          // (asked from just before the node: its own junction, whatever lies near the path further
-          // back; a node far out on a big junction's approach is asked nearer its centre)
-          const ax = f[k] - f[k + 2] * 2 - j.x;
-          const ay = f[k + 1] - f[k + 3] * 2 - j.y;
-          const c = Math.min(1, 30 / (Math.hypot(ax, ay) || 1));
-          return { dx, dy, x: j.x + ax * c, y: j.y + ay * c };
+          // (asked as the junction decided which arm the node controls)
+          const a = nodeAsk(j.x, j.y, f[k], f[k + 1], f[k + 2], f[k + 3]);
+          return { dx: f[k + 2], dy: f[k + 3], x: a.x, y: a.y };
         }
       }
     }
