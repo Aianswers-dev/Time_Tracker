@@ -73,6 +73,9 @@ SMALL_WATER_TUNNEL = 8.0  # m under the level of creeks and ponds
 CLR_ROAD = 5.5  # deck surface above a road surface below (4.6-5 m clearance + deck)
 CLR_RAIL = 7.0  # above rail (overhead wires)
 CLR_PED = 4.5  # above pedestrian streets, and service over service (car-park ramps over lanes)
+# A service way or path signed with a lower maxheight (a car park's lane under its own ramp, Albert
+# Street's car park at 1.93 m) needs only that much headroom, plus the structure over it
+MAXHEIGHT_DECK = 0.8
 # Over a tunnel the renderer builds a tube (src/world/roads.ts TUBE_H 5.8 m, +0.6
 # for motorways) with a roof: anything above must clear tube + roof (audit #1,
 # #5), plus a margin for the output simplification (ZTOL on both ways).
@@ -151,6 +154,7 @@ class Line:
     meta: dict = field(default_factory=dict)  # the output record (roads.json road / rail entry)
     name: str = ""  # for reports only
     reversed: bool = False  # oneway=-1: xy/nodes run against the OSM way
+    maxheight: float = 0.0  # signed headroom (m), 0 if none
     # filled by solve(): dense polyline and heights
     dxy: np.ndarray | None = None
     dz: np.ndarray | None = None
@@ -820,6 +824,11 @@ def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5,
     # over a tunnel: its tube and roof (whatever the kinds)
     tube = low_tunnel & (g.ekind[eb] != RAIL)
     clr = np.where(tube, np.maximum(clr, np.where(g.ekind[eb] == 0, CLR_TUBE_MWY, CLR_TUBE)), clr)
+    # a minor way under it signed with a lower maxheight (never a tube: the renderer's is full height)
+    mh = np.asarray([ln.maxheight for ln in lines])[lb]
+    signed = (mh > 0) & np.isin(g.ekind[eb], MINOR) & ~tube
+    clr = np.where(signed, np.minimum(clr, mh + MAXHEIGHT_DECK), clr)
+    log(f"{int(signed.sum())} crossings over minor ways signed with a maxheight (clearance from the sign)")
     clr_full = clr.copy()
     # Two ways that also meet at a junction nearby can only be as far apart
     # vertically as the grade caps allow along the network between the two
@@ -902,9 +911,12 @@ def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5,
     # its own constraints may have lowered since (Victoria Bridge humped 3-4 m
     # over the expressway ramps: sat review #8).
     REPAIR = 3.0
+    # (three passes: a deck over a way that the second pass lifts gets its own repair after it, as the
+    # Airport Link ramps over the M3 ramp at Bowen Hills, whose deck the second pass raised 4 m)
+    REPAIR_PASSES = 3
     U2 = U.copy()
     Lkeep = Lb.copy()  # direct bounds and what the ways over lowered tunnels had to give
-    for rp in range(2):
+    for rp in range(REPAIR_PASSES):
         za, zb = at(z, ea, ta), at(z, eb, tb)
         short = za - zb < clr - 0.2
         sel = raise_up

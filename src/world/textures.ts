@@ -254,3 +254,139 @@ export function makeGlowTexture(size = 128): THREE.DataTexture {
   t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
   return t;
 }
+
+/**
+ * Tunnel signs, lit from behind: a 512 x 128 atlas of 128 x 64 px cells. Row 0: emergency exit (running
+ * figure, door and arrow) pointing left, the same pointing right, emergency phone (SOS), fire hose reel.
+ * Row 1: lane control signals, 64 x 64 px each: green arrow down (lane open), red cross (lane closed).
+ * Cell (col, row) spans u col/4..(col+1)/4 and v 1-(row+1)/2..1-row/2 (see signFace in roads.ts).
+ */
+export function makeTunnelSignTexture(): THREE.CanvasTexture {
+  const c = document.createElement('canvas');
+  c.width = 512;
+  c.height = 128;
+  const g = c.getContext('2d')!;
+  g.fillStyle = '#101214';
+  g.fillRect(0, 0, 512, 128);
+  const panel = (x: number, y: number, w: number, h: number, fill: string) => {
+    g.fillStyle = '#e8ece8';
+    g.fillRect(x + 2, y + 2, w - 4, h - 4);
+    g.fillStyle = fill;
+    g.fillRect(x + 4, y + 4, w - 8, h - 8);
+  };
+  /** Running figure in a 48 px box at (x, y), facing +dir. */
+  const runner = (x: number, y: number, dir: number) => {
+    g.save();
+    g.translate(x + 24, y);
+    g.scale(dir, 1);
+    g.translate(-24, 0);
+    g.fillStyle = '#fff';
+    g.strokeStyle = '#fff';
+    g.lineCap = 'round';
+    g.lineJoin = 'round';
+    g.lineWidth = 6;
+    g.beginPath();
+    g.arc(32, 8, 5.5, 0, Math.PI * 2);
+    g.fill();
+    g.beginPath();
+    g.moveTo(28, 17);
+    g.lineTo(21, 31);
+    g.lineTo(31, 37);
+    g.lineTo(29, 46);
+    g.moveTo(21, 31);
+    g.lineTo(15, 40);
+    g.lineTo(5, 41);
+    g.moveTo(14, 22);
+    g.lineTo(25, 17);
+    g.lineTo(33, 23);
+    g.lineTo(41, 19);
+    g.stroke();
+    g.restore();
+  };
+  /** Arrow centred at (x, y), `len` long, pointing +dir along x. */
+  const arrow = (x: number, y: number, len: number, dir: number) => {
+    const h = len / 2;
+    g.fillStyle = '#fff';
+    g.beginPath();
+    g.moveTo(x + dir * h, y);
+    g.lineTo(x + dir * (h - 13), y - 13);
+    g.lineTo(x + dir * (h - 13), y - 5);
+    g.lineTo(x - dir * h, y - 5);
+    g.lineTo(x - dir * h, y + 5);
+    g.lineTo(x + dir * (h - 13), y + 5);
+    g.lineTo(x + dir * (h - 13), y + 13);
+    g.closePath();
+    g.fill();
+  };
+  for (const [col, dir] of [
+    [0, -1],
+    [1, 1],
+  ]) {
+    const x0 = col * 128;
+    panel(x0, 0, 128, 64, '#0a7d3b');
+    // the figure runs out through a door frame toward the arrow
+    g.strokeStyle = '#fff';
+    g.lineWidth = 3;
+    g.strokeRect(dir > 0 ? x0 + 14 : x0 + 86, 11, 28, 43);
+    runner(dir > 0 ? x0 + 30 : x0 + 50, 9, dir);
+    arrow(dir > 0 ? x0 + 101 : x0 + 27, 32, 30, dir);
+  }
+  // emergency phone: handset and SOS
+  panel(256, 0, 128, 64, '#1f56a8');
+  g.fillStyle = '#fff';
+  g.save();
+  g.translate(290, 32);
+  g.rotate(-0.6);
+  g.fillRect(-15, -4, 30, 8);
+  g.fillRect(-19, -4, 10, 15);
+  g.fillRect(9, -4, 10, 15);
+  g.restore();
+  g.font = 'bold 30px Arial, Helvetica, sans-serif';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillText('SOS', 346, 34);
+  // fire hose reel: drum, hose and nozzle
+  panel(384, 0, 128, 64, '#c8161e');
+  g.strokeStyle = '#fff';
+  g.lineWidth = 6;
+  g.beginPath();
+  g.arc(424, 32, 17, 0, Math.PI * 2);
+  g.stroke();
+  g.beginPath();
+  g.arc(424, 32, 6, 0, Math.PI * 2);
+  g.stroke();
+  g.beginPath();
+  g.moveTo(441, 32);
+  g.lineTo(470, 32);
+  g.lineTo(486, 22);
+  g.stroke();
+  g.fillStyle = '#fff';
+  g.fillRect(482, 15, 10, 9);
+  // lane control signals on black: green arrow down, red cross
+  g.fillStyle = '#050505';
+  g.fillRect(0, 64, 128, 64);
+  g.fillStyle = '#3cff5a';
+  g.beginPath();
+  g.moveTo(32, 120);
+  g.lineTo(12, 96);
+  g.lineTo(25, 96);
+  g.lineTo(25, 72);
+  g.lineTo(39, 72);
+  g.lineTo(39, 96);
+  g.lineTo(52, 96);
+  g.closePath();
+  g.fill();
+  g.strokeStyle = '#ff3020';
+  g.lineWidth = 10;
+  g.lineCap = 'butt';
+  g.beginPath();
+  g.moveTo(78, 78);
+  g.lineTo(114, 114);
+  g.moveTo(114, 78);
+  g.lineTo(78, 114);
+  g.stroke();
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}

@@ -220,8 +220,36 @@ export function platformGeoms(data: MapData): PlatformGeom[] {
       y0 = Math.min(y0, outline[i + 1]);
       y1 = Math.max(y1, outline[i + 1]);
     }
-    // Height: fit a line to the busway height beside the longest kerb.
+    // Height: fit a line to the busway height beside the longest kerb. With no bus road beside it, the
+    // ground along its longest side: a stop on a sloping drive follows the slope rather than lying level
+    // at its middle's height and buried at its high end (the School Bus Stop off College Drive).
     let plane = { px: (x0 + x1) / 2, py: (y0 + y1) / 2, tx: 1, ty: 0, z0: heightAt((x0 + x1) / 2, (y0 + y1) / 2), slope: 0 };
+    {
+      const m = outline.length / 2;
+      let ex = 1;
+      let ey = 0;
+      let best = 0;
+      for (let i = 0; i < m; i++) {
+        const j = (i + 1) % m;
+        const dx = outline[2 * j] - outline[2 * i];
+        const dy = outline[2 * j + 1] - outline[2 * i + 1];
+        const l = Math.hypot(dx, dy);
+        if (l > best) [best, ex, ey] = [l, dx / l, dy / l];
+      }
+      let d0 = Infinity;
+      let d1 = -Infinity;
+      for (let i = 0; i < m; i++) {
+        const d = (outline[2 * i] - plane.px) * ex + (outline[2 * i + 1] - plane.py) * ey;
+        d0 = Math.min(d0, d);
+        d1 = Math.max(d1, d);
+      }
+      if (d1 - d0 > 8) {
+        const za = heightAt(plane.px + ex * (d0 + 1), plane.py + ey * (d0 + 1));
+        const zb = heightAt(plane.px + ex * (d1 - 1), plane.py + ey * (d1 - 1));
+        const slope = Math.max(-0.12, Math.min(0.12, (zb - za) / (d1 - d0 - 2)));
+        plane = { px: plane.px, py: plane.py, tx: ex, ty: ey, z0: (za + zb) / 2 - (slope * (d0 + d1)) / 2, slope };
+      }
+    }
     const main = chains.reduce<KerbChain | null>((a, c) => (!a || c.len > a.len ? c : a), null);
     if (main) {
       const ds: number[] = [];
