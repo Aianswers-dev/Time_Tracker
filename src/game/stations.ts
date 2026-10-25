@@ -1817,7 +1817,8 @@ function buildTower(c: Ctx, b: StationBuild, t: TowerDef, base: number | null): 
     // low white hipped roof on a thin eave (Woolloongabba, QUT Kelvin Grove, Normanby): an X of ridges from
     // above, a flat cantilevered hat from the platform
     geo.paint(WHITE);
-    geo.box(t.x, t.y, z1, z1 + 0.3, hx, hy, hw + ow, hd + od, true);
+    geo.box(t.x, t.y, z1, z1 + 0.3, hx, hy, hw + ow, hd + od);
+    hatSoffit(geo, t, hx, hy, hw + ow, hd + od, z1);
     const rise = Math.min(hw + ow, hd + od) * 0.2;
     const ring = cs.map(([i, j]) => [t.x + hx * (hw + ow) * i + vx * (hd + od) * j, t.y + hy * (hw + ow) * i + vy * (hd + od) * j] as [number, number]);
     for (let i = 0; i < 4; i++) {
@@ -1840,7 +1841,8 @@ function buildTower(c: Ctx, b: StationBuild, t: TowerDef, base: number | null): 
   } else {
     // flat cantilevered hat roof
     geo.paint(WHITE);
-    geo.box(t.x, t.y, z1, z1 + 0.35, hx, hy, hw + ow, hd + od, true);
+    geo.box(t.x, t.y, z1, z1 + 0.35, hx, hy, hw + ow, hd + od);
+    hatSoffit(geo, t, hx, hy, hw + ow, hd + od, z1);
     geo.paint(0x2b2f33);
     geo.box(t.x, t.y, z1 + 0.35, z1 + 0.55, hx, hy, hw + ow - 0.2, hd + od - 0.2);
   }
@@ -1853,6 +1855,24 @@ function buildTower(c: Ctx, b: StationBuild, t: TowerDef, base: number | null): 
     geo.box(p[0] + vx * 0.5, p[1] + vy * 0.5, z1 - 1 - bh, z1 - 1, hx, hy, 0.5, 0.03);
     geo.deferSign(c.atlas, key, p[0] + vx * 0.5, p[1] + vy * 0.5, z1 - 1 - bh / 2, hx, hy, 0.95, bh, 0.035);
   }
+}
+
+/** The hat's underside: a light panel soffit with downlights, like the platform canopies (it reads from the cab). */
+function hatSoffit(geo: SGeo, t: TowerDef, hx: number, hy: number, hl: number, hw: number, z: number): void {
+  const vx = -hy;
+  const vy = hx;
+  geo.paint(0xe8e8e4, Pat.Soffit, 1.5);
+  geo.face(
+    [
+      [t.x - hx * hl - vx * hw, t.y - hy * hl - vy * hw, z],
+      [t.x + hx * hl - vx * hw, t.y + hy * hl - vy * hw, z],
+      [t.x + hx * hl + vx * hw, t.y + hy * hl + vy * hw, z],
+      [t.x - hx * hl + vx * hw, t.y - hy * hl + vy * hw, z],
+    ],
+    0,
+    0,
+    -1,
+  );
 }
 
 /** A glazed lift shaft (Mater Hill): glass all round in a light steel frame, a thin flat cap. */
