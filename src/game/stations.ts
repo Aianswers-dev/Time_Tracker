@@ -1221,11 +1221,34 @@ function buildMedian(c: Ctx, b: StationBuild): void {
         }
         const mx = (ax + bx) / 2;
         const my = (ay + by) / 2;
-        const hit = c.idx.nearest(mx, my, 4, undefined, 0, isBus);
+        const hit = c.idx.nearest(mx, my, 12, undefined, 0, isBus);
         if (!hit) continue;
-        // the busway's centreline must be under the fence (never across a lane)
-        if (hit.dist > 1.4) continue;
-        pts.push({ x: mx, y: my, z: hit.z, tx: s.tx, ty: s.ty });
+        // the fence stands on a two-way busway's centreline (never across a lane): at the kerbs' midpoint,
+        // or on the centreline itself where the bays make one side wider (Roma St); or in the gap between
+        // two one-way carriageways (Cultural Centre)
+        const road = c.data.roads[hit.road];
+        const hz = hit.z;
+        let fx = mx;
+        let fy = my;
+        if (!road.oneway) {
+          if (hit.dist > 3.5) continue;
+          if (hit.dist > 1.4) {
+            fx = hit.px;
+            fy = hit.py;
+          }
+        } else {
+          // a one-way pair: midway between this carriageway's centreline and the opposite one's
+          const p1x = hit.px;
+          const p1y = hit.py;
+          const h2 = c.idx.nearest(mx, my, 12, Math.atan2(-hit.dx, -hit.dy), 0.7, (r) => isBus(r) && r.oneway);
+          if (!h2) continue;
+          const sep = Math.hypot(h2.px - p1x, h2.py - p1y);
+          if (sep < 5 || sep > 16) continue;
+          fx = (p1x + h2.px) / 2;
+          fy = (p1y + h2.py) / 2;
+          if (Math.hypot(fx - mx, fy - my) > 4) continue;
+        }
+        pts.push({ x: fx, y: fy, z: hz, tx: s.tx, ty: s.ty });
       }
       if (pts.length < 4) continue;
       fenceRun(c, geo, glass, def, pts);
