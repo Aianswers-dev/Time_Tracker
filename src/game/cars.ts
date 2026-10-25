@@ -137,6 +137,8 @@ interface PlayerApproach {
 const ONCOMING_MARGIN = 1.5;
 /** Car acceleration (m/s^2). */
 const CAR_A = 1.7;
+/** Half a car's width (m), as the overlap checks take it. */
+const CAR_HALF_W = 0.92;
 /** Distance (m) before a node over which a car going straight on eases to the next lane's offset. */
 const LANE_BLEND = 14;
 /** Gap (s) to the next vehicle on a conflicting movement that one giving way waits for: merging left, and across. */
@@ -619,6 +621,28 @@ export class CarTraffic {
           this.stopD[a] = Math.max(this.stopD[a], Math.min(need, e.len - 2));
         }
       }
+    }
+    // The arm on a car's left leaving at an acute angle: its exit lane runs close past the waiting
+    // car's nose (the kerb lanes of the two arms face each other). Hold the car back until its
+    // front corner clears a car on that lane, or the two block each other in the box for good.
+    for (let a = 0; a < this.edges.length * 2; a++) {
+      if (!this.stopD[a]) continue;
+      const nd = this.nodes[this.endNode(a)];
+      const [ax, ay] = this.laneEndDir(a);
+      const la = this.laneOffset(a, 0) + CAR_HALF_W;
+      let need = 0;
+      for (const o of nd.out) {
+        if (o >> 1 === a >> 1) continue;
+        const [ox, oy] = this.laneStartDir(o);
+        if (ox * -ay + oy * ax <= 0) continue; // not on our left
+        const cos = -(ax * ox + ay * oy); // between our arm (pointing away from the node) and that one
+        const sin = Math.sqrt(Math.max(0, 1 - cos * cos));
+        if (cos <= 0 || sin < 0.2) continue;
+        const front = (this.laneOffset(o, 0) + CAR_HALF_W + 0.3 + la * cos) / sin;
+        need = Math.max(need, front + 2.3);
+      }
+      const e = this.edges[a >> 1];
+      this.stopD[a] = Math.max(this.stopD[a], Math.min(25, need, e.len - 2));
     }
     // Signals: those near a junction control the junction; the rest are
     // mid-block (pedestrian) lights with their own stop line on the lane.
