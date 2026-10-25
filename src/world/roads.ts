@@ -20,7 +20,7 @@ import * as THREE from 'three';
 import { RoadKind, type EdgeWalls, type Road } from '../types';
 import { type Ctx, densityAt } from './ctx';
 import { MeshGeo } from './geo';
-import { RoadIndex, roadHeight } from './roadindex';
+import { RoadIndex, roadHeight, roadRank } from './roadindex';
 import { NOISE_GLSL, patch } from './shaders';
 import type { TerrainField } from './terrain';
 import { greenBridgeSpan, storyOutline } from './landmarks';
@@ -682,6 +682,59 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   let stopPts: number[] | null = null;
   // station stopping bays (pipeline roads beside the busway, under the platform's edge)
   const bays = new RoadIndex(roads, data.bounds, (r) => !!r.bay);
+  // Paving under the carriageways it overlaps. A station bay's ribbon runs on under the busway it widens,
+  // and a pedestrian street's on into the road it meets. Both heights come from the data in whole
+  // decimetres, so where they overlap the two surfaces cross each other a few cm apart, and the bay's
+  // concrete or the pavers show through the asphalt in jagged patches across the lanes (Queen Street and
+  // King George Square stations, Dutton Park Place). Where the paving lies on a carriageway that draws
+  // above it (roadRank), its ribbon stops PAVE_OVER inside that carriageway's edge, PAVE_DROP under it.
+  const PAVE_DROP = 0.04;
+  const PAVE_OVER = 0.2;
+  /** Surface height of the carriageway drawn above paving road ri at (x, y), or NaN where there is none. */
+  const pavingCover = (ri: RI, x: number, y: number, z: number): number => {
+    const idx = ri.r.tunnel ? tunnels : index;
+    const rank = roadRank(ri.r);
+    if (idx.cover(x, y, z, 0.3, ri.i, (q) => roadRank(roads[q]) > rank) <= 0) return NaN;
+    return idx.coverZ + infos[idx.coverRoad].lift;
+  };
+  /** Paving road ri's surface height h at (x, y), under any carriageway drawn above it there. */
+  const pavingZ = (ri: RI, x: number, y: number, z: number, h: number): number => {
+    const c = pavingCover(ri, x, y, z);
+    return Number.isNaN(c) ? h : Math.min(h, c - PAVE_DROP);
+  };
+  /**
+   * Paving road ri's cross-section at (x, y) (normal (nx, ny), half-width hw, surface h): the offsets and
+   * heights of its left and right edges. An edge on a carriageway drawn above it moves in to PAVE_OVER past
+   * that carriageway's edge, PAVE_DROP under it; with both edges on one, it stays, PAVE_DROP under.
+   */
+  const pavingSection = (ri: RI, x: number, y: number, z: number, h: number, nx: number, ny: number, hw: number): [number, number, number, number] => {
+    const at = (o: number) => pavingCover(ri, x + nx * o, y + ny * o, z);
+    const cL = at(hw);
+    const cR = at(-hw);
+    const inL = !Number.isNaN(cL);
+    const inR = !Number.isNaN(cR);
+    if (inL === inR) return inL ? [hw, Math.min(h, cL - PAVE_DROP), -hw, Math.min(h, cR - PAVE_DROP)] : [hw, h, -hw, h];
+    // one edge on it: find where the section leaves it (0.25 m steps, then halving)
+    const sg = inL ? 1 : -1;
+    let inside = sg * hw;
+    let outside = -sg * hw;
+    for (let o = hw - 0.25; o > -hw; o -= 0.25) {
+      if (Number.isNaN(at(sg * o))) {
+        outside = sg * o;
+        break;
+      }
+      inside = sg * o;
+    }
+    for (let k = 0; k < 5; k++) {
+      const m = (inside + outside) / 2;
+      if (Number.isNaN(at(m))) outside = m;
+      else inside = m;
+    }
+    const o = sg > 0 ? Math.min(hw, outside + PAVE_OVER) : Math.max(-hw, outside - PAVE_OVER);
+    const c = at(o);
+    const hc = Number.isNaN(c) ? h : Math.min(h, c - PAVE_DROP);
+    return inL ? [o, hc, -hw, h] : [hw, h, o, hc];
+  };
   const mask = ctx.mask;
   const underPlatforms = data.platforms.filter((p) => p.underground || p.layer < 0);
   // each underground platform's level: the bus tunnel beside it, where src/game/platforms.ts takes the
@@ -1088,6 +1141,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const lift = ri.lift;
     const tp = tubePreps.get(ri.i) ?? null;
     const surf = r.bay ? 3 : r.kind === RoadKind.Pedestrian ? 2 : r.bus ? 1 : r.kind === RoadKind.Motorway ? 6 : r.kind === RoadKind.Service ? 5 : 0;
+    // (bay concrete and pavers go under the carriageways they overlap: pavingSection())
+    const paving = !!r.bay || r.kind === RoadKind.Pedestrian;
 
     // ---- asphalt ribbon (and terrain clamp under at-grade roads)
     {
@@ -1110,8 +1165,13 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const rx = x - nx2 * hw;
         const ry = yy - ny2 * hw;
         const tt = tp ? tubeFlag(tp, s, inBox) : 0;
-        const l = g.vert(lx, h, ly, hw, surf, s, tt);
-        const rr = g.vert(rx, h, ry, -hw, surf, s, tt);
+        let oL = hw;
+        let oR = -hw;
+        let hL = h;
+        let hR = h;
+        if (paving) [oL, hL, oR, hR] = pavingSection(ri, x, yy, z, h, nx2, ny2, hw);
+        const l = g.vert(x + nx2 * oL, hL, yy + ny2 * oL, oL, surf, s, tt);
+        const rr = g.vert(x + nx2 * oR, hR, yy + ny2 * oR, oR, surf, s, tt);
         if (prevL >= 0) g.up(prevL, prevR, rr, l);
         prevL = l;
         prevR = rr;
@@ -1133,7 +1193,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const ux = tx / tl;
         const uy = ty / tl;
         const ct = tp ? tubeFlag(tp, end === 0 ? 0 : ri.len, tubeRuns(tp, end === 0 ? 0 : ri.len - 0.01, end === 0 ? 0.01 : ri.len)[0][2]) : 0;
-        const c = g.vert(cx, cz + lift, cy, 0, surf, 0, ct);
+        const c = g.vert(cx, paving ? pavingZ(ri, cx, cy, cz, cz + lift) : cz + lift, cy, 0, surf, 0, ct);
         const segs = 6;
         let prev = -1;
         const arc: number[] = [];
@@ -1141,7 +1201,9 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
           const t = -Math.PI / 2 + (k / segs) * Math.PI;
           const dx = ux * Math.cos(t) - uy * Math.sin(t);
           const dy = ux * Math.sin(t) + uy * Math.cos(t);
-          const vi = g.vert(cx + dx * hw, cz + lift, cy + dy * hw, 0, surf, 0, ct);
+          const ax = cx + dx * hw;
+          const ay = cy + dy * hw;
+          const vi = g.vert(ax, paving ? pavingZ(ri, ax, ay, cz, cz + lift) : cz + lift, ay, 0, surf, 0, ct);
           if (prev >= 0) g.tri(c, prev, vi, 0, 1, 0);
           prev = vi;
           arc.push(cx + dx * hw, cy + dy * hw);
