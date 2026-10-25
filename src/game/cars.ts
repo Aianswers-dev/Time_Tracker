@@ -135,6 +135,8 @@ interface PlayerApproach {
  * metres short: from rest it takes about 4.5 s to clear.)
  */
 const ONCOMING_MARGIN = 1.5;
+/** A car whose lane ends at a node merges in front of the player's bus only this far (s) ahead of it. */
+const MERGE_MARGIN = 1;
 /** Car acceleration (m/s^2). */
 const CAR_A = 1.7;
 /** Half a car's width (m), as the overlap checks take it. */
@@ -1691,6 +1693,18 @@ export class CarTraffic {
       if (dot > 0.8) {
         const side = (c.x - pc.x) * pc.inY - (c.y - pc.y) * pc.inX;
         if (pc.near && ((side > 1.8 && cls === Turn.Left && pc.cls !== Turn.Left) || (side < -1.8 && cls === Turn.Right && pc.cls !== Turn.Right))) return Wait.Player;
+        // Our lane ends here (the road narrows by its offside lane) and the bus is coming along the one we
+        // merge into: unless we are in, tail and all, a second before it gets there, we fall in behind it.
+        if (
+          depth === 0 &&
+          side > 1.8 &&
+          cls === Turn.Straight &&
+          pc.cls === Turn.Straight &&
+          c.laneIdx >= this.lanesIn(next) &&
+          outX * pc.outX + outY * pc.outY > 0.8 &&
+          pc.eta < clearTime(c.v, Math.max(0, stopAt) + this.stopD[lane] + c.len, CAR_A) + MERGE_MARGIN
+        )
+          return Wait.Player;
       } else if (this.playerConflict(N, inX, inY, outX, outY, cls, time, this.turnClear(c, lane, next, stopAt, nd.boxR))) return Wait.Player;
     }
     // The player's bus in (or about to enter) the box: waiting for it is legitimate.
