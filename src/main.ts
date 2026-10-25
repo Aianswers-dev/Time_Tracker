@@ -326,6 +326,13 @@ async function main() {
         }
         return out;
       },
+      /** Junctions the route passes from s0 to s1 (signalised, side-road arrival, stop line, turn). */
+      junctions(s0: number, s1: number) {
+        return traffic.cars
+          .junctionsAlong(auto!.track)
+          .filter((j) => j.s >= s0 && j.s <= s1)
+          .map((j) => ({ node: j.node, x: +j.x.toFixed(1), y: +j.y.toFixed(1), s: +j.s.toFixed(1), stopS: +j.stopS.toFixed(1), boxR: +j.boxR.toFixed(1), sig: j.sig, minor: j.minor, inside: j.inside, cls: j.cls }));
+      },
       report() {
         return { ...auto!.report(), summary: guide.state.summary, served: guide.state.stopsServed, missed: guide.state.stopsMissed, total: guide.state.stopsTotal, events: guide.state.events.map((e) => `${e.kind}: ${e.text}`) };
       },
