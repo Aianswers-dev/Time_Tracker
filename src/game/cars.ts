@@ -2370,7 +2370,20 @@ export class CarTraffic {
           if (to2 < target) target += (to2 - target) * (1 - left / LANE_BLEND);
         }
       }
-      c.lat += Math.max(-dt * 1.2, Math.min(dt * 1.2, target - c.lat));
+      let dl = Math.max(-dt * 1.2, Math.min(dt * 1.2, target - c.lat));
+      if (Math.abs(dl) > 1e-3) {
+        // Not over towards a bus alongside: the lanes of a one-way road gaining one move over with its
+        // kerb at the node, and a car there moved 1.7 m into the side of the player's bus overtaking it
+        // in the kerb lane (222/0 s 2484). We move over once it is by.
+        this.at(c.lane, c.u, c.lat + Math.sign(dl) * 0.8, pt);
+        const hb = bg.nearest(pt.x, pt.y, 2.7, undefined, pt.z);
+        if (hb >= 0) {
+          const d1 = Math.hypot(bg.px[hb] - pt.x, bg.py[hb] - pt.y);
+          this.at(c.lane, c.u, c.lat, pt);
+          if (d1 < Math.hypot(bg.px[hb] - pt.x, bg.py[hb] - pt.y)) dl = 0;
+        }
+      }
+      c.lat += dl;
       this.at(c.lane, c.u, c.lat, pt);
       c.x = pt.x;
       c.y = pt.y;
