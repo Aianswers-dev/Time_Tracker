@@ -11,7 +11,7 @@
 // never stops inside the box. AI buses use the same reservations.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { RoadKind, type BusPose, type MapData, type WorldHandle } from '../types';
+import { RoadKind, type BusPose, type BusSpec, type MapData, type WorldHandle } from '../types';
 import { wrapAngle } from '../data/coords';
 import { speedLimitOf } from './roadIndex';
 import { PointGrid, type Body } from './bodies';
@@ -137,12 +137,39 @@ interface PlayerApproach {
 const ONCOMING_MARGIN = 1.5;
 /** A car whose lane ends at a node merges in front of the player's bus only this far (s) ahead of it. */
 const MERGE_MARGIN = 1;
+/** A route passes through a junction node within 7 m of it or inside its box, up to this far (m). */
+const JUNCTION_PICK_MAX = 9;
+/** Two ways out of a junction this far apart (rad) cross, for vehicles side by side going in. */
+const ACROSS = 0.3;
+/** Stop lines held back from a bus's swept path (holdBackFor): room left (m), farthest line (m), car size (m). */
+const SWEEP_MARGIN = 0.25;
+const SWEEP_MAX = 25;
+const SWEEP_CAR_L = 5;
+const SWEEP_CAR_W = 1.9;
+
+/** Do two rectangles (centre, unit axis along, half length, half width) overlap? (Separating axes.) */
+function boxesTouch(ax: number, ay: number, aux: number, auy: number, al: number, aw: number, bx: number, by: number, bux: number, buy: number, bl: number, bw: number): boolean {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const reach = al + aw + bl + bw;
+  if (dx * dx + dy * dy > reach * reach) return false;
+  // Each box's own two axes (along, across); the other's extent on them through |cos| and |sin|.
+  const c = Math.abs(aux * bux + auy * buy);
+  const s = Math.abs(aux * buy - auy * bux);
+  if (Math.abs(dx * aux + dy * auy) > al + bl * c + bw * s) return false;
+  if (Math.abs(-dx * auy + dy * aux) > aw + bl * s + bw * c) return false;
+  if (Math.abs(dx * bux + dy * buy) > bl + al * c + aw * s) return false;
+  if (Math.abs(-dx * buy + dy * bux) > bw + al * s + aw * c) return false;
+  return true;
+}
 /** Car acceleration (m/s^2). */
 const CAR_A = 1.7;
 /** Half a car's width (m), as the overlap checks take it. */
 const CAR_HALF_W = 0.92;
 /** Distance (m) before a node over which a car going straight on eases to the next lane's offset. */
 const LANE_BLEND = 14;
+/** A link this short (m) before a lane ends: a car merges as if its own lane ended at the node before it. */
+const MERGE_SHORT = 6;
 /** Longest corner cut (m) of a left turn, on either lane. */
 const CUT_MAX = 8;
 /** Gap (s) to the next vehicle on a conflicting movement that one giving way waits for: merging left, and across. */
@@ -422,6 +449,12 @@ export class CarTraffic {
   private ring: Int8Array = new Int8Array(0);
   /** Stop-line distance from the end node for each directed lane (0 = uncontrolled). */
   private stopD: Float32Array = new Float32Array(0);
+  /**
+   * Per directed lane: at its end node (unsignalised) it gives way to the other arms. A lower class
+   * of road than the junction's best, or the stem of a T-junction of equal roads (the T-intersection
+   * rule: the road that ends gives way to the one that goes on).
+   */
+  private minorIn: Uint8Array = new Uint8Array(0);
   /** Junction nodes (3+ arms) on a coarse grid, for mapping bus routes onto them. */
   private nodeGrid = new Map<number, number[]>();
   private busJunctions = new WeakMap<RouteTrack, BusJunction[]>();
@@ -606,6 +639,28 @@ export class CarTraffic {
       let l = this.nodeGrid.get(gk);
       if (!l) this.nodeGrid.set(gk, (l = []));
       l.push(n);
+    }
+    // Who gives way at an unsignalised junction: a lesser road; at a T of equal roads, its stem (two
+    // arms within 50° of straight on, clearly straighter than any other pair, the third off to the side).
+    this.minorIn = new Uint8Array(this.edges.length * 2);
+    for (let lane = 0; lane < this.edges.length * 2; lane++) {
+      const nd = this.nodes[this.endNode(lane)];
+      if (this.edges[lane >> 1].rank + 0.01 < nd.rank) this.minorIn[lane] = 1;
+    }
+    for (let n = 0; n < this.nodes.length; n++) {
+      const nd = this.nodes[n];
+      const es = nd.edges;
+      if (es.length !== 3 || es.some((ei) => this.edges[ei].a === this.edges[ei].b)) continue;
+      const d = es.map((ei) => this.armDir(ei, n, 10));
+      const dot = (i: number, j: number) => d[i][0] * d[j][0] + d[i][1] * d[j][1];
+      // (Arm k against the pair of the other two.)
+      const pd = [dot(1, 2), dot(2, 0), dot(0, 1)];
+      const stem = pd.indexOf(Math.min(...pd));
+      const other = Math.min(pd[(stem + 1) % 3], pd[(stem + 2) % 3]);
+      if (pd[stem] > -0.64 || other < pd[stem] + 0.25 || Math.max(pd[(stem + 1) % 3], pd[(stem + 2) % 3]) > 0.8) continue;
+      const ek = this.edges[es[stem]];
+      if (ek.rank > Math.max(this.edges[es[(stem + 1) % 3]].rank, this.edges[es[(stem + 2) % 3]].rank) + 0.01) continue;
+      this.minorIn[ek.b === n ? es[stem] * 2 : es[stem] * 2 + 1] = 1;
     }
     // Stop lines per directed lane, where the world paints them: clear of the
     // widest *other* road at the junction.
@@ -1202,10 +1257,22 @@ export class CarTraffic {
     if (Math.abs(cr) < 0.48 || ax * bx + ay * by < -0.9) return; // not a turn of ~29 degrees or more
     const wx = p.x - wx0;
     const wy = p.y - wy0;
-    const ca = -(wx * by - wy * bx) / cr;
-    const cb = (wx * ay - wy * ax) / cr;
+    let ca = -(wx * by - wy * bx) / cr;
+    let cb = (wx * ay - wy * ax) / cr;
     const sd = this.stopD[a];
-    if (ca < 0.3 || cb < 0.3 || ca > Math.min(CUT_MAX, ea.len * 0.5, sd > 0 ? sd - 0.5 : Infinity) || cb > Math.min(CUT_MAX, eb.len * 0.5)) return;
+    if (ca < 0.3 || cb < 0.3 || ca > Math.min(CUT_MAX, ea.len * 0.5) || cb > Math.min(CUT_MAX, eb.len * 0.5)) return;
+    if (sd > 0 && ca > sd - 0.5) {
+      // The corner is behind the stop line (a hairpin turn from a wide road's lane): leave the lane at
+      // the line and join the next one at its nearest point, not pivot at the node (61/0 s 5046: a
+      // 130-degree left turn jumped the car 6.7 m, in front of the player's bus).
+      ca = sd - 0.5;
+      if (ca < 0.3) return;
+      // (Our lane's point there, from the node end back along it; the next lane's line from its start.)
+      const qx = wx0 - ax * ca - p.x;
+      const qy = wy0 - ay * ca - p.y;
+      cb = qx * bx + qy * by;
+      if (cb < 0.3 || cb > Math.min(CUT_MAX, eb.len * 0.5)) return;
+    }
     c.cutA = ca;
     c.cutB = cb;
   }
@@ -1251,8 +1318,11 @@ export class CarTraffic {
     return facing;
   }
 
-  /** Is the box clear of movements that conflict with this one? (Expired holders are dropped.) */
-  boxClear(node: number, id: number, inX: number, inY: number, outX: number, outY: number, cls: Turn, time: number): boolean {
+  /**
+   * Is the box clear of movements that conflict with this one? (Expired holders are dropped.)
+   * `waitsForUs` names other holders (AI buses) standing in the box for us, which do not count.
+   */
+  boxClear(node: number, id: number, inX: number, inY: number, outX: number, outY: number, cls: Turn, time: number, waitsForUs?: (holder: number) => boolean): boolean {
     const nd = this.nodes[node];
     let w = 0;
     for (let i = 0; i < nd.occ.length; i++) {
@@ -1263,9 +1333,11 @@ export class CarTraffic {
     for (const o of nd.occ) {
       if (o.id !== id && movementsConflict(inX, inY, outX, outY, cls, o)) {
         // (A car holding the box but stopped for us, our nose already in its way out (we came
-        // through the junction's inside link), lets us out first: else the two wait for good.)
+        // through the junction's inside link), lets us out first: else the two wait for good.
+        // So does one stopped there for the player's bus, when it is the player asking.)
         const h = o.id > 0 ? this.byId.get(o.id) : undefined;
-        if (h && !h.dead && h.v < 0.5 && h.why === Wait.Car && h.ref === id) continue;
+        if (h && !h.dead && h.v < 0.5 && ((h.why === Wait.Car && h.ref === id) || (id === PLAYER_HOLD && h.why === Wait.Player))) continue;
+        if (waitsForUs?.(o.id)) continue;
         this.boxBy = o.id;
         return false;
       }
@@ -1379,10 +1451,13 @@ export class CarTraffic {
     if (cached) return cached;
     const best = new Map<number, { i: number; d: number }>();
     for (let i = 0; i < track.n; i++) {
-      // Only junctions on the route's level (not the street under a busway viaduct).
-      const n = this.nearestJunction(track.x[i], track.y[i], 7, track.z[i]);
+      // Only junctions on the route's level (not the street under a busway viaduct). Within 7 m, or
+      // inside the node's box: a left turn round a wide junction's corner passes 7-8 m from its node
+      // and through the waiting cars' stop lines (199/0 s 8872 at Commercial Rd, Teneriffe).
+      const n = this.nearestJunction(track.x[i], track.y[i], JUNCTION_PICK_MAX, track.z[i]);
       if (n < 0) continue;
       const d = Math.hypot(this.nodes[n].x - track.x[i], this.nodes[n].y - track.y[i]);
+      if (d > 7 && (d > this.nodes[n].boxR || !this.passesThrough(n, track, i))) continue;
       const cur = best.get(n);
       if (!cur || d < cur.d) best.set(n, { i, d });
     }
@@ -1417,7 +1492,7 @@ export class CarTraffic {
       let hw = 0;
       for (const ei of nd.edges) if (ei !== arrive) hw = Math.max(hw, this.edges[ei].width / 2);
       const stop = Math.max(3.5, Math.min(18, hw + 2.5));
-      const rank = arrive >= 0 && bestDot > 0.6 ? this.edges[arrive].rank : nd.rank;
+      const minor = arrive >= 0 && bestDot > 0.6 && this.minorIn[this.edges[arrive].b === n ? arrive * 2 : arrive * 2 + 1] === 1;
       out.push({
         node: n,
         x: nd.x,
@@ -1431,7 +1506,7 @@ export class CarTraffic {
         cls: classify(turn),
         boxR: nd.boxR,
         sig: nd.sig,
-        minor: rank + 0.01 < nd.rank,
+        minor,
         inside: false,
       });
     });
@@ -1449,6 +1524,138 @@ export class CarTraffic {
     });
     this.busJunctions.set(track, out);
     return out;
+  }
+
+  /**
+   * Stop lines held back from a bus's swept path: a bus of `spec` following `track` (its front axle on
+   * the lane, the rest tracking in behind) that would touch either of the first two cars waiting at
+   * another arm's line moves that line back until it is clear, up to SWEEP_MAX from the node. A bus
+   * turning left out of one narrow road into another swings over the far half of the one it turns
+   * into, where cars wait at their red (199/0 s 1926, s 7070). Returns the number of lines moved.
+   * With `only`, just the route's junction of that index (an AI bus coming up to it).
+   */
+  holdBackFor(track: RouteTrack, spec: BusSpec, only = -1): number {
+    const secs = spec.sections;
+    const ns = secs.length;
+    // Section i: its axle, its hitch to the one in front (section 0: the front axle), unit heading.
+    const ax = new Float64Array(ns);
+    const ay = new Float64Array(ns);
+    const hx = new Float64Array(ns);
+    const hy = new Float64Array(ns);
+    const link = secs.map((s, i) => (i === 0 ? spec.wheelbase : Math.max(0.5, s.axleFromFront - s.hitchFromFront)));
+    const halfW = spec.width / 2 + SWEEP_MARGIN;
+    const rects: number[] = [];
+    const smp = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
+    const pt = this.pt2;
+    let moved = 0;
+    const jl = this.junctionsAlong(track);
+    for (let q = only < 0 ? 0 : only; q < (only < 0 ? jl.length : Math.min(jl.length, only + 1)); q++) {
+      const j = jl[q];
+      const nd = this.nodes[j.node];
+      // Arms with a line cars wait at; the one the bus comes in on too, for the lanes beside the
+      // bus's (it may cross them before the node).
+      const lanes: number[] = [];
+      const same: boolean[] = [];
+      for (const ei of nd.edges) {
+        const e = this.edges[ei];
+        if (e.bus) continue;
+        const L = e.b === j.node ? ei * 2 : ei * 2 + 1;
+        if ((e.oneway && L & 1) || !this.stopD[L] || this.endNode(L) !== j.node) continue;
+        const [ix, iy] = this.laneEndDir(L);
+        lanes.push(L);
+        same.push(ix * j.inX + iy * j.inY > 0.7);
+      }
+      if (!lanes.length) continue;
+      // The bus's body over its way through: section rectangles (centre, unit axis, half length).
+      rects.length = 0;
+      const s0 = Math.max(0, j.s - 50);
+      const s1 = Math.min(track.length, j.s + 50);
+      for (let s = s0; s <= s1; s += 1) {
+        track.sample(s, smp);
+        for (let i = 0; i < ns; i++) {
+          // Where it hangs from: the front axle on the lane, or the hitch on the section in front.
+          const px = i === 0 ? smp.x : ax[i - 1] + hx[i - 1] * (secs[i - 1].axleFromFront - secs[i - 1].rearHitchFromFront);
+          const py = i === 0 ? smp.y : ay[i - 1] + hy[i - 1] * (secs[i - 1].axleFromFront - secs[i - 1].rearHitchFromFront);
+          if (s === s0) {
+            // Start straight behind, along the lane.
+            const bx = i === 0 ? smp.hx : hx[i - 1];
+            const by = i === 0 ? smp.hy : hy[i - 1];
+            ax[i] = px - bx * link[i];
+            ay[i] = py - by * link[i];
+          }
+          let dx = px - ax[i];
+          let dy = py - ay[i];
+          const l = Math.hypot(dx, dy) || 1;
+          dx /= l;
+          dy /= l;
+          ax[i] = px - dx * link[i];
+          ay[i] = py - dy * link[i];
+          hx[i] = dx;
+          hy[i] = dy;
+          // Front face to back face, about the axle.
+          const f = secs[i].axleFromFront;
+          const b = secs[i].length - f;
+          const cx = ax[i] + (dx * (f - b)) / 2;
+          const cy = ay[i] + (dy * (f - b)) / 2;
+          if (Math.hypot(cx - nd.x, cy - nd.y) < 45) rects.push(cx, cy, dx, dy, (f + b) / 2);
+        }
+      }
+      for (let li = 0; li < lanes.length; li++) {
+        const L = lanes[li];
+        const e = this.edges[L >> 1];
+        const cap = Math.min(SWEEP_MAX, e.len - 2);
+        const n = this.lanesIn(L);
+        const hitK = (sd: number, k: number): boolean => {
+          for (let q = 0; q < 2; q++) {
+            const dc = sd + SWEEP_CAR_L / 2 - 0.6 + q * (SWEEP_CAR_L + 2);
+            if (dc > e.len) break;
+            this.at(L, e.len - dc, this.laneOffset(L, k), pt);
+            for (let r = 0; r < rects.length; r += 5) {
+              if (boxesTouch(pt.x, pt.y, pt.hx, pt.hy, SWEEP_CAR_L / 2, SWEEP_CAR_W / 2, rects[r], rects[r + 1], rects[r + 2], rects[r + 3], rects[r + 4], halfW)) return true;
+            }
+          }
+          return false;
+        };
+        // (On the bus's own approach, not the lane it comes along, which it covers however far back.)
+        const ks: number[] = [];
+        for (let k = 0; k < n; k++) if (!same[li] || !hitK(cap, k)) ks.push(k);
+        if (!ks.length) continue;
+        const hit = (sd: number): boolean => ks.some((k) => hitK(sd, k));
+        let sd = this.stopD[L];
+        if (!hit(sd)) continue;
+        while (sd < cap && hit(sd)) sd += 0.5;
+        if (sd < cap) {
+          this.stopD[L] = sd;
+          moved++;
+        }
+      }
+    }
+    return moved;
+  }
+
+  /** Does `track` come in on one of `node`'s arms and leave on another, around its sample `i` (12 m either side)? */
+  private passesThrough(node: number, track: RouteTrack, i: number): boolean {
+    const ia = Math.max(0, i - 3);
+    const ib = Math.min(track.n - 1, i + 3);
+    let inArm = -1;
+    let outArm = -1;
+    for (const ei of this.nodes[node].edges) {
+      const [dx, dy] = this.armDir(ei, node, 10);
+      if (inArm < 0 && -(dx * track.tx[ia] + dy * track.ty[ia]) > 0.8) inArm = ei;
+      else if (outArm < 0 && dx * track.tx[ib] + dy * track.ty[ib] > 0.8) outArm = ei;
+    }
+    return inArm >= 0 && outArm >= 0;
+  }
+
+  /** Unit direction from `node` to the point `d` m out along edge `ei` (steadier than its first segment). */
+  private armDir(ei: number, node: number, d: number): [number, number] {
+    const e = this.edges[ei];
+    this.at(e.a === node ? ei * 2 : ei * 2 + 1, Math.min(d, e.len), 0, this.pt2);
+    const nd = this.nodes[node];
+    const dx = this.pt2.x - nd.x;
+    const dy = this.pt2.y - nd.y;
+    const l = Math.hypot(dx, dy) || 1;
+    return [dx / l, dy / l];
   }
 
   private edgeDirFrom(ei: number, node: number): [number, number] {
@@ -1674,7 +1881,6 @@ export class CarTraffic {
     const nd = this.nodes[N];
     const [inX, inY] = this.laneEndDir(lane);
     const [outX, outY] = this.laneStartDir(next);
-    const e0 = this.edges[lane >> 1];
     const cls = classify(wrapAngle(Math.atan2(outX, outY) - Math.atan2(inX, inY)));
     if (nd.sig) {
       // On a short link between two nodes of one junction we are already in it:
@@ -1687,27 +1893,49 @@ export class CarTraffic {
       // No light for this movement (an arm no signal faces, a slip lane): give way to the cars that have one.
       if (!inside && st === null && this.conflictEta(N, inX, inY, outX, outY, cls, cls === Turn.Left ? GAP_LEFT : GAP_ACROSS) < Infinity) return Wait.Junction;
     } else {
-      if (e0.rank + 0.01 < nd.rank && nd.until > time && nd.holder !== lane) return nd.holder === PLAYER_HOLD ? Wait.Player : Wait.Junction;
+      if (this.minorIn[lane] && nd.until > time && nd.holder !== lane) return nd.holder === PLAYER_HOLD ? Wait.Player : Wait.Junction;
     }
-    // The player's bus coming up on the same approach in the next lane: a car that would turn across
-    // its lane in front of it (left from the lane on its right, right from the lane on its left) waits.
-    // A car crossing its path gives way to it (playerConflict).
+    // The player's bus coming up on the same approach in the next lane: a car whose way and the bus's
+    // cross waits. It would turn across the bus's lane in front of it (left from the lane on its right,
+    // right from the lane on its left), or the bus goes out across the car's (a busway leaving on the
+    // right from the kerb lane: 222/0 s 2521); or the car is on the inside of the bus's turn, which its
+    // tail cuts across (turning right beside it: 199/0 s 5062). A car crossing its path from another
+    // arm gives way to it (playerConflict).
     const pc = nd.pc;
     if (pc && pc.until > time) {
       const dot = inX * pc.inX + inY * pc.inY;
       if (dot > 0.8) {
         const side = (c.x - pc.x) * pc.inY - (c.y - pc.y) * pc.inX;
-        if (pc.near && ((side > 1.8 && cls === Turn.Left && pc.cls !== Turn.Left) || (side < -1.8 && cls === Turn.Right && pc.cls !== Turn.Right))) return Wait.Player;
+        // (+: the bus's way out is to the right of ours.)
+        const across = wrapAngle(Math.atan2(pc.outX, pc.outY) - Math.atan2(outX, outY));
+        // (On a one-lane approach the bus is in our lane, a wide one it swings out in before turning:
+        // behind us, it waits for us. 199/0 s 8858: a car at the line of a 10.6 m road waited for the
+        // bus coming up 3.9 m to its right to turn left, which then turned across its nose.)
+        if (
+          pc.near &&
+          ((side > 1.8 && (across > ACROSS || (cls === Turn.Right && pc.cls === Turn.Right))) || (side < -1.8 && (across < -ACROSS || (cls === Turn.Left && pc.cls === Turn.Left)))) &&
+          (this.lanesIn(lane) > 1 || this.playerAlongside(c, inX, inY))
+        )
+          return Wait.Player;
         // Our lane ends here (the road narrows by its offside lane) and the bus is coming along the one we
         // merge into: unless we are in, tail and all, a second before it gets there, we fall in behind it.
+        // (Or just after, past a link too short to stop on: 61/0 s 4332 lost its lane 2.5 m on and
+        // cut in across the bus's front.)
+        let ends = c.laneIdx >= this.lanesIn(next);
+        let extra = 0;
+        if (!ends && depth === 0 && this.shortLink(next, nd.boxR, c.len)) {
+          if (c.next2 < 0) c.next2 = this.chooseNext(next, Math.min(c.laneIdx, this.lanesIn(next) - 1));
+          ends = c.next2 >= 0 && c.laneIdx >= this.lanesIn(c.next2);
+          extra = this.edges[next >> 1].len;
+        }
         if (
           depth === 0 &&
           side > 1.8 &&
           cls === Turn.Straight &&
           pc.cls === Turn.Straight &&
-          c.laneIdx >= this.lanesIn(next) &&
+          ends &&
           outX * pc.outX + outY * pc.outY > 0.8 &&
-          pc.eta < clearTime(c.v, Math.max(0, stopAt) + this.stopD[lane] + c.len, CAR_A) + MERGE_MARGIN
+          pc.eta < clearTime(c.v, Math.max(0, stopAt) + this.stopD[lane] + extra + c.len, CAR_A) + MERGE_MARGIN
         )
           return Wait.Player;
       } else if (this.playerConflict(N, inX, inY, outX, outY, cls, time, this.turnClear(c, lane, next, stopAt, nd.boxR))) return Wait.Player;
@@ -1779,6 +2007,18 @@ export class CarTraffic {
     if (!c.holds.some((h) => h.node === N)) c.holds.push({ node: N, d: -1, inX, inY, outX, outY, cls });
     const ne = this.edges[next >> 1];
     if (depth === 0 && c.next2 >= 0 && this.shortLink(next, nd.boxR, c.len)) this.commit(c, next, c.next2, stopAt + ne.len, time, 1);
+  }
+
+  /** Is any of the player's bus level with or ahead of car `c`'s tail, going (dx, dy), on its level? */
+  private playerAlongside(c: Car, dx: number, dy: number): boolean {
+    const g = this.busGrid;
+    let found = false;
+    g.query(c.x, c.y, 30, (i) => {
+      if (g.pid[i] !== -1 || Math.abs(g.pz[i] - c.z) > LEVEL_GAP) return false;
+      found = (g.px[i] - c.x) * dx + (g.py[i] - c.y) * dy > -c.len / 2;
+      return found;
+    });
+    return found;
   }
 
   /** A lane too short to wait on between two junction boxes. */
@@ -1958,13 +2198,53 @@ export class CarTraffic {
         // Only into a gap.
         if (!list.some((o) => o !== c && !o.dead && o.laneIdx === to && Math.abs(o.u - c.u) < c.len + 6)) {
           c.laneIdx = to;
-          // (A turn chosen from the old lane is chosen again from the new one, unless we are committed to it.)
-          if (c.next >= 0 && !c.holds.some((h) => h.node === this.endNode(c.lane))) {
+          // (A turn chosen from the old lane is chosen again from the new one, unless we are committed to it,
+          // or to the junction after it, looking through.)
+          if (c.next >= 0 && !c.holds.some((h) => h.node === this.endNode(c.lane) || h.node === this.endNode(c.next))) {
             c.next = -1;
             c.next2 = -1;
           }
         }
         c.busWait = 0;
+      }
+      // Our lane ends just ahead (the road narrows by it; or past a link too short to stop on, the one
+      // after: 61/0 s 4332): we move over only into a gap, behind a bus alongside in the lane we merge
+      // into, not across its front (a car merges in front of the player's bus at a junction only if it
+      // is through in time: canGo).
+      let mergeBlocked = false;
+      if (c.next >= 0) {
+        let mEnd = Infinity;
+        let mLane = -1;
+        if (c.laneIdx >= this.lanesIn(c.next)) {
+          mEnd = remain;
+          mLane = c.next;
+        } else if (c.next2 >= 0 && this.edges[c.next >> 1].len < MERGE_SHORT && c.laneIdx >= this.lanesIn(c.next2)) {
+          mEnd = remain + this.edges[c.next >> 1].len;
+          mLane = c.next2;
+        }
+        const hold = mLane === c.next ? LANE_BLEND : 0;
+        if (mEnd < LANE_BLEND + 8 + hold) {
+          // Where we would be in the lane we merge into: beside our tail (and a bus length's gap behind it) to our nose.
+          // (A bus standing behind our tail is not coming along it: it waits for us. 61/1 s 954: the
+          // player's bus, moving over from the kerb lane to turn right into the Eastern Busway, stopped
+          // 2 m behind a car whose lane ended at the node, which was in its way; the car waited for it.)
+          // (Where the road narrows at the node, we wait short of the last LANE_BLEND m, over which the
+          // lanes come together: the bus's track moves over there too. On Given Tce (node 12497, two
+          // lanes to one, 61/1 s 10188) a car in the second lane stopped 7 m short of the node beside
+          // the player's bus, whose track ran 2.2 m from it there, and the bus's side ran into it.)
+          const to = this.laneOffset(c.lane, Math.max(0, this.lanesIn(mLane) - 1));
+          const chx = Math.sin(c.heading);
+          const chy = Math.cos(c.heading);
+          for (let q = -c.len / 2 - 4; q <= c.len / 2 + 1 && !mergeBlocked; q += 2.5) {
+            const u = Math.min(e.len, Math.max(0, c.u + q));
+            this.at(c.lane, u, to, pt);
+            const hb = bg.nearest(pt.x, pt.y, 2.2, undefined, pt.z);
+            if (hb >= 0 && (bg.pv[hb] >= 1 || (bg.px[hb] - c.x) * chx + (bg.py[hb] - c.y) * chy > -c.len / 2)) {
+              mergeBlocked = true;
+              lim(idm(Math.max(0.05, mEnd - c.len / 2 - 1 - hold), 0, 0.6), bg.pid[hb] === -1 ? Wait.Player : Wait.Bus, bg.pid[hb]);
+            }
+          }
+        }
       }
       // Mid-block signals (pedestrian lights).
       const sig = e.sig[c.lane & 1];
@@ -2002,7 +2282,7 @@ export class CarTraffic {
       const nd = this.nodes[N];
       const sd = this.stopD[c.lane];
       if (sd > 0 && nd.deg >= 3) {
-        if (!nd.sig && e.rank + 0.01 >= nd.rank && remain < 25) this.markMajor(N, time, c.lane);
+        if (!nd.sig && !this.minorIn[c.lane] && remain < 25) this.markMajor(N, time, c.lane);
         if (!c.holds.some((h) => h.node === N) && c.next >= 0) {
           // (To the stop line from our front, not our middle: waiting with the nose 2 m over it put
           // it in the near lane of a narrow road, the player's bus there passing a metre off it.)
@@ -2012,6 +2292,34 @@ export class CarTraffic {
             const res = this.canGo(c, c.lane, c.next, stopAt, time, 0);
             if (res !== Wait.None) lim(idm(Math.max(0.05, stopAt), 0, 0.6), res, this.blockRef);
             else if (stopAt <= commitDist) this.commit(c, c.lane, c.next, stopAt, time, 0);
+          }
+        }
+      }
+      // The junction after that, when its line is closer past this node than we could stop in from our
+      // speed once there: we look through to it from here. (199/0 s 8659: a car at 47 km/h down a side
+      // street, its give-way line 2 m past a node where the street's width changes, came out across the
+      // player's bus on Vernon Tce. 61/1 s 157: a car at 54 km/h through a slip road's junction had 13 m
+      // to the line of the next and stopped 2 m over it, its nose in an AI bus's way, the bus and then
+      // the player's waiting on it for 45 s.) Through a link too short to stop on, canGo's look past it
+      // covers it; and not when one follows that junction (canGo would look past it from the wrong lane).
+      if (c.next >= 0 && !(sd > 0 && nd.deg >= 3 && this.shortLink(c.next, nd.boxR, c.len))) {
+        const L1 = c.next;
+        const N1 = this.endNode(L1);
+        const nd1 = this.nodes[N1];
+        const sd1 = this.stopD[L1];
+        const room = this.edges[L1 >> 1].len - sd1 - (c.len / 2 - 0.6);
+        if (sd1 > 0 && nd1.deg >= 3 && N1 !== N && room < commitDist) {
+          const stopAt = remain + room;
+          if (!nd1.sig && !this.minorIn[L1] && stopAt + sd1 < 25) this.markMajor(N1, time, L1);
+          if (stopAt < commitDist + 30 && !c.holds.some((h) => h.node === N1)) {
+            if (c.next2 < 0) c.next2 = this.chooseNext(L1, Math.min(c.laneIdx, this.lanesIn(L1) - 1));
+            if (c.next2 >= 0 && !this.shortLink(c.next2, nd1.boxR, c.len)) {
+              this.blockRef = 0;
+              const res = this.canGo(c, L1, c.next2, stopAt, time, 0);
+              if (res !== Wait.None) lim(idm(Math.max(0.05, stopAt), 0, 0.6), res, this.blockRef);
+              // (Committing to it only once through, or sure of, this one.)
+              else if (stopAt <= commitDist && (sd <= 0 || nd.deg < 3 || c.holds.some((h) => h.node === N))) this.commit(c, L1, c.next2, stopAt, time, 0);
+            }
           }
         }
       }
@@ -2065,7 +2373,7 @@ export class CarTraffic {
       // road only gains a lane, its kerb moves out at the node, not before it: so do its lanes.)
       const left = this.edges[c.lane >> 1].len - c.u;
       const widens = c.next >= 0 && this.edges[c.lane >> 1].oneway && this.edges[c.next >> 1].oneway && this.lanesIn(c.next) > this.lanesIn(c.lane);
-      if (c.next >= 0 && left < LANE_BLEND && !widens) {
+      if (c.next >= 0 && left < LANE_BLEND && !widens && !mergeBlocked) {
         const to = this.laneOffset(c.next, Math.min(c.laneIdx, this.lanesIn(c.next) - 1));
         const straight = Math.abs(this.turnAngle(c.lane, c.next)) < 0.5;
         if (to > target && straight) target += (to - target) * (1 - left / LANE_BLEND);
@@ -2077,7 +2385,20 @@ export class CarTraffic {
           if (to2 < target) target += (to2 - target) * (1 - left / LANE_BLEND);
         }
       }
-      c.lat += Math.max(-dt * 1.2, Math.min(dt * 1.2, target - c.lat));
+      let dl = Math.max(-dt * 1.2, Math.min(dt * 1.2, target - c.lat));
+      if (Math.abs(dl) > 1e-3) {
+        // Not over towards a bus alongside: the lanes of a one-way road gaining one move over with its
+        // kerb at the node, and a car there moved 1.7 m into the side of the player's bus overtaking it
+        // in the kerb lane (222/0 s 2484). We move over once it is by.
+        this.at(c.lane, c.u, c.lat + Math.sign(dl) * 0.8, pt);
+        const hb = bg.nearest(pt.x, pt.y, 2.7, undefined, pt.z);
+        if (hb >= 0) {
+          const d1 = Math.hypot(bg.px[hb] - pt.x, bg.py[hb] - pt.y);
+          this.at(c.lane, c.u, c.lat, pt);
+          if (d1 < Math.hypot(bg.px[hb] - pt.x, bg.py[hb] - pt.y)) dl = 0;
+        }
+      }
+      c.lat += dl;
       this.at(c.lane, c.u, c.lat, pt);
       c.x = pt.x;
       c.y = pt.y;

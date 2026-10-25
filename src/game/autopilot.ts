@@ -62,6 +62,8 @@ const DECEL = 1.1;
 const SIGNAL_DECEL = 1.6;
 /** Stanley cross-track gain (1/s). */
 const STANLEY_K = 1.4;
+/** Ahead of the front within this (m), a car counts as a lead anywhere it would touch the bus. */
+const CLOSE = 12;
 
 function clamp(v: number, a: number, b: number): number {
   return v < a ? a : v > b ? b : v;
@@ -166,6 +168,34 @@ export class Autopilot {
     this.rescue = { x: this.tmp.x, y: this.tmp.y, heading: this.tmp.heading, z: T.zAt(s) };
     this.sRear = s;
     return true;
+  }
+
+  /**
+   * Pulled in at a stop: is a car or AI bus passing in the lane beside us (its centre within ~1.6 m of
+   * the lane's, from a little ahead of our front to our tail)? Pulling out would swing our body into
+   * it. (Not one waiting behind our tail: it waits for us.)
+   */
+  private passingAlongside(sFront: number): boolean {
+    if (!this.traffic) return false;
+    const T = this.track;
+    let len = 0;
+    for (const sec of this.spec.sections) len += sec.length;
+    const grid = this.traffic.cars.grid;
+    const bodies = this.traffic.busBodies();
+    for (let d = -3; d <= len - 1; d += 2) {
+      const ss = sFront - d;
+      T.sample(ss, this.tmp, 0);
+      const pz = T.zAt(ss);
+      const px = this.tmp.x;
+      const py = this.tmp.y;
+      if (grid.nearest(px, py, 1.6, undefined, pz) >= 0) return true;
+      for (const b of bodies) {
+        const B = b.body;
+        if (Math.abs(B.fx - px) > b.len + 4 || Math.abs(B.fy - py) > b.len + 4) continue;
+        for (let k = 0; k < B.n; k++) if (Math.hypot(B.x[k] - px, B.y[k] - py) < 1.6 && Math.abs(B.z[k] - pz) <= LEVEL_GAP) return true;
+      }
+    }
+    return false;
   }
 
   /** Is the lane clear of AI buses and cars for the whole bus with its rear axle at s? */
@@ -367,6 +397,16 @@ export class Autopilot {
     }
 
     if (this.phase === 'dwell' || this.phase === 'closing') pullWant = this.pull;
+    else if (this.pull > 1 && pullWant < this.pull && this.time > this.ignoreTrafficUntil && this.passingAlongside(sFront)) {
+      // Pulling back out from the kerb with a vehicle passing in the lane beside us: let it by first
+      // (61/0 s 4832: a car came up alongside the bus at its stop, and the bus swung its tail into it).
+      pullWant = this.pull;
+      if (target > 0) {
+        target = 0;
+        why = 'traffic';
+        limitDist = 0;
+      }
+    }
     this.pull += clamp(pullWant - this.pull, -dt * 0.45, dt * 0.45);
 
     // --- Stop / dwell state machine ------------------------------------------------------
@@ -464,7 +504,11 @@ export class Autopilot {
     // Queued behind traffic for a long time: log it, then count only vehicles squarely on the lane
     // (a bus or car beside it can hold the sensor); only a queue that still hasn't moved after
     // two minutes is driven through (the traffic's own jam breaker should have cleared it).
-    if (why === 'traffic' && av < 0.5) this.queueT += dt;
+    // (Not while our light ahead is red: the queue in front is waiting for it. 222/0 s 2472 sat
+    // 66 s in the queue at a light that is green 40 s in 110.)
+    const held = !!g.signal && g.signal.state !== 'green' && g.signal.distance < 150;
+    if (why === 'traffic' && av < 0.5 && !held) this.queueT += dt;
+    else if (why === 'traffic' && av < 0.5) this.queueT = 0;
     else {
       this.queueT = 0;
       if (av > 3) this.blockedN = 0;
@@ -523,13 +567,16 @@ export class Autopilot {
     for (const b of tr.busBodies()) {
       if (Math.abs(b.body.fx - cx) < cr + b.len && Math.abs(b.body.fy - cy) < cr + b.len) near.push(b);
     }
-    for (let d = 2; d <= range; d += 2) {
+    // Cars: a point of one (0.3 of its length either side of its middle) near the lane centre. Close
+    // ahead, wherever its body would touch ours (half our width and half a car's): a slow car the lane
+    // turns away from, ~2 m to the side of it, was still in front of the bus's corner (61/1 s 4013).
+    for (let d = 1; d <= range; d += d < CLOSE ? 1 : 2) {
       T.sample(sFront + d, this.tmp);
       const pz = T.zAt(sFront + d);
       if (Math.abs(pz - z) > LEVEL_GAP + Math.abs(d * 0.08)) continue;
       const px = this.tmp.x;
       const py = this.tmp.y;
-      if (grid.nearest(px, py, strict ? 1.0 : 1.7, undefined, pz) >= 0) return d;
+      if (grid.nearest(px, py, strict ? 1.0 : d < CLOSE ? 2.0 : 1.7, undefined, pz) >= 0) return d;
       for (const b of near) {
         const B = b.body;
         for (let k = 0; k + 1 < B.n; k++) {
@@ -542,10 +589,14 @@ export class Autopilot {
           const t = l2 > 1e-6 ? clamp(((px - ax) * sx + (py - ay) * sy) / l2, 0, 1) : 0;
           const ex = px - ax - sx * t;
           const ey = py - ay - sy * t;
-          // A bus along our lane (ahead or oncoming) counts within ~1.8 m of the lane centre; one
-          // across it only when its body really covers the lane centre (not a car-length off).
-          const along = Math.abs(sx * this.tmp.hx + sy * this.tmp.hy) > 0.7 * Math.sqrt(l2);
-          const reach = along && !strict ? b.half + 0.55 : b.half - 0.2;
+          // A bus along our lane counts within ~1.8 m of the lane centre coming the other way, and going
+          // our way anywhere our body would touch it (a queue in the lane our lane moves out of, its last
+          // bus's tail 2.2 m off the lane where we pass it: M1/1 s 1597); one across it only when its
+          // body really covers the lane centre (not a car-length off). (Body points run front to back:
+          // a bus going our way has its segments pointing back.)
+          const dotS = sx * this.tmp.hx + sy * this.tmp.hy;
+          const along = Math.abs(dotS) > 0.7 * Math.sqrt(l2);
+          const reach = strict || !along ? b.half - 0.2 : dotS < 0 ? b.half + this.spec.width / 2 + 0.05 : b.half + 0.55;
           if (ex * ex + ey * ey < reach * reach) return d;
         }
       }
