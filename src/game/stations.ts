@@ -115,6 +115,68 @@ interface StationBuild {
   geo: SGeo;
   glass: SGeo;
   plats: PlatformGeom[];
+  /** Tower footprints: the platform kit (canopy, posts, screens, benches) stops at them. */
+  feet: Foot[];
+}
+
+/** An oriented rectangle: centre, unit heading (along hw) and half sizes. */
+interface Foot {
+  x: number;
+  y: number;
+  hx: number;
+  hy: number;
+  hw: number;
+  hd: number;
+}
+
+function inFoot(feet: Foot[], x: number, y: number, pad = 0.2): boolean {
+  for (const f of feet) {
+    const dx = x - f.x;
+    const dy = y - f.y;
+    if (Math.abs(dx * f.hx + dy * f.hy) < f.hw + pad && Math.abs(-dx * f.hy + dy * f.hx) < f.hd + pad) return true;
+  }
+  return false;
+}
+
+/** A tower's heading (unit, map): its own, else along the nearest busway. */
+function towerHeading(c: Ctx, t: TowerDef): [number, number] {
+  if (t.heading !== undefined) return [Math.sin(t.heading), Math.cos(t.heading)];
+  const hit = c.idx.nearest(t.x, t.y, 60, undefined, 0, isBus);
+  return hit ? [hit.dx, hit.dy] : [0, 1];
+}
+
+/** An overbridge's axis (its own, else across the nearest busway) and the busway level under it. */
+function bridgeAxis(c: Ctx, o: OverbridgeDef): { ax: number; ay: number; zb: number } | null {
+  const hit = c.idx.nearest(o.x, o.y, 40, undefined, 0, isBus);
+  let ax = o.ax ?? 0;
+  let ay = o.ay ?? 0;
+  if (!o.ax && !o.ay) {
+    if (!hit) return null;
+    ax = -hit.dy;
+    ay = hit.dx;
+  }
+  return { ax, ay, zb: hit ? hit.z : c.heights.ground(o.x, o.y) };
+}
+
+/** Where an overbridge's end towers stand (along its axis). */
+function bridgeTowerEnds(o: OverbridgeDef): number[] {
+  const tw = o.towerW ?? 6.5;
+  return o.towers ? [o.len[0] + tw / 2 + 0.25, o.len[1] - tw / 2 - 0.25] : [];
+}
+
+function stationFeet(c: Ctx, def: StationDef): Foot[] {
+  const out: Foot[] = [];
+  for (const t of def.towers ?? []) {
+    const [hx, hy] = towerHeading(c, t);
+    out.push({ x: t.x, y: t.y, hx, hy, hw: t.w / 2, hd: t.d / 2 });
+  }
+  for (const o of def.overbridges ?? []) {
+    const a = bridgeAxis(c, o);
+    if (!a) continue;
+    const tw = o.towerW ?? 6.5;
+    for (const s of bridgeTowerEnds(o)) out.push({ x: o.x + a.ax * s, y: o.y + a.ay * s, hx: a.ax, hy: a.ay, hw: tw / 2, hd: tw / 2 });
+  }
+  return out;
 }
 
 interface Ctx {
@@ -188,7 +250,7 @@ export function buildStations(scene: THREE.Scene, data: MapData, geoms: Platform
   // Group platforms by station.
   const builds = new Map<string, StationBuild>();
   const anon: StationBuild[] = [];
-  const mk = (def: StationDef): StationBuild => ({ def, geo: new SGeo(), glass: new SGeo(), plats: [] });
+  const mk = (def: StationDef): StationBuild => ({ def, geo: new SGeo(), glass: new SGeo(), plats: [], feet: stationFeet(c, def) });
   for (const g of geoms) {
     const cx = (g.x0 + g.x1) / 2;
     const cy = (g.y0 + g.y1) / 2;
@@ -453,15 +515,30 @@ function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
     });
     const back = depth.map((d) => Math.max(1.6, Math.min(d - 0.25, D)));
     const front = 0.45;
-    if (covered && !vault) (def.canopy === 'wing' ? wingCanopy : canopy)(geo, def, ss, back, front, top, H);
+    // no canopy through a lift tower standing on the platform
+    const feet = b.feet;
+    const cut = ss.map((s, i) => {
+      if (!feet.length || i + 1 >= ss.length) return false;
+      const e = ss[i + 1];
+      for (const u of [0, 0.5, 1]) {
+        const o = front + (back[i] + back[i + 1] - 2 * front) * 0.5 * u;
+        if (inFoot(feet, (s.x + e.x) / 2 + s.nx * o, (s.y + e.y) / 2 + s.ny * o)) return true;
+      }
+      return false;
+    });
+    if (covered && !vault) (def.canopy === 'wing' ? wingCanopy : canopy)(geo, def, ss, back, front, top, H, cut);
     // posts on the back line every ~9 m; screens between them
-    const postAt: Sample[] = [];
-    const np = Math.max(2, Math.round((k.len - 3) / 9) + 1);
-    for (let i = 0; i < np; i++) postAt.push(at(k, 1.5 + ((k.len - 3) * i) / (np - 1)));
     const backAt = (s: Sample) => {
       const d = rayRing(ring, s.x + s.nx * 0.05, s.y + s.ny * 0.05, s.nx, s.ny, 30);
       return Math.max(1.6, Math.min((Number.isFinite(d) ? d : 3.5) - 0.25, D)) - 0.35;
     };
+    const blocked = (s: Sample, o: number) => feet.length > 0 && inFoot(feet, s.x + s.nx * o, s.y + s.ny * o, 0.4);
+    const postAt: Sample[] = [];
+    const np = Math.max(2, Math.round((k.len - 3) / 9) + 1);
+    for (let i = 0; i < np; i++) {
+      const s = at(k, 1.5 + ((k.len - 3) * i) / (np - 1));
+      if (!blocked(s, backAt(s)) && !blocked(s, 1.5)) postAt.push(s);
+    }
     if (covered && !vault) {
       geo.paint(def.post);
       for (const s of postAt) {
@@ -479,6 +556,8 @@ function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
         const e = postAt[i + 1];
         const oa = backAt(a) + 0.05;
         const oe = backAt(e) + 0.05;
+        if (feet.length && inFoot(feet, (a.x + e.x) / 2 + a.nx * oa, (a.y + e.y) / 2 + a.ny * oa, 0.4)) continue;
+        if (Math.hypot(e.x - a.x, e.y - a.y) > 14) continue;
         const ax = a.x + a.nx * oa;
         const ay = a.y + a.ny * oa;
         const ex = e.x + e.nx * oe;
@@ -525,7 +604,7 @@ function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
     for (let d = 5; d < k.len - 4; d += 15) {
       const s = at(k, d);
       const o = Math.max(1.4, backAt(s) - 0.6);
-      if (o < 1.5) continue;
+      if (o < 1.5 || blocked(s, o)) continue;
       bench(geo, s.x + s.nx * o, s.y + s.ny * o, top(s.x, s.y), s.tx, s.ty, -s.nx, -s.ny);
       if (Math.round(d / 15) % 2 === 1) {
         const bx = s.x + s.nx * o + s.tx * 1.6;
@@ -650,12 +729,28 @@ function pidText(c: Ctx, def: StationDef): string {
 }
 
 /** The flat cantilevered canopy over a kerb strip. */
-function canopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front: number, top: (x: number, y: number) => number, H: number): void {
+/**
+ * The samples where a canopy run starts (sgn -1) or ends (sgn 1): the kerb's ends and the edges of
+ * the gaps left for towers (`cut[i]`: no canopy between samples i and i + 1).
+ */
+function runEnds(n: number, cut: boolean[]): [number, number][] {
+  const out: [number, number][] = [];
+  for (let i = 0; i < n; i++) {
+    const before = i > 0 && !cut[i - 1];
+    const after = i + 1 < n && !cut[i];
+    if (after && !before) out.push([i, -1]);
+    if (before && !after) out.push([i, 1]);
+  }
+  return out;
+}
+
+function canopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front: number, top: (x: number, y: number) => number, H: number, cut: boolean[]): void {
   const T = 0.45;
   const F = (i: number): V3 => [ss[i].x + ss[i].nx * front, ss[i].y + ss[i].ny * front, 0];
   const B = (i: number): V3 => [ss[i].x + ss[i].nx * back[i], ss[i].y + ss[i].ny * back[i], 0];
   const hU = (p: V3) => top(p[0], p[1]) + H;
   for (let i = 0; i + 1 < ss.length; i++) {
+    if (cut[i]) continue;
     const f0 = F(i);
     const f1 = F(i + 1);
     const b0 = B(i);
@@ -735,11 +830,10 @@ function canopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front:
   }
   // end caps
   geo.paint(def.fascia);
-  for (const i of [0, ss.length - 1]) {
+  for (const [i, sgn] of runEnds(ss.length, cut)) {
     const f = F(i);
     const bb = B(i);
     const s = ss[i];
-    const sgn = i === 0 ? -1 : 1;
     geo.face(
       [
         [f[0], f[1], hU(f) - 0.06],
@@ -756,6 +850,7 @@ function canopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front:
   geo.paint(def.fascia);
   const step = Math.max(1, Math.round(6 / 3));
   for (let i = 0; i < ss.length; i += step) {
+    if ((i === 0 || cut[i - 1]) && (i + 1 === ss.length || cut[i])) continue;
     const s = ss[i];
     const f = F(i);
     const bb = B(i);
@@ -769,7 +864,7 @@ function canopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front:
  * Dutton Park Place's "wing": a blade carried on the back row of posts, its panelled soffit curving up
  * towards the kerb and its top a stack of dark fins stepping down to a knife edge at the front.
  */
-function wingCanopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front: number, top: (x: number, y: number) => number, H: number): void {
+function wingCanopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front: number, top: (x: number, y: number) => number, H: number, cut: boolean[]): void {
   const WR = 1.4; // soffit rise at the front edge
   const N = 4; // strips across the depth, back (u 0) to front (u 1)
   const P = (i: number, u: number): [number, number] => {
@@ -780,6 +875,7 @@ function wingCanopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], fr
   const ht = (u: number) => hs(u) + 0.18 + 0.6 * (1 - u);
   const fin = mixCol(def.roofTop, 0x000000, 0.3);
   for (let i = 0; i + 1 < ss.length; i++) {
+    if (cut[i]) continue;
     const tx = ss[i + 1].x - ss[i].x;
     const ty = ss[i + 1].y - ss[i].y;
     for (let j = 0; j < N; j++) {
@@ -835,8 +931,7 @@ function wingCanopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], fr
   }
   // end caps: the blade's profile
   geo.paint(def.fascia);
-  for (const i of [0, ss.length - 1]) {
-    const sgn = i === 0 ? -1 : 1;
+  for (const [i, sgn] of runEnds(ss.length, cut)) {
     for (let j = 0; j < N; j++) {
       const u0 = j / N;
       const u1 = (j + 1) / N;
@@ -1295,15 +1390,9 @@ function nearRail(c: Ctx, x: number, y: number, r: number): boolean {
 function buildOverbridge(c: Ctx, b: StationBuild, o: OverbridgeDef): void {
   const geo = b.geo;
   const glass = b.glass;
-  let ax = o.ax ?? 0;
-  let ay = o.ay ?? 0;
-  const hit = c.idx.nearest(o.x, o.y, 40, undefined, 0, isBus);
-  if (!o.ax && !o.ay) {
-    if (!hit) return;
-    ax = -hit.dy;
-    ay = hit.dx;
-  }
-  const zb = hit ? hit.z : c.heights.ground(o.x, o.y);
+  const axis = bridgeAxis(c, o);
+  if (!axis) return;
+  const { ax, ay, zb } = axis;
   const deck = zb + (o.clear ?? 6.4);
   const [s0, s1] = o.len;
   const w = o.w / 2;
@@ -1412,7 +1501,7 @@ function buildOverbridge(c: Ctx, b: StationBuild, o: OverbridgeDef): void {
   }
   // towers or piers at the ends, plus piers where the ground allows
   const tw = o.towerW ?? 6.5;
-  const ends: number[] = o.towers ? [s0 + tw / 2 + 0.25, s1 - tw / 2 - 0.25] : [];
+  const ends = bridgeTowerEnds(o);
   for (const s of ends) {
     const p = P(s, 0);
     const t: TowerDef = { x: p[0], y: p[1], w: tw, d: tw, h: roofH - zb + (o.towerLift ? 0.6 : 2.5), heading: Math.atan2(ax, ay), frame: o.frame, banner: o.towerLift ? 0 : 0xe8552b, hat: o.towerHat, roof: o.towerRoof, lift: o.towerLift };
@@ -1586,18 +1675,7 @@ function buildConcourse(c: Ctx, b: StationBuild, o: ConcourseDef): void {
 function buildTower(c: Ctx, b: StationBuild, t: TowerDef, base: number | null): void {
   const geo = b.geo;
   const glass = b.glass;
-  let hx = 0;
-  let hy = 1;
-  if (t.heading !== undefined) {
-    hx = Math.sin(t.heading);
-    hy = Math.cos(t.heading);
-  } else {
-    const hit = c.idx.nearest(t.x, t.y, 60, undefined, 0, isBus);
-    if (hit) {
-      hx = hit.dx;
-      hy = hit.dy;
-    }
-  }
+  const [hx, hy] = towerHeading(c, t);
   const gz = c.heights.ground(t.x, t.y);
   const z0 = base ?? (t.ground ? gz : Math.min(gz, buswayZ(c, t.x, t.y)));
   const z1 = (t.ground ? gz : buswayZ(c, t.x, t.y)) + t.h;
