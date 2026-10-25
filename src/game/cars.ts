@@ -1689,7 +1689,13 @@ export class CarTraffic {
       } else if (this.playerConflict(N, inX, inY, outX, outY, cls, time, clearTime(c.v, Math.max(0, stopAt) + 2 * nd.boxR + c.len, CAR_A))) return Wait.Player;
     }
     // The player's bus in (or about to enter) the box: waiting for it is legitimate.
-    if (!this.boxClear(N, c.id, inX, inY, outX, outY, cls, time)) return this.boxBy === PLAYER_HOLD ? Wait.Player : Wait.Junction;
+    // (A car holding it from the queue in its exit, its tail still in the box, names the wait: as
+    // legitimate as that queue.)
+    if (!this.boxClear(N, c.id, inX, inY, outX, outY, cls, time)) {
+      if (this.boxBy === PLAYER_HOLD) return Wait.Player;
+      this.blockRef = Math.max(0, this.boxBy);
+      return Wait.Junction;
+    }
     // The exit must have room for the whole car, so it never stops in the box.
     const idx = Math.min(c.laneIdx, this.lanesIn(next) - 1);
     const room = nd.boxR + c.len + 1.5;
