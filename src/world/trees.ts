@@ -965,7 +965,9 @@ export async function buildTrees(
     const rSh = 2 * half + 25;
     const rMid = Math.max(R_MID, rSh);
     const jump = Math.hypot(x - prev.x, y - prev.y, z - prev.z);
-    const cut = !(jump < CUT_MOVE) || fwd.x * prev.fx + fwd.y * prev.fy + fwd.z * prev.fz < CUT_COS || dt > 0.1;
+    const cut = !(jump < CUT_MOVE) || fwd.x * prev.fx + fwd.y * prev.fy + fwd.z * prev.fz < CUT_COS;
+    // a long frame (film steps, a stall) finishes a far gathering at once
+    const slow = dt > 0.1;
     prev.x = x;
     prev.y = y;
     prev.z = z;
@@ -974,7 +976,7 @@ export async function buildTrees(
     prev.fz = fwd.z;
     let swapped = false;
     if (cut) {
-      // a jump (start, teleport, camera cut, a long frame): everything at once
+      // a jump (start, teleport, camera cut): everything at once
       startFar(camera, x, y, z, rMid);
       stepFar(Infinity);
       swapFar();
@@ -982,9 +984,9 @@ export async function buildTrees(
     } else {
       if (!job.active && (due(farSnap, x, y, z, pe, FAR_MOVE, FAR_TURN_COS) || Math.abs(rMid - farSnap.rMid) > 15)) startFar(camera, x, y, z, rMid);
       if (job.active) {
-        // about to leave the shown set's near ring: finish now
+        // a long frame, or about to leave the shown set's near ring: finish now
         const drift = Math.hypot(x - shown.x, z - shown.z);
-        if (stepFar(drift > FAR_MARGIN - 15 ? Infinity : FAR_BUDGET)) {
+        if (stepFar(slow || drift > FAR_MARGIN - 15 ? Infinity : FAR_BUDGET)) {
           swapFar();
           swapped = true;
         }
