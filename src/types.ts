@@ -204,6 +204,11 @@ export interface MapData {
   signalZ?: Float32Array;
   /** Marked pedestrian crossings, flat [x, y, ...]. */
   crossings: Float32Array;
+  /**
+   * Mapped retaining walls (OSM barrier=retaining_wall), each a polyline [x, y, ...]: where a road in a
+   * cutting has its wall when the map says so (src/world/roads.ts).
+   */
+  retainingWalls?: Float32Array[];
   buildings: Building[];
   areas: Area[];
   water: Area[];

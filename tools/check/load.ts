@@ -55,6 +55,7 @@ export function loadMapNode(): MapData {
     signals: dm(r.signals),
     ...(r.sigr && r.sigd && r.sigz ? { signalRoad: Int32Array.from(r.sigr), signalDir: Int8Array.from(r.sigd), signalZ: dm(r.sigz) } : {}),
     crossings: dm(r.crossings),
+    retainingWalls: (r.walls ?? []).map((w: number[]) => dm(w)),
     buildings: [],
     areas: [],
     water: [],

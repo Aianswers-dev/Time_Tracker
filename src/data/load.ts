@@ -3,7 +3,7 @@ import { cumulative } from './coords';
 
 /* Raw JSON shapes written by tools/data/*.py. Coordinates are decimetre ints. */
 interface RawRoad { z?: number[]; ms?: number; k: number; w: number; l: number; p: number[]; n?: number; o?: 1; b?: 1; t?: 1; y?: number; lk?: 1; bus?: 1; bay?: 1 }
-interface RawRoads { bounds: [number, number, number, number]; names: string[]; roads: RawRoad[]; rail: { p: number[]; z?: number[]; b?: 1; t?: 1 }[]; signals: number[]; sigr?: number[]; sigd?: number[]; sigz?: number[]; crossings: number[] }
+interface RawRoads { bounds: [number, number, number, number]; names: string[]; roads: RawRoad[]; rail: { p: number[]; z?: number[]; b?: 1; t?: 1 }[]; signals: number[]; sigr?: number[]; sigd?: number[]; sigz?: number[]; crossings: number[]; walls?: number[][] }
 interface RawBuilding { z?: number; h: number; m?: number; k?: number; pt?: 1; c?: string; r?: string; rc?: string; n?: string; p: number[] }
 interface RawArea { k?: number; p: number[]; h?: number[][] }
 interface RawAreas { water: RawArea[]; areas: RawArea[]; trees: number[] }
@@ -111,6 +111,7 @@ export async function loadMapData(onProgress: (fraction: number, label: string) 
       ? { signalRoad: Int32Array.from(r.sigr), signalDir: Int8Array.from(r.sigd), signalZ: dm(r.sigz) }
       : {}),
     crossings: dm(r.crossings),
+    retainingWalls: (r.walls ?? []).map(dm),
     buildings,
     areas: a.areas.map(area),
     water: a.water.map(area),

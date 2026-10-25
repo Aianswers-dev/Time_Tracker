@@ -19,7 +19,7 @@ The terrain tiles are fetched on the first run (about 60 PNGs) and cached in
 
 | Output | Source | Contents |
 | --- | --- | --- |
-| `roads.json` | OpenStreetMap | roads (kind, width, lanes, one-way, bridge, tunnel, name, speed limit) and rail, with per-vertex heights; traffic signals, crossings |
+| `roads.json` | OpenStreetMap | roads (kind, width, lanes, one-way, bridge, tunnel, name, speed limit) and rail, with per-vertex heights; traffic signals, crossings; mapped retaining walls (`"walls"`, `barrier=retaining_wall` lines, where a road's cutting wall stands) |
 | `buildings.json` | OpenStreetMap + terrain | footprints with heights, building type, colours, roof shape, base height |
 | `areas.json` | OpenStreetMap | Brisbane River and other water, parks, woods, sport fields, mapped trees |
 | `routes.json` | TransLink GTFS | every bus route-direction that runs ≥ 1.2 km inside the map: the most common shape, clipped to the map, with per-vertex heights, its stops (with heights) and scheduled times |
