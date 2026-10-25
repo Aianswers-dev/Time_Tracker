@@ -45,6 +45,16 @@ export interface TrackStop {
 /** Lane centre this far from a platform edge puts the bus side ~0.35 m off it. */
 const PLATFORM_LANE = 1.6;
 /**
+ * A pull-in starts only once the lane has left walls standing between it and the platform line (a
+ * viaduct parapet running on to the platform's end), this far past them (m: an articulated bus's rear
+ * sections pass the walls' end before its front swings over), and may then ease on over up to
+ * PULL_INTO m of the platform.
+ */
+const PULL_CLEAR = 8;
+const PULL_INTO = 30;
+/** Walls holding the lane less than this far off the platform line (m) leave the bus alongside. */
+const PULL_HOLD = 0.6;
+/**
  * The lane centre stays this far from walls (tunnel tubes, viaduct parapets,
  * cutting retaining walls; sim/collider.ts): half a bus plus a margin for the
  * body swinging out on bends.
@@ -58,9 +68,28 @@ const BUS_HI = 3.4;
  * except inside a junction box (up to the stop lines), where turning paths cross.
  */
 const OWN_MIN = 1.5;
+/**
+ * Nor does it run more than OPP_IN inside a one-way carriageway heading against it (within acos(OPP_DOT)
+ * of the opposite way): a dual carriageway's other half, mapped as its own way.
+ */
+const OPP_IN = 1;
+const OPP_DOT = 0.7;
 /** Junction box reach either side of a junction node (m), within these bounds. */
 const JUNCTION_BOX_MIN = 4.5;
 const JUNCTION_BOX_MAX = 12;
+/**
+ * Where a bus route turns sharply at a node (more than TURN_MIN radians), the junction box reaches as far
+ * as a lane turning on a TURN_R m radius needs, plus TURN_RAMP to ease into the turn (up to TURN_BOX_MAX),
+ * and a lane corner still tighter than R_OK in its own half may use it, the oncoming lanes in it included;
+ * the stop lines stay behind it.
+ */
+const TURN_MIN = 0.7;
+const TURN_R = 9;
+const TURN_BOX_MAX = 24;
+const TURN_RAMP = 5;
+const R_OK = 7.6;
+/** Lane radius the last evening pass aims for in the lane's own half (m). */
+const R_EASY = 9;
 /**
  * The furthest a wall gap may be from the lane's own road lane and still bound it (m): a gap further
  * off is another carriageway seen along a skewed GTFS normal (a junction, a shape far off the road),
@@ -217,6 +246,12 @@ interface RoadCand {
 
 /** A road only buses use (busway, bus lane, bus link). */
 const busRoad = (r: Road): boolean => r.bus || r.kind === RoadKind.Busway;
+/** How much further than the bus-road radius a one-way bus ramp is looked for near a sharp turn of the shape. */
+const RAMP_REACH = 6;
+/** A turn of the GTFS shape (heading 5-25 m before vs after) sharp enough that it may be running out to a node and back. */
+const SHAPE_SHARP = 1.0;
+/** How far either side of such a turn one-way bus ramps are looked for. */
+const SHAPE_SHARP_SPAN = 32;
 
 /**
  * Roads at level z within `radius` of (qx, qy) that run with the route
@@ -224,7 +259,12 @@ const busRoad = (r: Road): boolean => r.bus || r.kind === RoadKind.Busway;
  * over ~60 m, (ldx, ldy) its local one: GTFS shapes wobble round junction
  * halls, and a bus carrying straight on does not tour the turnaround beside it.
  * Bus-only roads are looked for up to `busRadius` away: TransLink shapes cut
- * the corners their slip lanes take (Victoria Bridge onto North Quay).
+ * the corners their slip lanes take (Victoria Bridge onto North Quay). With
+ * `ramps` (near a sharp turn of the shape), one-way bus roads running the
+ * route's way are looked for RAMP_REACH further and their distance past 8 m
+ * costs 0.2 a metre instead of 0.5: there the shapes can run out to the far
+ * junction node and back, 20+ m off the ramp buses take (Eastern Busway onto
+ * the SEB inbound, Butterfield Street onto the Northern Busway).
  */
 function roadCands(
   data: MapData,
@@ -239,12 +279,15 @@ function roadCands(
   minDot: number,
   accept: (r: Road) => boolean,
   busRadius = radius,
+  ramps = false,
 ): RoadCand[] {
   const list: RoadCand[] = [];
-  roadIndexFor(data).forEachNear(qx, qy, Math.max(radius, busRadius), (ri, ax, ay, sdx, sdy, slen, d, zz) => {
+  roadIndexFor(data).forEachNear(qx, qy, Math.max(radius, busRadius + (ramps ? RAMP_REACH : 0)), (ri, ax, ay, sdx, sdy, slen, d, zz) => {
     const r = data.roads[ri];
     if (!accept(r) || Math.abs(zz - z) > LEVEL_GAP) return;
     if (d > radius && !busRoad(r)) return;
+    const ramp = ramps && busRoad(r) && r.oneway;
+    if (d > busRadius && !ramp) return;
     const dot = sdx * gdx + sdy * gdy;
     const ldot = sdx * ldx + sdy * ldy;
     const best = Math.abs(dot) > Math.abs(ldot) ? dot : ldot;
@@ -254,7 +297,7 @@ function roadCands(
     // (Main carriageways over narrow ramps and turnaround loops beside them; not a one-way bus lane or
     // slip road, which is where the bus really runs.)
     const narrow = r.width < 5 && !(busRoad(r) && r.oneway && !r.tunnel);
-    const cost = d * 0.5 + (1 - Math.abs(dot)) * 30 + (narrow ? 4 : 0);
+    const cost = (ramp ? Math.min(d, 8) * 0.5 + Math.max(0, d - 8) * 0.2 : d * 0.5) + (1 - Math.abs(dot)) * 30 + (narrow ? 4 : 0);
     const old = list.find((c) => c.road === ri);
     if (old && old.cost <= cost) return;
     const c = { road: ri, px: ax + sdx * t, py: ay + sdy * t, dx: sdx * sg, dy: sdy * sg, z: zz, cost };
@@ -370,6 +413,104 @@ function roadCum(r: Road): Float32Array {
   return c;
 }
 /**
+ * The junction nodes where a bus route turns sharply (by its GTFS shape, at the node's level), with how
+ * far either side of the node a lane turning there on a TURN_R m radius reaches (the turn's junction
+ * box), and the nodes' positions for finding them near a signalised junction.
+ */
+export interface TurnBoxes {
+  box: Map<number, number>;
+  x: number[];
+  y: number[];
+  z: number[];
+  r: number[];
+}
+const turnBoxCache = new WeakMap<MapData, TurnBoxes>();
+export function turnBoxes(data: MapData): TurnBoxes {
+  const hit = turnBoxCache.get(data);
+  if (hit) return hit;
+  const deg = new Map<number, number>();
+  const at = new Map<number, [number, number, number]>();
+  for (const r of data.roads) {
+    const p = r.pts;
+    const nv = p.length / 2;
+    for (let k = 0; k < nv; k++) {
+      const q = endKey(p[2 * k], p[2 * k + 1]);
+      deg.set(q, (deg.get(q) ?? 0) + (k === 0 || k === nv - 1 ? 1 : 2));
+      if (!at.has(q)) at.set(q, [p[2 * k], p[2 * k + 1], r.z[k]]);
+    }
+  }
+  const CELL = 32;
+  const grid = new Map<number, number[]>();
+  for (const [q, d] of deg) {
+    if (d < 3) continue;
+    const [x, y] = at.get(q)!;
+    const g = (Math.floor(x / CELL) + 2048) * 4096 + Math.floor(y / CELL) + 2048;
+    let l = grid.get(g);
+    if (!l) grid.set(g, (l = []));
+    l.push(q);
+  }
+  const H = heightsOf(data);
+  const out: TurnBoxes = { box: new Map(), x: [], y: [], z: [], r: [] };
+  const heading = (route: Route, a: number, b: number) => {
+    const pa = pointAlong(route.pts, route.cum, a);
+    const pb = pointAlong(route.pts, route.cum, b);
+    return Math.atan2(pb.x - pa.x, pb.y - pa.y);
+  };
+  for (const route of data.routes) {
+    const p = route.pts;
+    const cum = route.cum;
+    // Each junction node within 5 m of the route line: where the line passes nearest it.
+    const near = new Map<number, [number, number]>();
+    for (let k = 0; k + 1 < cum.length; k++) {
+      const ax = p[2 * k];
+      const ay = p[2 * k + 1];
+      const ex = p[2 * k + 2] - ax;
+      const ey = p[2 * k + 3] - ay;
+      const l2 = ex * ex + ey * ey;
+      if (l2 < 1e-6) continue;
+      const gx0 = Math.floor((Math.min(ax, ax + ex) - 5) / CELL);
+      const gx1 = Math.floor((Math.max(ax, ax + ex) + 5) / CELL);
+      const gy0 = Math.floor((Math.min(ay, ay + ey) - 5) / CELL);
+      const gy1 = Math.floor((Math.max(ay, ay + ey) + 5) / CELL);
+      for (let gx = gx0; gx <= gx1; gx++) {
+        for (let gy = gy0; gy <= gy1; gy++) {
+          const l = grid.get((gx + 2048) * 4096 + gy + 2048);
+          if (!l) continue;
+          for (const q of l) {
+            const [x, y] = at.get(q)!;
+            const t = Math.max(0, Math.min(1, ((x - ax) * ex + (y - ay) * ey) / l2));
+            const d = Math.hypot(x - ax - ex * t, y - ay - ey * t);
+            if (d > 5) continue;
+            const prev = near.get(q);
+            if (!prev || d < prev[0]) near.set(q, [d, cum[k] + t * (cum[k + 1] - cum[k])]);
+          }
+        }
+      }
+    }
+    for (const [q, [, s]] of near) {
+      const [x, y, z] = at.get(q)!;
+      // The turn: the line's heading 5-25 m before the node against 5-25 m after it.
+      const turn = Math.abs(wrapAngle(heading(route, s + 5, s + 25) - heading(route, s - 25, s - 5)));
+      if (turn < TURN_MIN || Math.abs(H.routeZ(route, s) - z) > LEVEL_GAP) continue;
+      const box = Math.min(TURN_BOX_MAX, (TURN_R + 2) * Math.tan(Math.min(2.45, turn) / 2) + TURN_RAMP);
+      const had = out.box.get(q);
+      if (had === undefined) {
+        out.x.push(x);
+        out.y.push(y);
+        out.z.push(z);
+        out.r.push(0);
+      }
+      out.box.set(q, Math.max(had ?? 0, box));
+    }
+  }
+  // (Positions in insertion order: fill the radii from the map.)
+  let k = 0;
+  for (const b of out.box.values()) out.r[k++] = b;
+  turnBoxCache.set(data, out);
+  return out;
+}
+
+/**
  * Per road, where along it other roads join (distance along the road of every vertex where three or more
  * road ends meet, a road passing through counting as two) and how far either side of each the junction
  * box reaches (to just short of where the stop lines go: half the widest road there + 2 m), and whether
@@ -378,6 +519,8 @@ function roadCum(r: Road): Float32Array {
 interface RoadNodes {
   junctions: Float32Array[];
   box: Float32Array[];
+  /** The box a sharp bus turn there needs (0 where none turns sharply). */
+  turn: Float32Array[];
   deadStart: Uint8Array;
   deadEnd: Uint8Array;
   cum: Float32Array[];
@@ -398,7 +541,8 @@ function roadNodes(data: MapData): RoadNodes {
     }
   }
   const n = data.roads.length;
-  const out: RoadNodes = { junctions: new Array(n), box: new Array(n), deadStart: new Uint8Array(n), deadEnd: new Uint8Array(n), cum: new Array(n) };
+  const turns = turnBoxes(data);
+  const out: RoadNodes = { junctions: new Array(n), box: new Array(n), turn: new Array(n), deadStart: new Uint8Array(n), deadEnd: new Uint8Array(n), cum: new Array(n) };
   data.roads.forEach((r, i) => {
     const p = r.pts;
     const nv = p.length / 2;
@@ -406,14 +550,17 @@ function roadNodes(data: MapData): RoadNodes {
     out.cum[i] = cum;
     const js: number[] = [];
     const bs: number[] = [];
+    const ts: number[] = [];
     for (let k = 0; k < nv; k++) {
       const q = endKey(p[2 * k], p[2 * k + 1]);
       if ((deg.get(q) ?? 0) < 3) continue;
       js.push(cum[k]);
       bs.push(Math.max(JUNCTION_BOX_MIN, Math.min(JUNCTION_BOX_MAX, (wide.get(q) ?? 0) / 2 + 2)));
+      ts.push(turns.box.get(q) ?? 0);
     }
     out.junctions[i] = Float32Array.from(js);
     out.box[i] = Float32Array.from(bs);
+    out.turn[i] = Float32Array.from(ts);
     if (nv >= 2) {
       out.deadStart[i] = (deg.get(endKey(p[0], p[1])) ?? 0) <= 1 ? 1 : 0;
       out.deadEnd[i] = (deg.get(endKey(p[2 * nv - 2], p[2 * nv - 1])) ?? 0) <= 1 ? 1 : 0;
@@ -425,13 +572,14 @@ function roadNodes(data: MapData): RoadNodes {
 
 /**
  * Whether a lane at `along` on two-way road `ri` may leave its own half: inside a junction box, where
- * turning paths cross, or near a dead end, where the route turns round. (A road that simply carries on
- * as the next way is no junction.)
+ * turning paths cross (with `turning`, the box a sharp turn there needs), or near a dead end, where the
+ * route turns round. (A road that simply carries on as the next way is no junction.)
  */
-function ownHalfFree(nodes: RoadNodes, ri: number, along: number): boolean {
+function ownHalfFree(nodes: RoadNodes, ri: number, along: number, turning = false): boolean {
   const js = nodes.junctions[ri];
   const bs = nodes.box[ri];
-  for (let q = 0; q < js.length; q++) if (Math.abs(js[q] - along) < bs[q]) return true;
+  const ts = nodes.turn[ri];
+  for (let q = 0; q < js.length; q++) if (Math.abs(js[q] - along) < (turning ? Math.max(bs[q], ts[q]) : bs[q])) return true;
   const cum = nodes.cum[ri];
   return (nodes.deadStart[ri] === 1 && along < 20) || (nodes.deadEnd[ri] === 1 && along > cum[cum.length - 1] - 20);
 }
@@ -919,6 +1067,22 @@ export class RouteTrack {
     const wallPos: number[] = [];
     const wallSeen = W ? new Int32Array(W.count) : new Int32Array(0);
     const cands: RoadCand[][] = [];
+    // Where the GTFS shape turns sharply (and SHAPE_SHARP_SPAN either side): one-way bus ramps cutting
+    // across are looked for further there.
+    const rampNear = new Uint8Array(n);
+    {
+      const hd = (s0: number, s1: number) => {
+        const a = pointAlong(route.pts, route.cum, s0);
+        const b = pointAlong(route.pts, route.cum, s1);
+        return Math.atan2(b.x - a.x, b.y - a.y);
+      };
+      const span = Math.round(SHAPE_SHARP_SPAN / TRACK_STEP);
+      for (let i = 0; i < n; i++) {
+        const s = Math.min(L, i * TRACK_STEP);
+        if (Math.abs(wrapAngle(hd(s + 5, s + 25) - hd(s - 25, s - 5))) < SHAPE_SHARP) continue;
+        for (let k = Math.max(0, i - span); k <= Math.min(n - 1, i + span); k++) rampNear[k] = 1;
+      }
+    }
     this.limit = new Uint8Array(n);
     this.road = new Int32Array(n).fill(-1);
     this.z = new Float32Array(n);
@@ -946,7 +1110,7 @@ export class RouteTrack {
       const sl = Math.hypot(sb.x - sa.x, sb.y - sa.y) || 1;
       const gdx = (sb.x - sa.x) / sl;
       const gdy = (sb.y - sa.y) / sl;
-      let list = roadCands(data, p.x, p.y, zr, gdx, gdy, dx, dy, 14, 0.5, drivable, 22);
+      let list = roadCands(data, p.x, p.y, zr, gdx, gdy, dx, dy, 14, 0.5, drivable, 22, rampNear[i] === 1);
       if (!list.length) list = roadCands(data, p.x, p.y, zr, gdx, gdy, dx, dy, 32, 0.6, walledRoad);
       cands.push(list);
     }
@@ -1130,23 +1294,84 @@ export class RouteTrack {
         }
         return worst > 0.3;
       };
+      // The pull-in eases over [inS, inS + inL], from the road lane. Where walls between the road lane and
+      // the platform line hold the lane off it (a viaduct's parapet running on to the platform's end), it
+      // starts only PULL_CLEAR past them, easing over the platform's first metres instead, and from the
+      // line the walls held the lane on, carried on straight (stepping back to the road lane first and
+      // then pulling in makes an S-bend at the walls' end that a trailer cuts into).
+      let inS = z.s0 - lead - 5;
+      let inL = lead;
+      let ih = -1;
+      let from: Float32Array | null = null;
+      {
+        const iEnd = Math.min(n - 1, Math.floor(Math.min(z.s1, z.s0 + PULL_INTO) / TRACK_STEP));
+        // Where the walls leave the lane at sample i, if they hold it more than PULL_HOLD off the platform
+        // line (nearer, the bus is still alongside); NaN where they do not.
+        const heldAt = (i: number) => {
+          const h = home[i];
+          const t = edgeAt(i * TRACK_STEP) - PLATFORM_LANE;
+          let o = NaN;
+          for (let k = wallStart[i]; k < wallStart[i + 1]; k += 2) {
+            const a = wallPos[k];
+            const b = wallPos[k + 1];
+            if (t > h && b > h && a < t + WALL_CLEAR - PULL_HOLD) o = Math.min(Number.isNaN(o) ? h : o, a - WALL_CLEAR);
+            if (t < h && a < h && b > t - WALL_CLEAR + PULL_HOLD) o = Math.max(Number.isNaN(o) ? h : o, b + WALL_CLEAR);
+          }
+          return o;
+        };
+        for (let i = iEnd; i >= i0 && ih < 0; i--) if (!Number.isNaN(heldAt(i))) ih = i;
+        const free = ih < 0 ? -Infinity : (ih + 0.5) * TRACK_STEP + PULL_CLEAR;
+        // (Shorter to end within PULL_INTO of the platform's start, down to ~1 m sideways per 3.5 m.)
+        const len = Math.max(20, shift * 3.5, Math.min(lead, z.s0 + PULL_INTO - free));
+        // (Not where the walls run on along the platform, or leave no room for a bus alongside after.)
+        if (free > inS && ih < iEnd - 1 && free + len < z.s1 - 25) {
+          inS = free;
+          inL = len;
+          // The held line: through where the walls held the lane at ih and a few samples before.
+          const k0 = Math.max(0, ih - 3);
+          const oh = heldAt(ih);
+          const ok0 = heldAt(k0);
+          const px = bx[ih] + nx[ih] * oh;
+          const py = by[ih] + ny[ih] * oh;
+          let dx = ny[ih];
+          let dy = -nx[ih];
+          if (k0 < ih && !Number.isNaN(ok0)) {
+            dx = px - bx[k0] - nx[k0] * ok0;
+            dy = py - by[k0] - ny[k0] * ok0;
+          }
+          const dl = Math.hypot(dx, dy) || 1;
+          dx /= dl;
+          dy /= dl;
+          const jEnd = Math.min(n - 1, Math.ceil((inS + inL) / TRACK_STEP));
+          from = new Float32Array(Math.max(0, jEnd - ih));
+          for (let j = ih + 1; j <= jEnd && from; j++) {
+            // (base_j + n_j o on the line p + d u)
+            const den = nx[j] * dy - ny[j] * dx;
+            const o = ((px - bx[j]) * dy - (py - by[j]) * dx) / (den || 1e-9);
+            if (Math.abs(den) < 0.5 || offPaved(j, o)) from = null;
+            else from[j - ih - 1] = o;
+          }
+        }
+      }
       for (let i = i0; i <= i1; i++) {
         const s = i * TRACK_STEP;
-        const w = s < z.s0 ? smooth01((s - (z.s0 - lead - 5)) / lead) : s > z.s1 ? 1 - smooth01((s - z.s1) / tail) : 1;
-        if (w <= 0) continue;
+        const w = s < inS + inL ? smooth01((s - inS) / inL) : s > z.s1 ? 1 - smooth01((s - z.s1) / tail) : 1;
+        const f = from && i > ih && i - ih - 1 < from.length ? from[i - ih - 1] : NaN;
+        if (w <= 0 && Number.isNaN(f)) continue;
         if (s > z.s0 - 8 && s < z.s1 + 8) skew[i] |= 2; // (alongside the platform: the lane's shift from the road is meant)
-        if (s >= z.s0 && s <= z.s1) skew[i] |= 4;
+        if (s >= z.s0 && s <= z.s1 && w >= 1) skew[i] |= 4;
         else skew[i] |= 8; // (pulling in or out)
+        const kerbNow = this.kerb[i] + this.offset[i];
+        if (!Number.isNaN(f)) this.offset[i] = f;
         let want = edgeAt(s) - PLATFORM_LANE;
         if (s < z.s0 || s > z.s1) {
           const alt = home[i] + (s < z.s0 ? pullIn : pullOut);
           const cur = this.offset[i];
           if (offPaved(i, cur + (want - cur) * w) && !offPaved(i, cur + (alt - cur) * w)) want = alt;
         }
-        const kerbNow = this.kerb[i] + this.offset[i];
         this.offset[i] += (want - this.offset[i]) * w;
-        this.kerb[i] += (Math.max(PLATFORM_LANE, kerbNow - this.offset[i]) - this.kerb[i]) * w;
-        if (s >= z.s0 && s <= z.s1) this.kerb[i] = PLATFORM_LANE;
+        this.kerb[i] += (Math.max(PLATFORM_LANE, kerbNow - this.offset[i]) - this.kerb[i]) * (Number.isNaN(f) ? w : 1);
+        if (s >= z.s0 && s <= z.s1 && w >= 1) this.kerb[i] = PLATFORM_LANE;
       }
     }
     // The gap between walls the lane runs in: the one around its road lane where a bus fits and can
@@ -1359,6 +1584,7 @@ export class RouteTrack {
     const X = this.x;
     const Y = this.y;
     const J = signalJunctions(data);
+    const TB = turnBoxes(data);
     const idx = roadIndexFor(data);
     const grid = signalGrid(data);
     const sig = data.signals;
@@ -1443,9 +1669,26 @@ export class RouteTrack {
       }
       // At the world's stop line, or before the first signal for this approach if that comes first (the
       // junction centre can lie off to one side of a turning lane).
-      const stop = Math.min(s0 - 7, best < 15 ? sc - junctionStop(data, J, j) : Infinity);
+      const base = Math.min(s0 - 7, best < 15 ? sc - junctionStop(data, J, j) : Infinity);
       const last = out[out.length - 1];
-      if (stop < 12 || (last && stop - last.s < 30)) continue;
+      if (base < 12 || (last && base - last.s < 30)) continue;
+      let stop = base;
+      // And behind the junction box of any sharp bus turn here (a turning bus may sweep through this lane
+      // in it): where the lane, followed back from the centre, leaves the last such box. (Not so far back
+      // that it runs into the stop line before, or off the start.)
+      if (best < 15) {
+        let i = Math.min(n - 1, Math.round(sc / TRACK_STEP));
+        const near: number[] = [];
+        for (let k = 0; k < TB.x.length; k++) {
+          if (Math.hypot(TB.x[k] - cx, TB.y[k] - cy) < 30 && Math.abs(TB.z[k] - this.z[i]) < LEVEL_GAP) near.push(k);
+        }
+        const inBox = (q: number) => near.some((k) => Math.hypot(X[q] - TB.x[k], Y[q] - TB.y[k]) < TB.r[k]);
+        const lo = Math.max(0, Math.floor((sc - TURN_BOX_MAX - 12) / TRACK_STEP));
+        if (near.length && inBox(i)) {
+          while (i > lo && inBox(i - 1)) i--;
+          stop = Math.max(Math.min(stop, (i - 1) * TRACK_STEP), 12, last ? last.s + 30 : 12);
+        }
+      }
       out.push({ s: stop, x: cx, y: cy });
     }
     return out;
@@ -2137,7 +2380,10 @@ export class RouteTrack {
     }
   }
 
-  /** Local lane radius at sample i (from its two chords; 0 where the lane stalls or folds back). */
+  /**
+   * Local lane radius at sample i (from its two chords, the shorter of them: a corner between a short and a
+   * long chord is as tight as the short one; 0 where the lane stalls or folds back).
+   */
   private radiusAt(i: number): number {
     if (i < 1 || i + 1 >= this.n) return Infinity;
     const X = this.x;
@@ -2150,7 +2396,7 @@ export class RouteTrack {
     const lb = Math.hypot(bx, by);
     if (la < 0.25 * TRACK_STEP || lb < 0.25 * TRACK_STEP) return 0;
     const d = Math.abs(wrapAngle(Math.atan2(bx, by) - Math.atan2(ax, ay)));
-    return d > 1e-4 ? (la + lb) / 2 / d : Infinity;
+    return d > 1e-4 ? Math.min(la, lb) / d : Infinity;
   }
 
   /**
@@ -2194,6 +2440,47 @@ export class RouteTrack {
         }
       }
     }
+    // One-way carriageways running against the lane near each sample (a dual carriageway's other half, a
+    // busway's other direction): the lane keeps off them as it keeps its own half of a two-way road. Per
+    // sample: their segments (start, direction, length, how near the centreline counts as on it), and
+    // the sharp-turn junction boxes nearby.
+    const oppStart = new Int32Array(n + 1);
+    const oppSeg: number[] = [];
+    const boxStart = new Int32Array(n + 1);
+    const boxNear: number[] = [];
+    {
+      const idx = roadIndexFor(data);
+      const TB = turnBoxes(data);
+      for (let i = 0; i < n; i++) {
+        oppStart[i] = oppSeg.length;
+        boxStart[i] = boxNear.length;
+        const a = Math.max(0, i - 1);
+        const b = Math.min(n - 1, i + 1);
+        const tl = Math.hypot(X[b] - X[a], Y[b] - Y[a]) || 1;
+        const ux = (X[b] - X[a]) / tl;
+        const uy = (Y[b] - Y[a]) / tl;
+        // (Not one the lane already runs on: a shape against a one-way street, carriageways mapped
+        // overlapping. Keeping it there no worse is all the solve can do.)
+        const on = new Set<number>();
+        const segs: number[] = [];
+        idx.forEachNear(X[i], Y[i], 14, (rj, ax, ay, sdx, sdy, len, d, zz) => {
+          const r = data.roads[rj];
+          if (rj === this.road[i] || !r.oneway || r.kind === RoadKind.Pedestrian || Math.abs(zz - this.z[i]) > LEVEL_GAP) return;
+          if (sdx * ux + sdy * uy > -OPP_DOT) return;
+          if (d < r.width / 2 - OPP_IN) on.add(rj);
+          segs.push(rj, ax, ay, sdx, sdy, len, r.width / 2 - OPP_IN);
+        });
+        for (let k = 0; k < segs.length; k += 7) if (!on.has(segs[k])) oppSeg.push(...segs.slice(k + 1, k + 7));
+        if (oppSeg.length === oppStart[i]) continue;
+        for (let k = 0; k < TB.x.length; k++) {
+          if (Math.abs(TB.x[k] - X[i]) < 40 && Math.abs(TB.y[k] - Y[i]) < 40 && Math.abs(TB.z[k] - this.z[i]) < LEVEL_GAP) boxNear.push(TB.x[k], TB.y[k], TB.r[k]);
+        }
+      }
+      oppStart[n] = oppSeg.length;
+      boxStart[n] = boxNear.length;
+    }
+    /** Whether the stretch being solved may use the junction box its turn needs. */
+    let relax = false;
     /** How far left of the matched road's centre line (x, y) is, facing (ux, uy); Infinity in a junction or near a dead end. */
     const sideOf = (i: number, x: number, y: number, ux: number, uy: number): number => {
       const ri = this.road[i];
@@ -2211,7 +2498,7 @@ export class RouteTrack {
         if (d >= best) continue;
         best = d;
         const along = cum[k] + (cum[k + 1] - cum[k]) * t;
-        if (ownHalfFree(nodes, ri, along)) {
+        if (ownHalfFree(nodes, ri, along, relax)) {
           lat = Infinity;
           continue;
         }
@@ -2244,6 +2531,18 @@ export class RouteTrack {
         const lat = sideOf(i, x, y, ux, uy);
         if (lat < OWN_MIN) bad += 4 + (OWN_MIN - lat) * 2;
       }
+      // (So does running on a one-way carriageway the other way, outside the junction box of a sharp turn
+      // where the stretch may use it.)
+      for (let k = oppStart[i]; k < oppStart[i + 1]; k += 6) {
+        if (oppSeg[k + 2] * ux + oppSeg[k + 3] * uy > -OPP_DOT) continue;
+        const t = Math.max(0, Math.min(oppSeg[k + 4], (x - oppSeg[k]) * oppSeg[k + 2] + (y - oppSeg[k + 1]) * oppSeg[k + 3]));
+        const d = Math.hypot(x - oppSeg[k] - oppSeg[k + 2] * t, y - oppSeg[k + 1] - oppSeg[k + 3] * t);
+        if (d >= oppSeg[k + 5]) continue;
+        let boxed = false;
+        for (let q = boxStart[i]; relax && q < boxStart[i + 1] && !boxed; q += 3) boxed = Math.hypot(x - boxNear[q], y - boxNear[q + 1]) < boxNear[q + 2];
+        if (!boxed) bad += 4 + (oppSeg[k + 5] - d) * 2;
+        break;
+      }
       return bad;
     };
     const dirAt = (i: number): [number, number] => {
@@ -2253,6 +2552,189 @@ export class RouteTrack {
       const dy = Y[b] - Y[a];
       const l = Math.hypot(dx, dy) || 1;
       return [dx / l, dy / l];
+    };
+    /** Regularize the stretch A..B (both ends locked) towards the least bent lane a bus fits. */
+    const solveWindow = (A: number, B: number): void => {
+      const m = B - A + 1;
+      const X0 = X.slice(A, B + 1);
+      const Y0 = Y.slice(A, B + 1);
+      const lock = (i: number) => i <= A + 1 || i >= B - 1 || fixed[i] === 1;
+      const cur = new Float32Array(m);
+      for (let i = A; i <= B; i++) {
+        const [ux, uy] = dirAt(i);
+        cur[i - A] = badness(i, X[i], Y[i], ux, uy);
+      }
+      // The least bent curve through the locked points (bending energy: squared second differences, with
+      // a weak pull back to where the lane was), solved directly. A point it puts where a bus does not fit
+      // gets a one-sided constraint: stay on the near side of a line through the nearest place across the
+      // lane that does fit (it may slide along that edge, or leave it when the curve swings wide); solved
+      // again until all fit. If some still do not, the stretch goes only part of the way from the old lane.
+      const LAM = 0.01;
+      const CW = 60;
+      const SPACE = 4;
+      const S0X = Float64Array.from(X0);
+      const S0Y = Float64Array.from(Y0);
+      const wt = new Float64Array(m).fill(LAM);
+      // (Bending weighs more, iteration by iteration, where the curve is still tighter than RMIN: the
+      // turn spreads out, swinging wide, rather than bunching where the road is narrowest.)
+      const bw = new Float64Array(m).fill(1);
+      const cw = new Float64Array(m);
+      const cnx = new Float64Array(m);
+      const cny = new Float64Array(m);
+      const cc = new Float64Array(m);
+      const free: number[] = [];
+      for (let k = 0; k < m; k++) if (!lock(A + k)) free.push(k);
+      if (!free.length) return;
+      const PX = Float32Array.from(X0);
+      const PY = Float32Array.from(Y0);
+      const bad = (k: number, x: number, y: number, ux: number, uy: number) => badness(A + k, x, y, ux, uy) > cur[k] + 1e-6;
+      const tangent = (QX: ArrayLike<number>, QY: ArrayLike<number>, k: number): [number, number] => {
+        const dx = QX[Math.min(m - 1, k + 1)] - QX[Math.max(0, k - 1)];
+        const dy = QY[Math.min(m - 1, k + 1)] - QY[Math.max(0, k - 1)];
+        const dl = Math.hypot(dx, dy) || 1;
+        return [dx / dl, dy / dl];
+      };
+      let it = 0;
+      let left = 0;
+      for (; it < 30; it++) {
+        // Rows: bending (second differences, which measure curvature only while samples stay evenly
+        // spaced, so also: each chord, along its present direction, as long as the stretch's mean), the
+        // pull back to the old lane, and the half planes.
+        const rows: LsqRow[] = [];
+        let total = 0;
+        for (let k = 0; k + 1 < m; k++) total += Math.hypot(PX[k + 1] - PX[k], PY[k + 1] - PY[k]);
+        const hbar = Math.max(total, Math.hypot(PX[m - 1] - PX[0], PY[m - 1] - PY[0])) / (m - 1);
+        let lux = PX[1] - PX[0];
+        let luy = PY[1] - PY[0];
+        for (let k = 0; k + 1 < m; k++) {
+          const dx = PX[k + 1] - PX[k];
+          const dy = PY[k + 1] - PY[k];
+          const dl = Math.hypot(dx, dy);
+          if (dl > 0.05) {
+            lux = dx / dl;
+            luy = dy / dl;
+          }
+          rows.push({ w: relax ? SPACE * 16 : SPACE, k: [k, k + 1], cx: [-lux, lux], cy: [-luy, luy], c: hbar });
+        }
+        for (let j = 1; j + 1 < m; j++) {
+          rows.push({ w: bw[j], k: [j - 1, j, j + 1], cx: [1, -2, 1], cy: [0, 0, 0], c: 0 });
+          rows.push({ w: bw[j], k: [j - 1, j, j + 1], cx: [0, 0, 0], cy: [1, -2, 1], c: 0 });
+        }
+        for (const k of free) {
+          rows.push({ w: wt[k], k: [k], cx: [1], cy: [0], c: S0X[k] });
+          rows.push({ w: wt[k], k: [k], cx: [0], cy: [1], c: S0Y[k] });
+          if (cw[k] > 0) rows.push({ w: cw[k], k: [k], cx: [cnx[k]], cy: [cny[k]], c: cc[k] });
+        }
+        const sol = solveRows(X, Y, A, m, free, rows);
+        free.forEach((k, f) => {
+          PX[k] = sol[2 * f];
+          PY[k] = sol[2 * f + 1];
+        });
+        left = 0;
+        let changed = 0;
+        const rj = new Float64Array(m).fill(Infinity);
+        let rlo = Infinity;
+        for (let j = 1; j + 1 < m; j++) {
+          const ax = PX[j] - PX[j - 1];
+          const ay = PY[j] - PY[j - 1];
+          const bx = PX[j + 1] - PX[j];
+          const by = PY[j + 1] - PY[j];
+          const turn = Math.abs(wrapAngle(Math.atan2(bx, by) - Math.atan2(ax, ay)));
+          const len = (Math.hypot(ax, ay) + Math.hypot(bx, by)) / 2;
+          rj[j] = turn > 1e-6 ? len / turn : Infinity;
+          rlo = Math.min(rlo, rj[j]);
+        }
+        // (In the junction box pass only the tightest stretch stiffens, so the turn spreads out from there
+        // even where RMIN is out of reach.)
+        const rTarget = relax ? Math.min(RMIN, rlo * 1.3) : RMIN;
+        for (let j = 1; j + 1 < m; j++) {
+          if (rj[j] * 1.02 < rTarget && bw[j] < (relax ? 1600 : 200)) {
+            bw[j] *= 2;
+            changed++;
+          }
+        }
+        for (const k of free) {
+          const [ux, uy] = tangent(PX, PY, k);
+          const isBad = bad(k, PX[k], PY[k], ux, uy);
+          if (!isBad) {
+            // Released where the curve pulls it further onto the good side.
+            if (cw[k] > 0 && cnx[k] * PX[k] + cny[k] * PY[k] > cc[k] + 0.02) {
+              cw[k] = 0;
+              changed++;
+            }
+            continue;
+          }
+          left++;
+          // The nearest place across the lane where a bus fits.
+          let found = false;
+          for (let d = 0.25; d <= 6 && !found; d += 0.25) {
+            for (const sg of [1, -1]) {
+              const qx = PX[k] - uy * d * sg;
+              const qy = PY[k] + ux * d * sg;
+              if (bad(k, qx, qy, ux, uy)) continue;
+              const nx2 = -uy * sg;
+              const ny2 = ux * sg;
+              // (Keep the old edge if this one is barely different, else take the new one.)
+              cnx[k] = nx2;
+              cny[k] = ny2;
+              cc[k] = nx2 * qx + ny2 * qy + 0.1;
+              cw[k] = relax && cw[k] > 0 ? Math.min(CW * 64, cw[k] * 2) : CW;
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            // Nowhere across: back where it was.
+            wt[k] += CW;
+          }
+          changed++;
+        }
+        if (!left && !changed && it >= 3) break;
+      }
+      // Whatever still does not fit: only part of the way from the old lane.
+      let t = 1;
+      if (left) {
+        for (t = 0.75; t > 0; t -= 0.25) {
+          let ok = true;
+          for (const k of free) {
+            const x = S0X[k] + (PX[k] - S0X[k]) * t;
+            const y = S0Y[k] + (PY[k] - S0Y[k]) * t;
+            const [ux, uy] = tangent(PX, PY, k);
+            if (bad(k, x, y, ux, uy)) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok) break;
+        }
+        t = Math.max(0, t);
+      }
+      let before = Infinity;
+      for (let i = A + 1; i < B; i++) before = Math.min(before, this.radiusAt(i));
+      for (const k of free) {
+        X[A + k] = S0X[k] + (PX[k] - S0X[k]) * t;
+        Y[A + k] = S0Y[k] + (PY[k] - S0Y[k]) * t;
+      }
+      let after = Infinity;
+      for (let i = A + 1; i < B; i++) after = Math.min(after, this.radiusAt(i));
+      if (after < before) {
+        // (No better: as it was.)
+        for (const k of free) {
+          X[A + k] = S0X[k];
+          Y[A + k] = S0Y[k];
+        }
+      }
+      for (let i = A; i <= B; i++) {
+        const [ux, uy] = dirAt(i);
+        cur[i - A] = badness(i, X[i], Y[i], ux, uy);
+      }
+      // Even spacing between the stretch's fixed points (each sample stands for the same length of lane).
+      let k0 = A;
+      for (let k = A + 1; k <= B; k++) {
+        if (!(k === B || fixed[k] === 1)) continue;
+        this.respace(k0, k, badness, dirAt);
+        k0 = k;
+      }
     };
     for (let round = 0; round < 3; round++) {
       // Stretches that need it, widened by the corner's setback (a tangent arc of RMIN needs RMIN tan(turn/2)
@@ -2265,7 +2747,7 @@ export class RouteTrack {
         let turn = 0;
         for (let k = Math.max(1, i - 1); k <= Math.min(n - 2, b + 1); k++) {
           const r = this.radiusAt(k);
-          turn += r === 0 ? Math.PI / 2 : r === Infinity ? 0 : (Math.hypot(X[k + 1] - X[k], Y[k + 1] - Y[k]) + Math.hypot(X[k] - X[k - 1], Y[k] - Y[k - 1])) / 2 / r;
+          turn += r === 0 ? Math.PI / 2 : Math.abs(wrapAngle(Math.atan2(X[k + 1] - X[k], Y[k + 1] - Y[k]) - Math.atan2(X[k] - X[k - 1], Y[k] - Y[k - 1])));
         }
         const setback = RMIN * Math.tan(Math.min(2.4, turn) / 2);
         const M = Math.max(3, Math.min(12, Math.ceil(setback / TRACK_STEP) + 2 + round * 2));
@@ -2276,181 +2758,231 @@ export class RouteTrack {
         else wins.push([a0, b0]);
         i = b;
       }
-      if (!wins.length) return;
+      if (!wins.length) break;
+      // A stretch still tighter than R_OK in its own half is solved again using the turn's junction box,
+      // the oncoming lanes in it included.
       for (const [A, B] of wins) {
         if (B - A < 4) continue;
-        const m = B - A + 1;
-        const X0 = X.slice(A, B + 1);
-        const Y0 = Y.slice(A, B + 1);
-        const lock = (i: number) => i <= A + 1 || i >= B - 1 || fixed[i] === 1;
-        const cur = new Float32Array(m);
-        for (let i = A; i <= B; i++) {
-          const [ux, uy] = dirAt(i);
-          cur[i - A] = badness(i, X[i], Y[i], ux, uy);
-        }
-        // The least bent curve through the locked points (bending energy: squared second differences, with
-        // a weak pull back to where the lane was), solved directly. A point it puts where a bus does not fit
-        // gets a one-sided constraint: stay on the near side of a line through the nearest place across the
-        // lane that does fit (it may slide along that edge, or leave it when the curve swings wide); solved
-        // again until all fit. If some still do not, the stretch goes only part of the way from the old lane.
-        const LAM = 0.01;
-        const CW = 60;
-        const SPACE = 4;
-        const S0X = Float64Array.from(X0);
-        const S0Y = Float64Array.from(Y0);
-        const wt = new Float64Array(m).fill(LAM);
-        // (Bending weighs more, iteration by iteration, where the curve is still tighter than RMIN: the
-        // turn spreads out, swinging wide, rather than bunching where the road is narrowest.)
-        const bw = new Float64Array(m).fill(1);
-        const cw = new Float64Array(m);
-        const cnx = new Float64Array(m);
-        const cny = new Float64Array(m);
-        const cc = new Float64Array(m);
-        const free: number[] = [];
-        for (let k = 0; k < m; k++) if (!lock(A + k)) free.push(k);
-        if (!free.length) continue;
-        const PX = Float32Array.from(X0);
-        const PY = Float32Array.from(Y0);
-        const bad = (k: number, x: number, y: number, ux: number, uy: number) => badness(A + k, x, y, ux, uy) > cur[k] + 1e-6;
-        const tangent = (QX: ArrayLike<number>, QY: ArrayLike<number>, k: number): [number, number] => {
-          const dx = QX[Math.min(m - 1, k + 1)] - QX[Math.max(0, k - 1)];
-          const dy = QY[Math.min(m - 1, k + 1)] - QY[Math.max(0, k - 1)];
-          const dl = Math.hypot(dx, dy) || 1;
-          return [dx / dl, dy / dl];
-        };
-        let it = 0;
-        let left = 0;
-        for (; it < 30; it++) {
-          // Rows: bending (second differences, which measure curvature only while samples stay evenly
-          // spaced, so also: each chord, along its present direction, as long as the stretch's mean), the
-          // pull back to the old lane, and the half planes.
-          const rows: LsqRow[] = [];
-          let total = 0;
-          for (let k = 0; k + 1 < m; k++) total += Math.hypot(PX[k + 1] - PX[k], PY[k + 1] - PY[k]);
-          const hbar = Math.max(total, Math.hypot(PX[m - 1] - PX[0], PY[m - 1] - PY[0])) / (m - 1);
-          let lux = PX[1] - PX[0];
-          let luy = PY[1] - PY[0];
-          for (let k = 0; k + 1 < m; k++) {
-            const dx = PX[k + 1] - PX[k];
-            const dy = PY[k + 1] - PY[k];
-            const dl = Math.hypot(dx, dy);
-            if (dl > 0.05) {
-              lux = dx / dl;
-              luy = dy / dl;
-            }
-            rows.push({ w: SPACE, k: [k, k + 1], cx: [-lux, lux], cy: [-luy, luy], c: hbar });
-          }
-          for (let j = 1; j + 1 < m; j++) {
-            rows.push({ w: bw[j], k: [j - 1, j, j + 1], cx: [1, -2, 1], cy: [0, 0, 0], c: 0 });
-            rows.push({ w: bw[j], k: [j - 1, j, j + 1], cx: [0, 0, 0], cy: [1, -2, 1], c: 0 });
-          }
-          for (const k of free) {
-            rows.push({ w: wt[k], k: [k], cx: [1], cy: [0], c: S0X[k] });
-            rows.push({ w: wt[k], k: [k], cx: [0], cy: [1], c: S0Y[k] });
-            if (cw[k] > 0) rows.push({ w: cw[k], k: [k], cx: [cnx[k]], cy: [cny[k]], c: cc[k] });
-          }
-          const sol = solveRows(X, Y, A, m, free, rows);
-          free.forEach((k, f) => {
-            PX[k] = sol[2 * f];
-            PY[k] = sol[2 * f + 1];
-          });
-          left = 0;
-          let changed = 0;
-          for (let j = 1; j + 1 < m; j++) {
-            const ax = PX[j] - PX[j - 1];
-            const ay = PY[j] - PY[j - 1];
-            const bx = PX[j + 1] - PX[j];
-            const by = PY[j + 1] - PY[j];
-            const turn = Math.abs(wrapAngle(Math.atan2(bx, by) - Math.atan2(ax, ay)));
-            const len = (Math.hypot(ax, ay) + Math.hypot(bx, by)) / 2;
-            if (turn * RMIN > len * 1.02 && bw[j] < 200) {
-              bw[j] *= 2;
-              changed++;
-            }
-          }
-          for (const k of free) {
-            const [ux, uy] = tangent(PX, PY, k);
-            const isBad = bad(k, PX[k], PY[k], ux, uy);
-            if (!isBad) {
-              // Released where the curve pulls it further onto the good side.
-              if (cw[k] > 0 && cnx[k] * PX[k] + cny[k] * PY[k] > cc[k] + 0.02) {
-                cw[k] = 0;
-                changed++;
-              }
-              continue;
-            }
-            left++;
-            // The nearest place across the lane where a bus fits.
-            let found = false;
-            for (let d = 0.25; d <= 6 && !found; d += 0.25) {
-              for (const sg of [1, -1]) {
-                const qx = PX[k] - uy * d * sg;
-                const qy = PY[k] + ux * d * sg;
-                if (bad(k, qx, qy, ux, uy)) continue;
-                const nx2 = -uy * sg;
-                const ny2 = ux * sg;
-                // (Keep the old edge if this one is barely different, else take the new one.)
-                cnx[k] = nx2;
-                cny[k] = ny2;
-                cc[k] = nx2 * qx + ny2 * qy + 0.1;
-                cw[k] = CW;
-                found = true;
-                break;
-              }
-            }
-            if (!found) {
-              // Nowhere across: back where it was.
-              wt[k] += CW;
-            }
-            changed++;
-          }
-          if (!left && !changed && it >= 3) break;
-        }
-        // Whatever still does not fit: only part of the way from the old lane.
-        let t = 1;
-        if (left) {
-          for (t = 0.75; t > 0; t -= 0.25) {
-            let ok = true;
-            for (const k of free) {
-              const x = S0X[k] + (PX[k] - S0X[k]) * t;
-              const y = S0Y[k] + (PY[k] - S0Y[k]) * t;
-              const [ux, uy] = tangent(PX, PY, k);
-              if (bad(k, x, y, ux, uy)) {
-                ok = false;
-                break;
-              }
-            }
-            if (ok) break;
-          }
-          t = Math.max(0, t);
-        }
-        let before = Infinity;
-        for (let i = A + 1; i < B; i++) before = Math.min(before, this.radiusAt(i));
-        for (const k of free) {
-          X[A + k] = S0X[k] + (PX[k] - S0X[k]) * t;
-          Y[A + k] = S0Y[k] + (PY[k] - S0Y[k]) * t;
-        }
-        let after = Infinity;
-        for (let i = A + 1; i < B; i++) after = Math.min(after, this.radiusAt(i));
-        if (after < before) {
-          // (No better: as it was.)
-          for (const k of free) {
-            X[A + k] = S0X[k];
-            Y[A + k] = S0Y[k];
-          }
-        }
-        for (let i = A; i <= B; i++) {
-          const [ux, uy] = dirAt(i);
-          cur[i - A] = badness(i, X[i], Y[i], ux, uy);
-        }
-        // Even spacing between the stretch's fixed points (each sample stands for the same length of lane).
-        let k0 = A;
-        for (let k = A + 1; k <= B; k++) {
-          if (!(k === B || fixed[k] === 1)) continue;
-          this.respace(k0, k, badness, dirAt);
-          k0 = k;
+        relax = false;
+        solveWindow(A, B);
+        let tight = Infinity;
+        for (let i = A + 1; i < B; i++) tight = Math.min(tight, this.radiusAt(i));
+        if (tight < R_OK) {
+          relax = true;
+          solveWindow(A, B);
+          relax = false;
         }
       }
+    }
+    // Even out the tightest spots: in the lane's own half up to R_EASY, then using the turn's
+    // junction box where still under R_OK.
+    this.evenCorners(fixed, badness, dirAt, R_EASY, () => (relax = false));
+    this.evenCorners(fixed, badness, dirAt, R_OK, () => (relax = true));
+    relax = false;
+  }
+
+  /**
+   * What is still tighter than `target` after regularize: nudge each corner's tightest sample along its normal
+   * (alone, or with its neighbours half as far) while that eases the corner's tightest radius and leaves
+   * every point moved no worse off (the junction box of a sharp turn counting as road), a little at a time.
+   * The least-bending solve spreads a turn by its total bending; this evens out its tightest spot.
+   */
+  private evenCorners(
+    fixed: Uint8Array,
+    badness: (i: number, x: number, y: number, ux: number, uy: number) => number,
+    dirAt: (i: number) => [number, number],
+    target: number,
+    setMode: () => void,
+  ): void {
+    const n = this.n;
+    const X = this.x;
+    const Y = this.y;
+    const local = (i: number): number => {
+      let m = Infinity;
+      for (let k = Math.max(1, i - 3); k <= Math.min(n - 2, i + 3); k++) m = Math.min(m, this.radiusAt(k));
+      return m;
+    };
+    setMode();
+    // First the whole corner: between samples K either side of its tightest one, a cubic (Hermite) curve
+    // along the lane's own directions there, evenly resampled, where every sample it moves stays no worse
+    // off and the corner's tightest radius grows.
+    const span = (a: number, b: number): number => {
+      let m = Infinity;
+      for (let k = Math.max(1, a - 1); k <= Math.min(n - 2, b + 1); k++) m = Math.min(m, this.radiusAt(k));
+      return m;
+    };
+    const dense = 24;
+    for (let i = 2; i + 2 < n; i++) {
+      const r = this.radiusAt(i);
+      if (!(r < target) || r > local(i)) continue;
+      let best = span(i - 3, i + 3);
+      let bestPts: Float64Array | null = null;
+      let bestA = 0;
+      for (let K = 3; K <= 8; K++) {
+        const a = i - K;
+        const b = i + K;
+        if (a < 1 || b > n - 2) break;
+        let blocked = false;
+        for (let k = a + 1; k < b; k++) if (fixed[k]) blocked = true;
+        if (blocked) break;
+        const t0x = X[a] - X[a - 1];
+        const t0y = Y[a] - Y[a - 1];
+        const t1x = X[b + 1] - X[b];
+        const t1y = Y[b + 1] - Y[b];
+        const l0 = Math.hypot(t0x, t0y) || 1;
+        const l1 = Math.hypot(t1x, t1y) || 1;
+        const chord = Math.hypot(X[b] - X[a], Y[b] - Y[a]);
+        const was = new Float64Array(b - a + 1);
+        for (let k = a + 1; k < b; k++) {
+          const [vx, vy] = dirAt(k);
+          was[k - a] = badness(k, X[k], Y[k], vx, vy);
+        }
+        for (const lam of [0.5, 0.75, 1, 1.25, 1.5]) {
+          const m0 = (lam * chord) / l0;
+          const m1 = (lam * chord) / l1;
+          // The curve, densely, then its length along it.
+          const cx = new Float64Array(dense * (b - a) + 1);
+          const cy = new Float64Array(cx.length);
+          const cl = new Float64Array(cx.length);
+          for (let q = 0; q < cx.length; q++) {
+            const t = q / (cx.length - 1);
+            const h00 = 2 * t * t * t - 3 * t * t + 1;
+            const h10 = t * t * t - 2 * t * t + t;
+            const h01 = -2 * t * t * t + 3 * t * t;
+            const h11 = t * t * t - t * t;
+            cx[q] = h00 * X[a] + h10 * m0 * t0x + h01 * X[b] + h11 * m1 * t1x;
+            cy[q] = h00 * Y[a] + h10 * m0 * t0y + h01 * Y[b] + h11 * m1 * t1y;
+            if (q) cl[q] = cl[q - 1] + Math.hypot(cx[q] - cx[q - 1], cy[q] - cy[q - 1]);
+          }
+          const total = cl[cl.length - 1];
+          const pts = new Float64Array(2 * (b - a + 1));
+          let q = 0;
+          for (let k = 0; k <= b - a; k++) {
+            const u = (total * k) / (b - a);
+            while (q + 1 < cl.length - 1 && cl[q + 1] < u) q++;
+            const f = Math.max(0, Math.min(1, (u - cl[q]) / (cl[q + 1] - cl[q] || 1e-9)));
+            pts[2 * k] = cx[q] + (cx[q + 1] - cx[q]) * f;
+            pts[2 * k + 1] = cy[q] + (cy[q + 1] - cy[q]) * f;
+          }
+          const keep = new Float64Array(2 * (b - a + 1));
+          for (let k = a; k <= b; k++) {
+            keep[2 * (k - a)] = X[k];
+            keep[2 * (k - a) + 1] = Y[k];
+          }
+          for (let k = a + 1; k < b; k++) {
+            X[k] = pts[2 * (k - a)];
+            Y[k] = pts[2 * (k - a) + 1];
+          }
+          let ok = true;
+          for (let k = a + 1; k < b && ok; k++) {
+            const [vx, vy] = dirAt(k);
+            if (badness(k, X[k], Y[k], vx, vy) > was[k - a] + 1e-6) ok = false;
+          }
+          const got = ok ? span(a, b) : -1;
+          for (let k = a + 1; k < b; k++) {
+            X[k] = keep[2 * (k - a)];
+            Y[k] = keep[2 * (k - a) + 1];
+          }
+          if (got > best + 0.05) {
+            best = got;
+            bestPts = pts;
+            bestA = a;
+          }
+        }
+      }
+      if (!bestPts) continue;
+      const m = bestPts.length / 2 - 1;
+      for (let k = 1; k < m; k++) {
+        X[bestA + k] = bestPts[2 * k];
+        Y[bestA + k] = bestPts[2 * k + 1];
+      }
+    }
+    // Then what is left, a sample (or a few) at a time.
+    // (Offsets from the sample and how far each moves: it alone, it with a neighbour, or a wider bulge.)
+    const PATTERNS: [number, number][][] = [
+      [[0, 1]],
+      [
+        [-1, 0.5],
+        [0, 1],
+        [1, 0.5],
+      ],
+      [
+        [0, 1],
+        [1, 1],
+      ],
+      [
+        [-1, 1],
+        [0, 1],
+      ],
+      [
+        [-1, 0.5],
+        [0, 1],
+        [1, 1],
+        [2, 0.5],
+      ],
+      [
+        [-2, 0.5],
+        [-1, 1],
+        [0, 1],
+        [1, 0.5],
+      ],
+      [
+        [-2, 0.3],
+        [-1, 0.7],
+        [0, 1],
+        [1, 0.7],
+        [2, 0.3],
+      ],
+    ];
+    for (let pass = 0; pass < 40; pass++) {
+      let moved = false;
+      for (let i = 2; i + 2 < n; i++) {
+        const r = this.radiusAt(i);
+        if (!(r < target) || fixed[i]) continue;
+        const base = local(i);
+        if (r > base) continue;
+        const [ux, uy] = dirAt(i);
+        let best = base;
+        let bestStep = 0;
+        let bestPat = -1;
+        for (let pi = 0; pi < PATTERNS.length; pi++) {
+          const pat = PATTERNS[pi];
+          if (pat.some(([o]) => i + o < 1 || i + o > n - 2 || fixed[i + o])) continue;
+          for (const step of [0.4, -0.4, 0.15, -0.15]) {
+            const old = pat.map(([o]) => [X[i + o], Y[i + o]]);
+            const was = pat.map(([o]) => {
+              const [vx, vy] = dirAt(i + o);
+              return badness(i + o, X[i + o], Y[i + o], vx, vy);
+            });
+            pat.forEach(([o, f]) => {
+              X[i + o] += -uy * step * f;
+              Y[i + o] += ux * step * f;
+            });
+            let ok = true;
+            pat.forEach(([o], q) => {
+              const [vx, vy] = dirAt(i + o);
+              if (badness(i + o, X[i + o], Y[i + o], vx, vy) > was[q] + 1e-6) ok = false;
+            });
+            const got = ok ? local(i) : -1;
+            pat.forEach(([o], q) => {
+              X[i + o] = old[q][0];
+              Y[i + o] = old[q][1];
+            });
+            if (got > best + 0.02) {
+              best = got;
+              bestStep = step;
+              bestPat = pi;
+            }
+          }
+        }
+        if (bestPat < 0) continue;
+        for (const [o, f] of PATTERNS[bestPat]) {
+          X[i + o] += -uy * bestStep * f;
+          Y[i + o] += ux * bestStep * f;
+        }
+        moved = true;
+      }
+      if (!moved) break;
     }
   }
 
