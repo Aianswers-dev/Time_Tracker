@@ -1041,6 +1041,7 @@ def solve(lines: list[Line], ground, water: WaterInfo, tidal_level: float = 0.5,
 
 OPEN_SPAN_DZ = 2.5  # m: a surface way this far above a tunnel road passes over it
 SHALLOW_CUT = 1.5  # m: a tunnel way with the ground less than this above it is in an open approach cut
+BOXED_COVER = 3.4  # m: a tunnel way with the ground this far above it somewhere is boxed end to end
 
 
 def _resample(xy: np.ndarray, z: np.ndarray, step: float):
@@ -1050,16 +1051,56 @@ def _resample(xy: np.ndarray, z: np.ndarray, step: float):
     return np.stack([np.interp(s, cum, xy[:, 0]), np.interp(s, cum, xy[:, 1])], 1), np.interp(s, cum, z), s
 
 
-def open_cutting_spans(lines: list[Line], ground) -> dict[int, list[tuple[float, float]]]:
+def boxed_tunnels(lines: list[Line], ground) -> set[int]:
+    """Tunnel ways the game boxes from end to end (exported as "tb", see
+    src/world/roads.ts tubePrep): those with at least BOXED_COVER of ground,
+    or of a road or railway at grade over them, above the road somewhere
+    along them (a tube at its least clear height, 4.6 m, with its roof 1.2 m
+    out of the ground). Elsewhere a tube is an open cutting where the ground
+    is lower than its roof, but the 10 m grid, smoothed and with the
+    approach roads burned in, reads the ground over a portal's last 6-18 m
+    several metres too low, and a shallow box under a plaza or a lawn has
+    less cover than a tube is high (the South East Busway under the Cultural
+    Centre, the Inner Northern Busway under Victoria Park): the busway tubes
+    opened 6-18 m inside their mapped ends, where the satellite imagery shows
+    the portals. Returns line indices."""
+    from scipy.spatial import cKDTree
+
+    S, SZ = [], []
+    for ln in lines:
+        if ln.tunnel or ln.bridge or ln.dxy is None or len(ln.dxy) < 2:
+            continue
+        xy, z, _ = _resample(ln.dxy, ln.dz, 2.0)
+        S.append(xy)
+        SZ.append(z)
+    tree = cKDTree(np.concatenate(S))
+    SZ = np.concatenate(SZ)
+    out: set[int] = set()
+    for li, ln in enumerate(lines):
+        if not ln.tunnel or ln.bridge or ln.kind == RAIL or ln.dxy is None or len(ln.dxy) < 2:
+            continue
+        xy, z, _ = _resample(ln.dxy, ln.dz, 2.0)
+        cover = np.asarray(ground(xy[:, 0], xy[:, 1])) - z
+        # (a road or railway over the carriageway: the Inner Northern Busway under the Roma Street yards)
+        for k, idx in enumerate(tree.query_ball_point(xy, r=0.5 * float(ln.meta.get("w", 6.0)))):
+            if idx:
+                cover[k] = max(cover[k], float(SZ[idx].max()) - z[k])
+        if float(cover.max()) >= BOXED_COVER:
+            out.add(li)
+    return out
+
+
+def open_cutting_spans(lines: list[Line], ground, boxed: set[int]) -> dict[int, list[tuple[float, float]]]:
     """Stretches of surface ways that pass over a tunnel where its cutting is
-    open beside them (the ground lower than the tube roof): bridge pieces, so
-    they get a deck and parapets instead of an asphalt ribbon over the cutting
-    (audit #8). Returns {line index: [(s0, s1) along ln.dxy]}."""
+    open beside them (the ground lower than the tube roof, on a tunnel that
+    is not boxed end to end): bridge pieces, so they get a deck and parapets
+    instead of an asphalt ribbon over the cutting (audit #8). Returns
+    {line index: [(s0, s1) along ln.dxy]}."""
     from scipy.spatial import cKDTree
 
     t0 = time.time()
-    P, Z, HW, H = [], [], [], []
-    for ln in lines:
+    P, Z, HW, H, B = [], [], [], [], []
+    for li, ln in enumerate(lines):
         if not ln.tunnel or ln.bridge or ln.kind == RAIL or ln.dxy is None or len(ln.dxy) < 2:
             continue
         xy, z, _ = _resample(ln.dxy, ln.dz, 1.0)
@@ -1067,10 +1108,11 @@ def open_cutting_spans(lines: list[Line], ground) -> dict[int, list[tuple[float,
         Z.append(z)
         HW.append(np.full(len(z), 0.5 * float(ln.meta.get("w", 6.0))))
         H.append(np.full(len(z), TUBE_H + (0.6 if ln.kind == 0 else 0.0)))
+        B.append(np.full(len(z), li in boxed))
     if not P:
         return {}
     TP, TZ, THW, TH = np.concatenate(P), np.concatenate(Z), np.concatenate(HW), np.concatenate(H)
-    topen = np.asarray(ground(TP[:, 0], TP[:, 1])) < TZ + TH - 1.2
+    topen = (np.asarray(ground(TP[:, 0], TP[:, 1])) < TZ + TH - 1.2) & ~np.concatenate(B)
     tree = cKDTree(TP)
     hwmax = float(THW.max())
     out: dict[int, list[tuple[float, float]]] = {}
@@ -1366,7 +1408,9 @@ def build(lines: list[Line], water_out: list[dict], buildings: list[dict], areas
     rail: list[dict] = []
     runs = []  # (line, xy, z, bridge piece) as emitted
     junction = junction_nodes(lines, stats["graph"])
-    spans = open_cutting_spans(lines, ground.sample)
+    boxed = boxed_tunnels(lines, ground.sample)
+    log(f"{sum(1 for li in boxed if lines[li].emit)} tunnel ways boxed end to end")
+    spans = open_cutting_spans(lines, ground.sample, boxed)
     for li, ln in enumerate(lines):
         if not ln.emit:
             continue
@@ -1388,6 +1432,8 @@ def build(lines: list[Line], water_out: list[dict], buildings: list[dict], areas
                         rec["z"] = [q(v) for v in z]
                 if piece_bridge:
                     rec["b"] = 1
+                if li in boxed:
+                    rec["tb"] = 1
                 rec["_ln"] = ln
                 (rail if ln.kind == RAIL else roads).append(rec)
                 runs.append((ln, xy, np.rint(z * 10) / 10, piece_bridge))

@@ -2477,8 +2477,9 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   }
 
   /**
-   * Where a tunnel road is an enclosed box, sampled every 4 m: under enough
-   * ground, or under a street that crosses low over it (an underpass box, so
+   * Where a tunnel road is an enclosed box, sampled every 4 m: all along a
+   * tunnel the pipeline boxed end to end, else under enough ground; and
+   * under a street that crosses low over it (an underpass box, so
    * the street never spans an open cutting as a bare ribbon); its clear
    * height, lowered under a road that crosses low over the tube (never below
    * 4.6 m); and its portals.
@@ -2543,7 +2544,13 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     // underpass box, run on a sample past it so the headwalls stand beside it, not in it
     const street = (a: { dz: number; road: number }) => (a.road === -2 || (a.road >= 0 && !roads[a.road].bridge)) && a.dz < H + 3;
     const over = ss.map((_, k) => street(ab[k]) || (k > 0 && street(abm[k - 1])) || (k < n - 1 && street(abm[k])));
-    const cov = P0.map((c, k) => covered(ri, c) || over[k] || (k > 0 && over[k - 1]) || (k < n - 1 && over[k + 1]));
+    // a tunnel under ground somewhere (r.boxed, see tools/data/elevation.py boxed_tunnels) is a box from
+    // one mapped end to the other: the 10 m ground grid, with the approach roads burned in, shows too
+    // little ground over a portal's last 6-18 m, and over a shallow box under a plaza or a lawn (the
+    // busway under the Cultural Centre and Victoria Park). Not under a deck or a railway too low for
+    // the roof, which leaves the tube open there.
+    const roomy = (k: number) => Math.min(lim(ab[k]), k > 0 ? lim(abm[k - 1]) : Infinity, k < n - 1 ? lim(abm[k]) : Infinity) >= 4.6;
+    const cov = P0.map((c, k) => (!!r.boxed && roomy(k)) || covered(ri, c) || over[k] || (k > 0 && over[k - 1]) || (k < n - 1 && over[k + 1]));
     // no 4-8 m slivers of open cutting between two boxes, and no lone covered sample
     for (let k = 1; k + 1 < n; k++) {
       if (!cov[k] && cov[k - 1] && (cov[k + 1] || (k + 2 < n && cov[k + 2]))) cov[k] = true;
