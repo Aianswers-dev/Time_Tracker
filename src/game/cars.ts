@@ -2067,7 +2067,15 @@ export class CarTraffic {
       const widens = c.next >= 0 && this.edges[c.lane >> 1].oneway && this.edges[c.next >> 1].oneway && this.lanesIn(c.next) > this.lanesIn(c.lane);
       if (c.next >= 0 && left < LANE_BLEND && !widens) {
         const to = this.laneOffset(c.next, Math.min(c.laneIdx, this.lanesIn(c.next) - 1));
-        if (to > target && Math.abs(this.turnAngle(c.lane, c.next)) < 0.5) target += (to - target) * (1 - left / LANE_BLEND);
+        const straight = Math.abs(this.turnAngle(c.lane, c.next)) < 0.5;
+        if (to > target && straight) target += (to - target) * (1 - left / LANE_BLEND);
+        else if (to < target && straight && this.edges[c.next >> 1].oneway) {
+          // ...and into a one-way road's lane further right (no oncoming traffic there), as far as our half
+          // of a two-way road allows, as the bus lanes do: the second lane's car, going over only past the
+          // node, was still in the way of the player's bus moving over before it (61/1 s 3097).
+          const to2 = this.edges[c.lane >> 1].oneway ? to : Math.max(to, CAR_HALF_W + 0.3);
+          if (to2 < target) target += (to2 - target) * (1 - left / LANE_BLEND);
+        }
       }
       c.lat += Math.max(-dt * 1.2, Math.min(dt * 1.2, target - c.lat));
       this.at(c.lane, c.u, c.lat, pt);
