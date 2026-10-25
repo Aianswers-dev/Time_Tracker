@@ -18,26 +18,8 @@ import { PointGrid, type Body } from './bodies';
 import { LEVEL_GAP, heightsOf } from './height';
 import { TRACK_STEP, type RouteTrack } from './track';
 import { rng } from './util';
+import { hypot2 } from './hypot';
 import { nodeFacing, signalsFor } from '../data/signals';
-
-/**
- * Math.hypot(a, b), bit for bit, without its allocation. (V8's builtin is not inlined and boxes its
- * arguments into a new array on every call: tens of KB a frame in the traffic loops.) The same steps
- * as V8's builtins/math.tq: both magnitudes scaled by the larger, the squares summed (its Kahan
- * compensation is exactly 0 for two terms), then sqrt(sum) times the larger; identical on 2e7 random
- * and edge-case pairs in node and in Chromium.
- */
-export function hypot2(a: number, b: number): number {
-  if (a !== a || b !== b) return a === Infinity || a === -Infinity || b === Infinity || b === -Infinity ? Infinity : NaN;
-  const x = Math.abs(a);
-  const y = Math.abs(b);
-  const max = x > y ? x : y;
-  if (max === Infinity) return Infinity;
-  if (max === 0) return 0;
-  const nx = x / max;
-  const ny = y / max;
-  return Math.sqrt(nx * nx + ny * ny) * max;
-}
 
 /** Remove arr[k], keeping the order (splice without its result array). */
 export function removeAt<T>(arr: T[], k: number): void {
@@ -209,6 +191,15 @@ export function clearTime(v: number, d: number, a: number): number {
 /** The speed (m/s) a car slows to for a turn of `turn` rad (more than 0.5) at the end of its lane. */
 function turnSpeed(turn: number): number {
   return 4.5 + 7 * (1 - Math.min(1, turn / 2));
+}
+
+/** A movement through a junction: the unit directions in and out, and its class. */
+export interface Movement {
+  inX: number;
+  inY: number;
+  outX: number;
+  outY: number;
+  cls: Turn;
 }
 
 interface Hold {
@@ -471,8 +462,10 @@ export class CarTraffic {
   private models: Model[] = [];
   private rand = rng(777);
   private nextId = 1;
+  /** Spawn edges and their weights: the first candN. */
   private candidates: number[] = [];
   private candW: number[] = [];
+  private candN = 0;
   private candSum = 0;
   private candTimer = 0;
   private initial = true;
@@ -535,8 +528,6 @@ export class CarTraffic {
   private iV0 = 0.5;
   private iGap = 0.5;
   private iVL = 0.5;
-  /** Until when a junction a car holds stays reserved (this frame's time + 3 s). */
-  private holdUntil = 0.5;
   /** chooseNext's options and their weights. */
   private optL: number[] = [];
   private optW: number[] = [];
@@ -544,9 +535,14 @@ export class CarTraffic {
   private lRef = 0;
   private dX = 0.5;
   private dY = 0.5;
-  private mv: { inX: number; inY: number; outX: number; outY: number; cls: Turn } = { inX: 0.5, inY: 0.5, outX: 0.5, outY: 0.5, cls: Turn.Straight };
-  /** Lanes with a bucket (the buckets' keys, so they are walked without an iterator). */
+  private mv: Movement = { inX: 0.5, inY: 0.5, outX: 0.5, outY: 0.5, cls: Turn.Straight };
+  // The buckets' lanes, lists (the same arrays) and fill counts, by bucket index; bucketOf maps a lane
+  // to its index. Lists are refilled in place and then cut to length: an array emptied with
+  // `length = 0` loses its backing store in V8, so refilling it allocates a new one.
   private bucketLanes: number[] = [];
+  private bucketList: Car[][] = [];
+  private bucketN: number[] = [];
+  private bucketOf = new Map<number, number>();
   // Grid queries' arguments and results (their visitors are made once).
   private qX = 0.5;
   private qY = 0.5;
@@ -1250,9 +1246,8 @@ export class CarTraffic {
     // The options and their weights, in two lists (lane numbers kept small integers).
     const optL = this.optL;
     const optW = this.optW;
-    optL.length = 0;
-    optW.length = 0;
-    for (let pass = 0; pass < 2 && !optL.length; pass++) {
+    let nOpt = 0;
+    for (let pass = 0; pass < 2 && !nOpt; pass++) {
       for (let oi = 0; oi < node.out.length; oi++) {
         const o = node.out[oi];
         if (o >> 1 === lane >> 1) continue;
@@ -1269,14 +1264,20 @@ export class CarTraffic {
         }
         const turn = Math.abs(signed);
         const w = (Math.cos(turn) + 1.25) * (CLASS_W[oe.kind] ?? 0.3) * (oe.len < 15 ? 0.6 : 1);
-        optL.push(o);
-        optW.push(w);
+        if (nOpt < optL.length) {
+          optL[nOpt] = o;
+          optW[nOpt] = w;
+        } else {
+          optL.push(o);
+          optW.push(w);
+        }
+        nOpt++;
         sum += w;
       }
     }
-    if (!optL.length) return e.oneway ? -1 : lane ^ 1;
+    if (!nOpt) return e.oneway ? -1 : lane ^ 1;
     let r = this.rand() * sum;
-    for (let k = 0; k < optL.length; k++) {
+    for (let k = 0; k < nOpt; k++) {
       r -= optW[k];
       if (r <= 0) {
         best = optL[k];
@@ -1556,6 +1557,23 @@ export class CarTraffic {
   /** The holder that made the last boxClear() fail (PLAYER_HOLD for the player's bus). */
   get boxBlocker(): number {
     return this.boxBy;
+  }
+
+  /** Until when enterM reserves (set by its caller: a double passed to a call that is not inlined is boxed). */
+  enterUntil = 0.5;
+
+  /** enter(node, id, m's movement, enterUntil). */
+  enterM(node: number, id: number, m: Movement): void {
+    const until = this.enterUntil;
+    const occ = this.nodes[node].occ;
+    for (let i = 0; i < occ.length; i++) {
+      const o = occ[i];
+      if (o.id === id) {
+        o.until = Math.max(o.until, until);
+        return;
+      }
+    }
+    occ.push({ id, inX: m.inX, inY: m.inY, outX: m.outX, outY: m.outY, cls: m.cls, until });
   }
 
   /** Reserve the box for a movement until `until` (refreshes an existing hold). */
@@ -2015,8 +2033,7 @@ export class CarTraffic {
   // -------------------------------------------------------------------------
 
   private refreshCandidates(px: number, py: number): void {
-    this.candidates.length = 0;
-    this.candW.length = 0;
+    let n = 0;
     this.candSum = 0;
     const R2 = this.radius * this.radius;
     for (let i = 0; i < this.edges.length; i++) {
@@ -2025,10 +2042,17 @@ export class CarTraffic {
       const dx = e.mx - px;
       const dy = e.my - py;
       if (dx * dx + dy * dy > R2) continue;
-      this.candidates.push(i);
-      this.candW.push(e.weight);
+      if (n < this.candidates.length) {
+        this.candidates[n] = i;
+        this.candW[n] = e.weight;
+      } else {
+        this.candidates.push(i);
+        this.candW.push(e.weight);
+      }
+      n++;
       this.candSum += e.weight;
     }
+    this.candN = n;
   }
 
   private pickPaint(): THREE.Color {
@@ -2043,10 +2067,10 @@ export class CarTraffic {
   }
 
   private spawn(px: number, py: number, frustum: THREE.Frustum): boolean {
-    if (!this.candidates.length) return false;
+    if (!this.candN) return false;
     let r = this.rand() * this.candSum;
     let ei = this.candidates[0];
-    for (let i = 0; i < this.candidates.length; i++) {
+    for (let i = 0; i < this.candN; i++) {
       r -= this.candW[i];
       if (r <= 0) {
         ei = this.candidates[i];
@@ -2134,6 +2158,32 @@ export class CarTraffic {
   private note(msg: string): void {
     this.events.push(msg);
     if (this.events.length > 30) this.events.shift();
+  }
+
+  /** Drop the buckets of lanes without a car (they pile up as the player drives on). */
+  private pruneBuckets(): void {
+    const bl = this.bucketLanes;
+    const bList = this.bucketList;
+    const bN = this.bucketN;
+    const has = new Set<number>();
+    for (let ci = 0; ci < this.cars.length; ci++) has.add(this.cars[ci].lane);
+    let w = 0;
+    for (let k = 0; k < bl.length; k++) {
+      const lane = bl[k];
+      if (!has.has(lane)) {
+        this.buckets.delete(lane);
+        this.bucketOf.delete(lane);
+        continue;
+      }
+      bl[w] = lane;
+      bList[w] = bList[k];
+      bN[w] = bN[k];
+      this.bucketOf.set(lane, w);
+      w++;
+    }
+    bl.length = w;
+    bList.length = w;
+    bN.length = w;
   }
 
   private kill(c: Car): void {
@@ -2377,20 +2427,6 @@ export class CarTraffic {
     }
   }
 
-  /** enter(h's node, id, h's movement, until holdUntil): car `id` keeps the junction it holds reserved. */
-  private holdOn(h: Hold, id: number): void {
-    const until = this.holdUntil;
-    const occ = this.nodes[h.node].occ;
-    for (let i = 0; i < occ.length; i++) {
-      const o = occ[i];
-      if (o.id === id) {
-        o.until = Math.max(o.until, until);
-        return;
-      }
-    }
-    occ.push({ id, inX: h.inX, inY: h.inY, outX: h.outX, outY: h.outY, cls: h.cls, until });
-  }
-
   /** Is there another car in lane index `to` of `list` (car c's lane) within reach of c alongside? */
   private laneTaken(list: Car[], c: Car, to: number): boolean {
     for (let k = 0; k < list.length; k++) {
@@ -2487,24 +2523,38 @@ export class CarTraffic {
       let tries = this.initial ? 400 : 8;
       let made = 0;
       while (this.cars.length < desired && tries-- > 0 && made < (this.initial ? this.capCars : 2)) if (this.spawn(px, py, frustum)) made++;
-      if (this.initial && this.candidates.length) this.initial = false;
+      if (this.initial && this.candN) this.initial = false;
     }
 
     // Buckets per lane, sorted by u (byId holds every car in the list: kept up as they come and go;
     // exempt flags are last frame's).
+    // (A lane without cars reads as an empty bucket or none: the same to every reader.)
+    if (this.bucketLanes.length > 4 * this.cars.length + 256) this.pruneBuckets();
     const bl = this.bucketLanes;
-    for (let k = 0; k < bl.length; k++) this.buckets.get(bl[k])!.length = 0;
+    const bList = this.bucketList;
+    const bN = this.bucketN;
+    for (let k = 0; k < bl.length; k++) bN[k] = 0;
     for (let ci = 0; ci < this.cars.length; ci++) {
       const c = this.cars[ci];
-      let l = this.buckets.get(c.lane);
-      if (!l) {
-        this.buckets.set(c.lane, (l = []));
+      let k = this.bucketOf.get(c.lane);
+      if (k === undefined) {
+        k = bl.length;
+        const l: Car[] = [];
+        this.bucketOf.set(c.lane, k);
+        this.buckets.set(c.lane, l);
         bl.push(c.lane);
+        bList.push(l);
+        bN.push(0);
       }
-      l.push(c);
+      const l = bList[k];
+      const n = bN[k];
+      if (n < l.length) l[n] = c;
+      else l.push(c);
+      bN[k] = n + 1;
     }
     for (let k = 0; k < bl.length; k++) {
-      const l = this.buckets.get(bl[k])!;
+      const l = bList[k];
+      if (l.length !== bN[k]) l.length = bN[k];
       if (l.length > 1) sortByU(l);
     }
 
@@ -2514,7 +2564,8 @@ export class CarTraffic {
     st.waitingRed = 0;
     st.waitingJunction = 0;
     st.stationary = 0;
-    this.holdUntil = time + 3;
+    // (The junctions cars hold stay reserved for 3 s more.)
+    this.enterUntil = time + 3;
     for (let ci = 0; ci < this.cars.length; ci++) {
       const c = this.cars[ci];
       if (c.dead) continue;
@@ -2758,7 +2809,7 @@ export class CarTraffic {
         if (h.d > hn.boxR + c.len) {
           this.leave(h.node, c.id);
           removeAt(c.holds, k);
-        } else this.holdOn(h, c.id);
+        } else this.enterM(h.node, c.id, h);
       }
       // Advance onto the next lane (at a left turn's corner, short of the node).
       let guard = 0;
