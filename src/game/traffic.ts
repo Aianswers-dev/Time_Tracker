@@ -222,6 +222,8 @@ export class Traffic {
   private pGrid: { p: RouteTrack; cells: Map<number, number[]> } | null = null;
   /** The player's lane and its front's place on it (null off the route). */
   private pTrack: RouteTrack | null = null;
+  /** The player's track the car stop lines were held back for (holdBackFor). */
+  private heldFor: RouteTrack | null = null;
   private pS = 0;
   private asks = new WeakMap<TrackSignal, SignalAsk>();
   private bodiesOut: Body[] = [];
@@ -766,6 +768,11 @@ export class Traffic {
     const g = session.guide;
     this.pTrack = g?.track && g.state && !g.state.offRoute ? g.track : null;
     this.pS = g?.state?.s ?? 0;
+    // Car stop lines held back from the player's bus's swept path (once, before any car waits at one).
+    if (this.pTrack && this.pTrack !== this.heldFor && this.playerSpec) {
+      this.heldFor = this.pTrack;
+      this.events.push(`stop lines held back from the route's swept path: ${this.cars.holdBackFor(this.pTrack, this.playerSpec)}`);
+    }
     this.claimJunctions(time, player);
     for (const b of this.active) this.step(b, dt, time);
     for (const b of this.active) this.updateBody(b);

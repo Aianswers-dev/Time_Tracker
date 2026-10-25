@@ -11,7 +11,7 @@
 // never stops inside the box. AI buses use the same reservations.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { RoadKind, type BusPose, type MapData, type WorldHandle } from '../types';
+import { RoadKind, type BusPose, type BusSpec, type MapData, type WorldHandle } from '../types';
 import { wrapAngle } from '../data/coords';
 import { speedLimitOf } from './roadIndex';
 import { PointGrid, type Body } from './bodies';
@@ -139,6 +139,27 @@ const ONCOMING_MARGIN = 1.5;
 const MERGE_MARGIN = 1;
 /** Two ways out of a junction this far apart (rad) cross, for vehicles side by side going in. */
 const ACROSS = 0.3;
+/** Stop lines held back from a bus's swept path (holdBackFor): room left (m), farthest line (m), car size (m). */
+const SWEEP_MARGIN = 0.25;
+const SWEEP_MAX = 25;
+const SWEEP_CAR_L = 5;
+const SWEEP_CAR_W = 1.9;
+
+/** Do two rectangles (centre, unit axis along, half length, half width) overlap? (Separating axes.) */
+function boxesTouch(ax: number, ay: number, aux: number, auy: number, al: number, aw: number, bx: number, by: number, bux: number, buy: number, bl: number, bw: number): boolean {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const reach = al + aw + bl + bw;
+  if (dx * dx + dy * dy > reach * reach) return false;
+  // Each box's own two axes (along, across); the other's extent on them through |cos| and |sin|.
+  const c = Math.abs(aux * bux + auy * buy);
+  const s = Math.abs(aux * buy - auy * bux);
+  if (Math.abs(dx * aux + dy * auy) > al + bl * c + bw * s) return false;
+  if (Math.abs(-dx * auy + dy * aux) > aw + bl * s + bw * c) return false;
+  if (Math.abs(dx * bux + dy * buy) > bl + al * c + aw * s) return false;
+  if (Math.abs(-dx * buy + dy * bux) > bw + al * s + aw * c) return false;
+  return true;
+}
 /** Car acceleration (m/s^2). */
 const CAR_A = 1.7;
 /** Half a car's width (m), as the overlap checks take it. */
@@ -1479,6 +1500,104 @@ export class CarTraffic {
     });
     this.busJunctions.set(track, out);
     return out;
+  }
+
+  /**
+   * Stop lines held back from a bus's swept path: a bus of `spec` following `track` (its front axle on
+   * the lane, the rest tracking in behind) that would touch either of the first two cars waiting at
+   * another arm's line moves that line back until it is clear, up to SWEEP_MAX from the node. A bus
+   * turning left out of one narrow road into another swings over the far half of the one it turns
+   * into, where cars wait at their red (199/0 s 1926, s 7070). Returns the number of lines moved.
+   */
+  holdBackFor(track: RouteTrack, spec: BusSpec): number {
+    const secs = spec.sections;
+    const ns = secs.length;
+    // Section i: its axle, its hitch to the one in front (section 0: the front axle), unit heading.
+    const ax = new Float64Array(ns);
+    const ay = new Float64Array(ns);
+    const hx = new Float64Array(ns);
+    const hy = new Float64Array(ns);
+    const link = secs.map((s, i) => (i === 0 ? spec.wheelbase : Math.max(0.5, s.axleFromFront - s.hitchFromFront)));
+    const halfW = spec.width / 2 + SWEEP_MARGIN;
+    const rects: number[] = [];
+    const smp = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
+    const pt = this.pt2;
+    let moved = 0;
+    for (const j of this.junctionsAlong(track)) {
+      const nd = this.nodes[j.node];
+      // Arms other than the one the bus comes in on, with a line cars wait at.
+      const lanes: number[] = [];
+      for (const ei of nd.edges) {
+        const e = this.edges[ei];
+        if (e.bus) continue;
+        const L = e.b === j.node ? ei * 2 : ei * 2 + 1;
+        if ((e.oneway && L & 1) || !this.stopD[L] || this.endNode(L) !== j.node) continue;
+        const [ix, iy] = this.laneEndDir(L);
+        if (ix * j.inX + iy * j.inY > 0.7) continue;
+        lanes.push(L);
+      }
+      if (!lanes.length) continue;
+      // The bus's body over its way through: section rectangles (centre, unit axis, half length).
+      rects.length = 0;
+      const s0 = Math.max(0, j.s - 50);
+      const s1 = Math.min(track.length, j.s + 50);
+      for (let s = s0; s <= s1; s += 1) {
+        track.sample(s, smp);
+        for (let i = 0; i < ns; i++) {
+          // Where it hangs from: the front axle on the lane, or the hitch on the section in front.
+          const px = i === 0 ? smp.x : ax[i - 1] + hx[i - 1] * (secs[i - 1].axleFromFront - secs[i - 1].rearHitchFromFront);
+          const py = i === 0 ? smp.y : ay[i - 1] + hy[i - 1] * (secs[i - 1].axleFromFront - secs[i - 1].rearHitchFromFront);
+          if (s === s0) {
+            // Start straight behind, along the lane.
+            const bx = i === 0 ? smp.hx : hx[i - 1];
+            const by = i === 0 ? smp.hy : hy[i - 1];
+            ax[i] = px - bx * link[i];
+            ay[i] = py - by * link[i];
+          }
+          let dx = px - ax[i];
+          let dy = py - ay[i];
+          const l = Math.hypot(dx, dy) || 1;
+          dx /= l;
+          dy /= l;
+          ax[i] = px - dx * link[i];
+          ay[i] = py - dy * link[i];
+          hx[i] = dx;
+          hy[i] = dy;
+          // Front face to back face, about the axle.
+          const f = secs[i].axleFromFront;
+          const b = secs[i].length - f;
+          const cx = ax[i] + (dx * (f - b)) / 2;
+          const cy = ay[i] + (dy * (f - b)) / 2;
+          if (Math.hypot(cx - nd.x, cy - nd.y) < 45) rects.push(cx, cy, dx, dy, (f + b) / 2);
+        }
+      }
+      for (const L of lanes) {
+        const e = this.edges[L >> 1];
+        const cap = Math.min(SWEEP_MAX, e.len - 2);
+        const n = this.lanesIn(L);
+        const hit = (sd: number): boolean => {
+          for (let q = 0; q < 2; q++) {
+            const dc = sd + SWEEP_CAR_L / 2 - 0.6 + q * (SWEEP_CAR_L + 2);
+            if (dc > e.len) break;
+            for (let k = 0; k < n; k++) {
+              this.at(L, e.len - dc, this.laneOffset(L, k), pt);
+              for (let r = 0; r < rects.length; r += 5) {
+                if (boxesTouch(pt.x, pt.y, pt.hx, pt.hy, SWEEP_CAR_L / 2, SWEEP_CAR_W / 2, rects[r], rects[r + 1], rects[r + 2], rects[r + 3], rects[r + 4], halfW)) return true;
+              }
+            }
+          }
+          return false;
+        };
+        let sd = this.stopD[L];
+        if (!hit(sd)) continue;
+        while (sd < cap && hit(sd)) sd += 0.5;
+        if (sd < cap) {
+          this.stopD[L] = sd;
+          moved++;
+        }
+      }
+    }
+    return moved;
   }
 
   /** Unit direction from `node` to the point `d` m out along edge `ei` (steadier than its first segment). */
