@@ -195,8 +195,10 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       }
       // far-side right pole (across the junction) for major roads
       if (a.kind <= RoadKind.Secondary) {
-        const fx = a.ox - a.ux * ds - lx * (a.oneway ? a.hw + 0.9 : 1.5);
-        const fy = a.oy - a.uy * ds - ly * (a.oneway ? a.hw + 0.9 : 1.5);
+        // (across the box, not as far out as a set-back stop line)
+        const df = Math.min(ds, 22);
+        const fx = a.ox - a.ux * df - lx * (a.oneway ? a.hw + 0.9 : 1.5);
+        const fy = a.oy - a.uy * df - ly * (a.oneway ? a.hw + 0.9 : 1.5);
         if (index.penetrationZ(fx, fy, a.z, 3) < -0.3) {
           poles.push({ x: fx, y: fy, z: base, h: 4.6 });
           heads.push({ x: fx, y: fy, h: base + 3.4, fx: a.ux, fy: a.uy, j: ji, group });

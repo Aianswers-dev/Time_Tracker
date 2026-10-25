@@ -113,7 +113,7 @@ const TIE = 0.25;
 /** A signal node controls the arm whose traffic heads its facing way to within this (cos; 60 degrees). */
 const FACE = 0.5;
 /** A cluster's directed node this close to another cluster's centre may be that junction's signal for an arm. */
-const MERGE_R = 45;
+const MERGE_R = 60;
 /** Clusters merge into one junction only while its nodes stay this close to their centre. */
 const MERGE_SPREAD = 36;
 /** ... and the node stands within this of the arm's line (m). */
@@ -618,10 +618,10 @@ export class SignalModel {
     // node the road it stands on and the direction of the traffic it faces along
     // that road (OSM traffic_signals:direction): a node controls the arm that
     // traffic arrives on, heading its way, on the node's side of the centre. An
-    // arm no node faces has no light (a free slip lane, the through busway at
-    // Buranda): it gives way in the box as at an unsignalised junction, as the
-    // player's guide (src/game/track.ts) shows it no light. Untagged nodes, or
-    // map data without directions, control every arm.
+    // arm no node faces has no light (a free slip lane): it gives way in the
+    // box as at an unsignalised junction, as the player's guide
+    // (src/game/track.ts) shows it no light. Untagged nodes, or map data
+    // without directions, control every arm.
     const controlled = new Set<number>();
     for (const m of nodes) {
       const f = nodeFacing(data, m);
@@ -630,7 +630,15 @@ export class SignalModel {
         break;
       }
       const i = facedArm(arms, cx, cy, f);
-      if (i >= 0) controlled.add(i);
+      if (i < 0) continue;
+      controlled.add(i);
+      // A node well out on its arm (a big junction's set-back stop line): the
+      // line where the guide stops for it, 7 m before it (src/game/track.ts),
+      // where the arm runs straight out to it.
+      const a = arms[i];
+      const rx = f.x - a.ox;
+      const ry = f.y - a.oy;
+      if (Math.abs(rx * a.uy - ry * a.ux) < 4) a.stop = Math.min(40, Math.max(a.stop, rx * a.ux + ry * a.uy - 7));
     }
     // Phases: pair opposite controlled arms (straight through each other), the rest alone.
     // Signals nobody can see (every approach is inside a tunnel, e.g. in an
