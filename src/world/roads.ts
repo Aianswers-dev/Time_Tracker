@@ -793,6 +793,69 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   };
 
   const inWater = (x: number, y: number) => mask.has(x, y, MASK_WATER);
+  // mapped retaining walls (OSM barrier=retaining_wall) as segments in a 16 m grid, for earthworks()
+  const MW_CELL = 16;
+  const mwSeg: number[] = [];
+  const mwCells = new Map<number, number[]>();
+  const mwKey = (cx: number, cy: number) => (cx + 4096) * 8192 + cy + 4096;
+  for (const w of data.retainingWalls ?? []) {
+    for (let i = 0; i + 3 < w.length; i += 2) {
+      const id = mwSeg.length / 4;
+      mwSeg.push(w[i], w[i + 1], w[i + 2], w[i + 3]);
+      for (let cx = Math.floor(Math.min(w[i], w[i + 2]) / MW_CELL); cx <= Math.floor(Math.max(w[i], w[i + 2]) / MW_CELL); cx++) {
+        for (let cy = Math.floor(Math.min(w[i + 1], w[i + 3]) / MW_CELL); cy <= Math.floor(Math.max(w[i + 1], w[i + 3]) / MW_CELL); cy++) {
+          const key = mwKey(cx, cy);
+          const cell = mwCells.get(key);
+          if (cell) cell.push(id);
+          else mwCells.set(key, [id]);
+        }
+      }
+    }
+  }
+  /**
+   * The nearest mapped retaining wall the ray from (x, y) along the unit direction (dx, dy) crosses
+   * between t0 and t1, among segments within 37 degrees of parallel to (tx, ty): [t, segment] or null.
+   * With `only` >= 0, just that segment, its line extended up to `ext` m past either end.
+   */
+  const mappedWallRay = (x: number, y: number, dx: number, dy: number, tx: number, ty: number, t0: number, t1: number, only = -1, ext = 0): [number, number] | null => {
+    let best: [number, number] | null = null;
+    const test = (id: number) => {
+      const ax = mwSeg[4 * id];
+      const ay = mwSeg[4 * id + 1];
+      const ex = mwSeg[4 * id + 2] - ax;
+      const ey = mwSeg[4 * id + 3] - ay;
+      const el = Math.hypot(ex, ey);
+      if (el < 0.1 || Math.abs(ex * tx + ey * ty) / el < 0.8) return;
+      const den = ex * dy - dx * ey;
+      if (Math.abs(den) < 1e-9) return;
+      const wx = ax - x;
+      const wy = ay - y;
+      const t = (ex * wy - wx * ey) / den;
+      const u = (dx * wy - dy * wx) / den;
+      const e = ext / el + 1e-6;
+      if (u < -e || u > 1 + e || t < t0 || t > t1) return;
+      if (!best || t < best[0]) best = [t, id];
+    };
+    if (only >= 0) {
+      test(only);
+      return best;
+    }
+    const seen = new Set<number>();
+    const xa = x + dx * t0;
+    const ya = y + dy * t0;
+    const xb = x + dx * t1;
+    const yb = y + dy * t1;
+    for (let cx = Math.floor(Math.min(xa, xb) / MW_CELL); cx <= Math.floor(Math.max(xa, xb) / MW_CELL); cx++) {
+      for (let cy = Math.floor(Math.min(ya, yb) / MW_CELL); cy <= Math.floor(Math.max(ya, yb) / MW_CELL); cy++) {
+        for (const id of mwCells.get(mwKey(cx, cy)) ?? []) {
+          if (seen.has(id)) continue;
+          seen.add(id);
+          test(id);
+        }
+      }
+    }
+    return best;
+  };
   // the Story Bridge truss carries its own piers (landmarks.ts)
   const story = storyOutline(ctx);
   // ... and the Green Bridge's cable-stayed span its own pylons
@@ -915,6 +978,82 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   }
   /** A ground strip's height at (x, y): never below the roof of a tunnel box there. */
   const stripZ = (x: number, y: number, z: number) => Math.max(z, field.roofAt(x, y) + 0.05);
+
+  // Cutting floors out to a mapped retaining wall (earthPlan()), as quads [road, z, x0, y0, ... x3, y3]
+  // in the 16 m grid, so that no other road's cutting wall stands on one (earthworks())
+  const mwFloor: number[] = [];
+  const mwFloorCells = new Map<number, number[]>();
+  if (mwSeg.length) {
+    for (const ri of infos) {
+      const r = ri.r;
+      if (ri.n < 2 || ri.len < 0.5 || r.tunnel || r.bridge || r.bay) continue;
+      // (only a road passing near a mapped wall)
+      let x0 = Infinity;
+      let y0 = Infinity;
+      let x1 = -Infinity;
+      let y1 = -Infinity;
+      for (let i = 0; i + 1 < r.pts.length; i += 2) {
+        x0 = Math.min(x0, r.pts[i]);
+        x1 = Math.max(x1, r.pts[i]);
+        y0 = Math.min(y0, r.pts[i + 1]);
+        y1 = Math.max(y1, r.pts[i + 1]);
+      }
+      const R = ri.hw + 8;
+      let near = false;
+      for (let cx = Math.floor((x0 - R) / MW_CELL); cx <= Math.floor((x1 + R) / MW_CELL) && !near; cx++) {
+        for (let cy = Math.floor((y0 - R) / MW_CELL); cy <= Math.floor((y1 + R) / MW_CELL) && !near; cy++) near = mwCells.has(mwKey(cx, cy));
+      }
+      if (!near) continue;
+      const ss = gradeSamples(ri);
+      for (const side of [1, -1]) {
+        const { P, e0, mwShift, mwEnd } = earthPlan(ri, side, ss, footPlan(ri, side, ss).foot);
+        for (let k = 0; k + 1 < ss.length; k++) {
+          if (!(mwShift[k] > 0)) continue;
+          const A = P[k];
+          const B = P[k + 1];
+          const oa = e0[k] + 0.6;
+          const ob = e0[k + 1] + mwEnd[k + 1] + 0.6;
+          const q = [A.x + A.nx * side * ri.hw, A.y + A.ny * side * ri.hw, B.x + B.nx * side * ri.hw, B.y + B.ny * side * ri.hw, B.x + B.nx * side * ob, B.y + B.ny * side * ob, A.x + A.nx * side * oa, A.y + A.ny * side * oa];
+          const id = mwFloor.length;
+          mwFloor.push(ri.i, (A.z + B.z) / 2, ...q);
+          let qx0 = Infinity;
+          let qy0 = Infinity;
+          let qx1 = -Infinity;
+          let qy1 = -Infinity;
+          for (let v = 0; v < 8; v += 2) {
+            qx0 = Math.min(qx0, q[v]);
+            qx1 = Math.max(qx1, q[v]);
+            qy0 = Math.min(qy0, q[v + 1]);
+            qy1 = Math.max(qy1, q[v + 1]);
+          }
+          for (let cx = Math.floor(qx0 / MW_CELL); cx <= Math.floor(qx1 / MW_CELL); cx++) {
+            for (let cy = Math.floor(qy0 / MW_CELL); cy <= Math.floor(qy1 / MW_CELL); cy++) {
+              const key = mwKey(cx, cy);
+              const cell = mwFloorCells.get(key);
+              if (cell) cell.push(id);
+              else mwFloorCells.set(key, [id]);
+            }
+          }
+        }
+      }
+    }
+  }
+  /** On another road's cutting floor out to a mapped retaining wall, within 2 m of its level. */
+  const onMappedFloor = (x: number, y: number, z: number, self: number) => {
+    for (const id of mwFloorCells.get(mwKey(Math.floor(x / MW_CELL), Math.floor(y / MW_CELL))) ?? []) {
+      if (mwFloor[id] === self || Math.abs(mwFloor[id + 1] - z) > 2) continue;
+      let inside = false;
+      for (let a = 0, b = 3; a < 4; b = a++) {
+        const ax = mwFloor[id + 2 + 2 * a];
+        const ay = mwFloor[id + 3 + 2 * a];
+        const bx = mwFloor[id + 2 + 2 * b];
+        const by = mwFloor[id + 3 + 2 * b];
+        if (ay > y !== by > y && x < ax + ((y - ay) * (bx - ax)) / (by - ay)) inside = !inside;
+      }
+      if (inside) return true;
+    }
+    return false;
+  };
 
   for (let ri0 = 0; ri0 < infos.length; ri0++) {
     const ri = infos[ri0];
@@ -1286,52 +1425,69 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
 
   /** At-grade road: footpaths, then the earthworks on each side. */
   function buildAtGrade(ri: RI, L: Layer, skips: [number, number][]): void {
-    const r = ri.r;
-    const hw = ri.hw;
-    const footKinds = r.kind >= RoadKind.Primary && r.kind <= RoadKind.Residential && !r.link;
-    const expressway = r.kind === RoadKind.Trunk && r.oneway && r.lanes >= 3;
-    const wantFoot = (footKinds || (r.kind === RoadKind.Trunk && !r.link)) && !expressway;
+    const ss = gradeSamples(ri);
+    for (const side of [1, -1]) {
+      const { foot, runs } = footPlan(ri, side, ss);
+      for (const [a, b, w, style] of runs) footRun(L.foot, ri, a, b, side, w, style);
+      earthworks(ri, L, side, ss, foot, skips);
+    }
+  }
+
+  /** An at-grade road's earthworks samples: every 4 m, the last exactly at its end. */
+  function gradeSamples(ri: RI): number[] {
     const step = 4;
     const ss: number[] = [];
     for (let s = 0; s <= ri.len + 0.01; s += step) ss.push(Math.min(s, ri.len));
     // (the last sample exactly at the end: the earthworks meet the next road's at the mitre line)
     if (ss.length > 1 && ss[ss.length - 1] >= ri.len - 0.5) ss[ss.length - 1] = ri.len;
     else if (ss[ss.length - 1] < ri.len) ss.push(ri.len);
-    for (const side of [1, -1]) {
-      // footpath validity per sample
-      const foot: number[] = ss.map((s) => {
-        if (!wantFoot) return 0;
-        const c = roadAt(ri, s);
-        for (const off of [hw + 0.35, hw + 2.2, hw + 3.9]) {
-          const qx = c.x + c.nx * side * off;
-          const qy = c.y + c.ny * side * off;
-          if (otherAt(qx, qy, c.z, ri.i) > -0.25 || inWater(qx, qy) || overOpen(qx, qy, c.z, ri.i)) return 0;
-        }
-        return 1;
-      });
-      // footpath runs
-      let k = 0;
-      while (k < foot.length) {
-        if (!foot[k]) {
-          k++;
-          continue;
-        }
-        let e = k;
-        while (e + 1 < foot.length && foot[e + 1]) e++;
-        const a = Math.max(0, ss[k] - (k > 0 ? 1.5 : 0));
-        const b = Math.min(ri.len, ss[e] + (e < foot.length - 1 ? 1.5 : 0));
-        if (b - a > 3) {
-          const c = roadAt(ri, (a + b) / 2);
-          const dens = densityAt(ctx, c.x + c.nx * side * (hw + 6), c.y + c.ny * side * (hw + 6));
-          const style = dens > 0.28 ? 1 : dens > 0.1 ? 2 : 0;
-          const w = style === 1 ? 4.2 : style === 2 ? 3.2 : 3.9;
-          footRun(L.foot, ri, a, b, side, w, style);
-          for (let q = k; q <= e; q++) foot[q] = w;
-        } else for (let q = k; q <= e; q++) foot[q] = 0;
-        k = e + 1;
+    return ss;
+  }
+
+  /**
+   * The footpath on one side of an at-grade road: its width at each sample (0 for none), and its runs
+   * [from, to, width, style] for footRun().
+   */
+  function footPlan(ri: RI, side: number, ss: number[]): { foot: number[]; runs: [number, number, number, number][] } {
+    const r = ri.r;
+    const hw = ri.hw;
+    const footKinds = r.kind >= RoadKind.Primary && r.kind <= RoadKind.Residential && !r.link;
+    const expressway = r.kind === RoadKind.Trunk && r.oneway && r.lanes >= 3;
+    const wantFoot = (footKinds || (r.kind === RoadKind.Trunk && !r.link)) && !expressway;
+    const runs: [number, number, number, number][] = [];
+    // footpath validity per sample
+    const foot: number[] = ss.map((s) => {
+      if (!wantFoot) return 0;
+      const c = roadAt(ri, s);
+      for (const off of [hw + 0.35, hw + 2.2, hw + 3.9]) {
+        const qx = c.x + c.nx * side * off;
+        const qy = c.y + c.ny * side * off;
+        if (otherAt(qx, qy, c.z, ri.i) > -0.25 || inWater(qx, qy) || overOpen(qx, qy, c.z, ri.i)) return 0;
       }
-      earthworks(ri, L, side, ss, foot, skips);
+      return 1;
+    });
+    // footpath runs
+    let k = 0;
+    while (k < foot.length) {
+      if (!foot[k]) {
+        k++;
+        continue;
+      }
+      let e = k;
+      while (e + 1 < foot.length && foot[e + 1]) e++;
+      const a = Math.max(0, ss[k] - (k > 0 ? 1.5 : 0));
+      const b = Math.min(ri.len, ss[e] + (e < foot.length - 1 ? 1.5 : 0));
+      if (b - a > 3) {
+        const c = roadAt(ri, (a + b) / 2);
+        const dens = densityAt(ctx, c.x + c.nx * side * (hw + 6), c.y + c.ny * side * (hw + 6));
+        const style = dens > 0.28 ? 1 : dens > 0.1 ? 2 : 0;
+        const w = style === 1 ? 4.2 : style === 2 ? 3.2 : 3.9;
+        runs.push([a, b, w, style]);
+        for (let q = k; q <= e; q++) foot[q] = w;
+      } else for (let q = k; q <= e; q++) foot[q] = 0;
+      k = e + 1;
     }
+    return { foot, runs };
   }
 
   /**
@@ -1390,14 +1546,14 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   }
 
   /**
-   * Shoulders / retaining walls / cuttings on one side of an at-grade road.
-   * Profile types per sample: 0 none (junction), 1 batter, 2 cutting wall, 3 fill wall.
+   * The ground beside one side of an at-grade road at the samples `ss`, before earthworks() looks at its
+   * neighbours: where the earthworks start (`e0`, out to the cutting wall's line on a mapped retaining
+   * wall), the edge height, the natural ground's depth and the profile it asks for (`raw`).
    */
-  function earthworks(ri: RI, L: Layer, side: number, ss: number[], foot: number[], skips: [number, number][]): void {
+  function earthPlan(ri: RI, side: number, ss: number[], foot: number[]) {
     const r = ri.r;
     const hw = ri.hw;
     const n = ss.length;
-    const type = new Uint8Array(n);
     const e0 = new Float32Array(n);
     const zE = new Float32Array(n);
     const P = ss.map((s) => roadAt(ri, s));
@@ -1405,6 +1561,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const straightOn = new Set<number>();
     // (and the road it runs straight on into at grade: its own earthworks take over at the join)
     const straightOnGrade = new Set<number>();
+    // (and every road meeting it at its start, and at its end, and the tunnels within 15 m of either)
+    const endNb = [new Set<number>(), new Set<number>()];
     if (ri.i >= 0) {
       const p = r.pts;
       for (const v of [0, ri.n - 1]) {
@@ -1426,6 +1584,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         };
         tunnels.roadsNear(ex, ey, 0.05, visit(straightOn));
         index.roadsNear(ex, ey, 0.05, visit(straightOnGrade));
+        index.roadsNear(ex, ey, 0.05, (q) => endNb[v === 0 ? 0 : 1].add(q));
+        tunnels.roadsNear(ex, ey, 15, (q) => endNb[v === 0 ? 0 : 1].add(q));
       }
     }
     const m0 = endMiter(ri, false);
@@ -1516,6 +1676,92 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         a = b + 1;
       }
     }
+    // A retaining wall mapped beside the road (OSM barrier=retaining_wall), nearly parallel to it and a
+    // little further out than the cutting wall would stand (0.4-5 m): the cutting wall is that wall, with
+    // the floor level with the road out to it (behind Cultural Centre platform 3 it stands 8 m out, behind
+    // the station's paving, not on it). Past the mapped wall's ends, within the same cutting, its line runs
+    // on for up to 12 m rather than the wall stepping back in toward the lanes. Not behind a footpath (the
+    // wall stands at its back edge), nor where another carriageway or water lies in between (a road
+    // meeting this one at an end may: the wall stops at its edge, or turns to the jamb of a tunnel portal
+    // there, as at the turn into the Cultural Centre tunnel).
+    const mwShift = new Float32Array(n);
+    // (and where a cutting on the mapped line ends, the offset its last wall piece runs out to: the mapped
+    // line still, not slanting back in to where the batter beyond it starts)
+    const mwEnd = new Float32Array(n);
+    if (mwSeg.length && !r.tunnel) {
+      const hitSeg = new Int32Array(n).fill(-1);
+      const clearTo = (k: number, dx: number, dy: number, to: number) => {
+        const c = P[k];
+        // (within 12 m of an end, the roads meeting it there)
+        const near0 = ss[k] < 12;
+        const near1 = ss[k] > ri.len - 12;
+        const between = (q: number) => !roads[q].bay && roads[q].kind !== RoadKind.Pedestrian && !(near0 && endNb[0].has(q)) && !(near1 && endNb[1].has(q));
+        for (let o = hw + 0.5; o < to - 0.3; o += 0.5) {
+          const qx = c.x + dx * o;
+          const qy = c.y + dy * o;
+          if (inWater(qx, qy)) return false;
+          if (index.penetrationZ(qx, qy, c.z, 1.5, ri.i, between) > 0.3) return false;
+          if (tunnels.penetrationZ(qx, qy, c.z, 1.5, ri.i, (q) => !straightOn.has(q) && between(q)) > 0.3) return false;
+        }
+        return true;
+      };
+      const shiftAt = (k: number, only: number, ext: number): [number, number] | null => {
+        if (foot[k] > 0) return null;
+        const c = P[k];
+        const fl = Math.hypot(c.nx, c.ny) || 1;
+        const dx = (c.nx * side) / fl;
+        const dy = (c.ny * side) / fl;
+        const f0 = e0[k] + 0.6;
+        // (the mapped line is the wall's middle: its face toward the road 0.2 m nearer)
+        const h = mappedWallRay(c.x, c.y, dx, dy, -dy, dx, f0 + 0.6, f0 + 5.2, only, ext);
+        if (!h || !clearTo(k, dx, dy, h[0] - 0.2)) return null;
+        return [h[0] - 0.2 - f0, h[1]];
+      };
+      const tryAt = (k: number, only: number, ext: number) => {
+        if (raw[k] !== 2) return;
+        const h = shiftAt(k, only, ext);
+        if (h) [mwShift[k], hitSeg[k]] = h;
+      };
+      for (let k = 0; k < n; k++) tryAt(k, -1, 0);
+      if (hitSeg.some((v) => v >= 0)) {
+        for (let k = 0; k < n; k++) {
+          if (raw[k] !== 2 || hitSeg[k] >= 0) continue;
+          let best = -1;
+          for (let j = k - 1; j >= 0 && raw[j] === 2 && ss[k] - ss[j] <= 12; j--) {
+            if (hitSeg[j] >= 0) {
+              best = j;
+              break;
+            }
+          }
+          for (let j = k + 1; j < n && raw[j] === 2 && ss[j] - ss[k] <= 12; j++) {
+            if (hitSeg[j] >= 0) {
+              if (best < 0 || ss[j] - ss[k] < ss[k] - ss[best]) best = j;
+              break;
+            }
+          }
+          if (best >= 0) tryAt(k, hitSeg[best], 12);
+        }
+        for (let k = 0; k + 1 < n; k++) {
+          if (hitSeg[k] < 0 || raw[k + 1] === 2) continue;
+          const h = shiftAt(k + 1, hitSeg[k], 12);
+          mwEnd[k + 1] = h ? h[0] : mwShift[k];
+        }
+        for (let k = 0; k < n; k++) e0[k] += mwShift[k];
+      }
+    }
+    return { P, e0, zE, depth, raw, pfar, mwShift, mwEnd, straightOn, straightOnGrade };
+  }
+
+  /**
+   * Shoulders / retaining walls / cuttings on one side of an at-grade road.
+   * Profile types per sample: 0 none (junction), 1 batter, 2 cutting wall, 3 fill wall, 4 open cutting.
+   */
+  function earthworks(ri: RI, L: Layer, side: number, ss: number[], foot: number[], skips: [number, number][]): void {
+    const r = ri.r;
+    const hw = ri.hw;
+    const n = ss.length;
+    const type = new Uint8Array(n);
+    const { P, e0, zE, depth, raw, pfar, mwShift, mwEnd, straightOn, straightOnGrade } = earthPlan(ri, side, ss, foot);
     const tubeNbAt = new Uint8Array(n);
     // (and a carriageway at grade level with us there: the gore between two busways meeting at Cultural Centre)
     const gradeNbAt = new Uint8Array(n);
@@ -1548,6 +1794,75 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       else type[k] = t;
       if (t === 2 && (nb || inJ)) type[k] = 4; // cutting but open toward a neighbour: floor only
     }
+    // A cutting wall that would stand on another road's floor out to a mapped retaining wall (on the
+    // inside of a turn off a busway whose wall stands on the mapped line, as into the Cultural Centre
+    // tunnel): that floor runs on to the mapped wall, so here the cutting is open
+    if (mwFloor.length) {
+      for (let k = 0; k + 1 < n; k++) {
+        if (type[k] !== 2 || mwShift[k] > 0) continue;
+        const A = P[k];
+        const B = P[k + 1];
+        const ax = A.x + A.nx * side * (e0[k] + 0.6);
+        const ay = A.y + A.ny * side * (e0[k] + 0.6);
+        const bx = B.x + B.nx * side * (e0[k + 1] + mwEnd[k + 1] + 0.6);
+        const by = B.y + B.ny * side * (e0[k + 1] + mwEnd[k + 1] + 0.6);
+        let on = 0;
+        for (const f of [0, 0.5, 1]) if (onMappedFloor(ax + (bx - ax) * f, ay + (by - ay) * f, A.z + (B.z - A.z) * f, ri.i)) on++;
+        if (on >= 2) type[k] = 4;
+      }
+    }
+    // (an open stretch keeps its own floor's width unless it runs on from a wall on the mapped line)
+    for (let k = 0; k < n; k++) {
+      if (mwShift[k] > 0 && type[k] !== 2 && !(k > 0 && type[k - 1] === 2 && mwShift[k - 1] > 0) && !(k + 1 < n && type[k + 1] === 2 && mwShift[k + 1] > 0)) e0[k] -= mwShift[k];
+    }
+    const eW = Float32Array.from(e0, (v, k) => v + mwEnd[k]);
+    /**
+     * The jamb of a tunnel portal (the tube's wall line at its end) within 6 m of the wall at sample k,
+     * that lies alongside the road before sample k + 1: [s, e] for cutSeg(), its wall face there. Null if
+     * there is none.
+     */
+    const portalJamb = (k: number): [number, number] | null => {
+      const A = P[k];
+      const B = P[k + 1];
+      const wx = A.x + A.nx * side * (e0[k] + 0.6);
+      const wy = A.y + A.ny * side * (e0[k] + 0.6);
+      let jx = 0;
+      let jy = 0;
+      let jd = 6;
+      tunnels.roadsNear(B.x, B.y, 15, (q) => {
+        if (straightOn.has(q)) return;
+        const qi = infos[q];
+        for (const atEnd of [false, true]) {
+          const c = roadAt(qi, atEnd ? qi.len : 0);
+          if (Math.hypot(c.x - B.x, c.y - B.y) > 15) continue;
+          const m = endMiter(qi, atEnd) ?? [c.nx, c.ny];
+          for (const sd of [1, -1]) {
+            const x = c.x + m[0] * sd * (qi.hw + 0.9);
+            const y = c.y + m[1] * sd * (qi.hw + 0.9);
+            const d = Math.hypot(x - wx, y - wy);
+            if (d < jd) [jd, jx, jy] = [d, x, y];
+          }
+        }
+      });
+      if (jd >= 6) return null;
+      // (where along the road its normal passes through the jamb, and how far out)
+      const along = (s: number) => {
+        const c = roadAt(ri, s);
+        return ((jx - c.x) * c.ny - (jy - c.y) * c.nx) / (Math.hypot(c.nx, c.ny) || 1);
+      };
+      let s0 = ss[k];
+      let s1 = ss[k + 1];
+      if (along(s0) < 0 || along(s1) > 0) return null;
+      for (let it = 0; it < 16; it++) {
+        const s = (s0 + s1) / 2;
+        if (along(s) > 0) s0 = s;
+        else s1 = s;
+      }
+      const s = (s0 + s1) / 2;
+      const c = roadAt(ri, s);
+      const e = (((jx - c.x) * c.nx + (jy - c.y) * c.ny) * side) / (c.nx * c.nx + c.ny * c.ny || 1) - 0.6;
+      return s - ss[k] > 0.3 && e > hw + 0.5 ? [s, e] : null;
+    };
     // a cutting wall piece that would end inside such a tunnel's lanes stops where it meets them
     const g = L.strip;
     const st = L.struct;
@@ -1559,13 +1874,13 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       const span = (k: number) => {
         const zk = zE[k] - (foot[k] > 0 ? KERB_H : 0.02);
         const zk1 = zE[k + 1] - (foot[k + 1] > 0 ? KERB_H : 0.02);
-        return [Math.min(P[k].z, P[k + 1].z) - 0.4, Math.max(cutTop(P[k], side, e0[k] + 0.6, zk), cutTop(P[k + 1], side, e0[k + 1] + 0.6, zk1))];
+        return [Math.min(P[k].z, P[k + 1].z) - 0.4, Math.max(cutTop(P[k], side, e0[k] + 0.6, zk), cutTop(P[k + 1], side, eW[k + 1] + 0.6, zk1))];
       };
       const cross: number[] = [];
       for (let k = 0; k + 1 < n; k++) {
         if (type[k] !== 2) continue;
         const [ax, ay] = at(P[k], e0[k] + 0.6);
-        const [bx, by] = at(P[k + 1], e0[k + 1] + 0.6);
+        const [bx, by] = at(P[k + 1], eW[k + 1] + 0.6);
         const [lo, hi] = span(k);
         routeIdx.roadsNear((ax + bx) / 2, (ay + by) / 2, Math.hypot(bx - ax, by - ay) / 2 + 0.5, (_q, sg) => {
           const S = routeIdx.seg;
@@ -1588,7 +1903,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       for (let k = 0; k + 1 < n && cross.length; k++) {
         if (type[k] !== 2) continue;
         const [ax, ay] = at(P[k], e0[k] + 0.6);
-        const [bx, by] = at(P[k + 1], e0[k + 1] + 0.6);
+        const [bx, by] = at(P[k + 1], eW[k + 1] + 0.6);
         const [lo, hi] = span(k);
         for (let q = 0; q < cross.length; q += 4) {
           if (Math.hypot(cross[q] - (ax + bx) / 2, cross[q + 1] - (ay + by) / 2) < cross[q + 3] && cross[q + 2] + 3.6 > lo && cross[q + 2] < hi) {
@@ -1670,7 +1985,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         // or the edge of a carriageway at grade)
         const inside = (f: number) => {
           const c = roadAt(ri, ss[k] + (ss[k + 1] - ss[k]) * f);
-          const o = e0[k] + (e0[k + 1] - e0[k]) * f + 1.05;
+          const o = e0[k] + (eW[k + 1] - e0[k]) * f + 1.05;
           const ix = c.x + c.nx * side * o;
           const iy = c.y + c.ny * side * o;
           return (
@@ -1682,15 +1997,22 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         let f1 = 1;
         if (inside(0)) f1 = 0;
         else for (let it = 0; it < 12; it++) inside((f0 + f1) / 2) ? (f1 = (f0 + f1) / 2) : (f0 = (f0 + f1) / 2);
-        const sm = ss[k] + (ss[k + 1] - ss[k]) * f0;
-        const em = e0[k] + (e0[k + 1] - e0[k]) * f0;
+        let sm = ss[k] + (ss[k + 1] - ss[k]) * f0;
+        let em = e0[k] + (eW[k + 1] - e0[k]) * f0;
+        // (a wall on a mapped line running on past the mapped wall's end into a tunnel portal turns to meet
+        // the tube's wall at the portal instead, along the portal's headwall: the Cultural Centre tunnel)
+        const j = mwShift[k] > 0 && mwEnd[k + 1] > 0 ? portalJamb(k) : null;
+        if (j) {
+          [sm, em] = j;
+          f0 = (sm - ss[k]) / (ss[k + 1] - ss[k]);
+        }
         const fm = f0 < 0.5 ? foot[k] : foot[k + 1];
         const M = roadAt(ri, sm);
         if (sm - ss[k] > 0.3) cutSeg(L, A, M, side, ss[k], sm, foot[k], fm, e0[k], em, hw, true, (k === 0 || type[k - 1] !== 2 ? 1 : 0) | 2, ri.i);
-        cutSeg(L, sm - ss[k] > 0.3 ? M : A, B, side, sm - ss[k] > 0.3 ? sm : ss[k], ss[k + 1], sm - ss[k] > 0.3 ? fm : foot[k], foot[k + 1], sm - ss[k] > 0.3 ? em : e0[k], e0[k + 1], hw, false, 0, ri.i);
+        cutSeg(L, sm - ss[k] > 0.3 ? M : A, B, side, sm - ss[k] > 0.3 ? sm : ss[k], ss[k + 1], sm - ss[k] > 0.3 ? fm : foot[k], foot[k + 1], sm - ss[k] > 0.3 ? em : e0[k], eW[k + 1], hw, false, 0, ri.i);
       } else if (t === 2 || t === 4) {
         const ends = t === 2 ? (k === 0 || type[k - 1] !== 2 ? 1 : 0) | (k + 2 >= n || type[k + 1] !== 2 || tubeNbAt[k + 2] || gradeNbAt[k + 2] ? 2 : 0) : 0;
-        cutSeg(L, A, B, side, ss[k], ss[k + 1], foot[k], foot[k + 1], e0[k], e0[k + 1], hw, t === 2, ends, ri.i);
+        cutSeg(L, A, B, side, ss[k], ss[k + 1], foot[k], foot[k + 1], e0[k], eW[k + 1], hw, t === 2, ends, ri.i);
       } else if (t === 3) {
         // high fill: retaining wall from a parapet down to the ground
         const [w0x, w0y] = at(A, e0[k] + 0.1);

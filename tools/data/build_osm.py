@@ -162,8 +162,14 @@ class Handler(osmium.SimpleHandler):
         # (OSM node id, x, y, direction: +1 forward / -1 backward along the way, 0 both)
         self.signal_nodes: list[tuple[int, float, float, int]] = []
         self.width_tagged: set[int] = set()
+        self.lanes_tagged: set[int] = set()
+        # every man_made=bridge outline, and the paths (footways, cycleways) on bridges: bridge_widths()
+        self.bridge_decks: list[Polygon] = []
+        self.bridge_paths: list[list[tuple[float, float]]] = []
         # named man_made=bridge outlines: (polygon, name), see name_bridges()
         self.bridge_outlines: list[tuple[Polygon, str]] = []
+        # mapped barrier=retaining_wall lines (flat decimetres): where a road's cutting wall really stands
+        self.retaining: list[list[int]] = []
 
     def name(self, n: str | None) -> int:
         if not n:
@@ -213,6 +219,22 @@ class Handler(osmium.SimpleHandler):
             return
         hw = tags.get("highway")
         rw = tags.get("railway")
+        if hw in BRIDGE_PATHS and tags.get("bridge") not in (None, "no") and tags.get("area") != "yes":
+            try:
+                pts = [(nd.lon, nd.lat) for nd in w.nodes]
+            except osmium.InvalidLocationError:
+                return
+            if len(pts) >= 2 and any(in_bbox(lon, lat, 0.002) for lon, lat in pts):
+                self.bridge_paths.append([project(lon, lat) for lon, lat in pts])
+            return
+        if hw is None and rw is None and tags.get("barrier") == "retaining_wall":
+            try:
+                pts = [(nd.lon, nd.lat) for nd in w.nodes]
+            except osmium.InvalidLocationError:
+                return
+            if len(pts) >= 2 and any(in_bbox(lon, lat, 0.002) for lon, lat in pts):
+                self.retaining.append(flat(project(lon, lat) for lon, lat in pts))
+            return
         if hw is None and rw is None:
             return
         try:
@@ -234,6 +256,8 @@ class Handler(osmium.SimpleHandler):
             if hw == "service" and (tags.get("bus") in ("yes", "designated") or tags.get("psv") == "designated"):
                 kind = 7
             lanes = num(tags.get("lanes"))
+            if lanes and 0 < lanes < 10:
+                self.lanes_tagged.add(w.id)
             lanes = int(lanes) if lanes and 0 < lanes < 10 else DEFAULT_LANES[kind]
             oneway = tags.get("oneway")
             ow = 0
@@ -318,6 +342,15 @@ class Handler(osmium.SimpleHandler):
     # Areas (buildings, water, parks) --------------------------------------
     def area(self, a):
         tags = a.tags
+        if tags.get("man_made") == "bridge":
+            try:
+                for outer in a.outer_rings():
+                    xy = [project(n.lon, n.lat) for n in outer]
+                    if len(xy) >= 4 and any(in_bbox(n.lon, n.lat, 0.003) for n in outer):
+                        poly = Polygon(xy)
+                        self.bridge_decks.append(poly if poly.is_valid else make_valid(poly))
+            except osmium.InvalidLocationError:
+                pass
         if tags.get("man_made") == "bridge" and tags.get("name"):
             try:
                 for outer in a.outer_rings():
@@ -485,6 +518,85 @@ class Handler(osmium.SimpleHandler):
 
 
 FOOTPATH = 1.5  # m kept between a kerb and a building face (cap_widths)
+BRIDGE_PATHS = ("footway", "cycleway", "path", "steps", "bridleway")
+BRIDGE_PARAPET = 0.3  # m of a bridge outline's width taken by each parapet (bridge_widths)
+BRIDGE_W_MAX = 10.5  # m: the widest deck bridge_widths gives a two-way busway
+
+
+def bridge_widths(h: "Handler") -> int:
+    """Two-way bus ways on a bridge with no width or lanes tags take the deck
+    width of the man_made=bridge outline they run along, instead of the 7.4 m
+    default (two 3.5 m lanes + 0.4): the RBWH busway bridge (way 423268770 in
+    outline 766218372) is 9.5-13.4 m wide, and on a 7.4 m deck two buses could
+    not pass. Every 2 m along the way inside the outline, across it: the
+    distance to the outline's edge on each side, or, if nearer, half way to
+    another road on a bridge or 1.5 m short of a footway or cycleway on one
+    (ways that meet or cross the way do not count). The deck is twice the
+    nearer side less a parapet; the way takes the 20th percentile of that along
+    it, never narrower than it was and at most BRIDGE_W_MAX."""
+    import shapely
+
+    from elevation import RAIL
+
+    if not h.bridge_decks:
+        return 0
+    decks = h.bridge_decks
+    dtree = shapely.STRtree(decks)
+    others = [(LineString(ln.xy), True, ln.id) for ln in h.lines if ln.kind != RAIL and ln.bridge and len(ln.xy) >= 2]
+    others += [(LineString(p), False, -1) for p in h.bridge_paths]
+    otree = shapely.STRtree([o[0] for o in others])
+    n = 0
+    for ln in h.lines:
+        m = ln.meta
+        if ln.kind != 7 or not ln.bridge or m.get("o") or ln.id in h.width_tagged or ln.id in h.lanes_tagged or len(ln.xy) < 2:
+            continue
+        line = LineString(ln.xy)
+        L = line.length
+        if L < 10:
+            continue
+        best, share = None, 0.0
+        for i in dtree.query(line, predicate="intersects"):
+            f = decks[int(i)].buffer(1.0).intersection(line).length / L
+            if f > share:
+                best, share = int(i), f
+        if best is None or share < 0.6:
+            continue
+        P = decks[best]
+        edge = P.boundary
+        near = [others[int(j)] for j in otree.query(P, predicate="intersects")]
+        near = [(g, road) for g, road, oid in near if oid != ln.id and not g.intersects(line)]
+        ws = []
+        for s in np.arange(1.0, L - 1.0 + 1e-6, 2.0):
+            a = line.interpolate(s)
+            if not P.contains(a):
+                continue
+            b = line.interpolate(min(L, s + 0.5))
+            c = line.interpolate(max(0.0, s - 0.5))
+            tl = float(np.hypot(b.x - c.x, b.y - c.y)) or 1.0
+            nx, ny = -(b.y - c.y) / tl, (b.x - c.x) / tl
+            free = []
+            for sg in (1.0, -1.0):
+                ray = LineString([(a.x, a.y), (a.x + sg * nx * 30.0, a.y + sg * ny * 30.0)])
+                ts = [float(np.hypot(q[0] - a.x, q[1] - a.y)) for q in shapely.get_coordinates(ray.intersection(edge))]
+                if not ts:
+                    break
+                d = min(ts)
+                for g, road in near:
+                    for q in shapely.get_coordinates(ray.intersection(g)):
+                        t = float(np.hypot(q[0] - a.x, q[1] - a.y))
+                        if t < d:
+                            d = min(d, t / 2.0 if road else t - 1.5)
+                free.append(d)
+            if len(free) == 2:
+                ws.append(2.0 * (min(free) - BRIDGE_PARAPET))
+        if len(ws) < 3:
+            continue
+        wn = min(BRIDGE_W_MAX, float(np.percentile(ws, 20)))
+        if wn > float(m["w"]) + 0.3:
+            print(f"widths: bridge way {ln.id} '{ln.name}' {m['w']} -> {wn:.1f} m ({L:.0f} m long)", file=sys.stderr)
+            m["w"] = round(wn, 1)
+            n += 1
+    return n
 
 
 def name_bridges(h: "Handler") -> int:
@@ -655,6 +767,8 @@ def main():
 
     nb = name_bridges(h)
     print(f"bridges: {nb} bridge ways named after the man_made=bridge outline they lie in", file=sys.stderr)
+    nw = bridge_widths(h)
+    print(f"widths: {nw} two-way busway bridges widened to their bridge outline", file=sys.stderr)
     cap_widths(h.lines, h.buildings, h.width_tagged)
     # Heights: terrain cleaning, the road/rail solve, station platforms and bays,
     # terrain.bin, building bases.
@@ -685,7 +799,9 @@ def main():
     }
     with open(os.path.join(OUT, "roads.json"), "w") as f:
         json.dump({**meta, "names": names, "roads": roads, "rail": rail, "signals": h.signals,
-                   "sigr": sig_road, "sigd": sig_dir, "sigz": sig_z, "crossings": h.crossings}, f, separators=(",", ":"))
+                   "sigr": sig_road, "sigd": sig_dir, "sigz": sig_z, "crossings": h.crossings,
+                   "walls": h.retaining}, f, separators=(",", ":"))
+    print("retaining walls", len(h.retaining), file=sys.stderr)
     with open(os.path.join(OUT, "buildings.json"), "w") as f:
         json.dump({**meta, "buildings": buildings}, f, separators=(",", ":"))
     with open(os.path.join(OUT, "areas.json"), "w") as f:
