@@ -268,7 +268,8 @@ export function buildStations(scene: THREE.Scene, data: MapData, geoms: Platform
 // One platform
 
 function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
-  const def = b.def;
+  const own = b.def.platforms?.[platformNumber(c, g)];
+  const def = own ? { ...b.def, ...own } : b.def;
   const geo = b.geo;
   const glass = b.glass;
   const pl = g.plane;
@@ -440,6 +441,7 @@ function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
   const covered = g.covered && def.roof !== 'none';
   const H = def.canopyH ?? 4.2;
   const D = def.canopyDepth ?? 4.6;
+  const SH = Math.min(def.screenH ?? 2.45, H - 0.05);
   const num = platformNumber(c, g);
   for (const k of g.kerbs) {
     if (k.len < 6) continue;
@@ -451,7 +453,7 @@ function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
     });
     const back = depth.map((d) => Math.max(1.6, Math.min(d - 0.25, D)));
     const front = 0.45;
-    if (covered && !vault) canopy(geo, def, ss, back, front, top, H);
+    if (covered && !vault) (def.canopy === 'wing' ? wingCanopy : canopy)(geo, def, ss, back, front, top, H);
     // posts on the back line every ~9 m; screens between them
     const postAt: Sample[] = [];
     const np = Math.max(2, Math.round((k.len - 3) / 9) + 1);
@@ -486,15 +488,15 @@ function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
           [
             [ax, ay, top(ax, ay) + 0.12],
             [ex, ey, top(ex, ey) + 0.12],
-            [ex, ey, top(ex, ey) + 2.45],
-            [ax, ay, top(ax, ay) + 2.45],
+            [ex, ey, top(ex, ey) + SH],
+            [ax, ay, top(ax, ay) + SH],
           ],
           0,
           0,
           0,
         );
         geo.paint(def.post);
-        geo.beam([ax, ay, top(ax, ay) + 2.48], [ex, ey, top(ex, ey) + 2.48], 0.04);
+        geo.beam([ax, ay, top(ax, ay) + SH + 0.03], [ex, ey, top(ex, ey) + SH + 0.03], 0.04);
         geo.beam([ax, ay, top(ax, ay) + 0.1], [ex, ey, top(ex, ey) + 0.1], 0.03);
         // an advertising / timetable case every other bay
         if (i % 2 === 1) {
@@ -760,6 +762,100 @@ function canopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front:
     const hf = hU(f) - 0.17;
     const hb = hU(bb) - 0.17;
     geo.beam([bb[0] - s.nx * 0.1, bb[1] - s.ny * 0.1, hb], [f[0] + s.nx * 0.3, f[1] + s.ny * 0.3, hf], 0.12, true);
+  }
+}
+
+/**
+ * Dutton Park Place's "wing": a blade carried on the back row of posts, its panelled soffit curving up
+ * towards the kerb and its top a stack of dark fins stepping down to a knife edge at the front.
+ */
+function wingCanopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front: number, top: (x: number, y: number) => number, H: number): void {
+  const WR = 1.4; // soffit rise at the front edge
+  const N = 4; // strips across the depth, back (u 0) to front (u 1)
+  const P = (i: number, u: number): [number, number] => {
+    const o = back[i] + (front - back[i]) * u;
+    return [ss[i].x + ss[i].nx * o, ss[i].y + ss[i].ny * o];
+  };
+  const hs = (u: number) => H + WR * u * u;
+  const ht = (u: number) => hs(u) + 0.18 + 0.6 * (1 - u);
+  const fin = mixCol(def.roofTop, 0x000000, 0.3);
+  for (let i = 0; i + 1 < ss.length; i++) {
+    const tx = ss[i + 1].x - ss[i].x;
+    const ty = ss[i + 1].y - ss[i].y;
+    for (let j = 0; j < N; j++) {
+      const u0 = j / N;
+      const u1 = (j + 1) / N;
+      const a0 = P(i, u0);
+      const a1 = P(i + 1, u0);
+      const b0 = P(i, u1);
+      const b1 = P(i + 1, u1);
+      const z = (p: [number, number], h: number): V3 => [p[0], p[1], top(p[0], p[1]) + h];
+      geo.paint(def.soffit, Pat.Soffit, 1.5);
+      geo.face([z(a0, hs(u0)), z(a1, hs(u0)), z(b1, hs(u1)), z(b0, hs(u1))], 0, 0, -1);
+      // top, with a dark fin standing up along each strip's back edge (the stacked look from the side)
+      geo.paint(def.roofTop);
+      geo.face([z(a0, ht(u0)), z(a1, ht(u0)), z(b1, ht(u1)), z(b0, ht(u1))], 0, 0, 1);
+      if (j > 0) {
+        geo.paint(fin);
+        geo.face([z(a0, ht(u0)), z(a1, ht(u0)), z(a1, ht(u0) + 0.3), z(a0, ht(u0) + 0.3)], ty, -tx, 0);
+      }
+    }
+    // knife edge at the front
+    geo.paint(fin);
+    const f0 = P(i, 1);
+    const f1 = P(i + 1, 1);
+    geo.face(
+      [
+        [f0[0], f0[1], top(f0[0], f0[1]) + hs(1)],
+        [f1[0], f1[1], top(f1[0], f1[1]) + hs(1)],
+        [f1[0], f1[1], top(f1[0], f1[1]) + ht(1)],
+        [f0[0], f0[1], top(f0[0], f0[1]) + ht(1)],
+      ],
+      ty,
+      -tx,
+      0,
+    );
+    // back edge over the posts
+    geo.paint(def.fascia);
+    const a0 = P(i, 0);
+    const a1 = P(i + 1, 0);
+    const za0 = top(a0[0], a0[1]);
+    const za1 = top(a1[0], a1[1]);
+    geo.face(
+      [
+        [a0[0], a0[1], za0 + hs(0)],
+        [a1[0], a1[1], za1 + hs(0)],
+        [a1[0], a1[1], za1 + ht(0)],
+        [a0[0], a0[1], za0 + ht(0)],
+      ],
+      -ty,
+      tx,
+      0,
+    );
+  }
+  // end caps: the blade's profile
+  geo.paint(def.fascia);
+  for (const i of [0, ss.length - 1]) {
+    const sgn = i === 0 ? -1 : 1;
+    for (let j = 0; j < N; j++) {
+      const u0 = j / N;
+      const u1 = (j + 1) / N;
+      const a = P(i, u0);
+      const e = P(i, u1);
+      const za = top(a[0], a[1]);
+      const ze = top(e[0], e[1]);
+      geo.face(
+        [
+          [a[0], a[1], za + hs(u0)],
+          [e[0], e[1], ze + hs(u1)],
+          [e[0], e[1], ze + ht(u1)],
+          [a[0], a[1], za + ht(u0)],
+        ],
+        ss[i].tx * sgn,
+        ss[i].ty * sgn,
+        0,
+      );
+    }
   }
 }
 
@@ -1177,6 +1273,25 @@ function buswayZ(c: Ctx, x: number, y: number, r = 40): number {
   return hit ? hit.z : c.heights.ground(x, y);
 }
 
+/** True if a surface rail line runs within `r` m of (x, y) (no bridge piers on the tracks). */
+function nearRail(c: Ctx, x: number, y: number, r: number): boolean {
+  for (const l of c.data.rail) {
+    if (l.tunnel) continue;
+    const p = l.pts;
+    for (let i = 0; i + 3 < p.length; i += 2) {
+      const ax = p[i];
+      const ay = p[i + 1];
+      const dx = p[i + 2] - ax;
+      const dy = p[i + 3] - ay;
+      if (Math.min(ax, ax + dx) > x + r || Math.max(ax, ax + dx) < x - r || Math.min(ay, ay + dy) > y + r || Math.max(ay, ay + dy) < y - r) continue;
+      const l2 = dx * dx + dy * dy || 1;
+      const t = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / l2));
+      if (Math.hypot(ax + dx * t - x, ay + dy * t - y) < r) return true;
+    }
+  }
+  return false;
+}
+
 function buildOverbridge(c: Ctx, b: StationBuild, o: OverbridgeDef): void {
   const geo = b.geo;
   const glass = b.glass;
@@ -1300,7 +1415,8 @@ function buildOverbridge(c: Ctx, b: StationBuild, o: OverbridgeDef): void {
   const ends: number[] = o.towers ? [s0 + tw / 2 + 0.25, s1 - tw / 2 - 0.25] : [];
   for (const s of ends) {
     const p = P(s, 0);
-    buildTower(c, b, { x: p[0], y: p[1], w: tw, d: tw, h: roofH - zb + 2.5, heading: Math.atan2(ax, ay), frame: o.frame, banner: 0xe8552b }, Math.min(c.heights.ground(p[0], p[1]), zb));
+    const t: TowerDef = { x: p[0], y: p[1], w: tw, d: tw, h: roofH - zb + (o.towerLift ? 0.6 : 2.5), heading: Math.atan2(ax, ay), frame: o.frame, banner: o.towerLift ? 0 : 0xe8552b, hat: o.towerHat, roof: o.towerRoof, lift: o.towerLift };
+    buildTower(c, b, t, Math.min(c.heights.ground(p[0], p[1]), zb));
   }
   const pierStep = 12;
   for (let s = s0 + 2; s <= s1 - 2; s += pierStep) {
@@ -1309,7 +1425,7 @@ function buildOverbridge(c: Ctx, b: StationBuild, o: OverbridgeDef): void {
     const gz = c.heights.ground(p[0], p[1]);
     const under = c.idx.nearest(p[0], p[1], 12);
     if (under && under.dist < c.data.roads[under.road].width / 2 + 1.0) continue;
-    if (deck - gz < 1.5) continue;
+    if (deck - gz < 1.5 || nearRail(c, p[0], p[1], 3.2)) continue;
     geo.paint(CONCRETE);
     geo.cylinder(p[0], p[1], gz - 1, deck - 0.9, 0.45, 10, false);
   }
@@ -1490,13 +1606,17 @@ function buildTower(c: Ctx, b: StationBuild, t: TowerDef, base: number | null): 
   const vx = -hy;
   const vy = hx;
   const corner = (i: number, j: number): [number, number] => [t.x + hx * hw * i + vx * hd * j, t.y + hy * hw * i + vy * hd * j];
-  // core: glass on two faces, louvres on the others
+  // core: glass on two faces, louvres on the others (a lift shaft is glass all round)
   const cs: [number, number][] = [
     [-1, -1],
     [1, -1],
     [1, 1],
     [-1, 1],
   ];
+  if (t.lift) {
+    buildLiftShaft(geo, glass, t, corner, cs, z0, z1, hx, hy);
+    return;
+  }
   for (let i = 0; i < 4; i++) {
     const p = corner(...cs[i]);
     const q = corner(...cs[(i + 1) % 4]);
@@ -1546,11 +1666,37 @@ function buildTower(c: Ctx, b: StationBuild, t: TowerDef, base: number | null): 
       geo.beam([p[0], p[1], h], [q[0], q[1], h], 0.09, false);
     }
   }
-  // hat roof
-  geo.paint(WHITE);
-  geo.box(t.x, t.y, z1, z1 + 0.35, hx, hy, hw + 1.8, hd + 1.8, true);
-  geo.paint(0x2b2f33);
-  geo.box(t.x, t.y, z1 + 0.35, z1 + 0.55, hx, hy, hw + 1.6, hd + 1.6);
+  const [ow, od] = t.hat ?? [1.8, 1.8];
+  if (t.roof === 'pyramid') {
+    // white hipped roof on a thin eave (Woolloongabba, QUT Kelvin Grove)
+    geo.paint(WHITE);
+    geo.box(t.x, t.y, z1, z1 + 0.3, hx, hy, hw + ow, hd + od, true);
+    const rise = Math.min(hw, hd) * 0.55;
+    const ring = cs.map(([i, j]) => [t.x + hx * (hw + ow) * i + vx * (hd + od) * j, t.y + hy * (hw + ow) * i + vy * (hd + od) * j] as [number, number]);
+    for (let i = 0; i < 4; i++) {
+      const p = ring[i];
+      const q = ring[(i + 1) % 4];
+      const mx = (p[0] + q[0]) / 2 - t.x;
+      const my = (p[1] + q[1]) / 2 - t.y;
+      geo.paint(i % 2 ? 0xe4e4e0 : 0xf0f0ec);
+      geo.face(
+        [
+          [p[0], p[1], z1 + 0.3],
+          [q[0], q[1], z1 + 0.3],
+          [t.x, t.y, z1 + 0.3 + rise],
+        ],
+        mx,
+        my,
+        0.5,
+      );
+    }
+  } else {
+    // flat cantilevered hat roof
+    geo.paint(WHITE);
+    geo.box(t.x, t.y, z1, z1 + 0.35, hx, hy, hw + ow, hd + od, true);
+    geo.paint(0x2b2f33);
+    geo.box(t.x, t.y, z1 + 0.35, z1 + 0.55, hx, hy, hw + ow - 0.2, hd + od - 0.2);
+  }
   // orange banner on a corner
   if (t.banner) {
     const p = corner(1, 1);
@@ -1560,6 +1706,53 @@ function buildTower(c: Ctx, b: StationBuild, t: TowerDef, base: number | null): 
     geo.box(p[0] + vx * 0.5, p[1] + vy * 0.5, z1 - 1 - bh, z1 - 1, hx, hy, 0.5, 0.03);
     geo.deferSign(c.atlas, key, p[0] + vx * 0.5, p[1] + vy * 0.5, z1 - 1 - bh / 2, hx, hy, 0.95, bh, 0.035);
   }
+}
+
+/** A glazed lift shaft (Mater Hill): glass all round in a light steel frame, a thin flat cap. */
+function buildLiftShaft(
+  geo: SGeo,
+  glass: SGeo,
+  t: TowerDef,
+  corner: (i: number, j: number) => [number, number],
+  cs: [number, number][],
+  z0: number,
+  z1: number,
+  hx: number,
+  hy: number,
+): void {
+  for (let i = 0; i < 4; i++) {
+    const p = corner(...cs[i]);
+    const q = corner(...cs[(i + 1) % 4]);
+    glass.paint(0x9ccad6);
+    glass.face(
+      [
+        [p[0], p[1], z0 - 0.5],
+        [q[0], q[1], z0 - 0.5],
+        [q[0], q[1], z1],
+        [p[0], p[1], z1],
+      ],
+      (p[0] + q[0]) / 2 - t.x,
+      (p[1] + q[1]) / 2 - t.y,
+      0,
+    );
+  }
+  geo.paint(t.frame);
+  for (const [i, j] of cs) {
+    const p = corner(i, j);
+    geo.box(p[0], p[1], z0 - 0.5, z1, hx, hy, 0.09, 0.09);
+  }
+  for (let h = z0 + 3; h < z1 - 0.5; h += 3) {
+    for (let i = 0; i < 4; i++) {
+      const p = corner(...cs[i]);
+      const q = corner(...cs[(i + 1) % 4]);
+      geo.beam([p[0], p[1], h], [q[0], q[1], h], 0.06, false);
+    }
+  }
+  // the car and its stainless doors at the bottom, the machine head at the top
+  geo.paint(STAINLESS);
+  geo.box(t.x, t.y, z0, z0 + 2.3, hx, hy, t.w * 0.3, t.d * 0.3);
+  geo.paint(t.frame);
+  geo.box(t.x, t.y, z1, z1 + 0.5, hx, hy, t.w / 2 + 0.25, t.d / 2 + 0.25, true);
 }
 
 /** UQ Lakes pantograph chargers: steel mast, L-arm over the bay, hood with the pantograph. */
@@ -1796,10 +1989,13 @@ function buildRomaP1(c: Ctx, b: StationBuild): void {
       -a.ny,
       0,
     );
-    // white columns at the platform back every other sample
+    // white columns at the platform back every other sample, forking into V struts under the roof
     if (i % 2 === 0) {
       geo.paint(WHITE);
-      geo.box(ga[0] - a.nx * 0.4, ga[1] - a.ny * 0.4, za, za + 10.2, a.tx, a.ty, 0.22, 0.22);
+      const cx = ga[0] - a.nx * 0.4;
+      const cy = ga[1] - a.ny * 0.4;
+      geo.box(cx, cy, za, za + 7.6, a.tx, a.ty, 0.22, 0.22);
+      for (const sg of [-1, 1]) geo.beam([cx, cy, za + 7.5], [cx + a.tx * 1.7 * sg - a.nx * 0.6, cy + a.ty * 1.7 * sg - a.ny * 0.6, za + 10.2], 0.14, false);
     }
   }
 }
