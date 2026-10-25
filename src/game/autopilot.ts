@@ -170,6 +170,34 @@ export class Autopilot {
     return true;
   }
 
+  /**
+   * Pulled in at a stop: is a car or AI bus passing in the lane beside us (its centre within ~1.6 m of
+   * the lane's, from a little ahead of our front to our tail)? Pulling out would swing our body into
+   * it. (Not one waiting behind our tail: it waits for us.)
+   */
+  private passingAlongside(sFront: number): boolean {
+    if (!this.traffic) return false;
+    const T = this.track;
+    let len = 0;
+    for (const sec of this.spec.sections) len += sec.length;
+    const grid = this.traffic.cars.grid;
+    const bodies = this.traffic.busBodies();
+    for (let d = -3; d <= len - 1; d += 2) {
+      const ss = sFront - d;
+      T.sample(ss, this.tmp, 0);
+      const pz = T.zAt(ss);
+      const px = this.tmp.x;
+      const py = this.tmp.y;
+      if (grid.nearest(px, py, 1.6, undefined, pz) >= 0) return true;
+      for (const b of bodies) {
+        const B = b.body;
+        if (Math.abs(B.fx - px) > b.len + 4 || Math.abs(B.fy - py) > b.len + 4) continue;
+        for (let k = 0; k < B.n; k++) if (Math.hypot(B.x[k] - px, B.y[k] - py) < 1.6 && Math.abs(B.z[k] - pz) <= LEVEL_GAP) return true;
+      }
+    }
+    return false;
+  }
+
   /** Is the lane clear of AI buses and cars for the whole bus with its rear axle at s? */
   private clearAt(sRear: number): boolean {
     if (!this.traffic) return true;
@@ -369,6 +397,16 @@ export class Autopilot {
     }
 
     if (this.phase === 'dwell' || this.phase === 'closing') pullWant = this.pull;
+    else if (this.pull > 1 && pullWant < this.pull && this.time > this.ignoreTrafficUntil && this.passingAlongside(sFront)) {
+      // Pulling back out from the kerb with a vehicle passing in the lane beside us: let it by first
+      // (61/0 s 4832: a car came up alongside the bus at its stop, and the bus swung its tail into it).
+      pullWant = this.pull;
+      if (target > 0) {
+        target = 0;
+        why = 'traffic';
+        limitDist = 0;
+      }
+    }
     this.pull += clamp(pullWant - this.pull, -dt * 0.45, dt * 0.45);
 
     // --- Stop / dwell state machine ------------------------------------------------------
