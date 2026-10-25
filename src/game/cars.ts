@@ -1530,16 +1530,18 @@ export class CarTraffic {
     let moved = 0;
     for (const j of this.junctionsAlong(track)) {
       const nd = this.nodes[j.node];
-      // Arms other than the one the bus comes in on, with a line cars wait at.
+      // Arms with a line cars wait at; the one the bus comes in on too, for the lanes beside the
+      // bus's (it may cross them before the node).
       const lanes: number[] = [];
+      const same: boolean[] = [];
       for (const ei of nd.edges) {
         const e = this.edges[ei];
         if (e.bus) continue;
         const L = e.b === j.node ? ei * 2 : ei * 2 + 1;
         if ((e.oneway && L & 1) || !this.stopD[L] || this.endNode(L) !== j.node) continue;
         const [ix, iy] = this.laneEndDir(L);
-        if (ix * j.inX + iy * j.inY > 0.7) continue;
         lanes.push(L);
+        same.push(ix * j.inX + iy * j.inY > 0.7);
       }
       if (!lanes.length) continue;
       // The bus's body over its way through: section rectangles (centre, unit axis, half length).
@@ -1576,23 +1578,27 @@ export class CarTraffic {
           if (Math.hypot(cx - nd.x, cy - nd.y) < 45) rects.push(cx, cy, dx, dy, (f + b) / 2);
         }
       }
-      for (const L of lanes) {
+      for (let li = 0; li < lanes.length; li++) {
+        const L = lanes[li];
         const e = this.edges[L >> 1];
         const cap = Math.min(SWEEP_MAX, e.len - 2);
         const n = this.lanesIn(L);
-        const hit = (sd: number): boolean => {
+        const hitK = (sd: number, k: number): boolean => {
           for (let q = 0; q < 2; q++) {
             const dc = sd + SWEEP_CAR_L / 2 - 0.6 + q * (SWEEP_CAR_L + 2);
             if (dc > e.len) break;
-            for (let k = 0; k < n; k++) {
-              this.at(L, e.len - dc, this.laneOffset(L, k), pt);
-              for (let r = 0; r < rects.length; r += 5) {
-                if (boxesTouch(pt.x, pt.y, pt.hx, pt.hy, SWEEP_CAR_L / 2, SWEEP_CAR_W / 2, rects[r], rects[r + 1], rects[r + 2], rects[r + 3], rects[r + 4], halfW)) return true;
-              }
+            this.at(L, e.len - dc, this.laneOffset(L, k), pt);
+            for (let r = 0; r < rects.length; r += 5) {
+              if (boxesTouch(pt.x, pt.y, pt.hx, pt.hy, SWEEP_CAR_L / 2, SWEEP_CAR_W / 2, rects[r], rects[r + 1], rects[r + 2], rects[r + 3], rects[r + 4], halfW)) return true;
             }
           }
           return false;
         };
+        // (On the bus's own approach, not the lane it comes along, which it covers however far back.)
+        const ks: number[] = [];
+        for (let k = 0; k < n; k++) if (!same[li] || !hitK(cap, k)) ks.push(k);
+        if (!ks.length) continue;
+        const hit = (sd: number): boolean => ks.some((k) => hitK(sd, k));
         let sd = this.stopD[L];
         if (!hit(sd)) continue;
         while (sd < cap && hit(sd)) sd += 0.5;
