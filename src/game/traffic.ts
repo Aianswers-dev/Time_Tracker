@@ -11,7 +11,7 @@ import { busTypeForRoute, stopUsage } from './routeMeta';
 import { TRACK_STEP, hasTrack, trackFor, type RouteTrack, type TrackSample, type TrackSignal, type TrackStop } from './track';
 import type { MapMarker } from './minimap';
 import { brighten, rng } from './util';
-import { CarTraffic, GAP_ACROSS, GAP_LEFT, PLAYER_HOLD, STALL_HIDDEN, STALL_VISIBLE, Turn, Wait, clearTime, type BusJunction } from './cars';
+import { CarTraffic, GAP_ACROSS, GAP_LEFT, PLAYER_HOLD, STALL_HIDDEN, STALL_VISIBLE, Turn, Wait, clearTime, hypot2, removeAt, type BusJunction } from './cars';
 import { TRAFFIC_CAPS, defaultTrafficLevel, type TrafficLevel } from './trafficLevel';
 import { makeBody, type Body } from './bodies';
 import { LEVEL_GAP, heightAt } from './height';
@@ -238,6 +238,15 @@ export class Traffic {
   /** The vehicle that made the last junctionOk() fail on its exit (bus id or car id), else 0. */
   private jRef = 0;
   private aheadHY = new Float32Array(LOOK_MAX);
+  // step's scratch (nothing allocated per bus): the binding acceleration and why (lim), and the
+  // nearest body on the path ahead (consider).
+  private sAcc = 0.5;
+  private sWhy: Wait = Wait.None;
+  private sRef = 0;
+  private cGap = 0.5;
+  private cV = 0.5;
+  private cId = 0;
+  private cKind: Wait = Wait.None;
   private lastPlayerZ: number | undefined;
   private aheadX = new Float32Array(LOOK_MAX);
   private aheadY = new Float32Array(LOOK_MAX);
@@ -450,7 +459,7 @@ export class Traffic {
     c.track.sample(s, this.tmp);
     const dx = this.tmp.x - px;
     const dy = this.tmp.y - py;
-    const d = Math.hypot(dx, dy);
+    const d = hypot2(dx, dy);
     if (d > this.radius) return false;
     if (this.initial ? d < 45 : d < 120) return false;
     if (this.shadowsPlayer(r, s)) return false;
@@ -466,7 +475,7 @@ export class Traffic {
     for (const o of this.active) {
       const b = o.body;
       for (let k = 0; k < b.n; k++) {
-        if (Math.abs(b.x[k] - this.tmp.x) < 26 && Math.abs(b.y[k] - this.tmp.y) < 26 && Math.abs(b.z[k] - zs) <= LEVEL_GAP && Math.hypot(b.x[k] - this.tmp.x, b.y[k] - this.tmp.y) < 26) return false;
+        if (Math.abs(b.x[k] - this.tmp.x) < 26 && Math.abs(b.y[k] - this.tmp.y) < 26 && Math.abs(b.z[k] - zs) <= LEVEL_GAP && hypot2(b.x[k] - this.tmp.x, b.y[k] - this.tmp.y) < 26) return false;
       }
     }
     const type = busTypeForRoute(r);
@@ -543,6 +552,7 @@ export class Traffic {
     while (b.jNext < b.jl.length && b.jl[b.jNext].stopS < s + 2) b.jNext++;
     this.updateBody(b);
     this.active.push(b);
+    this.byId.set(b.id, b);
     return true;
   }
 
@@ -686,7 +696,7 @@ export class Traffic {
       const mid = body.n >> 1;
       const cx = body.x[mid];
       const cy = body.y[mid];
-      const dist = Math.hypot(cx - cam.x, -cy - cam.z);
+      const dist = hypot2(cx - cam.x, -cy - cam.z);
       this.sphere.center.set(cx, body.z[mid] + 2, -cy);
       this.sphere.radius = b.len / 2 + 3;
       const vis = dist < VIEW_DIST && this.frustum.intersectsSphere(this.sphere);
@@ -740,7 +750,7 @@ export class Traffic {
     // Despawn far away / finished / stuck buses.
     for (let i = this.active.length - 1; i >= 0; i--) {
       const b = this.active[i];
-      const d = Math.hypot(b.body.fx - px, b.body.fy - py);
+      const d = hypot2(b.body.fx - px, b.body.fy - py);
       // End of the trip: gone once out of view, or a few seconds after its last
       // dwell (it never holds a terminal's front bay for long).
       const done = b.state === State.Terminus && b.dwell <= 0 && (!b.visible || b.dwell < -6);
@@ -763,15 +773,16 @@ export class Traffic {
     if (this.active.length > this.maxActive + 4) {
       let pick = -1;
       let score = -1;
-      this.active.forEach((b, i) => {
-        const d = Math.hypot(b.body.fx - px, b.body.fy - py);
-        if (b.visible && d < 300) return;
+      for (let i = 0; i < this.active.length; i++) {
+        const b = this.active[i];
+        const d = hypot2(b.body.fx - px, b.body.fy - py);
+        if (b.visible && d < 300) continue;
         const sc = d + (b.visible ? 0 : 1e5);
         if (sc > score) {
           score = sc;
           pick = i;
         }
-      });
+      }
       if (pick >= 0) {
         this.removeBus(pick);
         this.stats.capDespawns++;
@@ -804,8 +815,7 @@ export class Traffic {
       if (this.initial && !this.buildQueue.length && (this.active.length >= desired || tries <= 0)) this.initial = false;
     } else if (this.capBuses === 0 && this.initial && !this.buildQueue.length) this.initial = false;
 
-    this.byId.clear();
-    for (const b of this.active) this.byId.set(b.id, b);
+    // (byId holds every bus in the list: set in spawn, deleted in removeBus.)
     const g = session.guide;
     this.pTrack = g?.track && g.state && !g.state.offRoute ? g.track : null;
     this.pS = g?.state?.s ?? 0;
@@ -847,7 +857,7 @@ export class Traffic {
         const body = o.body;
         let hit = false;
         const fz = a.body.fz;
-        for (let q = 0; q < body.n && !hit; q++) hit = Math.hypot(body.x[q] - fx, body.y[q] - fy) < 1.6 && Math.abs(body.z[q] - fz) <= LEVEL_GAP;
+        for (let q = 0; q < body.n && !hit; q++) hit = hypot2(body.x[q] - fx, body.y[q] - fy) < 1.6 && Math.abs(body.z[q] - fz) <= LEVEL_GAP;
         if (hit) {
           a.dead = true;
           this.stats.overlapDespawns++;
@@ -927,7 +937,8 @@ export class Traffic {
     for (const q of b.holds) this.cars.leave(b.jl[q].node, -b.id);
     b.holds.length = 0;
     this.release(b);
-    this.active.splice(i, 1);
+    removeAt(this.active, i);
+    this.byId.delete(b.id);
   }
 
   /** How a track signal is asked for: the approach point and direction into its junction, and the level. */
@@ -1020,15 +1031,10 @@ export class Traffic {
 
     // Free-road speed from the track profile.
     const v0 = tr.vmaxAt(b.s + Math.min(10, b.v * 0.8));
-    let acc = idm(b.v, v0, Infinity, 0, 2);
-    const wt: { why: Wait; ref: number } = { why: Wait.None, ref: 0 };
-    const lim = (a: number, w: Wait, ref = 0) => {
-      if (a < acc) {
-        acc = a;
-        wt.why = w;
-        wt.ref = ref;
-      }
-    };
+    // The binding acceleration and why (lim), with no closure or captured variable per bus.
+    this.sAcc = idm(b.v, v0, Infinity, 0, 2);
+    this.sWhy = Wait.None;
+    this.sRef = 0;
 
     // Next stop.
     const st = stops[b.nextStop];
@@ -1047,7 +1053,7 @@ export class Traffic {
           b.v = 0;
           return;
         }
-        if (gap < 140) acc = Math.min(acc, idm(b.v, v0, gap + 0.6, 0, 0.6));
+        if (gap < 140) this.sAcc = Math.min(this.sAcc, idm(b.v, v0, gap + 0.6, 0, 0.6));
         // Kerbside stops pull in to the kerb (where one was found near the lane);
         // at platforms the lane already runs along the platform edge.
         const kerb = tr.kerbAt(st.s);
@@ -1065,7 +1071,7 @@ export class Traffic {
       b.v = 0;
       return;
     }
-    if (b.s > L - 120) acc = Math.min(acc, idm(b.v, v0, L - 1 - b.s, 0, 0.5));
+    if (b.s > L - 120) this.sAcc = Math.min(this.sAcc, idm(b.v, v0, L - 1 - b.s, 0, 0.5));
 
     // Pull back out after a stop.
     if (time - b.departT < 6 && (!st || st.s - b.s > 45 || !b.serve)) b.pullTarget = 0;
@@ -1077,19 +1083,17 @@ export class Traffic {
     const j = jl[b.jNext];
     if (j) {
       if (!j.sig && !j.minor && j.s - b.s < Math.max(30, b.v * 4)) this.cars.markMajor(j.node, time, -1);
-      // Its stop line (where the bus waits), unless it is already past that (spawned there): the box edge.
-      const line = (q: number) => (b.s <= b.jLine[q] + 1 ? b.jLine[q] : jl[q].stopS);
-      const stopAt = line(b.jNext) - b.s;
+      const stopAt = this.lineOf(b, b.jNext) - b.s;
       const commitDist = Math.max(3, (b.v * b.v) / (2 * 2.2)) + 2;
       if (stopAt < commitDist + 35) {
         // Junctions closer together than our length are taken in one go.
         let res = this.junctionOk(b, b.jNext, stopAt, time);
         let k = b.jNext + 1;
         while (res === Wait.None && k < jl.length && jl[k].s - j.s < j.boxR + jl[k].boxR + b.len) {
-          res = this.junctionOk(b, k, line(k) - b.s, time);
+          res = this.junctionOk(b, k, this.lineOf(b, k) - b.s, time);
           k++;
         }
-        if (res !== Wait.None) lim(idm(b.v, v0, Math.max(0.05, stopAt), 0, 0.8), res, this.jRef);
+        if (res !== Wait.None) this.lim(idm(b.v, v0, Math.max(0.05, stopAt), 0, 0.8), res, this.jRef);
         else if (stopAt <= commitDist) {
           for (let q = b.jNext; q < k; q++) {
             const jq = jl[q];
@@ -1126,7 +1130,7 @@ export class Traffic {
           // Beside us or in the lane there now; else on its way there (from a standstill only from close by).
           let yieldTo = dP < 2;
           if (!yieldTo && dP < Math.max(60, pv * 8)) yieldTo = pv < 1 ? dP < 8 : playerEta(dP, pv) < clearTime(b.v, J.a1 - b.s + b.len, BUS_A) + MERGE_GAP;
-          if (yieldTo) lim(idm(b.v, v0, Math.max(0.05, dA), 0, 0.8), Wait.Player);
+          if (yieldTo) this.lim(idm(b.v, v0, Math.max(0.05, dA), 0, 0.8), Wait.Player);
         }
       }
       // A narrow (a tight street on a bend, the player's bus cutting in towards our lane) with the player's
@@ -1144,7 +1148,7 @@ export class Traffic {
           const dP = N.p0 - sp;
           let yieldTo = dP < 2;
           if (!yieldTo && dP < Math.max(60, pv * 8)) yieldTo = pv < 1 ? dP < 8 : playerEta(dP, pv) < clearTime(b.v, N.a1 - b.s + b.len, BUS_A) + MERGE_GAP;
-          if (yieldTo) lim(idm(b.v, v0, Math.max(0.05, dN), 0, 0.8), Wait.Player);
+          if (yieldTo) this.lim(idm(b.v, v0, Math.max(0.05, dN), 0, 0.8), Wait.Player);
         }
       }
     }
@@ -1170,7 +1174,7 @@ export class Traffic {
         }
         const stopDist = (b.v * b.v) / (2 * 2.6);
         if (b.sigState === 'red' || (b.sigState === 'amber' && !b.sigCommit && gap > stopDist + 1)) {
-          if (!b.sigCommit) lim(idm(b.v, v0, gap, 0, 1.0), Wait.Red);
+          if (!b.sigCommit) this.lim(idm(b.v, v0, gap, 0, 1.0), Wait.Red);
         } else if (gap < 6) b.sigCommit = true;
       }
     }
@@ -1178,7 +1182,6 @@ export class Traffic {
     // Car following against other buses, the player and cars: sample our
     // path ahead once, then test every nearby body against it.
     const look = 9 + b.v * 3.2;
-    const bodyF = b.body;
     const ns = Math.min(LOOK_MAX, Math.floor((look - 1.5) / 2.5) + 1);
     const ax = this.aheadX;
     const ay = this.aheadY;
@@ -1193,44 +1196,17 @@ export class Traffic {
       ahy[k] = this.tmp2.hy;
       az[k] = tr.zAt(b.s + 1.5 + k * 2.5);
     }
-    let bestGap = Infinity;
-    let bestV = 0;
-    let bestId = 0;
-    let bestKind: Wait = Wait.None;
+    this.cGap = Infinity;
+    this.cV = 0;
+    this.cId = 0;
+    this.cKind = Wait.None;
     const reach = look + 30;
-    const consider = (o: Body, id: number, other: AiBus | null) => {
-      if (Math.abs(o.fx - bodyF.fx) > reach || Math.abs(o.fy - bodyF.fy) > reach) return;
-      const rel = wrapAngle(o.heading - bodyF.heading);
-      // Two buses waiting on each other (across a junction, at a merge): one of them goes.
-      if (other && other.obstacle === b.id && other.id < b.id) return;
-      // Two 2.5 m wide bodies touch with their centrelines 2.5 m apart: look
-      // wider than that, except at oncoming traffic in the next lane.
-      const r2 = Math.abs(rel) > 2.4 ? (other ? 3.4 : ONCOMING_PLAYER_R2) : 2.8 * 2.8;
-      for (let k = 0; k < ns; k++) {
-        const d = 1.5 + k * 2.5;
-        if (d - 2.5 > bestGap) return;
-        let found = false;
-        for (let q = 0; q < o.n; q++) {
-          const ex = o.x[q] - ax[k];
-          const ey = o.y[q] - ay[k];
-          // Only what is on our level (not the street under a viaduct).
-          if (ex * ex + ey * ey < r2 && Math.abs(o.z[q] - az[k]) <= LEVEL_GAP) {
-            // The gap to that point along our path (its points run bumper to bumper).
-            const g = d + Math.max(-2.5, Math.min(2.5, ex * ahx[k] + ey * ahy[k]));
-            if (g < bestGap) {
-              bestGap = g;
-              bestV = Math.max(0, o.speed * Math.cos(rel));
-              bestId = id;
-              bestKind = other ? Wait.Bus : Wait.Player;
-            }
-            found = true;
-          }
-        }
-        if (found) return;
-      }
-    };
-    for (const o of this.active) if (o !== b && !o.dead) consider(o.body, o.id, o);
-    consider(this.playerBody, -2, null);
+    for (const o of this.active) if (o !== b && !o.dead) this.consider(b, ns, reach, o.body, o.id, o);
+    this.consider(b, ns, reach, this.playerBody, -2, null);
+    let bestGap = this.cGap;
+    let bestV = this.cV;
+    let bestId = this.cId;
+    let bestKind = this.cKind as Wait;
     const G = this.cars.grid;
     for (let k = 0; k < ns; k++) {
       const d = 1.5 + k * 2.5;
@@ -1249,26 +1225,27 @@ export class Traffic {
         break;
       }
     }
-    if (bestGap < Infinity) lim(idm(b.v, v0, Math.max(0.05, bestGap - 0.5), bestV, 2.2), bestKind, bestId);
+    if (bestGap < Infinity) this.lim(idm(b.v, v0, Math.max(0.05, bestGap - 0.5), bestV, 2.2), bestKind, bestId);
     // Touching the player's bus with our front half: stop (the player is never bulldozed).
     const tk = this.touching.get(b.id);
     const touchFront = tk !== undefined && tk < (b.body.n - 1) / 2;
-    if (touchFront) lim(-6.5, Wait.Player);
-    const why = wt.why;
-    b.obstacle = why === Wait.Bus ? wt.ref : 0;
+    if (touchFront) this.lim(-6.5, Wait.Player);
+    const why = this.sWhy as Wait;
+    const wref = this.sRef as number;
+    b.obstacle = why === Wait.Bus ? wref : 0;
     b.wait = why;
     b.exempt =
       why === Wait.Red ||
       why === Wait.Player ||
-      (why === Wait.Bus && (this.byId.get(wt.ref)?.exempt ?? false)) ||
-      (why === Wait.Car && this.cars.isExempt(wt.ref));
+      (why === Wait.Bus && (this.byId.get(wref)?.exempt ?? false)) ||
+      (why === Wait.Car && this.cars.isExempt(wref));
 
-    acc = Math.max(-6.5, Math.min(1.2, acc));
+    const acc = Math.max(-6.5, Math.min(1.2, this.sAcc));
     b.a = acc;
     b.v = touchFront ? 0 : Math.max(0, b.v + acc * dt);
     // Convert lane speed to route distance (lanes are shorter on the inside of bends).
     const i = Math.max(0, Math.min(tr.n - 2, Math.floor(b.s / TRACK_STEP)));
-    const segLen = Math.hypot(tr.x[i + 1] - tr.x[i], tr.y[i + 1] - tr.y[i]) / TRACK_STEP;
+    const segLen = hypot2(tr.x[i + 1] - tr.x[i], tr.y[i + 1] - tr.y[i]) / TRACK_STEP;
     b.s += (b.v * dt) / Math.max(0.4, Math.min(1.6, segLen || 1));
     if (b.s - b.progS > 4) {
       b.progS = b.s;
@@ -1293,6 +1270,61 @@ export class Traffic {
     b.turnSign = Math.abs(turn) > 0.6 ? Math.sign(turn) : 0;
     lights.indicatorLeft = !!pullingIn || b.turnSign < 0;
     lights.indicatorRight = (!pullingIn && pullingOut) || (b.turnSign > 0 && !pullingIn);
+  }
+
+  /**
+   * Body `o` (vehicle `id`, the AI bus `other` or null for the player's) against bus b's path ahead
+   * (the first `ns` points of aheadX/Y/Z/HX/HY), keeping the nearest hit in cGap, cV, cId, cKind.
+   */
+  private consider(b: AiBus, ns: number, reach: number, o: Body, id: number, other: AiBus | null): void {
+    const ax = this.aheadX;
+    const ay = this.aheadY;
+    const az = this.aheadZ;
+    const ahx = this.aheadHX;
+    const ahy = this.aheadHY;
+    if (Math.abs(o.fx - b.body.fx) > reach || Math.abs(o.fy - b.body.fy) > reach) return;
+    const rel = wrapAngle(o.heading - b.body.heading);
+    // Two buses waiting on each other (across a junction, at a merge): one of them goes.
+    if (other && other.obstacle === b.id && other.id < b.id) return;
+    // Two 2.5 m wide bodies touch with their centrelines 2.5 m apart: look
+    // wider than that, except at oncoming traffic in the next lane.
+    const r2 = Math.abs(rel) > 2.4 ? (other ? 3.4 : ONCOMING_PLAYER_R2) : 2.8 * 2.8;
+    for (let k = 0; k < ns; k++) {
+      const d = 1.5 + k * 2.5;
+      if (d - 2.5 > this.cGap) return;
+      let found = false;
+      for (let q = 0; q < o.n; q++) {
+        const ex = o.x[q] - ax[k];
+        const ey = o.y[q] - ay[k];
+        // Only what is on our level (not the street under a viaduct).
+        if (ex * ex + ey * ey < r2 && Math.abs(o.z[q] - az[k]) <= LEVEL_GAP) {
+          // The gap to that point along our path (its points run bumper to bumper).
+          const g = d + Math.max(-2.5, Math.min(2.5, ex * ahx[k] + ey * ahy[k]));
+          if (g < this.cGap) {
+            this.cGap = g;
+            this.cV = Math.max(0, o.speed * Math.cos(rel));
+            this.cId = id;
+            this.cKind = other ? Wait.Bus : Wait.Player;
+          }
+          found = true;
+        }
+      }
+      if (found) return;
+    }
+  }
+
+  /** Bus b's stop line for junction q of its route (where it waits), unless it is already past that (spawned there): the box edge. */
+  private lineOf(b: AiBus, q: number): number {
+    return b.s <= b.jLine[q] + 1 ? b.jLine[q] : b.jl[q].stopS;
+  }
+
+  /** The bus being stepped is held to acceleration `a` (why `w`, by `ref`) if that is the tightest so far. */
+  private lim(a: number, w: Wait, ref = 0): void {
+    if (a < this.sAcc) {
+      this.sAcc = a;
+      this.sWhy = w;
+      this.sRef = ref;
+    }
   }
 
   /**
@@ -1474,7 +1506,7 @@ export class Traffic {
       const j = b.jl[b.holds[k]];
       if (b.s - b.len > j.s + j.boxR) {
         this.cars.leave(j.node, -b.id);
-        b.holds.splice(k, 1);
+        removeAt(b.holds, k);
       } else this.cars.enter(j.node, -b.id, j.inX, j.inY, j.outX, j.outY, j.cls, time + 4);
     }
   }
@@ -1517,14 +1549,14 @@ export class Traffic {
         const body = o.body;
         if (Math.abs(body.fx - x) > o.len + 3 || Math.abs(body.fy - y) > o.len + 3) continue;
         for (let k = 0; k < body.n; k++) {
-          if (Math.hypot(body.x[k] - x, body.y[k] - y) < 2.2 && Math.abs(body.z[k] - z) <= LEVEL_GAP) {
+          if (hypot2(body.x[k] - x, body.y[k] - y) < 2.2 && Math.abs(body.z[k] - z) <= LEVEL_GAP) {
             this.jRef = o.id;
             return Wait.Bus;
           }
         }
       }
       if (Math.abs(pb.speed) < 2) {
-        for (let k = 0; k < pb.n; k++) if (Math.hypot(pb.x[k] - x, pb.y[k] - y) < 2.2 && Math.abs(pb.z[k] - z) <= LEVEL_GAP) return Wait.Player;
+        for (let k = 0; k < pb.n; k++) if (hypot2(pb.x[k] - x, pb.y[k] - y) < 2.2 && Math.abs(pb.z[k] - z) <= LEVEL_GAP) return Wait.Player;
       }
     }
     return Wait.None;
