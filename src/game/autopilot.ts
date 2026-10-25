@@ -551,10 +551,14 @@ export class Autopilot {
           const t = l2 > 1e-6 ? clamp(((px - ax) * sx + (py - ay) * sy) / l2, 0, 1) : 0;
           const ex = px - ax - sx * t;
           const ey = py - ay - sy * t;
-          // A bus along our lane (ahead or oncoming) counts within ~1.8 m of the lane centre; one
-          // across it only when its body really covers the lane centre (not a car-length off).
-          const along = Math.abs(sx * this.tmp.hx + sy * this.tmp.hy) > 0.7 * Math.sqrt(l2);
-          const reach = along && !strict ? b.half + 0.55 : b.half - 0.2;
+          // A bus along our lane counts within ~1.8 m of the lane centre coming the other way, and going
+          // our way anywhere our body would touch it (a queue in the lane our lane moves out of, its last
+          // bus's tail 2.2 m off the lane where we pass it: M1/1 s 1597); one across it only when its
+          // body really covers the lane centre (not a car-length off). (Body points run front to back:
+          // a bus going our way has its segments pointing back.)
+          const dotS = sx * this.tmp.hx + sy * this.tmp.hy;
+          const along = Math.abs(dotS) > 0.7 * Math.sqrt(l2);
+          const reach = strict || !along ? b.half - 0.2 : dotS < 0 ? b.half + this.spec.width / 2 + 0.05 : b.half + 0.55;
           if (ex * ex + ey * ey < reach * reach) return d;
         }
       }
