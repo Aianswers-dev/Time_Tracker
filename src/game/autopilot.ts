@@ -60,9 +60,8 @@ const MAX_DWELL = 75;
 const MIRRORS = 1.2;
 const DECEL = 1.1;
 const SIGNAL_DECEL = 1.6;
-/** Stanley cross-track gain (1/s) and how far ahead the lane heading is read (s per m/s). */
+/** Stanley cross-track gain (1/s). */
 const STANLEY_K = 1.4;
-const PREVIEW = 0.35;
 
 function clamp(v: number, a: number, b: number): number {
   return v < a ? a : v > b ? b : v;
@@ -275,8 +274,8 @@ export class Autopilot {
     // Front axle left (+) / right (−) of the lane.
     const lat = (fx - this.tmp.x) * -this.tmp.hy + (fy - this.tmp.y) * this.tmp.hx;
     this.frame.lateral = -lat;
-    // The lane's heading a little ahead covers the steering rate and the yaw lag.
-    T.sample(sAxle + 1 + av * PREVIEW, this.tmp, this.pull);
+    // The lane's heading at the front axle itself: read further on, the cross-track term has to
+    // cancel the difference and the bus runs on the inside of every bend (~1 m at 33 km/h on R 27).
     const delta = wrapAngle(this.tmp.heading - pose.heading) + Math.atan2(STANLEY_K * lat, 1 + av);
     const ratio = 1 / (1 + Math.pow(Math.max(0, av - 1.5) / 6.5, 2));
     out.steer = clamp(delta / (spec.maxSteer * ratio), -1, 1);
