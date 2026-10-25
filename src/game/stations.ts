@@ -115,6 +115,68 @@ interface StationBuild {
   geo: SGeo;
   glass: SGeo;
   plats: PlatformGeom[];
+  /** Tower footprints: the platform kit (canopy, posts, screens, benches) stops at them. */
+  feet: Foot[];
+}
+
+/** An oriented rectangle: centre, unit heading (along hw) and half sizes. */
+interface Foot {
+  x: number;
+  y: number;
+  hx: number;
+  hy: number;
+  hw: number;
+  hd: number;
+}
+
+function inFoot(feet: Foot[], x: number, y: number, pad = 0.2): boolean {
+  for (const f of feet) {
+    const dx = x - f.x;
+    const dy = y - f.y;
+    if (Math.abs(dx * f.hx + dy * f.hy) < f.hw + pad && Math.abs(-dx * f.hy + dy * f.hx) < f.hd + pad) return true;
+  }
+  return false;
+}
+
+/** A tower's heading (unit, map): its own, else along the nearest busway. */
+function towerHeading(c: Ctx, t: TowerDef): [number, number] {
+  if (t.heading !== undefined) return [Math.sin(t.heading), Math.cos(t.heading)];
+  const hit = c.idx.nearest(t.x, t.y, 60, undefined, 0, isBus);
+  return hit ? [hit.dx, hit.dy] : [0, 1];
+}
+
+/** An overbridge's axis (its own, else across the nearest busway) and the busway level under it. */
+function bridgeAxis(c: Ctx, o: OverbridgeDef): { ax: number; ay: number; zb: number } | null {
+  const hit = c.idx.nearest(o.x, o.y, 40, undefined, 0, isBus);
+  let ax = o.ax ?? 0;
+  let ay = o.ay ?? 0;
+  if (!o.ax && !o.ay) {
+    if (!hit) return null;
+    ax = -hit.dy;
+    ay = hit.dx;
+  }
+  return { ax, ay, zb: hit ? hit.z : c.heights.ground(o.x, o.y) };
+}
+
+/** Where an overbridge's end towers stand (along its axis). */
+function bridgeTowerEnds(o: OverbridgeDef): number[] {
+  const tw = o.towerW ?? 6.5;
+  return o.towers ? [o.len[0] + tw / 2 + 0.25, o.len[1] - tw / 2 - 0.25] : [];
+}
+
+function stationFeet(c: Ctx, def: StationDef): Foot[] {
+  const out: Foot[] = [];
+  for (const t of def.towers ?? []) {
+    const [hx, hy] = towerHeading(c, t);
+    out.push({ x: t.x, y: t.y, hx, hy, hw: t.w / 2, hd: t.d / 2 });
+  }
+  for (const o of def.overbridges ?? []) {
+    const a = bridgeAxis(c, o);
+    if (!a) continue;
+    const tw = o.towerW ?? 6.5;
+    for (const s of bridgeTowerEnds(o)) out.push({ x: o.x + a.ax * s, y: o.y + a.ay * s, hx: a.ax, hy: a.ay, hw: tw / 2, hd: tw / 2 });
+  }
+  return out;
 }
 
 interface Ctx {
@@ -188,7 +250,7 @@ export function buildStations(scene: THREE.Scene, data: MapData, geoms: Platform
   // Group platforms by station.
   const builds = new Map<string, StationBuild>();
   const anon: StationBuild[] = [];
-  const mk = (def: StationDef): StationBuild => ({ def, geo: new SGeo(), glass: new SGeo(), plats: [] });
+  const mk = (def: StationDef): StationBuild => ({ def, geo: new SGeo(), glass: new SGeo(), plats: [], feet: stationFeet(c, def) });
   for (const g of geoms) {
     const cx = (g.x0 + g.x1) / 2;
     const cy = (g.y0 + g.y1) / 2;
@@ -219,16 +281,23 @@ export function buildStations(scene: THREE.Scene, data: MapData, geoms: Platform
     if (b.def.concourse) buildConcourse(c, b, b.def.concourse);
     for (const e of b.def.entrances ?? []) buildEntrance(c, b, e);
   }
-  // INB enclosures (QUT Kelvin Grove to Herston)
+  // INB enclosures (QUT Kelvin Grove to Herston). OSM's roofs reach the data in pieces (the pipeline cuts
+  // them about every 20 m and clips them off the platforms), so each station's pieces make one vault.
+  const encl = new Map<StationDef, Float32Array[]>();
   for (const bld of data.buildings) {
     const def = enclosureStyle(bld);
     if (!def) continue;
-    const b = builds.get(def.key) ?? mk(def);
-    if (!builds.has(def.key)) {
-      builds.set(def.key, b);
+    const list = encl.get(def);
+    if (list) list.push(bld.pts);
+    else encl.set(def, [bld.pts]);
+  }
+  for (const [def, pieces] of encl) {
+    let b = builds.get(def.key);
+    if (!b) {
+      builds.set(def.key, (b = mk(def)));
       all.push(b);
     }
-    buildVault(c, b, bld.pts);
+    buildVault(c, b, pieces);
   }
   c.atlas.build();
   const opaque = stationMaterial(c.atlas);
@@ -268,7 +337,8 @@ export function buildStations(scene: THREE.Scene, data: MapData, geoms: Platform
 // One platform
 
 function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
-  const def = b.def;
+  const own = b.def.platforms?.[platformNumber(c, g)];
+  const def = own ? { ...b.def, ...own } : b.def;
   const geo = b.geo;
   const glass = b.glass;
   const pl = g.plane;
@@ -440,6 +510,7 @@ function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
   const covered = g.covered && def.roof !== 'none';
   const H = def.canopyH ?? 4.2;
   const D = def.canopyDepth ?? 4.6;
+  const SH = Math.min(def.screenH ?? 2.45, H - 0.05);
   const num = platformNumber(c, g);
   for (const k of g.kerbs) {
     if (k.len < 6) continue;
@@ -451,15 +522,30 @@ function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
     });
     const back = depth.map((d) => Math.max(1.6, Math.min(d - 0.25, D)));
     const front = 0.45;
-    if (covered && !vault) canopy(geo, def, ss, back, front, top, H);
+    // no canopy through a lift tower standing on the platform
+    const feet = b.feet;
+    const cut = ss.map((s, i) => {
+      if (!feet.length || i + 1 >= ss.length) return false;
+      const e = ss[i + 1];
+      for (const u of [0, 0.5, 1]) {
+        const o = front + (back[i] + back[i + 1] - 2 * front) * 0.5 * u;
+        if (inFoot(feet, (s.x + e.x) / 2 + s.nx * o, (s.y + e.y) / 2 + s.ny * o)) return true;
+      }
+      return false;
+    });
+    if (covered && !vault) (def.canopy === 'wing' ? wingCanopy : canopy)(geo, def, ss, back, front, top, H, cut);
     // posts on the back line every ~9 m; screens between them
-    const postAt: Sample[] = [];
-    const np = Math.max(2, Math.round((k.len - 3) / 9) + 1);
-    for (let i = 0; i < np; i++) postAt.push(at(k, 1.5 + ((k.len - 3) * i) / (np - 1)));
     const backAt = (s: Sample) => {
       const d = rayRing(ring, s.x + s.nx * 0.05, s.y + s.ny * 0.05, s.nx, s.ny, 30);
       return Math.max(1.6, Math.min((Number.isFinite(d) ? d : 3.5) - 0.25, D)) - 0.35;
     };
+    const blocked = (s: Sample, o: number) => feet.length > 0 && inFoot(feet, s.x + s.nx * o, s.y + s.ny * o, 0.4);
+    const postAt: Sample[] = [];
+    const np = Math.max(2, Math.round((k.len - 3) / 9) + 1);
+    for (let i = 0; i < np; i++) {
+      const s = at(k, 1.5 + ((k.len - 3) * i) / (np - 1));
+      if (!blocked(s, backAt(s)) && !blocked(s, 1.5)) postAt.push(s);
+    }
     if (covered && !vault) {
       geo.paint(def.post);
       for (const s of postAt) {
@@ -477,6 +563,8 @@ function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
         const e = postAt[i + 1];
         const oa = backAt(a) + 0.05;
         const oe = backAt(e) + 0.05;
+        if (feet.length && inFoot(feet, (a.x + e.x) / 2 + a.nx * oa, (a.y + e.y) / 2 + a.ny * oa, 0.4)) continue;
+        if (Math.hypot(e.x - a.x, e.y - a.y) > 14) continue;
         const ax = a.x + a.nx * oa;
         const ay = a.y + a.ny * oa;
         const ex = e.x + e.nx * oe;
@@ -486,15 +574,15 @@ function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
           [
             [ax, ay, top(ax, ay) + 0.12],
             [ex, ey, top(ex, ey) + 0.12],
-            [ex, ey, top(ex, ey) + 2.45],
-            [ax, ay, top(ax, ay) + 2.45],
+            [ex, ey, top(ex, ey) + SH],
+            [ax, ay, top(ax, ay) + SH],
           ],
           0,
           0,
           0,
         );
         geo.paint(def.post);
-        geo.beam([ax, ay, top(ax, ay) + 2.48], [ex, ey, top(ex, ey) + 2.48], 0.04);
+        geo.beam([ax, ay, top(ax, ay) + SH + 0.03], [ex, ey, top(ex, ey) + SH + 0.03], 0.04);
         geo.beam([ax, ay, top(ax, ay) + 0.1], [ex, ey, top(ex, ey) + 0.1], 0.03);
         // an advertising / timetable case every other bay
         if (i % 2 === 1) {
@@ -523,7 +611,7 @@ function buildPlatform(c: Ctx, b: StationBuild, g: PlatformGeom): void {
     for (let d = 5; d < k.len - 4; d += 15) {
       const s = at(k, d);
       const o = Math.max(1.4, backAt(s) - 0.6);
-      if (o < 1.5) continue;
+      if (o < 1.5 || blocked(s, o)) continue;
       bench(geo, s.x + s.nx * o, s.y + s.ny * o, top(s.x, s.y), s.tx, s.ty, -s.nx, -s.ny);
       if (Math.round(d / 15) % 2 === 1) {
         const bx = s.x + s.nx * o + s.tx * 1.6;
@@ -648,12 +736,28 @@ function pidText(c: Ctx, def: StationDef): string {
 }
 
 /** The flat cantilevered canopy over a kerb strip. */
-function canopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front: number, top: (x: number, y: number) => number, H: number): void {
+/**
+ * The samples where a canopy run starts (sgn -1) or ends (sgn 1): the kerb's ends and the edges of
+ * the gaps left for towers (`cut[i]`: no canopy between samples i and i + 1).
+ */
+function runEnds(n: number, cut: boolean[]): [number, number][] {
+  const out: [number, number][] = [];
+  for (let i = 0; i < n; i++) {
+    const before = i > 0 && !cut[i - 1];
+    const after = i + 1 < n && !cut[i];
+    if (after && !before) out.push([i, -1]);
+    if (before && !after) out.push([i, 1]);
+  }
+  return out;
+}
+
+function canopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front: number, top: (x: number, y: number) => number, H: number, cut: boolean[]): void {
   const T = 0.45;
   const F = (i: number): V3 => [ss[i].x + ss[i].nx * front, ss[i].y + ss[i].ny * front, 0];
   const B = (i: number): V3 => [ss[i].x + ss[i].nx * back[i], ss[i].y + ss[i].ny * back[i], 0];
   const hU = (p: V3) => top(p[0], p[1]) + H;
   for (let i = 0; i + 1 < ss.length; i++) {
+    if (cut[i]) continue;
     const f0 = F(i);
     const f1 = F(i + 1);
     const b0 = B(i);
@@ -733,11 +837,10 @@ function canopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front:
   }
   // end caps
   geo.paint(def.fascia);
-  for (const i of [0, ss.length - 1]) {
+  for (const [i, sgn] of runEnds(ss.length, cut)) {
     const f = F(i);
     const bb = B(i);
     const s = ss[i];
-    const sgn = i === 0 ? -1 : 1;
     geo.face(
       [
         [f[0], f[1], hU(f) - 0.06],
@@ -754,12 +857,107 @@ function canopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front:
   geo.paint(def.fascia);
   const step = Math.max(1, Math.round(6 / 3));
   for (let i = 0; i < ss.length; i += step) {
+    if ((i === 0 || cut[i - 1]) && (i + 1 === ss.length || cut[i])) continue;
     const s = ss[i];
     const f = F(i);
     const bb = B(i);
     const hf = hU(f) - 0.17;
     const hb = hU(bb) - 0.17;
     geo.beam([bb[0] - s.nx * 0.1, bb[1] - s.ny * 0.1, hb], [f[0] + s.nx * 0.3, f[1] + s.ny * 0.3, hf], 0.12, true);
+  }
+}
+
+/**
+ * Dutton Park Place's "wing": a blade carried on the back row of posts, its panelled soffit curving up
+ * towards the kerb and its top a stack of dark fins stepping down to a knife edge at the front.
+ */
+function wingCanopy(geo: SGeo, def: StationDef, ss: Sample[], back: number[], front: number, top: (x: number, y: number) => number, H: number, cut: boolean[]): void {
+  const WR = 1.4; // soffit rise at the front edge
+  const N = 4; // strips across the depth, back (u 0) to front (u 1)
+  const P = (i: number, u: number): [number, number] => {
+    const o = back[i] + (front - back[i]) * u;
+    return [ss[i].x + ss[i].nx * o, ss[i].y + ss[i].ny * o];
+  };
+  const hs = (u: number) => H + WR * u * u;
+  const ht = (u: number) => hs(u) + 0.18 + 0.6 * (1 - u);
+  const fin = mixCol(def.roofTop, 0x000000, 0.3);
+  for (let i = 0; i + 1 < ss.length; i++) {
+    if (cut[i]) continue;
+    const tx = ss[i + 1].x - ss[i].x;
+    const ty = ss[i + 1].y - ss[i].y;
+    for (let j = 0; j < N; j++) {
+      const u0 = j / N;
+      const u1 = (j + 1) / N;
+      const a0 = P(i, u0);
+      const a1 = P(i + 1, u0);
+      const b0 = P(i, u1);
+      const b1 = P(i + 1, u1);
+      const z = (p: [number, number], h: number): V3 => [p[0], p[1], top(p[0], p[1]) + h];
+      geo.paint(def.soffit, Pat.Soffit, 1.5);
+      geo.face([z(a0, hs(u0)), z(a1, hs(u0)), z(b1, hs(u1)), z(b0, hs(u1))], 0, 0, -1);
+      // top, with a dark fin standing up along each strip's back edge (the stacked look from the side)
+      geo.paint(def.roofTop);
+      geo.face([z(a0, ht(u0)), z(a1, ht(u0)), z(b1, ht(u1)), z(b0, ht(u1))], 0, 0, 1);
+      if (j > 0) {
+        geo.paint(fin);
+        geo.face([z(a0, ht(u0)), z(a1, ht(u0)), z(a1, ht(u0) + 0.3), z(a0, ht(u0) + 0.3)], ty, -tx, 0);
+      }
+    }
+    // knife edge at the front
+    geo.paint(fin);
+    const f0 = P(i, 1);
+    const f1 = P(i + 1, 1);
+    geo.face(
+      [
+        [f0[0], f0[1], top(f0[0], f0[1]) + hs(1)],
+        [f1[0], f1[1], top(f1[0], f1[1]) + hs(1)],
+        [f1[0], f1[1], top(f1[0], f1[1]) + ht(1)],
+        [f0[0], f0[1], top(f0[0], f0[1]) + ht(1)],
+      ],
+      ty,
+      -tx,
+      0,
+    );
+    // back edge over the posts
+    geo.paint(def.fascia);
+    const a0 = P(i, 0);
+    const a1 = P(i + 1, 0);
+    const za0 = top(a0[0], a0[1]);
+    const za1 = top(a1[0], a1[1]);
+    geo.face(
+      [
+        [a0[0], a0[1], za0 + hs(0)],
+        [a1[0], a1[1], za1 + hs(0)],
+        [a1[0], a1[1], za1 + ht(0)],
+        [a0[0], a0[1], za0 + ht(0)],
+      ],
+      -ty,
+      tx,
+      0,
+    );
+  }
+  // end caps: the blade's profile
+  geo.paint(def.fascia);
+  for (const [i, sgn] of runEnds(ss.length, cut)) {
+    for (let j = 0; j < N; j++) {
+      const u0 = j / N;
+      const u1 = (j + 1) / N;
+      const a = P(i, u0);
+      const e = P(i, u1);
+      const za = top(a[0], a[1]);
+      const ze = top(e[0], e[1]);
+      geo.face(
+        [
+          [a[0], a[1], za + hs(u0)],
+          [e[0], e[1], ze + hs(u1)],
+          [e[0], e[1], ze + ht(u1)],
+          [a[0], a[1], za + ht(u0)],
+        ],
+        ss[i].tx * sgn,
+        ss[i].ty * sgn,
+        0,
+      );
+    }
   }
 }
 
@@ -851,10 +1049,11 @@ function buildUndergroundPlatform(c: Ctx, b: StationBuild, g: PlatformGeom, top:
         0,
         0,
       );
-      geo.paint(STAINLESS);
+      // mullions: stainless at KGS, dark frames at Queen St (photos: Vision_Australia_..._Queen_Street_bus_station)
+      geo.paint(kgs ? STAINLESS : 0x2a2b2d);
       geo.box(ax, ay, top(ax, ay), top(ax, ay) + 2.7, a.tx, a.ty, 0.035, 0.05);
       // bulkhead over the glass up to the hall ceiling
-      geo.paint(kgs ? 0xd9d9d4 : 0x9a9488);
+      geo.paint(kgs ? 0xd9d9d4 : 0x6f695f);
       geo.face(
         [
           [ax, ay, top(ax, ay) + 2.7],
@@ -1030,11 +1229,34 @@ function buildMedian(c: Ctx, b: StationBuild): void {
         }
         const mx = (ax + bx) / 2;
         const my = (ay + by) / 2;
-        const hit = c.idx.nearest(mx, my, 4, undefined, 0, isBus);
+        const hit = c.idx.nearest(mx, my, 12, undefined, 0, isBus);
         if (!hit) continue;
-        // the busway's centreline must be under the fence (never across a lane)
-        if (hit.dist > 1.4) continue;
-        pts.push({ x: mx, y: my, z: hit.z, tx: s.tx, ty: s.ty });
+        // the fence stands on a two-way busway's centreline (never across a lane): at the kerbs' midpoint,
+        // or on the centreline itself where the bays make one side wider (Roma St); or in the gap between
+        // two one-way carriageways (Cultural Centre)
+        const road = c.data.roads[hit.road];
+        const hz = hit.z;
+        let fx = mx;
+        let fy = my;
+        if (!road.oneway) {
+          if (hit.dist > 3.5) continue;
+          if (hit.dist > 1.4) {
+            fx = hit.px;
+            fy = hit.py;
+          }
+        } else {
+          // a one-way pair: midway between this carriageway's centreline and the opposite one's
+          const p1x = hit.px;
+          const p1y = hit.py;
+          const h2 = c.idx.nearest(mx, my, 12, Math.atan2(-hit.dx, -hit.dy), 0.7, (r) => isBus(r) && r.oneway);
+          if (!h2) continue;
+          const sep = Math.hypot(h2.px - p1x, h2.py - p1y);
+          if (sep < 5 || sep > 16) continue;
+          fx = (p1x + h2.px) / 2;
+          fy = (p1y + h2.py) / 2;
+          if (Math.hypot(fx - mx, fy - my) > 4) continue;
+        }
+        pts.push({ x: fx, y: fy, z: hz, tx: s.tx, ty: s.ty });
       }
       if (pts.length < 4) continue;
       fenceRun(c, geo, glass, def, pts);
@@ -1177,18 +1399,31 @@ function buswayZ(c: Ctx, x: number, y: number, r = 40): number {
   return hit ? hit.z : c.heights.ground(x, y);
 }
 
+/** True if a surface rail line runs within `r` m of (x, y) (no bridge piers on the tracks). */
+function nearRail(c: Ctx, x: number, y: number, r: number): boolean {
+  for (const l of c.data.rail) {
+    if (l.tunnel) continue;
+    const p = l.pts;
+    for (let i = 0; i + 3 < p.length; i += 2) {
+      const ax = p[i];
+      const ay = p[i + 1];
+      const dx = p[i + 2] - ax;
+      const dy = p[i + 3] - ay;
+      if (Math.min(ax, ax + dx) > x + r || Math.max(ax, ax + dx) < x - r || Math.min(ay, ay + dy) > y + r || Math.max(ay, ay + dy) < y - r) continue;
+      const l2 = dx * dx + dy * dy || 1;
+      const t = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / l2));
+      if (Math.hypot(ax + dx * t - x, ay + dy * t - y) < r) return true;
+    }
+  }
+  return false;
+}
+
 function buildOverbridge(c: Ctx, b: StationBuild, o: OverbridgeDef): void {
   const geo = b.geo;
   const glass = b.glass;
-  let ax = o.ax ?? 0;
-  let ay = o.ay ?? 0;
-  const hit = c.idx.nearest(o.x, o.y, 40, undefined, 0, isBus);
-  if (!o.ax && !o.ay) {
-    if (!hit) return;
-    ax = -hit.dy;
-    ay = hit.dx;
-  }
-  const zb = hit ? hit.z : c.heights.ground(o.x, o.y);
+  const axis = bridgeAxis(c, o);
+  if (!axis) return;
+  const { ax, ay, zb } = axis;
   const deck = zb + (o.clear ?? 6.4);
   const [s0, s1] = o.len;
   const w = o.w / 2;
@@ -1297,10 +1532,11 @@ function buildOverbridge(c: Ctx, b: StationBuild, o: OverbridgeDef): void {
   }
   // towers or piers at the ends, plus piers where the ground allows
   const tw = o.towerW ?? 6.5;
-  const ends: number[] = o.towers ? [s0 + tw / 2 + 0.25, s1 - tw / 2 - 0.25] : [];
+  const ends = bridgeTowerEnds(o);
   for (const s of ends) {
     const p = P(s, 0);
-    buildTower(c, b, { x: p[0], y: p[1], w: tw, d: tw, h: roofH - zb + 2.5, heading: Math.atan2(ax, ay), frame: o.frame, banner: 0xe8552b }, Math.min(c.heights.ground(p[0], p[1]), zb));
+    const t: TowerDef = { x: p[0], y: p[1], w: tw, d: tw, h: roofH - zb + (o.towerLift ? 0.6 : 2.5), heading: Math.atan2(ax, ay), frame: o.frame, banner: o.towerLift ? 0 : 0xe8552b, hat: o.towerHat, roof: o.towerRoof, lift: o.towerLift };
+    buildTower(c, b, t, Math.min(c.heights.ground(p[0], p[1]), zb));
   }
   const pierStep = 12;
   for (let s = s0 + 2; s <= s1 - 2; s += pierStep) {
@@ -1309,7 +1545,7 @@ function buildOverbridge(c: Ctx, b: StationBuild, o: OverbridgeDef): void {
     const gz = c.heights.ground(p[0], p[1]);
     const under = c.idx.nearest(p[0], p[1], 12);
     if (under && under.dist < c.data.roads[under.road].width / 2 + 1.0) continue;
-    if (deck - gz < 1.5) continue;
+    if (deck - gz < 1.5 || nearRail(c, p[0], p[1], 3.2)) continue;
     geo.paint(CONCRETE);
     geo.cylinder(p[0], p[1], gz - 1, deck - 0.9, 0.45, 10, false);
   }
@@ -1427,6 +1663,50 @@ function buildConcourse(c: Ctx, b: StationBuild, o: ConcourseDef): void {
         1,
       );
     }
+    // long faces (photo RBWH_busway_station): a bay of raked green glass fins at one end, grey
+    // horizontal louvres over the rest of the upper storey
+    if (Math.abs(fx * nx + fy * ny) > 0.5 * Math.hypot(fx, fy)) {
+      const fl = Math.hypot(fx, fy) || 1;
+      const ux = fx / fl;
+      const uy = fy / fl;
+      const ex = e[0] - a[0];
+      const ey = e[1] - a[1];
+      const el = Math.hypot(ex, ey) || 1;
+      const nf = Math.max(4, Math.round((el * 0.28) / 1.3));
+      glass.paint(0x4f9a76);
+      for (let i = 0; i <= nf; i++) {
+        const t = 0.05 + (0.28 * i) / nf;
+        const px = a[0] + ex * t + ux * 0.1;
+        const py = a[1] + ey * t + uy * 0.1;
+        const qx = px + ux * 0.75 + (ex / el) * 0.55;
+        const qy = py + uy * 0.75 + (ey / el) * 0.55;
+        glass.face(
+          [
+            [px, py, z0 + 0.6],
+            [qx, qy, z0 + 0.6],
+            [qx, qy, z1 - 1.2],
+            [px, py, z1 - 1.2],
+          ],
+          -(ey / el),
+          ex / el,
+          0,
+        );
+      }
+      geo.paint(0x9ea4a8, Pat.Louvre, 0.35);
+      const l0 = 0.42;
+      const l1 = 0.95;
+      geo.face(
+        [
+          [a[0] + ex * l0 + ux * 0.12, a[1] + ey * l0 + uy * 0.12, z0 + 2.5],
+          [a[0] + ex * l1 + ux * 0.12, a[1] + ey * l1 + uy * 0.12, z0 + 2.5],
+          [a[0] + ex * l1 + ux * 0.12, a[1] + ey * l1 + uy * 0.12, z1 - 1.2],
+          [a[0] + ex * l0 + ux * 0.12, a[1] + ey * l0 + uy * 0.12, z1 - 1.2],
+        ],
+        fx,
+        fy,
+        0,
+      );
+    }
     // lettering on the long faces
     if (Math.abs(fx * nx + fy * ny) > 0.5 * Math.hypot(fx, fy) && b.def.name) {
       const fl = Math.hypot(fx, fy) || 1;
@@ -1470,18 +1750,7 @@ function buildConcourse(c: Ctx, b: StationBuild, o: ConcourseDef): void {
 function buildTower(c: Ctx, b: StationBuild, t: TowerDef, base: number | null): void {
   const geo = b.geo;
   const glass = b.glass;
-  let hx = 0;
-  let hy = 1;
-  if (t.heading !== undefined) {
-    hx = Math.sin(t.heading);
-    hy = Math.cos(t.heading);
-  } else {
-    const hit = c.idx.nearest(t.x, t.y, 60, undefined, 0, isBus);
-    if (hit) {
-      hx = hit.dx;
-      hy = hit.dy;
-    }
-  }
+  const [hx, hy] = towerHeading(c, t);
   const gz = c.heights.ground(t.x, t.y);
   const z0 = base ?? (t.ground ? gz : Math.min(gz, buswayZ(c, t.x, t.y)));
   const z1 = (t.ground ? gz : buswayZ(c, t.x, t.y)) + t.h;
@@ -1490,13 +1759,17 @@ function buildTower(c: Ctx, b: StationBuild, t: TowerDef, base: number | null): 
   const vx = -hy;
   const vy = hx;
   const corner = (i: number, j: number): [number, number] => [t.x + hx * hw * i + vx * hd * j, t.y + hy * hw * i + vy * hd * j];
-  // core: glass on two faces, louvres on the others
+  // core: glass on two faces, louvres on the others (a lift shaft is glass all round)
   const cs: [number, number][] = [
     [-1, -1],
     [1, -1],
     [1, 1],
     [-1, 1],
   ];
+  if (t.lift) {
+    buildLiftShaft(geo, glass, t, corner, cs, z0, z1, hx, hy);
+    return;
+  }
   for (let i = 0; i < 4; i++) {
     const p = corner(...cs[i]);
     const q = corner(...cs[(i + 1) % 4]);
@@ -1546,11 +1819,40 @@ function buildTower(c: Ctx, b: StationBuild, t: TowerDef, base: number | null): 
       geo.beam([p[0], p[1], h], [q[0], q[1], h], 0.09, false);
     }
   }
-  // hat roof
-  geo.paint(WHITE);
-  geo.box(t.x, t.y, z1, z1 + 0.35, hx, hy, hw + 1.8, hd + 1.8, true);
-  geo.paint(0x2b2f33);
-  geo.box(t.x, t.y, z1 + 0.35, z1 + 0.55, hx, hy, hw + 1.6, hd + 1.6);
+  const [ow, od] = t.hat ?? [1.8, 1.8];
+  if (t.roof === 'pyramid') {
+    // low white hipped roof on a thin eave (Woolloongabba, QUT Kelvin Grove, Normanby): an X of ridges from
+    // above, a flat cantilevered hat from the platform
+    geo.paint(WHITE);
+    geo.box(t.x, t.y, z1, z1 + 0.3, hx, hy, hw + ow, hd + od);
+    hatSoffit(geo, t, hx, hy, hw + ow, hd + od, z1);
+    const rise = Math.min(hw + ow, hd + od) * 0.2;
+    const ring = cs.map(([i, j]) => [t.x + hx * (hw + ow) * i + vx * (hd + od) * j, t.y + hy * (hw + ow) * i + vy * (hd + od) * j] as [number, number]);
+    for (let i = 0; i < 4; i++) {
+      const p = ring[i];
+      const q = ring[(i + 1) % 4];
+      const mx = (p[0] + q[0]) / 2 - t.x;
+      const my = (p[1] + q[1]) / 2 - t.y;
+      geo.paint(i % 2 ? 0xe4e4e0 : 0xf0f0ec);
+      geo.face(
+        [
+          [p[0], p[1], z1 + 0.3],
+          [q[0], q[1], z1 + 0.3],
+          [t.x, t.y, z1 + 0.3 + rise],
+        ],
+        mx,
+        my,
+        0.5,
+      );
+    }
+  } else {
+    // flat cantilevered hat roof
+    geo.paint(WHITE);
+    geo.box(t.x, t.y, z1, z1 + 0.35, hx, hy, hw + ow, hd + od);
+    hatSoffit(geo, t, hx, hy, hw + ow, hd + od, z1);
+    geo.paint(0x2b2f33);
+    geo.box(t.x, t.y, z1 + 0.35, z1 + 0.55, hx, hy, hw + ow - 0.2, hd + od - 0.2);
+  }
   // orange banner on a corner
   if (t.banner) {
     const p = corner(1, 1);
@@ -1560,6 +1862,71 @@ function buildTower(c: Ctx, b: StationBuild, t: TowerDef, base: number | null): 
     geo.box(p[0] + vx * 0.5, p[1] + vy * 0.5, z1 - 1 - bh, z1 - 1, hx, hy, 0.5, 0.03);
     geo.deferSign(c.atlas, key, p[0] + vx * 0.5, p[1] + vy * 0.5, z1 - 1 - bh / 2, hx, hy, 0.95, bh, 0.035);
   }
+}
+
+/** The hat's underside: a light panel soffit with downlights, like the platform canopies (it reads from the cab). */
+function hatSoffit(geo: SGeo, t: TowerDef, hx: number, hy: number, hl: number, hw: number, z: number): void {
+  const vx = -hy;
+  const vy = hx;
+  geo.paint(0xe8e8e4, Pat.Soffit, 1.5);
+  geo.face(
+    [
+      [t.x - hx * hl - vx * hw, t.y - hy * hl - vy * hw, z],
+      [t.x + hx * hl - vx * hw, t.y + hy * hl - vy * hw, z],
+      [t.x + hx * hl + vx * hw, t.y + hy * hl + vy * hw, z],
+      [t.x - hx * hl + vx * hw, t.y - hy * hl + vy * hw, z],
+    ],
+    0,
+    0,
+    -1,
+  );
+}
+
+/** A glazed lift shaft (Mater Hill): glass all round in a light steel frame, a thin flat cap. */
+function buildLiftShaft(
+  geo: SGeo,
+  glass: SGeo,
+  t: TowerDef,
+  corner: (i: number, j: number) => [number, number],
+  cs: [number, number][],
+  z0: number,
+  z1: number,
+  hx: number,
+  hy: number,
+): void {
+  for (let i = 0; i < 4; i++) {
+    const p = corner(...cs[i]);
+    const q = corner(...cs[(i + 1) % 4]);
+    glass.paint(0x9ccad6);
+    glass.face(
+      [
+        [p[0], p[1], z0 - 0.5],
+        [q[0], q[1], z0 - 0.5],
+        [q[0], q[1], z1],
+        [p[0], p[1], z1],
+      ],
+      (p[0] + q[0]) / 2 - t.x,
+      (p[1] + q[1]) / 2 - t.y,
+      0,
+    );
+  }
+  geo.paint(t.frame);
+  for (const [i, j] of cs) {
+    const p = corner(i, j);
+    geo.box(p[0], p[1], z0 - 0.5, z1, hx, hy, 0.09, 0.09);
+  }
+  for (let h = z0 + 3; h < z1 - 0.5; h += 3) {
+    for (let i = 0; i < 4; i++) {
+      const p = corner(...cs[i]);
+      const q = corner(...cs[(i + 1) % 4]);
+      geo.beam([p[0], p[1], h], [q[0], q[1], h], 0.06, false);
+    }
+  }
+  // the car and its stainless doors at the bottom, the machine head at the top
+  geo.paint(STAINLESS);
+  geo.box(t.x, t.y, z0, z0 + 2.3, hx, hy, t.w * 0.3, t.d * 0.3);
+  geo.paint(t.frame);
+  geo.box(t.x, t.y, z1, z1 + 0.5, hx, hy, t.w / 2 + 0.25, t.d / 2 + 0.25, true);
 }
 
 /** UQ Lakes pantograph chargers: steel mast, L-arm over the bay, hood with the pantograph. */
@@ -1796,82 +2163,144 @@ function buildRomaP1(c: Ctx, b: StationBuild): void {
       -a.ny,
       0,
     );
-    // white columns at the platform back every other sample
+    // white columns at the platform back every other sample, forking into V struts under the roof
     if (i % 2 === 0) {
       geo.paint(WHITE);
-      geo.box(ga[0] - a.nx * 0.4, ga[1] - a.ny * 0.4, za, za + 10.2, a.tx, a.ty, 0.22, 0.22);
+      const cx = ga[0] - a.nx * 0.4;
+      const cy = ga[1] - a.ny * 0.4;
+      geo.box(cx, cy, za, za + 7.6, a.tx, a.ty, 0.22, 0.22);
+      for (const sg of [-1, 1]) geo.beam([cx, cy, za + 7.5], [cx + a.tx * 1.7 * sg - a.nx * 0.6, cy + a.ty * 1.7 * sg - a.ny * 0.6, za + 10.2], 0.14, false);
     }
   }
 }
 
-/** QUT Kelvin Grove / Herston / INB enclosures: an arched vault over the busway and platforms, from the OSM roof footprint. */
-function buildVault(c: Ctx, b: StationBuild, foot: Float32Array): void {
+/**
+ * QUT Kelvin Grove / Herston / INB enclosures: an arched vault over the busway and platforms, over the OSM
+ * roof pieces. The ribs spring from the platform backs where there are platforms (the pieces stop at the
+ * platform kerbs) and from the pieces' outer edges elsewhere; they stop at overbridges and lift towers.
+ */
+function buildVault(c: Ctx, b: StationBuild, pieces: Float32Array[]): void {
   const v = b.def.vault;
   if (!v) return;
   const geo = b.geo;
   const glass = b.glass;
-  // the busway through the footprint: the bus road with the longest run inside it
-  let bestRoad = -1;
-  let bestLen = 0;
-  let x0 = Infinity;
-  let y0 = Infinity;
-  let x1 = -Infinity;
-  let y1 = -Infinity;
-  for (let i = 0; i < foot.length; i += 2) {
-    x0 = Math.min(x0, foot[i]);
-    x1 = Math.max(x1, foot[i]);
-    y0 = Math.min(y0, foot[i + 1]);
-    y1 = Math.max(y1, foot[i + 1]);
-  }
+  const boxes = pieces.map((p) => {
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    for (let i = 0; i < p.length; i += 2) {
+      x0 = Math.min(x0, p[i]);
+      x1 = Math.max(x1, p[i]);
+      y0 = Math.min(y0, p[i + 1]);
+      y1 = Math.max(y1, p[i + 1]);
+    }
+    return [x0, y0, x1, y1];
+  });
+  const pieceAt = (x: number, y: number): number => {
+    for (let k = 0; k < pieces.length; k++) {
+      const q = boxes[k];
+      if (x >= q[0] && x <= q[2] && y >= q[1] && y <= q[3] && pointInRing(pieces[k], x, y)) return k;
+    }
+    return -1;
+  };
+  // how far the pieces reach from (x, y) along (dx, dy), across the cuts between them
+  const reach = (x: number, y: number, dx: number, dy: number): number => {
+    let t = 0;
+    for (let n = 0; n < 12 && t < 40; n++) {
+      const px = x + dx * (t + 0.05);
+      const py = y + dy * (t + 0.05);
+      const k = pieceAt(px, py);
+      if (k < 0) break;
+      const e = rayRing(pieces[k], px, py, dx, dy, 40);
+      if (!Number.isFinite(e)) break;
+      t += 0.05 + e;
+    }
+    return t;
+  };
+  // the back of a platform along (dx, dy), up to 22 m out
+  const plats = b.plats.filter((g) => !isUnder(b.def, g));
+  const back = (x: number, y: number, dx: number, dy: number): number => {
+    let best = 0;
+    for (const g of plats) {
+      const f = rayRing(g.outline, x + dx * 30, y + dy * 30, -dx, -dy, 30);
+      if (Number.isFinite(f) && 30 - f < 22) best = Math.max(best, 30 - f);
+    }
+    return best;
+  };
+  // overbridge decks and tower footprints the vault stops at
+  const bridges = (b.def.overbridges ?? []).flatMap((o) => {
+    const a = bridgeAxis(c, o);
+    return a ? [{ o, ax: a.ax, ay: a.ay }] : [];
+  });
+  const blocked = (x: number, y: number): boolean => {
+    if (inFoot(b.feet, x, y, 0.8)) return true;
+    for (const { o, ax, ay } of bridges) {
+      const dx = x - o.x;
+      const dy = y - o.y;
+      const q = dx * ax + dy * ay;
+      if (q > o.len[0] - 1 && q < o.len[1] + 1 && Math.abs(-dx * ay + dy * ax) < o.w / 2 + 1.5) return true;
+    }
+    return false;
+  };
+  // the bus roads through the pieces, longest first; each vaults only the pieces no earlier road did
+  const cands: [number, number][] = [];
   c.data.roads.forEach((r, ri) => {
     if (!isBus(r) || r.tunnel) return;
     let len = 0;
     for (let i = 0; i + 3 < r.pts.length; i += 2) {
-      const mx = (r.pts[i] + r.pts[i + 2]) / 2;
-      const my = (r.pts[i + 1] + r.pts[i + 3]) / 2;
-      if (mx < x0 || mx > x1 || my < y0 || my > y1) continue;
-      if (pointInRing(foot, mx, my)) len += Math.hypot(r.pts[i + 2] - r.pts[i], r.pts[i + 3] - r.pts[i + 1]);
+      if (pieceAt((r.pts[i] + r.pts[i + 2]) / 2, (r.pts[i + 1] + r.pts[i + 3]) / 2) >= 0) len += Math.hypot(r.pts[i + 2] - r.pts[i], r.pts[i + 3] - r.pts[i + 1]);
     }
-    if (len > bestLen) {
-      bestLen = len;
-      bestRoad = ri;
-    }
+    if (len >= 8) cands.push([ri, len]);
   });
-  if (bestRoad < 0 || bestLen < 20) return;
-  const r = c.data.roads[bestRoad];
-  // walk the road, keep samples inside the footprint
-  const ribs: { x: number; y: number; z: number; tx: number; ty: number; L: [number, number]; R: [number, number] }[] = [];
-  let acc = 0;
-  let next = 0;
-  for (let i = 0; i + 3 < r.pts.length; i += 2) {
-    const ax = r.pts[i];
-    const ay = r.pts[i + 1];
-    const bx = r.pts[i + 2];
-    const by = r.pts[i + 3];
-    const sl = Math.hypot(bx - ax, by - ay);
-    if (sl < 1e-3) continue;
-    const tx = (bx - ax) / sl;
-    const ty = (by - ay) / sl;
-    while (next <= acc + sl) {
-      const t = (next - acc) / sl;
-      const x = ax + (bx - ax) * t;
-      const y = ay + (by - ay) * t;
-      next += v.spacing;
-      if (!pointInRing(foot, x, y)) continue;
-      const nx = -ty;
-      const ny = tx;
-      const dl = rayRing(foot, x, y, nx, ny, 40);
-      const dr = rayRing(foot, x, y, -nx, -ny, 40);
-      if (!Number.isFinite(dl) || !Number.isFinite(dr) || dl + dr < 8) continue;
-      const z = r.z[i / 2] + (r.z[i / 2 + 1] - r.z[i / 2]) * t;
-      ribs.push({ x, y, z, tx, ty, L: [x + nx * (dl - 0.3), y + ny * (dl - 0.3)], R: [x - nx * (dr - 0.3), y - ny * (dr - 0.3)] });
+  cands.sort((p, q) => q[1] - p[1]);
+  const ribs: { x: number; y: number; z: number; tx: number; ty: number; L: [number, number]; R: [number, number]; metal: boolean; run: number }[] = [];
+  const done = new Set<number>();
+  let run = 0;
+  for (const [ri] of cands) {
+    const r = c.data.roads[ri];
+    const got = new Set<number>();
+    let acc = 0;
+    let next = 0;
+    run++;
+    for (let i = 0; i + 3 < r.pts.length; i += 2) {
+      const ax = r.pts[i];
+      const ay = r.pts[i + 1];
+      const bx = r.pts[i + 2];
+      const by = r.pts[i + 3];
+      const sl = Math.hypot(bx - ax, by - ay);
+      if (sl < 1e-3) continue;
+      const tx = (bx - ax) / sl;
+      const ty = (by - ay) / sl;
+      while (next <= acc + sl) {
+        const t = (next - acc) / sl;
+        const x = ax + (bx - ax) * t;
+        const y = ay + (by - ay) * t;
+        next += v.spacing;
+        const k = pieceAt(x, y);
+        const nx = -ty;
+        const ny = tx;
+        const bl = k < 0 || done.has(k) ? 0 : back(x, y, nx, ny);
+        const br = k < 0 || done.has(k) ? 0 : back(x, y, -nx, -ny);
+        const dl = k < 0 || done.has(k) ? 0 : Math.max(reach(x, y, nx, ny), bl);
+        const dr = k < 0 || done.has(k) ? 0 : Math.max(reach(x, y, -nx, -ny), br);
+        const L: [number, number] = [x + nx * (dl - 0.3), y + ny * (dl - 0.3)];
+        const R: [number, number] = [x - nx * (dr - 0.3), y - ny * (dr - 0.3)];
+        if (dl + dr < 8 || blocked(x, y) || blocked(...L) || blocked(...R)) {
+          run++;
+          continue;
+        }
+        const z = r.z[i / 2] + (r.z[i / 2 + 1] - r.z[i / 2]) * t;
+        ribs.push({ x, y, z, tx, ty, L, R, metal: bl > 0 || br > 0, run });
+        got.add(k);
+      }
+      acc += sl;
     }
-    acc += sl;
+    for (const k of got) done.add(k);
   }
   if (ribs.length < 2) return;
-  // over the stations the vault is sheeted in metal over the platforms with a
-  // glazed crown; between them (the INB enclosures) it is glazed throughout
-  const atStation = Math.hypot((x0 + x1) / 2 - b.def.x, (y0 + y1) / 2 - b.def.y) < b.def.r + 10;
+  // over the platforms the vault is sheeted in metal with a glazed crown; elsewhere (the INB enclosures)
+  // it is glazed throughout
   const N = 12;
   const arch = (rb: (typeof ribs)[number], k: number): V3 => {
     const u = k / N;
@@ -1901,7 +2330,7 @@ function buildVault(c: Ctx, b: StationBuild, foot: Float32Array): void {
   for (let i = 0; i + 1 < ribs.length; i++) {
     const a = ribs[i];
     const e = ribs[i + 1];
-    if (Math.hypot(a.x - e.x, a.y - e.y) > v.spacing * 2.5) continue;
+    if (a.run !== e.run || Math.hypot(a.x - e.x, a.y - e.y) > v.spacing * 2.5) continue;
     for (let k = 0; k <= N; k += 2) {
       geo.paint(0xb8bcbd);
       geo.beam(arch(a, k), arch(e, k), 0.05, false);
@@ -1913,7 +2342,7 @@ function buildVault(c: Ctx, b: StationBuild, foot: Float32Array): void {
       const q1 = arch(e, k + 1);
       const quad: V3[] = [p0, p1, q1, q0];
       const centre = Math.abs((k + 0.5) / N - 0.5) < 0.2;
-      if (atStation && !centre) {
+      if ((a.metal || e.metal) && !centre) {
         // corrugated metal deck over the platforms (both faces)
         geo.paint(0xb9bcbc, Pat.Louvre, 0.25);
         geo.panel(quad, 0, 0, 1);
