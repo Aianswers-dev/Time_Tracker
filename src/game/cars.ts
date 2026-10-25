@@ -251,7 +251,9 @@ export function movementsConflict(
   if (inDot > 0.8) return false; // same approach: lanes and following handle it
   if (aOutX * b.outX + aOutY * b.outY > 0.8) return true; // merging into the same exit
   if (aCls === Turn.Left || b.cls === Turn.Left) return false; // left turns hug the kerb
-  if (inDot < -0.8) return (aCls === Turn.Right) !== (b.cls === Turn.Right); // right turn across oncoming
+  // A right turn across oncoming traffic; and two opposing right turns, whose
+  // paths through the box cross (taken together they block each other there).
+  if (inDot < -0.8) return aCls === Turn.Right || b.cls === Turn.Right;
   return true; // crossing paths
 }
 
