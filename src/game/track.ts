@@ -53,6 +53,14 @@ const PLATFORM_LANE = 1.6;
  */
 const PLATFORM_APART = 3.0;
 /**
+ * Alongside a stop's platform, a road whose left kerb is more than PLATFORM_KERB_GAP m further from the platform
+ * edge than the nearest one's costs the road match this much more per sample: the bus is on the road beside the
+ * platform (a busway splitting into a road along the platform and a through road, the GTFS shape nearer the
+ * through road).
+ */
+const PLATFORM_MATCH = 6;
+const PLATFORM_KERB_GAP = 1;
+/**
  * A pull-in starts only once the lane has left walls standing between it and the platform line (a
  * viaduct parapet running on to the platform's end), this far past them (m: an articulated bus's rear
  * sections pass the walls' end before its front swings over), and may then ease on over up to
@@ -97,7 +105,7 @@ const OWN_GIVE = 0.15;
  * TURN_ALONG of them: OWN_MIN where it goes through the box straight on (turning less than TURN_STRAIGHT
  * radians), TURN_LEFT_MIN where it turns left (a bus swings wide into a narrow street) and TURN_RIGHT_MIN
  * (within TURN_RIGHT_ALONG) where it turns right, across the oncoming lanes. The wall sweep holds to this;
- * the corner solve only turning left, and only where its own half was too tight (see regularize).
+ * the corner solve only turning left, to TURN_LEFT_HOLD where that leaves the corner wide enough (see regularize).
  */
 const TURN_ALONG = (50 * Math.PI) / 180;
 /**
@@ -107,26 +115,51 @@ const TURN_ALONG = (50 * Math.PI) / 180;
  * going straight on.
  */
 const TURN_LANE_MIN = 1.0;
-const TURN_LANE_HOLD = 25;
+const TURN_LANE_HOLD = 32;
 const TURN_LANE_EASE = 9;
+/** A turn lane the road leaves room to hold for less than this (m) is not taken. */
+const TURN_LANE_HELD = 16;
+/** Samples past a turn's node its turn lane may carry on straight for, to meet the lane it turns into. */
+const TURN_CARRY = 6;
+/** How hard the corner solve holds a turn lane's held samples sideways where they were (against bending). */
+const TURN_HOLD_W = 1;
 /**
  * Bearing right by TURN_FORK_MIN radians and up to TURN_LANE_MIN where another road carries straight on (a
- * fork: the branch leaves from the road's centreline, as OSM maps it), the lane takes the lane nearest the
- * centreline instead of the kerb lane, as for a turn.
+ * fork), the lane takes the right-hand lane as for a turn: the traffic going straight on keeps the lanes left
+ * of it.
  */
 const TURN_FORK_MIN = 0.4;
 /** Another road carries straight on from a fork's node within this (radians) of the approach. */
 const TURN_FORK_ON = 0.35;
+/**
+ * Bearing right by TURN_BEAR_MIN up to TURN_FORK_MIN radians at a split (another road leaving the node straight on,
+ * TURN_BEAR_APART or more left of the route's way: a busway splitting into platform roads), the lane takes the
+ * right-hand lane too: buses queueing for the left-hand branch's platform wait in the kerb lane.
+ */
+const TURN_BEAR_MIN = 0.12;
+const TURN_BEAR_APART = 0.12;
+/** The route's own shape may bear up to this (radians) the other way at a split, the roads' headings deciding. */
+const TURN_SPLIT_SLACK = 0.2;
 const TURN_STRAIGHT = 0.35;
 const TURN_LEFT_MIN = 0.0;
 const TURN_LEFT_ALONG = (50 * Math.PI) / 180;
 const TURN_RIGHT_MIN = 1.0;
 const TURN_RIGHT_ALONG = (15 * Math.PI) / 180;
 /**
- * A corner the guard leaves tighter than this (m) even using the junction box is solved again without it there:
- * in a narrow street a bus swings across the centre line rather than kink.
+ * Turning left, the corner solve keeps the lane this far left of the centre lines of the roads it turns from and
+ * into (TURN_LEFT_MIN is the wall sweep's): the bus swings wide in the junction box, its body on its own side.
+ */
+const TURN_LEFT_HOLD = 1.25;
+/**
+ * A corner the junction-box solve leaves tighter than this (m) is solved again, from where that left it, while that
+ * still eases it by TURN_EASED m (up to TURN_SOLVES times); still too tight, with the left-turn guard eased to the
+ * centre lines, then without it (in a narrow street a bus swings across the centre line rather than kink).
  */
 const TURN_GUARD_R = 6.5;
+const TURN_SOLVES = 4;
+const TURN_EASED = 0.25;
+/** The left-turn guard's hold at each step (NaN: none). */
+const TURN_GUARD_STEPS = [TURN_LEFT_HOLD, TURN_LEFT_MIN, NaN];
 /**
  * Nor does it run more than OPP_IN inside a one-way carriageway heading against it (within acos(OPP_DOT)
  * of the opposite way): a dual carriageway's other half, mapped as its own way.
@@ -1032,26 +1065,36 @@ function resample(path: number[], ox: Float32Array, oy: Float32Array): void {
 /** Roads that can have walls along them (tunnels and viaducts). */
 const walledRoad = (r: Road): boolean => drivable(r) && (r.tunnel || r.bridge);
 
-/** A road's lane centre from its own centreline (+ = left of travel): the kerb lane. */
+/** A narrow two-way road's kerb lane keeps up to LANE_NARROW from the centre line, LANE_NARROW_KERB off the kerb. */
+const LANE_NARROW = 1.75;
+const LANE_NARROW_KERB = 0.2;
+const BUS_HALF = 1.25;
+/**
+ * A road's lane centre from its own centreline (+ = left of travel): the kerb lane. On a narrow two-way road
+ * it keeps up to LANE_NARROW from the centre line where the bus stays LANE_NARROW_KERB off the kerb: two
+ * buses passing there have a metre between them.
+ */
 function laneFromCentre(r: Road): number {
   const w = Math.max(3.2, r.width);
-  return r.oneway ? Math.max(0, w / 2 - 1.75) : Math.min(6, Math.max(1.6, w / 2 - 1.75));
-}
-/** A road's right-hand lane centre from its centreline (+ = left of travel), NaN with one lane its way. */
-function rightLaneFromCentre(r: Road): number {
-  if (r.oneway) return r.lanes >= 2 && r.width >= 6.4 ? -(r.width / 2 - 1.75) : NaN;
-  const per = Math.floor(r.lanes / 2);
-  return per >= 2 && r.width >= 12 ? Math.max(OWN_MIN, r.width / 2 / per / 2) : NaN;
+  if (r.oneway) return Math.max(0, w / 2 - 1.75);
+  return Math.min(6, Math.max(1.6, w / 2 - 1.75, Math.min(LANE_NARROW, w / 2 - BUS_HALF - LANE_NARROW_KERB)));
 }
 /**
- * The lane a fork's branch leaves from (TURN_FORK_MIN), from the road's centreline (+ = left): a one-way road's
- * lane nearest its centreline (left of it where two straddle it), a two-way road's right-hand lane; NaN where
- * that is the kerb lane.
+ * A road's right-hand lane centre from its centreline (+ = left of travel), NaN with one lane its way. On a
+ * one-way road it is the traffic's offside lane (cars.ts): as many lanes as fit 2.7 m apart, packed from the
+ * left kerb at most 3.2 m apart, the queue to turn right waiting in it; on a bus-only road, the kerb lane
+ * mirrored.
  */
-function forkLaneFromCentre(r: Road): number {
-  if (!r.oneway) return rightLaneFromCentre(r);
-  if (r.lanes < 3 || r.width < 9.6) return NaN;
-  return r.lanes % 2 ? 0 : r.width / (2 * r.lanes);
+function rightLaneFromCentre(r: Road): number {
+  if (r.oneway) {
+    const n = Math.min(r.lanes, 1 + Math.floor((r.width - 3.2) / 2.7));
+    if (n < 2) return NaN;
+    if (r.bus) return -laneFromCentre(r);
+    const outer = r.width / 2 - 1.6;
+    return outer - (n - 1) * Math.min(3.2, (2 * outer) / (n - 1));
+  }
+  const per = Math.floor(r.lanes / 2);
+  return per >= 2 && r.width >= 12 ? Math.max(OWN_MIN, r.width / 2 / per / 2) : NaN;
 }
 const vertexRoadsCache = new WeakMap<MapData, Map<number, number[]>>();
 /** Every road vertex by endKey: [road, vertex, ...]. */
@@ -1071,8 +1114,11 @@ function vertexRoads(data: MapData): Map<number, number[]> {
   vertexRoadsCache.set(data, out);
   return out;
 }
-/** Whether a road other than a and b leaves the node nearest (x, y) of road b's ends within TURN_FORK_ON of heading h. */
-function forkAt(data: MapData, a: number, b: number, x: number, y: number, h: number): boolean {
+/**
+ * Whether a road other than a and b leaves the node nearest (x, y) of road b's ends within TURN_FORK_ON of heading h
+ * (and, given the route's way on, at least `apart` left of it).
+ */
+function forkAt(data: MapData, a: number, b: number, x: number, y: number, h: number, on = NaN, apart = 0): boolean {
   const p = data.roads[b].pts;
   const nv = p.length / 2;
   const e = Math.hypot(p[0] - x, p[1] - y) <= Math.hypot(p[2 * nv - 2] - x, p[2 * nv - 1] - y) ? 0 : nv - 1;
@@ -1088,9 +1134,29 @@ function forkAt(data: MapData, a: number, b: number, x: number, y: number, h: nu
     const dirs: [number, number][] = [];
     if (v + 1 < m) dirs.push([q[2 * v + 2] - q[2 * v], q[2 * v + 3] - q[2 * v + 1]]);
     if (v > 0 && !r.oneway) dirs.push([q[2 * v - 2] - q[2 * v], q[2 * v - 1] - q[2 * v + 1]]);
-    for (const [dx, dy] of dirs) if (Math.abs(wrapAngle(Math.atan2(dx, dy) - h)) < TURN_FORK_ON) return true;
+    for (const [dx, dy] of dirs) {
+      const hq = Math.atan2(dx, dy);
+      if (Math.abs(wrapAngle(hq - h)) < TURN_FORK_ON && !(wrapAngle(hq - on) > -apart)) return true;
+    }
   }
   return false;
+}
+/**
+ * Road ri's heading at its end nearest (x, y): leaving the node there (`out`), or arriving at it; NaN where it
+ * cannot be driven that way (a one-way road).
+ */
+function headingAtEnd(data: MapData, ri: number, x: number, y: number, out: boolean): number {
+  const r = data.roads[ri];
+  const p = r.pts;
+  const nv = p.length / 2;
+  if (nv < 2) return NaN;
+  const atStart = Math.hypot(p[0] - x, p[1] - y) <= Math.hypot(p[2 * nv - 2] - x, p[2 * nv - 1] - y);
+  // (Along the road's points: leaving its start, arriving at its end.)
+  const along = atStart === out;
+  if (!along && r.oneway) return NaN;
+  const [a, b] = atStart ? [0, 1] : [nv - 1, nv - 2];
+  const h = Math.atan2(p[2 * b] - p[2 * a], p[2 * b + 1] - p[2 * a + 1]);
+  return out ? h : wrapAngle(h + Math.PI);
 }
 /** From a road's centreline to its left kerb (two-way roads at least a lane each way). */
 function halfWidthLeft(r: Road): number {
@@ -1355,6 +1421,8 @@ export class RouteTrack {
   readonly signals: TrackSignal[];
   /** Every 40 m: [s, x, y] triples, for quick "is this route near me" tests. */
   readonly coarse: Float32Array;
+  /** Samples held in a turn lane (the corner solve keeps them there). */
+  private turnHeld: Uint8Array;
 
   constructor(
     readonly route: Route,
@@ -1438,6 +1506,25 @@ export class RouteTrack {
       cands.push(list);
     }
     // The road at each sample, matched along the whole route.
+    // (Alongside a platform: the road along its edge.)
+    const zones = route.stops.map((_, k) => matchStopPlatform(data, route, k));
+    for (const z of zones) {
+      if (!z) continue;
+      for (let i = Math.max(0, Math.ceil(z.s0 / TRACK_STEP)); i <= Math.min(n - 1, Math.floor(z.s1 / TRACK_STEP)); i++) {
+        const list = cands[i];
+        if (list.length < 2) continue;
+        const e = z.edge[Math.max(0, Math.min(z.edge.length - 1, Math.round((i * TRACK_STEP - z.s0) / z.step)))];
+        const gap = list.map((c) => {
+          const dC = (c.px - bx[i]) * nx[i] + (c.py - by[i]) * ny[i];
+          return dC < e ? Math.abs(dC + halfWidthLeft(data.roads[c.road]) - e) : Infinity;
+        });
+        const best = Math.min(...gap);
+        if (!Number.isFinite(best)) continue;
+        list.forEach((c, q) => {
+          if (gap[q] > best + PLATFORM_KERB_GAP) c.cost += PLATFORM_MATCH;
+        });
+      }
+    }
     const picks = matchRoads(data, cands);
     // The lane's height: the matched road's own (the GTFS line's heights can be the median's or a
     // neighbouring carriageway's, up to ~0.7 m off), kept within a metre of the route's level.
@@ -1535,6 +1622,9 @@ export class RouteTrack {
       this.limit[i] = speedLimitOf(road);
       this.road[i] = c.road;
     }
+    /** The last sample of each turn lane held to its turn's node. */
+    const heldTo: number[] = [];
+    this.turnHeld = new Uint8Array(n);
     // The turn lane before a right turn (TURN_LANE_MIN): where the matched road changes and the route turns
     // right there off a straight approach (not round a roundabout's ring), the samples before it on roads
     // with a right-hand lane of their own take it, eased in from the kerb lane (and not before a stop made
@@ -1555,31 +1645,53 @@ export class RouteTrack {
         const sj = j * TRACK_STEP;
         if (sj < 40 || sj > L - 30) continue;
         const turn = wrapAngle(hd(sj + 5, sj + 30) - hd(sj - 30, sj - 5));
-        if (turn < TURN_FORK_MIN || Math.abs(wrapAngle(hd(sj - 30, sj - 8) - hd(sj - 60, sj - 30))) > 0.3) continue;
-        // (Bearing right, only at a fork.)
-        const fork = turn < TURN_LANE_MIN;
-        if (fork && !forkAt(data, a.road, b.road, bx[j], by[j], hd(sj - 30, sj - 5))) continue;
+        if (turn < -TURN_SPLIT_SLACK || Math.abs(wrapAngle(hd(sj - 30, sj - 8) - hd(sj - 60, sj - 30))) > 0.3) continue;
+        // (Bearing right, only at a fork; gently, by the roads themselves, only at a split.)
+        const h0 = hd(sj - 30, sj - 5);
+        if (turn < TURN_FORK_MIN) {
+          const ha = headingAtEnd(data, a.road, bx[j], by[j], false);
+          const hb = headingAtEnd(data, b.road, bx[j], by[j], true);
+          if (!(wrapAngle(hb - ha) >= TURN_BEAR_MIN && wrapAngle(hb - ha) < TURN_FORK_MIN)) continue;
+          if (!forkAt(data, a.road, b.road, bx[j], by[j], ha, hb, TURN_BEAR_APART)) continue;
+        } else if (turn < TURN_LANE_MIN && !forkAt(data, a.road, b.road, bx[j], by[j], h0)) continue;
         // (Back from the turn while the road has a right-hand lane: hold, then ease.)
         const lastStop = Math.max(-Infinity, ...stopS.filter((q) => q < sj + 5));
+        const ks: number[] = [];
+        const ws: number[] = [];
+        const ts: number[] = [];
+        let held = 0;
+        let short = false;
         for (let k = j - 1; k >= 0; k--) {
           const c = picks[k];
-          if (!c) break;
-          const r = data.roads[c.road];
-          const rl = fork ? forkLaneFromCentre(r) : rightLaneFromCentre(r);
-          if (Number.isNaN(rl)) break;
+          const r = c ? data.roads[c.road] : null;
+          const rl = r ? rightLaneFromCentre(r) : NaN;
           const back = sj - k * TRACK_STEP;
+          if (!r || Number.isNaN(rl)) {
+            short = back <= TURN_LANE_HOLD;
+            break;
+          }
           const ease = (laneFromCentre(r) - rl) / 3.5 * TURN_LANE_EASE;
           if (back > TURN_LANE_HOLD + ease) break;
           // (A stop made on the way: the lane is at the kerb for it.)
           if (k * TRACK_STEP < lastStop + 10) break;
           const w = back <= TURN_LANE_HOLD ? 1 : 1 - (back - TURN_LANE_HOLD) / ease;
-          if (w > weight[k]) {
-            weight[k] = w;
-            target[k] = rl;
-          }
+          ks.push(k);
+          ws.push(w);
+          ts.push(rl);
+          if (w === 1) held++;
         }
+        // (Too short to wait in: a roundabout's ring, a slip road between two nodes.)
+        if (short && held * TRACK_STEP < TURN_LANE_HELD) continue;
+        ks.forEach((k, q) => {
+          if (ws[q] > weight[k]) {
+            weight[k] = ws[q];
+            target[k] = ts[q];
+          }
+        });
       }
       for (let i = 0; i < n; i++) if (weight[i] > 0 && known[i]) fromC[i] = fromC[i] + (target[i] - fromC[i]) * smooth01(weight[i]);
+      for (let i = 0; i < n; i++) if (weight[i] === 1 && known[i]) this.turnHeld[i] = 1;
+      for (let j = 1; j < n; j++) if (weight[j - 1] === 1 && known[j - 1] && !(weight[j] === 1 && known[j])) heldTo.push(j - 1);
     }
     // Fill unknown samples by interpolating between known neighbours.
     let lastKnown = -1;
@@ -1603,6 +1715,33 @@ export class RouteTrack {
       }
       lastKnown = i;
     }
+    // Past the node of a right turn from its turn lane, the lane carries on along that lane's line until it
+    // meets the lane of the road turned into, where that starts left of it (a road mapped from the centreline
+    // between carriageways, a busway link off a dual carriageway's offside lane): turning back towards the
+    // centreline first, the lane would swing across the lanes beside it before turning.
+    const unsmoothed = new Uint8Array(n);
+    for (const k0 of heldTo) {
+      const c = picks[k0];
+      if (!c) continue;
+      const o0 = roadC[k0] + fromC[k0];
+      const px = bx[k0] + nx[k0] * o0;
+      const py = by[k0] + ny[k0] * o0;
+      const sg = c.dx * ny[k0] - c.dy * nx[k0] >= 0 ? 1 : -1;
+      const ddx = c.dx * sg;
+      const ddy = c.dy * sg;
+      let end = -1;
+      for (let k = k0 + 1; k < Math.min(n, k0 + 1 + TURN_CARRY); k++) {
+        const den = nx[k] * ddy - ny[k] * ddx;
+        if (Math.abs(den) < 0.5) break;
+        const oA = ((px - bx[k]) * ddy - (py - by[k]) * ddx) / den;
+        if (!(oA < roadC[k] + fromC[k])) break;
+        fromC[k] = oA - roadC[k];
+        end = k;
+      }
+      if (end < 0) continue;
+      // (Unsmoothed there and just before: smoothing would round off the corner it makes.)
+      unsmoothed.fill(1, Math.max(0, k0 - 3), end + 1);
+    }
     // The lane is the matched road's own lane: where the road is (exactly: a GTFS shape that wanders
     // 10 m off a curving tunnel must not drag the lane across the centreline), plus the road's lane
     // offset, eased where that changes (a one-way ramp off a two-way busway). Only jumps in where the
@@ -1622,6 +1761,7 @@ export class RouteTrack {
         for (let i = 0; i < n; i++) if (jump[i]) cS[i] = sm[i];
       }
     }
+    for (let i = 0; i < n; i++) if (unsmoothed[i]) fS[i] = roadC[i] + fromC[i] - cS[i];
     const kS = boxSmooth(median7(kerbBase), 3);
     this.x = new Float32Array(n);
     this.y = new Float32Array(n);
@@ -1642,7 +1782,6 @@ export class RouteTrack {
     const lo = new Float32Array(n).fill(-Infinity);
     const hi = new Float32Array(n).fill(Infinity);
     // Busway platforms: the lane hugs the platform edge so buses pull right alongside.
-    const zones = route.stops.map((_, k) => matchStopPlatform(data, route, k));
     for (const z of zones) {
       if (!z) continue;
       // The nearest edge within a couple of samples: a platform's end can kink towards the lane, and the
@@ -3365,8 +3504,8 @@ export class RouteTrack {
       if (ri >= 0 && ownHalfFree(nodes, ri, projectOnRoad(data.roads[ri], nodes.cum[ri], X[i], Y[i]), true)) tFree[i] = 1;
     }
     const tLines = turnLines(data, this.road, own, tFree, X, Y);
-    /** Samples of a corner too tight with the guard (TURN_GUARD_R), which do without it. */
-    const noGuard = new Uint8Array(n);
+    /** The left-turn guard's hold at each sample (TURN_GUARD_STEPS). */
+    const hold = new Float32Array(n).fill(TURN_LEFT_HOLD);
     /** Whether the stretch being solved may use the junction box its turn needs. */
     let relax = false;
     /** How far left of the matched road's centre line (x, y) is, facing (ux, uy); Infinity in a junction or near a dead end. */
@@ -3421,11 +3560,12 @@ export class RouteTrack {
         const least = OWN_MIN - OWN_GIVE;
         if (lat < least) bad += 4 + (least - lat) * 2;
       }
-      // (A left turn solved using its junction box swings wide in it, not into the oncoming lanes of the
-      // roads it turns from and into: unless that kinks it, TURN_GUARD_R. A right turn or a corner on the
-      // way through may use the box as before.)
-      if (tFree[i] && !noGuard[i] && relax && tLines[10 * i + 8] === Math.fround(TURN_LEFT_MIN)) {
-        const lat = turnSide(tLines, i, x, y, ux, uy);
+      // (A left turn swings wide in its junction box, in every pass, but keeps its body on its side of the
+      // centre lines of the roads it turns from and into, TURN_LEFT_HOLD: a bus turning left from the kerb lane
+      // does not swing out into the oncoming lanes, unless that kinks it (TURN_GUARD_R). A right turn or a
+      // corner on the way through may use the box as before.)
+      if (tFree[i] && !Number.isNaN(hold[i]) && tLines[10 * i + 8] === Math.fround(TURN_LEFT_MIN)) {
+        const lat = turnSide(tLines, i, x, y, ux, uy) - (hold[i] - TURN_LEFT_MIN);
         if (lat < -OWN_GIVE) bad += 4 + (-OWN_GIVE - lat) * 2;
       }
       // (So does running on a one-way carriageway the other way, outside the junction box of a sharp turn
@@ -3535,6 +3675,11 @@ export class RouteTrack {
             rows.push({ w: wt[k], k: [k], cx: [1], cy: [0], c: S0X[k] });
             rows.push({ w: wt[k], k: [k], cx: [0], cy: [1], c: S0Y[k] });
             if (cw[k] > 0) rows.push({ w: cw[k], k: [k], cx: [cnx[k]], cy: [cny[k]], c: cc[k] });
+            // (A turn lane's held sample, sideways.)
+            if (this.turnHeld[A + k]) {
+              const [hx, hy] = tangent(S0X, S0Y, k);
+              rows.push({ w: TURN_HOLD_W, k: [k], cx: [-hy], cy: [hx], c: -hy * S0X[k] + hx * S0Y[k] });
+            }
           }
           const sol = solveRows(X, Y, A, m, free, rows);
           free.forEach((k, f) => {
@@ -3713,12 +3858,16 @@ export class RouteTrack {
         for (let i = A + 1; i < B; i++) tight = Math.min(tight, this.radiusAt(i));
         if (tight < R_OK) {
           relax = true;
-          solveWindow(A, B);
-          tight = Infinity;
-          for (let i = A + 1; i < B; i++) tight = Math.min(tight, this.radiusAt(i));
-          if (tight < TURN_GUARD_R) {
-            noGuard.fill(1, A, B + 1);
-            solveWindow(A, B);
+          for (let q = 0; q < TURN_GUARD_STEPS.length && (q === 0 || tight < TURN_GUARD_R); q++) {
+            // (Never back to a firmer hold than a stretch overlapping this one came to; NaN stays NaN.)
+            for (let i = A; i <= B; i++) hold[i] = Math.min(hold[i], TURN_GUARD_STEPS[q]);
+            for (let k = 0; k < TURN_SOLVES; k++) {
+              const was = tight;
+              solveWindow(A, B);
+              tight = Infinity;
+              for (let i = A + 1; i < B; i++) tight = Math.min(tight, this.radiusAt(i));
+              if (!(tight < TURN_GUARD_R) || !(tight > was + TURN_EASED)) break;
+            }
           }
           relax = false;
         }
