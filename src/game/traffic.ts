@@ -11,7 +11,7 @@ import { busTypeForRoute, stopUsage } from './routeMeta';
 import { TRACK_STEP, hasTrack, trackFor, type RouteTrack, type TrackSample, type TrackSignal, type TrackStop } from './track';
 import type { MapMarker } from './minimap';
 import { brighten, rng } from './util';
-import { CarTraffic, PLAYER_HOLD, STALL_HIDDEN, STALL_VISIBLE, Wait, clearTime, type BusJunction } from './cars';
+import { CarTraffic, PLAYER_HOLD, STALL_HIDDEN, STALL_VISIBLE, Turn, Wait, clearTime, type BusJunction } from './cars';
 import { TRAFFIC_CAPS, defaultTrafficLevel, type TrafficLevel } from './trafficLevel';
 import { makeBody, type Body } from './bodies';
 import { LEVEL_GAP, heightAt } from './height';
@@ -123,6 +123,9 @@ function idm(v: number, v0: number, gap: number, vLead: number, s0: number): num
 const MAJOR_GAP = 6;
 /** ...and how far ahead (s) oncoming right-turners see it coming (a bus from rest needs 6-7 s to clear its path). */
 const CLAIM_GAP = 9;
+/** Gap (s) to the next car on a conflicting movement the player's bus waits for where it gives way: merging left, and across. */
+const GAP_LEFT = 4.5;
+const GAP_ACROSS = 6.5;
 /** How far past a route's stop line a signalised junction's first node may lie and still be on that line's light (m). */
 const FAR_LINE = 70;
 
@@ -622,6 +625,7 @@ export class Traffic {
 
   /** One simulation step of the buses and cars (no drawing). */
   private simulate(dt: number, time: number, player: BusPose): void {
+    this.simTime = time;
     const px = player.x;
     const py = player.y;
     this.updatePlayerBody(player);
@@ -1408,6 +1412,31 @@ export class Traffic {
     return out;
   }
   private readonly busBodiesOut: { body: Body; half: number; len: number }[] = [];
+  private simTime = 0;
+
+  /**
+   * Distance from `s` to the stop line of the next junction within `range` where the player's
+   * route gives way (comes in from a side road at an unsignalised junction, or on an arm no
+   * signal faces) and there is no gap: main-road traffic passing, a crossing movement in the
+   * box, or a car on a conflicting movement due sooner than the bus clears it. Infinity when
+   * there is none.
+   */
+  giveWayAhead(track: RouteTrack, s: number, range: number): number {
+    const time = this.simTime;
+    for (const j of this.cars.junctionsAlong(track)) {
+      if (j.stopS < s - 1) continue;
+      if (j.stopS - s > range) break;
+      if (j.inside) continue;
+      if (j.sig ? this.cars.signalFor(j.node, j.inX, j.inY, time, j.outX, j.outY) !== null : !j.minor) continue;
+      if (
+        this.cars.giveWayBusy(j.node, true, time) ||
+        !this.cars.boxClear(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time) ||
+        this.cars.conflictEta(j.node, j.inX, j.inY, j.outX, j.outY, j.cls, j.cls === Turn.Left ? GAP_LEFT : GAP_ACROSS) < Infinity
+      )
+        return j.stopS - s;
+    }
+    return Infinity;
+  }
 
   /** AI buses and cars within r of (x, y) with their state, and recent valve events (diagnostics). */
   debugNear(x: number, y: number, r = 60): object {

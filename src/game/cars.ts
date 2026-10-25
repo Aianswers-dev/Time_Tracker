@@ -1161,6 +1161,25 @@ export class CarTraffic {
     return inX * pc.inX + inY * pc.inY < -0.8 && pc.eta < clearT + ONCOMING_MARGIN;
   }
 
+  /**
+   * Seconds until the first car coming into `node` on a movement that conflicts with ours
+   * (in, out, cls) gets there, if under `horizon` (the gap a vehicle giving way there has);
+   * Infinity when none. Cars held at a red light do not count.
+   */
+  conflictEta(node: number, inX: number, inY: number, outX: number, outY: number, cls: Turn, horizon: number): number {
+    let best = Infinity;
+    for (const c of this.cars) {
+      if (c.dead || c.v < 0.5 || c.next < 0 || c.why === Wait.Red || this.endNode(c.lane) !== node) continue;
+      const eta = (this.edges[c.lane >> 1].len - c.u) / c.v;
+      if (eta >= horizon || eta >= best) continue;
+      const [ix, iy] = this.laneEndDir(c.lane);
+      const [ox, oy] = this.laneStartDir(c.next);
+      const ccls = classify(wrapAngle(Math.atan2(ox, oy) - Math.atan2(ix, iy)));
+      if (movementsConflict(inX, inY, outX, outY, cls, { inX: ix, inY: iy, outX: ox, outY: oy, cls: ccls })) best = eta;
+    }
+    return best;
+  }
+
   /** Main-road vehicle approaching an unsignalised junction: mark it busy. */
   markMajor(node: number, time: number, holder: number): void {
     const nd = this.nodes[node];
