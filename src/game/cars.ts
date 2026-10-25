@@ -177,8 +177,8 @@ interface Car {
   dead: boolean;
 }
 
-/** Links between two nodes of one signalised junction shorter than this are inside it. */
-const INSIDE_LINK = 40;
+/** Links between two nodes of one signalised junction shorter than this are inside it (a big junction spans 70 m). */
+const INSIDE_LINK = 60;
 
 /** A junction on an AI bus route (for the shared reservations). */
 export interface BusJunction {
@@ -606,19 +606,23 @@ export class CarTraffic {
     const H = heightsOf(this.data);
     // Every graph node of a signalised junction is controlled (a dual-carriageway
     // crossing is several nodes, and a light is not always nearest its own node):
-    // the nodes on the junction's level close to one of its signal nodes.
+    // the nodes on the junction's level close to one of its signal nodes, or to
+    // its centre (in the middle of a big junction whose stop lines stand well
+    // back, so a path through it meets no unsignalised node between two of its
+    // nodes, and is inside it at the second: below).
     for (const j of signalsFor(this.data).junctions) {
       if (!j.phases.length) continue;
-      for (const k of j.nodes) {
-        const sx = sg[2 * k];
-        const sy = sg[2 * k + 1];
+      for (const k of [...j.nodes, -1]) {
+        const sx = k < 0 ? j.x : sg[2 * k];
+        const sy = k < 0 ? j.y : sg[2 * k + 1];
+        const near = k < 0 ? 6 : 10;
         const gx = Math.floor(sx / 50);
         const gy = Math.floor(sy / 50);
         for (let ox = -1; ox <= 1; ox++) {
           for (let oy = -1; oy <= 1; oy++) {
             for (const n of this.nodeGrid.get((gx + ox) * 4096 + gy + oy) ?? []) {
               const nd = this.nodes[n];
-              if (Math.abs(nd.z - j.z) <= LEVEL_GAP && Math.hypot(nd.x - sx, nd.y - sy) < nd.boxR + 10) nd.sig = true;
+              if (Math.abs(nd.z - j.z) <= LEVEL_GAP && Math.hypot(nd.x - sx, nd.y - sy) < nd.boxR + near) nd.sig = true;
             }
           }
         }
@@ -1178,11 +1182,16 @@ export class CarTraffic {
       });
     });
     out.sort((a, b) => a.s - b.s);
+    // Inside: the route's last signalised node before, within INSIDE_LINK, was the same junction's.
     out.forEach((j, k) => {
-      const p = out[k - 1];
-      if (!p?.sig || !j.sig || j.s - p.s >= INSIDE_LINK) return;
-      const jp = this.signalJunction(p.node, p.inX, p.inY);
-      j.inside = jp >= 0 && jp === this.signalJunction(j.node, j.inX, j.inY);
+      if (!j.sig) return;
+      for (let q = k - 1; q >= 0 && j.s - out[q].s < INSIDE_LINK; q--) {
+        const p = out[q];
+        if (!p.sig) continue;
+        const jp = this.signalJunction(p.node, p.inX, p.inY);
+        j.inside = jp >= 0 && jp === this.signalJunction(j.node, j.inX, j.inY);
+        return;
+      }
     });
     this.busJunctions.set(track, out);
     return out;

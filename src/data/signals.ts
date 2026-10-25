@@ -11,6 +11,9 @@
  *   approaches and pieces shorter than the 16 m probe count too.
  * - Arms a signal node faces (the pipeline's signal direction along its road)
  *   are controlled; an approach no node faces has no light and gives way.
+ * - Clusters whose nodes stand more than 28 m apart but face each other's
+ *   otherwise uncontrolled arms (a big junction with set-back stop lines) are
+ *   one junction.
  * - Phases: controlled arms roughly opposite each other (straight-through
  *   flows) share a phase; every other one gets one of its own. Crossing or
  *   merging controlled streams are therefore never green together, and every
@@ -109,6 +112,12 @@ const IN_R = 12;
 const TIE = 0.25;
 /** A signal node controls the arm whose traffic heads its facing way to within this (cos; 60 degrees). */
 const FACE = 0.5;
+/** A cluster's directed node this close to another cluster's centre may be that junction's signal for an arm. */
+const MERGE_R = 45;
+/** Clusters merge into one junction only while its nodes stay this close to their centre. */
+const MERGE_SPREAD = 36;
+/** ... and the node stands within this of the arm's line (m). */
+const MERGE_LAT = 8;
 
 const CLASS_W: Partial<Record<RoadKind, number>> = {
   [RoadKind.Motorway]: 3,
@@ -252,6 +261,36 @@ function segmentDir(r: Road, x: number, y: number): [number, number] {
     }
   }
   return [ux, uy];
+}
+
+/** A directed signal node: where it stands and the way the traffic it faces heads (null if untagged). */
+interface Facing {
+  x: number;
+  y: number;
+  fx: number;
+  fy: number;
+}
+
+/** The traffic a signal node faces: along its own road, the pipeline's direction (OSM traffic_signals:direction). */
+function nodeFacing(data: MapData, m: number): Facing | null {
+  const ri = data.signalRoad?.[m] ?? -1;
+  const d = data.signalDir?.[m] ?? 0;
+  if (ri < 0 || !d) return null;
+  const x = data.signals[2 * m];
+  const y = data.signals[2 * m + 1];
+  const [rx, ry] = segmentDir(data.roads[ri], x, y);
+  return { x, y, fx: rx * d, fy: ry * d };
+}
+
+/**
+ * The arm (of a junction centred at (cx, cy)) a directed signal node
+ * controls: the one its traffic arrives on, asked from where approachDir and
+ * stateAt ask it, if that traffic heads in along it. -1 if none.
+ */
+function facedArm(arms: readonly Pick<SignalArm, 'ux' | 'uy' | 'incoming'>[], cx: number, cy: number, f: Facing): number {
+  const q = nodeAsk(cx, cy, f.x, f.y, f.fx, f.fy);
+  const i = pickArm(arms, cx, cy, q.x, q.y, f.fx, f.fy);
+  return i >= 0 && -(arms[i].ux * f.fx + arms[i].uy * f.fy) > FACE ? i : -1;
 }
 
 /** Uniform grid of road segments (all roads, tunnels included). */
@@ -406,7 +445,7 @@ export class SignalModel {
       g.push(i);
     }
 
-    for (const members of groups.values()) {
+    const centre = (members: readonly number[]) => {
       let cx = 0;
       let cy = 0;
       let cz = 0;
@@ -415,28 +454,105 @@ export class SignalModel {
         cy += sig[2 * m + 1];
         cz += nz[m];
       }
-      cx /= members.length;
-      cy /= members.length;
-      cz /= members.length;
-      const j = this.buildJunction(data, geo, segs, cx, cy, cz, members);
+      return { x: cx / members.length, y: cy / members.length, z: cz / members.length };
+    };
+    const clusters = [...groups.values()];
+    const built = clusters.map((members) => {
+      const c = centre(members);
+      return this.buildJunction(data, geo, segs, c.x, c.y, c.z, members);
+    });
+
+    // ---- one junction over several clusters. Where a junction's stop lines
+    // stand further apart than CLUSTER_R (a big junction, or a T whose
+    // approach signals are set back, as where the Woolloongabba busway joins
+    // the SEB), its nodes fall into separate clusters, each controlling only
+    // the arms its own nodes face and running its own phases: streams that
+    // cross in the box could be green together. A directed node of one
+    // cluster that faces an incoming arm of another, out on that arm within
+    // MERGE_R of its centre, where no node of that cluster faces the arm, is
+    // that junction's signal for it: the two are one junction (nearest pairs
+    // first, while its nodes stay within MERGE_SPREAD of their centre).
+    const facing = Array.from({ length: ns }, (_, m) => (live(m) ? nodeFacing(data, m) : null));
+    const cgrid = new Map<number, number[]>();
+    built.forEach((j, k) => {
+      const key = Math.floor(j.x / 60) * 65536 + Math.floor(j.y / 60);
+      let l = cgrid.get(key);
+      if (!l) cgrid.set(key, (l = []));
+      l.push(k);
+    });
+    const cand: { a: number; b: number; d: number }[] = [];
+    built.forEach((A, a) => {
+      if (!A.phases.length && !A.arms.length) return;
+      const faced = new Set<number>();
+      for (const m of clusters[a]) {
+        const f = facing[m];
+        // (an untagged node controls every arm)
+        if (!f) return;
+        faced.add(facedArm(A.arms, A.x, A.y, f));
+      }
+      const gx = Math.floor(A.x / 60);
+      const gy = Math.floor(A.y / 60);
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          for (const b of cgrid.get((gx + ox) * 65536 + gy + oy) ?? []) {
+            if (b === a || Math.abs(built[b].z - A.z) > LEVEL) continue;
+            for (const m of clusters[b]) {
+              const f = facing[m];
+              if (!f) continue;
+              const d = Math.hypot(f.x - A.x, f.y - A.y);
+              if (d > MERGE_R) continue;
+              const i = facedArm(A.arms, A.x, A.y, f);
+              if (i < 0 || faced.has(i)) continue;
+              const u = A.arms[i];
+              const rx = f.x - u.ox;
+              const ry = f.y - u.oy;
+              if (rx * u.ux + ry * u.uy < 2 || Math.abs(rx * u.uy - ry * u.ux) > MERGE_LAT) continue;
+              cand.push({ a, b, d });
+            }
+          }
+        }
+      }
+    });
+    const root = clusters.map((_, k) => k);
+    const top = (k: number): number => {
+      while (root[k] !== k) k = root[k] = root[root[k]];
+      return k;
+    };
+    const merged = clusters.map((members) => [...members]);
+    for (const c of cand.sort((p, q) => p.d - q.d)) {
+      const ra = top(c.a);
+      const rb = top(c.b);
+      if (ra === rb) continue;
+      const all = [...merged[ra], ...merged[rb]];
+      const m = centre(all);
+      if (all.some((n) => Math.hypot(sig[2 * n] - m.x, sig[2 * n + 1] - m.y) > MERGE_SPREAD)) continue;
+      root[rb] = ra;
+      merged[ra] = all;
+    }
+
+    clusters.forEach((_, k) => {
+      if (top(k) !== k) return;
+      const members = merged[k];
+      let j = built[k];
+      if (members.length !== clusters[k].length) {
+        const c = centre(members);
+        j = this.buildJunction(data, geo, segs, c.x, c.y, c.z, members);
+      }
       j.nodes = members;
       const ji = this.junctions.length;
       this.junctions.push(j);
       const f: number[] = [];
       for (const m of members) {
-        const d = data.signalDir?.[m] ?? 0;
-        const ri = sigRoad?.[m] ?? -1;
-        if (!d || ri < 0) continue;
-        const [rx, ry] = segmentDir(roads[ri], sig[2 * m], sig[2 * m + 1]);
-        f.push(sig[2 * m], sig[2 * m + 1], rx * d, ry * d);
+        const n = facing[m];
+        if (n) f.push(n.x, n.y, n.fx, n.fy);
       }
       this.faces.push(Float32Array.from(f));
       for (const m of members) this.nodeJunction[m] = ji;
-      const key = Math.floor(cx / 60) * 65536 + Math.floor(cy / 60);
+      const key = Math.floor(j.x / 60) * 65536 + Math.floor(j.y / 60);
       let l = this.grid.get(key);
       if (!l) this.grid.set(key, (l = []));
       l.push(ji);
-    }
+    });
     this.coordinate(data.routes);
   }
 
@@ -506,22 +622,15 @@ export class SignalModel {
     // Buranda): it gives way in the box as at an unsignalised junction, as the
     // player's guide (src/game/track.ts) shows it no light. Untagged nodes, or
     // map data without directions, control every arm.
-    const sig = data.signals;
     const controlled = new Set<number>();
     for (const m of nodes) {
-      const ri = data.signalRoad?.[m] ?? -1;
-      const d = data.signalDir?.[m] ?? 0;
-      if (ri < 0 || !d) {
+      const f = nodeFacing(data, m);
+      if (!f) {
         arms.forEach((_, i) => controlled.add(i));
         break;
       }
-      const x = sig[2 * m];
-      const y = sig[2 * m + 1];
-      const [rx, ry] = segmentDir(roads[ri], x, y);
-      // (the arm its traffic is asked on, as approachDir and stateAt ask it)
-      const q = nodeAsk(cx, cy, x, y, rx * d, ry * d);
-      const i = pickArm(arms, cx, cy, q.x, q.y, rx * d, ry * d);
-      if (i >= 0 && -(arms[i].ux * rx + arms[i].uy * ry) * d > FACE) controlled.add(i);
+      const i = facedArm(arms, cx, cy, f);
+      if (i >= 0) controlled.add(i);
     }
     // Phases: pair opposite controlled arms (straight through each other), the rest alone.
     // Signals nobody can see (every approach is inside a tunnel, e.g. in an
