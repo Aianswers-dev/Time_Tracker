@@ -1903,7 +1903,14 @@ export class CarTraffic {
         const side = (c.x - pc.x) * pc.inY - (c.y - pc.y) * pc.inX;
         // (+: the bus's way out is to the right of ours.)
         const across = wrapAngle(Math.atan2(pc.outX, pc.outY) - Math.atan2(outX, outY));
-        if (pc.near && ((side > 1.8 && (across > ACROSS || (cls === Turn.Right && pc.cls === Turn.Right))) || (side < -1.8 && (across < -ACROSS || (cls === Turn.Left && pc.cls === Turn.Left)))))
+        // (On a one-lane approach the bus is in our lane, a wide one it swings out in before turning:
+        // behind us, it waits for us. 199/0 s 8858: a car at the line of a 10.6 m road waited for the
+        // bus coming up 3.9 m to its right to turn left, which then turned across its nose.)
+        if (
+          pc.near &&
+          ((side > 1.8 && (across > ACROSS || (cls === Turn.Right && pc.cls === Turn.Right))) || (side < -1.8 && (across < -ACROSS || (cls === Turn.Left && pc.cls === Turn.Left)))) &&
+          (this.lanesIn(lane) > 1 || this.playerAlongside(c, inX, inY))
+        )
           return Wait.Player;
         // Our lane ends here (the road narrows by its offside lane) and the bus is coming along the one we
         // merge into: unless we are in, tail and all, a second before it gets there, we fall in behind it.
@@ -1995,6 +2002,18 @@ export class CarTraffic {
     if (!c.holds.some((h) => h.node === N)) c.holds.push({ node: N, d: -1, inX, inY, outX, outY, cls });
     const ne = this.edges[next >> 1];
     if (depth === 0 && c.next2 >= 0 && this.shortLink(next, nd.boxR, c.len)) this.commit(c, next, c.next2, stopAt + ne.len, time, 1);
+  }
+
+  /** Is any of the player's bus level with or ahead of car `c`'s tail, going (dx, dy), on its level? */
+  private playerAlongside(c: Car, dx: number, dy: number): boolean {
+    const g = this.busGrid;
+    let found = false;
+    g.query(c.x, c.y, 30, (i) => {
+      if (g.pid[i] !== -1 || Math.abs(g.pz[i] - c.z) > LEVEL_GAP) return false;
+      found = (g.px[i] - c.x) * dx + (g.py[i] - c.y) * dy > -c.len / 2;
+      return found;
+    });
+    return found;
   }
 
   /** A lane too short to wait on between two junction boxes. */
