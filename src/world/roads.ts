@@ -602,6 +602,9 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       }
       return { p, x0, y0, x1, y1 };
     });
+  /** Inside a surface platform's slab outline (a deck edge under it is hidden by the slab). */
+  const underSurfacePlatform = (x: number, y: number) =>
+    gradePlatforms.some((q) => q.p.area && x >= q.x0 && x <= q.x1 && y >= q.y0 && y <= q.y1 && pointInRing(x, y, q.p.pts));
   const portals: { x: number; y: number; z: number }[] = [];
   const wallLog = new WallLog();
 
@@ -710,13 +713,14 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   const green = greenBridgeSpan(ctx);
   const otherAt = (x: number, y: number, z: number, self: number, dz = 2.5) => index.penetrationZ(x, y, z, dz, self);
   /**
-   * Over another carriageway (or its cutting wall, 1 m beyond its edge) 1.5-8.5 m below, in the open: a
+   * Over another carriageway (or its cutting wall, 1 m beyond its edge) 1.5-12 m below, in the open: a
    * busway ramp between the carriageways of a street, or a tunnel road's open approach cutting (over its
-   * box the ground, a fill wall or a footpath stands on the roof).
+   * box the ground, a fill wall or a footpath stands on the roof). (12 m: the street over the Inner
+   * Northern Busway's portal at Roma Street stands 9 m above it, and its fill wall ran across the ramp.)
    */
   const overOpen = (x: number, y: number, z: number, self: number) =>
-    index.penetrationZ(x, y, z - 5, 3.5, self, (q) => !roads[q].tunnel) > -1.05 ||
-    (tunnels.penetrationZ(x, y, z - 5, 3.5, self) > -1.05 && field.roofAt(x, y) === -Infinity);
+    index.penetrationZ(x, y, z - 6.75, 5.25, self, (q) => !roads[q].tunnel) > -1.05 ||
+    (tunnels.penetrationZ(x, y, z - 6.75, 5.25, self) > -1.05 && field.roofAt(x, y) === -Infinity);
   // Mater Hill and Buranda busway stations stand between buff block cutting walls on a dark base
   const blockSites: [number, number][] = [];
   for (const pf of ctx.data.platforms) if (/Mater Hill|Buranda/i.test(pf.name) && pf.pts.length >= 2) blockSites.push([pf.pts[0], pf.pts[1]]);
@@ -1273,6 +1277,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     const P = ss.map((s) => roadAt(ri, s));
     // tunnel roads this one runs straight on into at an end (a portal approach): not a neighbour
     const straightOn = new Set<number>();
+    // (and the road it runs straight on into at grade: its own earthworks take over at the join)
+    const straightOnGrade = new Set<number>();
     if (ri.i >= 0) {
       const p = r.pts;
       for (const v of [0, ri.n - 1]) {
@@ -1281,7 +1287,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const ey = p[2 * v + 1];
         const ax = p[2 * w] - ex;
         const ay = p[2 * w + 1] - ey;
-        tunnels.roadsNear(ex, ey, 0.05, (q) => {
+        const visit = (set: Set<number>) => (q: number) => {
           const t = roads[q].pts;
           const m = t.length >> 1;
           const at0 = Math.hypot(t[0] - ex, t[1] - ey) < 0.05;
@@ -1290,8 +1296,10 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
           const bx = at0 ? t[2] - t[0] : t[2 * m - 4] - t[2 * m - 2];
           const by = at0 ? t[3] - t[1] : t[2 * m - 3] - t[2 * m - 1];
           // (both pointing away from the shared node: straight on when nearly opposite)
-          if ((ax * bx + ay * by) / ((Math.hypot(ax, ay) || 1) * (Math.hypot(bx, by) || 1)) < -0.7) straightOn.add(q);
-        });
+          if ((ax * bx + ay * by) / ((Math.hypot(ax, ay) || 1) * (Math.hypot(bx, by) || 1)) < -0.7) set.add(q);
+        };
+        tunnels.roadsNear(ex, ey, 0.05, visit(straightOn));
+        index.roadsNear(ex, ey, 0.05, visit(straightOnGrade));
       }
     }
     const m0 = endMiter(ri, false);
@@ -1383,6 +1391,9 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       }
     }
     const tubeNbAt = new Uint8Array(n);
+    // (and a carriageway at grade level with us there: the gore between two busways meeting at Cultural Centre)
+    const gradeNbAt = new Uint8Array(n);
+    const gradeNb = (q: number) => !roads[q].tunnel && roads[q].kind !== RoadKind.Pedestrian && !straightOnGrade.has(q);
     for (let k = 0; k < n; k++) {
       const c = P[k];
       const ox = (off: number) => c.x + c.nx * side * off;
@@ -1394,6 +1405,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       // (a tunnel carriageway level with us counts too: the SEB's cutting wall at Woolloongabba ran on
       // into the tube's lanes where the busway turns into it)
       tubeNbAt[k] = tunnels.penetrationZ(ox(e0[k] + 0.3), oy(e0[k] + 0.3), c.z, 1.5, ri.i, (q) => !straightOn.has(q)) > -0.4 ? 1 : 0;
+      gradeNbAt[k] = index.penetrationZ(ox(e0[k] + 0.3), oy(e0[k] + 0.3), c.z, 1.5, ri.i, gradeNb) > -0.4 ? 1 : 0;
       const nb =
         otherAt(ox(probe), oy(probe), c.z, ri.i, 3) > -0.4 ||
         (t === 2 && tubeNbAt[k] === 1) ||
@@ -1527,12 +1539,18 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         g.quad(i3, i2, s2, s3, fx, 0, -fy);
         field.clampQuad([a0x, a0y, zE[k], b0x, b0y, zE[kb], b1x, b1y, b1z, a1x, a1y, a1z], 0.25);
         k = kb - 1;
-      } else if (t === 2 && tubeNbAt[k + 1]) {
-        // (the wall stops where the outer corner of its box reaches the tunnel's tube wall line, hw + 0.9)
+      } else if (t === 2 && (tubeNbAt[k + 1] || gradeNbAt[k + 1])) {
+        // (the wall stops where the outer corner of its box reaches the tunnel's tube wall line, hw + 0.9,
+        // or the edge of a carriageway at grade)
         const inside = (f: number) => {
           const c = roadAt(ri, ss[k] + (ss[k + 1] - ss[k]) * f);
           const o = e0[k] + (e0[k + 1] - e0[k]) * f + 1.05;
-          return tunnels.penetrationZ(c.x + c.nx * side * o, c.y + c.ny * side * o, c.z, 1.5, ri.i, (q) => !straightOn.has(q)) > -0.9;
+          const ix = c.x + c.nx * side * o;
+          const iy = c.y + c.ny * side * o;
+          return (
+            tunnels.penetrationZ(ix, iy, c.z, 1.5, ri.i, (q) => !straightOn.has(q)) > -0.9 ||
+            index.penetrationZ(ix, iy, c.z, 1.5, ri.i, gradeNb) > 0
+          );
         };
         let f0 = 0;
         let f1 = 1;
@@ -1545,7 +1563,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         if (sm - ss[k] > 0.3) cutSeg(L, A, M, side, ss[k], sm, foot[k], fm, e0[k], em, hw, true, (k === 0 || type[k - 1] !== 2 ? 1 : 0) | 2, ri.i);
         cutSeg(L, sm - ss[k] > 0.3 ? M : A, B, side, sm - ss[k] > 0.3 ? sm : ss[k], ss[k + 1], sm - ss[k] > 0.3 ? fm : foot[k], foot[k + 1], sm - ss[k] > 0.3 ? em : e0[k], e0[k + 1], hw, false, 0, ri.i);
       } else if (t === 2 || t === 4) {
-        const ends = t === 2 ? (k === 0 || type[k - 1] !== 2 ? 1 : 0) | (k + 2 >= n || type[k + 1] !== 2 || tubeNbAt[k + 2] ? 2 : 0) : 0;
+        const ends = t === 2 ? (k === 0 || type[k - 1] !== 2 ? 1 : 0) | (k + 2 >= n || type[k + 1] !== 2 || tubeNbAt[k + 2] || gradeNbAt[k + 2] ? 2 : 0) : 0;
         cutSeg(L, A, B, side, ss[k], ss[k + 1], foot[k], foot[k + 1], e0[k], e0[k + 1], hw, t === 2, ends, ri.i);
       } else if (t === 3) {
         // high fill: retaining wall from a parapet down to the ground
@@ -1803,28 +1821,60 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         k = e + 1;
       }
     }
-    // deck edges and underside
-    let prev: number[] | null = null;
-    walkRun(ri, 0, ri.len, (x, yy, z, nx2, ny2) => {
+    // deck edges and underside. An edge inside another deck flush with this one (two one-way carriageways
+    // whose decks overlap: Victoria Bridge, the Northern Busway at RBWH) is internal: no fascia there (one
+    // over a deck a little lower stays: it is the step between them). Under a platform's slab (a stopping
+    // bay's platform side) the fascia stops under the slab.
+    const edgeCode = (x: number, y: number, z: number) => (otherAt(x, y, z, ri.i, 0.15) > 0.2 ? 1 : underSurfacePlatform(x, y) ? 2 : 0);
+    const samples: { s: number; x: number; y: number; z: number; nx: number; ny: number }[] = [];
+    walkRun(ri, 0, ri.len, (x, yy, z, nx2, ny2, s) => samples.push({ s, x, y: yy, z, nx: nx2, ny: ny2 }));
+    {
+      // where an edge goes in or out of another deck or a platform between the vertices, a sample either side
+      const step = 2;
+      const code = (s: number) => {
+        const c = roadAt(ri, s);
+        return edgeCode(c.x + c.nx * edge, c.y + c.ny * edge, c.z) * 4 + edgeCode(c.x - c.nx * edge, c.y - c.ny * edge, c.z);
+      };
+      let pc = code(0);
+      const extra: number[] = [];
+      for (let s = step; s < ri.len + step - 0.01; s += step) {
+        const sc = Math.min(s, ri.len);
+        const c = code(sc);
+        if (c !== pc) extra.push(Math.max(0, sc - step), sc);
+        pc = c;
+      }
+      for (const s of extra) {
+        if (samples.some((q) => Math.abs(q.s - s) < 0.3)) continue;
+        const c = roadAt(ri, s);
+        samples.push({ s, x: c.x, y: c.y, z: c.z, nx: c.nx, ny: c.ny });
+      }
+      samples.sort((p, q) => p.s - q.s);
+    }
+    let prev: { v: number[]; cl: number; cr: number } | null = null;
+    for (const q of samples) {
+      const { x, z, nx: nx2, ny: ny2 } = q;
+      const yy = q.y;
       const lx = x + nx2 * edge;
       const ly = yy + ny2 * edge;
       const rx = x - nx2 * edge;
       const ry = yy - ny2 * edge;
+      const cl = edgeCode(lx, ly, z);
+      const cr = edgeCode(rx, ry, z);
       const v = [
-        g.vert(lx, z + ri.lift, ly, ...CONC),
+        g.vert(lx, cl === 2 ? z - 1.0 : z + ri.lift, ly, ...CONC),
         g.vert(lx, z - depth, ly, ...CONC),
         g.vert(rx, z - depth, ry, ...CONC_DARK),
-        g.vert(rx, z + ri.lift, ry, ...CONC),
+        g.vert(rx, cr === 2 ? z - 1.0 : z + ri.lift, ry, ...CONC),
         g.vert(lx, z - depth, ly, ...CONC_DARK),
         g.vert(rx, z - depth, ry, ...CONC),
       ];
       if (prev) {
-        g.quad(prev[0], v[0], v[1], prev[1], nx2, 0, -ny2);
-        g.quad(prev[3], v[3], v[5], prev[5], -nx2, 0, ny2);
-        g.quad(prev[4], v[4], v[2], prev[2], 0, -1, 0);
+        if (!(cl === 1 && prev.cl === 1)) g.quad(prev.v[0], v[0], v[1], prev.v[1], nx2, 0, -ny2);
+        if (!(cr === 1 && prev.cr === 1)) g.quad(prev.v[3], v[3], v[5], prev.v[5], -nx2, 0, ny2);
+        g.quad(prev.v[4], v[4], v[2], prev.v[2], 0, -1, 0);
       }
-      prev = v;
-    });
+      prev = { v, cl, cr };
+    }
     // piers, moved off roads and railways underneath
     const span = ri.len > 200 && ri.z[0] > 12 ? 40 : 30;
     const highDeck = (s: number) => roadAt(ri, s).z > 26; // Story Bridge main span: no generic piers
