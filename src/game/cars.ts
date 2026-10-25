@@ -1965,7 +1965,9 @@ export class CarTraffic {
       if (sd > 0 && nd.deg >= 3) {
         if (!nd.sig && e.rank + 0.01 >= nd.rank && remain < 25) this.markMajor(N, time, c.lane);
         if (!c.holds.some((h) => h.node === N) && c.next >= 0) {
-          const stopAt = remain - sd;
+          // (To the stop line from our front, not our middle: waiting with the nose 2 m over it put
+          // it in the near lane of a narrow road, the player's bus there passing a metre off it.)
+          const stopAt = remain - sd - (c.len / 2 - 0.6);
           if (stopAt < commitDist + 30) {
             this.blockRef = 0;
             const res = this.canGo(c, c.lane, c.next, stopAt, time, 0);
