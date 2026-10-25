@@ -15,6 +15,7 @@ import { brighten } from './util';
 import { session } from './session';
 import { LEVEL_GAP, heightAt, heightsOf } from './height';
 import type { Heights } from '../data/height';
+import { signalsFor } from '../data/signals';
 import { Passengers, type DwellState } from './passengers';
 
 export const enum StopStatus {
@@ -210,6 +211,8 @@ export class RouteGuide {
   private sigIdx = 0;
   private sigTimer = 0;
   private sigState: 'green' | 'amber' | 'red' | null = null;
+  /** How the upcoming signal is asked for (approach point, direction and level; src/data/signals.ts). */
+  private sigAsk: { i: number; x: number; y: number; dx: number; dy: number; z: number } | null = null;
   private readonly pax: Passengers;
   /** The doors were opened at the departure stop before the shift. */
   private departBoarded = false;
@@ -706,8 +709,16 @@ export class RouteGuide {
       this.sigTimer -= dt;
       if (this.sigTimer <= 0 || this.sigState === null) {
         this.sigTimer = 0.2;
-        this.track.sample(sg.s, this.tmp);
-        this.sigState = world.signalStateAt(sg.x, sg.y, this.time, this.tmp.hx, this.tmp.hy);
+        // Ask like the AI does: from the approach, with the direction we arrive in
+        // (not the lane's direction at the stop line, which can be past a turn).
+        if (this.sigAsk?.i !== this.sigIdx) {
+          const z = this.track.zAt(sg.s);
+          const ad = signalsFor(this.data).approachDir(sg.x, sg.y, z, (q, o) => Object.assign(o, this.track.sample(q, this.tmp)), sg.s);
+          this.track.sample(sg.s, this.tmp);
+          this.sigAsk = ad ? { i: this.sigIdx, x: ad.x, y: ad.y, dx: ad.dx, dy: ad.dy, z } : { i: this.sigIdx, x: sg.x, y: sg.y, dx: this.tmp.hx, dy: this.tmp.hy, z };
+        }
+        const q = this.sigAsk;
+        this.sigState = world.signalStateAt(q.x, q.y, this.time, q.dx, q.dy, q.z);
       }
       st.signal = this.sigState ? { distance: Math.max(0, sg.s - st.s), state: this.sigState } : null;
     } else st.signal = null;

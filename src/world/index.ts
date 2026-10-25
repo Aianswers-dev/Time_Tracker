@@ -199,10 +199,13 @@ export async function buildWorld(
   let sigClock = 0;
   let sigOffset = 0;
   const debug = location.search.includes('world=debug');
-  const dbgWin = window as unknown as { __worldCam?: number[]; __worldHours?: number; __worldInfo?: () => string; __worldRoot?: THREE.Group };
+  const dbgWin = window as unknown as { __worldCam?: number[]; __worldHours?: number; __worldInfo?: () => string; __worldRoot?: THREE.Group; __worldTicks?: Ctx['tick'] };
   if (debug) dbgWin.__worldRoot = root;
+  // the per-frame callbacks, so a harness can time each subsystem's CPU work without rendering
+  if (debug) dbgWin.__worldTicks = ctx.tick;
   if (debug) dbgWin.__worldInfo = () => `calls ${renderer.info.render.calls} tris ${renderer.info.render.triangles} geos ${renderer.info.memory.geometries} tex ${renderer.info.memory.textures}${underground ? ` underground (${hidden.length} hidden)` : ''}`;
   return {
+    walls: roads.walls,
     update(dt: number, camera: THREE.Camera, hours: number) {
       if (debug && dbgWin.__worldCam) {
         // debug camera: [x, y, h, lookX, lookY, lookH] in map coordinates
@@ -243,9 +246,11 @@ export async function buildWorld(
       for (const o of hidden) o.visible = true;
       hidden.length = 0;
       for (const c of ctx.cull) {
-        const dx = c.x - camPos.x;
-        const dz = c.z - camPos.z;
-        c.obj.visible = dx * dx + dz * dz < c.range * c.range;
+        const b = c.box;
+        const dx = b ? Math.max(b[0] - camPos.x, 0, camPos.x - b[2]) : c.x - camPos.x;
+        const dz = b ? Math.max(b[1] - camPos.z, 0, camPos.z - b[3]) : c.z - camPos.z;
+        const d2 = dx * dx + dz * dz;
+        c.obj.visible = d2 < c.range * c.range && !(c.min && d2 < c.min * c.min);
       }
       for (const t of ctx.tick) t(dt, camera);
       // underground culling (last frame's hidden meshes were restored above)
@@ -278,9 +283,9 @@ export async function buildWorld(
         console.info(`[world] calls ${renderer.info.render.calls} tris ${renderer.info.render.triangles}`);
       }
     },
-    signalStateAt(x: number, y: number, timeSeconds: number, dirX?: number, dirY?: number) {
+    signalStateAt(x: number, y: number, timeSeconds: number, dirX?: number, dirY?: number, z?: number) {
       sigOffset = timeSeconds - sigClock;
-      return signals.stateAt(x, y, timeSeconds, dirX, dirY);
+      return signals.stateAt(x, y, timeSeconds, dirX, dirY, z);
     },
   };
 }

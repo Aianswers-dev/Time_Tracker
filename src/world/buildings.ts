@@ -1,6 +1,7 @@
 /**
  * OSM buildings: footprints extruded into walls with procedural facades,
- * flat or pitched roofs, merged into 600 m chunks (one draw call each).
+ * flat or pitched roofs, merged into 800 m chunks (one draw call each, two
+ * levels of detail).
  */
 import * as THREE from 'three';
 import { BuildingKind, RoadKind, type Building } from '../types';
@@ -13,6 +14,16 @@ import { type RI, roadAt } from './roads';
 import { IdGrid, centroid, f32, hash1, i8, obb, oriented, pointInRing, ringBounds, signedArea, smoothstep, u32, u8, yieldFrame } from './util';
 
 export const CHUNK = 800;
+/**
+ * Level of detail by chunk: within this distance of the camera (to the nearest
+ * point of the chunk) everything shows; further out only the buildings that
+ * still read at that distance (FAR_H tall or FAR_AREA in plan: the skyline,
+ * mid-rise blocks, sheds and shopping centres), out to FAR_RANGE.
+ */
+export const NEAR_RANGE = 1800;
+const FAR_H = 9;
+const FAR_AREA = 1200;
+const FAR_RANGE = 7000;
 
 const GLASS = [0x5d7f99, 0x4f7f7a, 0x6a7884, 0x7a8a8f, 0x41617a, 0x6b6455, 0x56708a, 0x8a9aa4];
 const OFFICE = [0xc8c2b4, 0xa9a9a4, 0xd6d1c4, 0x8f9496, 0xbdb3a0, 0xe0dcd2];
@@ -59,6 +70,19 @@ export class BGeo {
     g.computeBoundingSphere();
     g.computeBoundingBox();
     return g;
+  }
+  /** Append what `src` gained since it had `v0` vertices and `i0` indices. */
+  appendFrom(src: BGeo, v0: number, i0: number): void {
+    const off = this.count - v0;
+    const cp = (d: { push(a: number): void }, s: { arr: ArrayLike<number>; len: number }, from: number) => {
+      for (let k = from; k < s.len; k++) d.push(s.arr[k]);
+    };
+    cp(this.pos, src.pos, v0 * 3);
+    cp(this.nrm, src.nrm, v0 * 3);
+    cp(this.uv, src.uv, v0 * 2);
+    cp(this.col, src.col, v0 * 3);
+    cp(this.sty, src.sty, v0 * 4);
+    for (let k = i0; k < src.idx.len; k++) this.idx.push(src.idx.arr[k] + off);
   }
   /** Set the normal (three.js space, unit) of vertices a..b inclusive. */
   setNormal(a: number, b: number, nx: number, ny: number, nz: number): void {
@@ -429,6 +453,8 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
   const nx = Math.ceil((R[2] - R[0]) / CHUNK);
   const ny = Math.ceil((R[3] - R[1]) / CHUNK);
   const chunks = new Map<number, BGeo>();
+  /** The far level of detail: the same chunks with only the buildings that read from afar. */
+  const farChunks = new Map<number, BGeo>();
   const mat = makeBuildingMaterial(ctx.tex.noise);
   const n = data.buildings.length;
   const box = new Float32Array(n * 4);
@@ -460,6 +486,8 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
       g = new BGeo();
       chunks.set(key, g);
     }
+    const v0 = g.count;
+    const i0 = g.idx.len;
     let m = b.minHeight;
     // base at the footprint centroid; walls reach down to the lowest ground under the footprint
     const base = b.z;
@@ -506,6 +534,14 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
       const top = m > 0.4 ? base + m : soffit;
       if (top > -Infinity) piers(g, ring, x0, y0, x1, y1, base, () => top, seed);
     }
+    if (b.height >= FAR_H || area >= FAR_AREA) {
+      let f = farChunks.get(key);
+      if (!f) {
+        f = new BGeo();
+        farChunks.set(key, f);
+      }
+      f.appendFrom(g, v0, i0);
+    }
     if (bi % 4000 === 0) {
       progress(bi / n);
       await yieldFrame();
@@ -520,7 +556,17 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
     mesh.name = `buildings-${key}`;
     ctx.root.add(mesh);
     const c = geo.boundingSphere!.center;
-    ctx.cull.push({ obj: mesh, x: c.x, z: c.z, range: 7500 });
+    const bb = geo.boundingBox!;
+    const box: [number, number, number, number] = [bb.min.x, bb.min.z, bb.max.x, bb.max.z];
+    const far = farChunks.get(key);
+    ctx.cull.push({ obj: mesh, x: c.x, z: c.z, range: NEAR_RANGE, box });
+    if (!far) continue;
+    // beyond the shadow box (at most +-700 m around the camera): no shadow pass
+    const fm = new THREE.Mesh(far.build(), mat);
+    fm.receiveShadow = true;
+    fm.name = `buildings-far-${key}`;
+    ctx.root.add(fm);
+    ctx.cull.push({ obj: fm, x: c.x, z: c.z, range: FAR_RANGE, min: NEAR_RANGE, box });
   }
   return { grid, box, big };
 }

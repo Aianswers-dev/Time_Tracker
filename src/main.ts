@@ -47,7 +47,8 @@ async function main() {
 
   const data = await loadMapData((f, t) => loading.set(f * 0.5, t));
   const world = await buildWorld(scene, renderer, data, (f, t) => loading.set(0.5 + f * 0.5, t));
-  const collider = buildCollider(data);
+  // (the collider's walls are the ones the world drew)
+  const collider = buildCollider(data, { walls: world.walls });
   const traffic = new Traffic(scene, data, busFactory, world);
   loading.remove();
 

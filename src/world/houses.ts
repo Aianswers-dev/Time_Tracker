@@ -5,8 +5,8 @@
  */
 import * as THREE from 'three';
 import { BuildingKind, RoadKind } from '../types';
-import { CHUNK, type BuildingIndex } from './buildings';
-import { type Ctx, densityAt } from './ctx';
+import { CHUNK, NEAR_RANGE, type BuildingIndex } from './buildings';
+import { type Ctx, boxAround, densityAt } from './ctx';
 import { F_HIGHSET, F_TILE, Style, makeHouseMaterial } from './facade';
 import { MeshGeo } from './geo';
 import type { RoadIndex } from './roadindex';
@@ -297,10 +297,12 @@ export async function buildHouses(ctx: Ctx, roads: { infos: RI[]; index: RoadInd
     yards.push({ x: cx + Math.cos(a) * dd, y: cy + Math.sin(a) * dd });
   }
 
-  // ---- instanced meshes per building chunk
+  // ---- instanced meshes per building chunk, shown (like the low OSM buildings) while
+  // the camera is within NEAR_RANGE of the chunk's nearest house: one-storey houses
+  // are a few pixels and in the haze beyond that
   const mat = makeHouseMaterial(ctx.tex.noise);
   const tpls = [houseTemplate(true, 0.12), houseTemplate(false, 0.28)];
-  const HCH = CHUNK * 2;
+  const HCH = CHUNK;
   const nx = Math.ceil((R[2] - R[0]) / HCH);
   const groups = new Map<number, H[][]>();
   for (const h of houses) {
@@ -327,6 +329,7 @@ export async function buildHouses(ctx: Ctx, roads: { infos: RI[]; index: RoadInd
       const mesh = new THREE.InstancedMesh(geo, mat, n);
       let cx = 0;
       let cz = 0;
+      const xz: number[] = [];
       items.forEach((h, i) => {
         // basis: X along the road (flipped so Z = outward stays right-handed), Y up, Z away from the road
         let xx = h.tx;
@@ -345,6 +348,7 @@ export async function buildHouses(ctx: Ctx, roads: { infos: RI[]; index: RoadInd
         roof.set(hexRgb(h.roof), i * 3);
         cx += h.x;
         cz -= h.y;
+        xz.push(h.x, -h.y);
       });
       geo.setAttribute('iStyle', new THREE.InstancedBufferAttribute(style, 4, false));
       geo.setAttribute('iWall', new THREE.InstancedBufferAttribute(wall, 3, true));
@@ -354,7 +358,7 @@ export async function buildHouses(ctx: Ctx, roads: { infos: RI[]; index: RoadInd
       mesh.computeBoundingSphere();
       mesh.name = `houses-${key}-${t}`;
       ctx.root.add(mesh);
-      ctx.cull.push({ obj: mesh, x: cx / n, z: cz / n, range: 5000 });
+      ctx.cull.push({ obj: mesh, x: cx / n, z: cz / n, range: NEAR_RANGE, box: boxAround(xz, 10) });
     }
   }
   progress(1);

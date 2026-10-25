@@ -1237,6 +1237,102 @@ export function chunkGeometry(f: TerrainField, ci0: number, cj0: number, ci1: nu
   return g;
 }
 
+/** Shadow bins per chunk side (240 m). */
+const SB = 8;
+
+/** Position of cell (x, y) along a Hilbert curve over an n x n grid (n a power of two): nearby cells are near on the curve. */
+function hilbert(n: number, x: number, y: number): number {
+  let d = 0;
+  for (let s = n >> 1; s > 0; s >>= 1) {
+    const rx = (x & s) > 0 ? 1 : 0;
+    const ry = (y & s) > 0 ? 1 : 0;
+    d += s * s * ((3 * rx) ^ ry);
+    if (ry === 0) {
+      if (rx === 1) {
+        x = n - 1 - x;
+        y = n - 1 - y;
+      }
+      const t = x;
+      x = y;
+      y = t;
+    }
+  }
+  return d;
+}
+
+/**
+ * The full-detail chunk (~2 km across) casts shadows only from the triangles
+ * near the sun's shadow box (~220-500 m across): its triangles are sorted into
+ * 240 m bins along a Hilbert curve, and the shadow pass draws only the run of
+ * bins from the first to the last one that meets the shadow camera's frustum.
+ * Same triangles, same draw call; the main pass still draws them all.
+ */
+function shadowByBin(mesh: THREE.Mesh): void {
+  const g = mesh.geometry;
+  const P = g.getAttribute('position').array as Float32Array;
+  const I = g.getIndex()!.array as Uint16Array | Uint32Array;
+  const nt = I.length / 3;
+  if (!g.boundingBox) g.computeBoundingBox();
+  const bb = g.boundingBox!;
+  const sx = SB / Math.max(1, bb.max.x - bb.min.x);
+  const sz = SB / Math.max(1, bb.max.z - bb.min.z);
+  const binOf = new Uint8Array(nt);
+  const cnt = new Int32Array(SB * SB);
+  const lo = new Float32Array(SB * SB * 3).fill(Infinity);
+  const hi = new Float32Array(SB * SB * 3).fill(-Infinity);
+  for (let t = 0; t < nt; t++) {
+    let cx = 0;
+    let cz = 0;
+    for (let k = 0; k < 3; k++) {
+      cx += P[3 * I[3 * t + k]];
+      cz += P[3 * I[3 * t + k] + 2];
+    }
+    const bi = Math.min(SB - 1, Math.max(0, Math.floor((cx / 3 - bb.min.x) * sx)));
+    const bj = Math.min(SB - 1, Math.max(0, Math.floor((cz / 3 - bb.min.z) * sz)));
+    const b = hilbert(SB, bi, bj);
+    binOf[t] = b;
+    cnt[b]++;
+    for (let k = 0; k < 3; k++) {
+      const v = I[3 * t + k];
+      for (let a = 0; a < 3; a++) {
+        lo[3 * b + a] = Math.min(lo[3 * b + a], P[3 * v + a]);
+        hi[3 * b + a] = Math.max(hi[3 * b + a], P[3 * v + a]);
+      }
+    }
+  }
+  const start = new Int32Array(SB * SB + 1);
+  for (let b = 0; b < SB * SB; b++) start[b + 1] = start[b] + cnt[b];
+  const fill = start.slice(0, SB * SB);
+  const J = new (I.constructor as Uint16ArrayConstructor | Uint32ArrayConstructor)(I.length);
+  for (let t = 0; t < nt; t++) {
+    const o = 3 * fill[binOf[t]]++;
+    J[o] = I[3 * t];
+    J[o + 1] = I[3 * t + 1];
+    J[o + 2] = I[3 * t + 2];
+  }
+  g.setIndex(new THREE.BufferAttribute(J, 1));
+  const fr = new THREE.Frustum();
+  const pm = new THREE.Matrix4();
+  const box = new THREE.Box3();
+  mesh.onBeforeShadow = (_r, _o, _c, shadowCamera, geometry) => {
+    pm.multiplyMatrices(shadowCamera.projectionMatrix, shadowCamera.matrixWorldInverse);
+    fr.setFromProjectionMatrix(pm);
+    let first = -1;
+    let last = -1;
+    for (let b = 0; b < SB * SB; b++) {
+      if (!cnt[b]) continue;
+      box.min.set(lo[3 * b], lo[3 * b + 1], lo[3 * b + 2]);
+      box.max.set(hi[3 * b], hi[3 * b + 1], hi[3 * b + 2]);
+      if (!fr.intersectsBox(box)) continue;
+      if (first < 0) first = b;
+      last = b;
+    }
+    if (first < 0) geometry.setDrawRange(0, 0);
+    else geometry.setDrawRange(3 * start[first], 3 * (start[last + 1] - start[first]));
+  };
+  mesh.onAfterShadow = (_r, _o, _c, _sc, geometry) => geometry.setDrawRange(0, Infinity);
+}
+
 export async function buildTerrain(ctx: Ctx, f: TerrainField, mat: THREE.Material, outerMat: THREE.Material): Promise<void> {
   const chunks: LodChunk[] = [];
   for (let cj = 0; cj < f.ny - 1; cj += CH) {
@@ -1250,6 +1346,7 @@ export async function buildTerrain(ctx: Ctx, f: TerrainField, mat: THREE.Materia
         const m = new THREE.Mesh(g, mat);
         m.receiveShadow = true;
         m.castShadow = s === 1;
+        if (s === 1) shadowByBin(m);
         m.name = `terrain-${ci}-${cj}-${s}`;
         m.visible = false;
         ctx.root.add(m);
