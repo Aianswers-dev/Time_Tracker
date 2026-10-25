@@ -1211,6 +1211,10 @@ export class CarTraffic {
     nd.occ.length = w;
     for (const o of nd.occ) {
       if (o.id !== id && movementsConflict(inX, inY, outX, outY, cls, o)) {
+        // (A car holding the box but stopped for us, our nose already in its way out (we came
+        // through the junction's inside link), lets us out first: else the two wait for good.)
+        const h = o.id > 0 ? this.byId.get(o.id) : undefined;
+        if (h && !h.dead && h.v < 0.5 && h.why === Wait.Car && h.ref === id) continue;
         this.boxBy = o.id;
         return false;
       }
