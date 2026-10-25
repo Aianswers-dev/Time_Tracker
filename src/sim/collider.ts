@@ -27,7 +27,7 @@
  * corners across a wall line are pushed back to the side the bus came from.
  * Deepest first, a few iterations per frame.
  */
-import type { BusPose, BusSpec, Collider, MapData, Road } from '../types';
+import type { BusPose, BusSpec, Collider, EdgeWalls, MapData, Road } from '../types';
 import { BuildingKind, RoadKind } from '../types';
 import { heightsFor, type Heights, type Surface } from '../data/height';
 
@@ -124,6 +124,8 @@ export interface SimCollider extends Collider {
     tunnelWalls: number;
     parapets: number;
     retainingWalls: number;
+    /** Wall pieces left out where a bus route crosses them. */
+    routeGaps: number;
     /** Camera-only: covered tube stretches (ceilings) and drawn-but-not-solid occluders. */
     ceilings: number;
     viewOccluders: number;
@@ -144,6 +146,11 @@ export let activeCollider: SimCollider | null = null;
 export interface ColliderOptions {
   /** Height queries to use (defaults to the shared `heightsFor(data)`). */
   heights?: Heights;
+  /**
+   * The walls the world drew (WorldHandle.walls): the bus collides with exactly those. Without them
+   * (tests, tools without a world) the collider derives its own from the road network.
+   */
+  walls?: EdgeWalls;
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,7 +1312,33 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     }
   };
 
-  for (let ri = 0; ri < data.roads.length; ri++) {
+  const EW = opts.walls;
+  if (EW) {
+    // The world's walls as drawn (it leaves cutting walls open where a bus route crosses them, and stops
+    // them under a deck passing over), in pieces of at most PIECE.
+    for (let i = 0; i < EW.count; i++) {
+      const ax = EW.seg[4 * i];
+      const ay = EW.seg[4 * i + 1];
+      const bx = EW.seg[4 * i + 2];
+      const by = EW.seg[4 * i + 3];
+      const lo = EW.lo[i];
+      const hi = EW.hi[i];
+      const np = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / PIECE));
+      for (let q = 0; q < np; q++) {
+        wAx.push(ax + ((bx - ax) * q) / np);
+        wAy.push(ay + ((by - ay) * q) / np);
+        wBx.push(ax + ((bx - ax) * (q + 1)) / np);
+        wBy.push(ay + ((by - ay) * (q + 1)) / np);
+        wLo.push(lo);
+        wHi.push(hi);
+        wKind.push(EW.kind[i]);
+        wRoad.push(EW.road[i]);
+        wTube.push(EW.tunnel[i]);
+      }
+    }
+    for (let i = 0; i < EW.ceilings.length; i++) ceil.push(EW.ceilings[i]);
+  }
+  for (let ri = 0; ri < data.roads.length && !EW; ri++) {
     const r = data.roads[ri];
     if (r.tunnel) {
       tubeWalls(ri);
@@ -1392,9 +1425,10 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     o[3] = Math.max(ceil[c + 1], ceil[c + 3]) + r;
     return true;
   });
-  // Bus routes crossing a wall at its level open a gap there (with a few metres either side).
+  // Bus routes crossing a wall at its level open a gap there (with a few metres either side); the world's
+  // walls already have theirs.
   const crossings: number[] = [];
-  for (let w = 0; w < wAx.length; w++) {
+  for (let w = 0; w < wAx.length && !EW; w++) {
     if (wTube[w]) continue;
     const mx = (wAx[w] + wBx[w]) / 2;
     const my = (wAy[w] + wBy[w]) / 2;
@@ -2222,6 +2256,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
       tunnelWalls: kindCount[WallKind.Tunnel],
       parapets: kindCount[WallKind.Parapet],
       retainingWalls: kindCount[WallKind.Retaining],
+      routeGaps: wAx.length - nW,
       ceilings: nCeil,
       viewOccluders: view.count,
       bays: bayLines.length,

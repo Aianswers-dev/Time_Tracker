@@ -397,7 +397,34 @@ export interface Collider {
 // ---------------------------------------------------------------------------
 // World
 
+/**
+ * The solid edges the world draws along roads, for the driving collider, so a bus collides with exactly
+ * what is on screen: tunnel tube walls, nose and end walls, portal pilasters, cutting retaining walls,
+ * fill-wall and bridge parapets. Each piece is a line in plan (the face toward the road) with a vertical span.
+ */
+export interface EdgeWalls {
+  /** ax, ay, bx, by per piece (map metres). */
+  seg: Float32Array;
+  /** Vertical span per piece (m AHD). */
+  lo: Float32Array;
+  hi: Float32Array;
+  /** 0 tunnel structure, 1 parapet (bridge, fill wall), 2 retaining wall (cutting): the sim's WallKind. */
+  kind: Uint8Array;
+  /** Road each piece belongs to (-1: a railway's). */
+  road: Int32Array;
+  /** 1 where the piece belongs to a tunnel road (its tube, or the open cutting of its approach). */
+  tunnel: Uint8Array;
+  count: number;
+  /**
+   * Covered tube stretches (for cameras), 9 numbers each: ax, ay, bx, by, road height at a and b, reach
+   * left and right of the centreline (to the walls, or across a platform hall), clear height inside.
+   */
+  ceilings: Float32Array;
+}
+
 export interface WorldHandle {
+  /** The solid edges drawn along the roads (pass to the driving collider). */
+  walls?: EdgeWalls;
   /** Call every frame. `hours` is local time of day 0..24. */
   update(dt: number, camera: THREE.Camera, hours: number): void;
   /**
