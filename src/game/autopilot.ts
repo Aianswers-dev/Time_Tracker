@@ -118,6 +118,8 @@ export class Autopilot {
   private strictLeadUntil = -1;
   /** Consecutive 40 s blocked spells without moving on. */
   private blockedN = 0;
+  /** Rescues put off in a row because the lane was full. */
+  private noRescueN = 0;
   private levelBadT = 0;
   private lastProblem = new Map<string, number>();
   private readonly near: { body: Body; half: number; len: number }[] = [];
@@ -141,7 +143,7 @@ export class Autopilot {
    * Put the bus back on the lane `jump` metres on, but not past the stop it's heading for, and
    * only where its whole length is clear of AI vehicles (teleporting into a queue gets the bus
    * shoved sideways, over a kerb or parapet). Nowhere clear: put it straight on the lane where it
-   * is, or, if even that is taken, leave it and try again later.
+   * is, or, if even that is taken, leave it and try again later (twice; then go anyway).
    */
   private rescueTo(jump: number, stopTarget: number): boolean {
     const T = this.track;
@@ -155,7 +157,11 @@ export class Autopilot {
         break;
       }
     }
-    if (!Number.isFinite(s)) return false;
+    if (!Number.isFinite(s)) {
+      if (++this.noRescueN < 3) return false;
+      s = want;
+    }
+    this.noRescueN = 0;
     T.sample(s, this.tmp, this.pull);
     this.rescues++;
     this.rescue = { x: this.tmp.x, y: this.tmp.y, heading: this.tmp.heading, z: T.zAt(s) };
@@ -179,7 +185,7 @@ export class Autopilot {
       const pz = T.zAt(ss);
       const px = this.tmp.x;
       const py = this.tmp.y;
-      if (grid.nearest(px, py, R + 1.2, undefined, pz) >= 0) return false;
+      if (grid.nearest(px, py, R + 1.0, undefined, pz) >= 0) return false;
       for (const b of bodies) {
         const B = b.body;
         if (Math.abs(B.fx - px) > b.len + 4 || Math.abs(B.fy - py) > b.len + 4) continue;
@@ -191,7 +197,7 @@ export class Autopilot {
           const sy = B.y[k + 1] - ay;
           const l2 = sx * sx + sy * sy;
           const t = l2 > 1e-6 ? clamp(((px - ax) * sx + (py - ay) * sy) / l2, 0, 1) : 0;
-          const r = R + b.half + 0.3;
+          const r = R + b.half + 0.1;
           if ((px - ax - sx * t) ** 2 + (py - ay - sy * t) ** 2 < r * r) return false;
         }
       }

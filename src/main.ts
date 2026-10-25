@@ -314,6 +314,18 @@ async function main() {
         }
         return out;
       },
+      /** Collider wall pieces within r of (x, y) (for diagnosing a wall hit: kind, road, span). */
+      walls(x: number, y: number, r = 15) {
+        const W = collider.walls;
+        const out: { i: number; a: number[]; b: number[]; lo: number; hi: number; kind: number; road: number }[] = [];
+        for (let i = 0; i < W.count; i++) {
+          const mx = (W.ax[i] + W.bx[i]) / 2;
+          const my = (W.ay[i] + W.by[i]) / 2;
+          if (Math.hypot(mx - x, my - y) > r) continue;
+          out.push({ i, a: [+W.ax[i].toFixed(2), +W.ay[i].toFixed(2)], b: [+W.bx[i].toFixed(2), +W.by[i].toFixed(2)], lo: +W.lo[i].toFixed(2), hi: +W.hi[i].toFixed(2), kind: W.kind[i], road: W.road[i] });
+        }
+        return out;
+      },
       report() {
         return { ...auto!.report(), summary: guide.state.summary, served: guide.state.stopsServed, missed: guide.state.stopsMissed, total: guide.state.stopsTotal, events: guide.state.events.map((e) => `${e.kind}: ${e.text}`) };
       },
