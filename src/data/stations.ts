@@ -28,10 +28,16 @@ export interface OverbridgeDef {
   /** Glass tint 0xRRGGBB and frame colour. */
   glass: number;
   frame: number;
-  /** Lift/stair towers at the two ends (centred 3.5 m in from each end of `len`). */
+  /** Lift/stair towers at the two ends (each centred half its width in from an end of `len`). */
   towers: boolean;
   /** Tower footprint (m square), default 6.5. */
   towerW?: number;
+  /** Towers' flat roof overhang past the body (m): [along the bridge axis, across it]; default 1.8. */
+  towerHat?: [number, number];
+  /** Towers' roof form: flat cantilevered "hat" (default) or a white hipped/pyramid roof (Gabba, QUT KG). */
+  towerRoof?: 'flat' | 'pyramid';
+  /** Towers are slim all-glass lift shafts (Mater Hill) rather than stair towers. */
+  towerLift?: boolean;
   /** Flat white roof wider than the deck (CC's oval canopy). */
   roofW?: number;
   /** Roof only over this part of the deck, as a flat oval (CC); else the whole deck. */
@@ -56,6 +62,12 @@ export interface TowerDef {
   banner?: number;
   /** Ground-level building (not raised on the busway level). */
   ground?: boolean;
+  /** Flat roof overhang past the body (m): [along the heading side, across]; default 1.8. */
+  hat?: [number, number];
+  /** Roof form: flat cantilevered "hat" (default) or a white hipped/pyramid roof. */
+  roof?: 'flat' | 'pyramid';
+  /** A slim all-glass lift shaft with a thin cap (Mater Hill's light-blue lifts). */
+  lift?: boolean;
 }
 
 /**
@@ -101,6 +113,15 @@ export interface StationDef {
   canopyH?: number;
   /** Depth of the canopy strip from the kerb (m). */
   canopyDepth?: number;
+  /** Height of the glazed rear screens (m), default 2.45; UQ Lakes' run up to the canopy. */
+  screenH?: number;
+  /**
+   * Canopy form: the flat cantilever (default) or Dutton Park Place's curved "wing", a blade on one
+   * row of tall posts whose soffit rises towards the kerb.
+   */
+  canopy?: 'flat' | 'wing';
+  /** Per-platform overrides by platform number (Roma St's new P1 vs the older P2). */
+  platforms?: Record<string, Partial<Pick<StationDef, 'post' | 'fascia' | 'roofTop' | 'soffit' | 'canopyH' | 'canopyDepth' | 'screenH' | 'glass'>>>;
   /**
    * Underground (KGS, Queen St): glass screen walls with door pods instead of
    * canopies. Unset: from the platform data; false overrides it.
@@ -192,6 +213,12 @@ export const STATIONS: StationDef[] = [
     medianLights: true,
     // The QPAC - Museum overpass (Melbourne Street Overpass outline) with its white oval canopy.
     overbridges: [{ x: -461, y: -531, ax: 0.52, ay: -0.854, len: [-60, 60], w: 8, glass: 0xdfe6e6, frame: 0xd9d9d4, towers: false, roofW: 15, roofLen: [-28, 28], open: true, clear: 6.8 }],
+    // its dark-framed glass lift shafts beside the deck (OSM elevators 10290775677, 13417295247; photo
+    // Cultural_Centre_busway_front)
+    towers: [
+      { x: -458.2, y: -549.2, w: 3.2, d: 3.2, h: 10.4, heading: 2.595, frame: 0x2b2f33, lift: true },
+      { x: -481.4, y: -511.2, w: 3.2, d: 3.2, h: 10.4, heading: 2.595, frame: 0x2b2f33, lift: true },
+    ],
     ownRoofs: 60,
   },
   {
@@ -200,10 +227,12 @@ export const STATIONS: StationDef[] = [
     x: -375,
     y: 312,
     r: 75,
+    // the new P1 (2026): white posts, copper fascia band; P2: white fascia on grey square posts
     post: 0xf2f2ee,
     fascia: 0xb06a45,
     roofTop: 0x7a7a78,
     soffit: 0xf2f2ee,
+    platforms: { '2': { post: 0x8a8d90, fascia: 0xf2f2ee } },
     paving: 0x6e6f71,
     tile: 0.6,
     glass: 0xb9cfd3,
@@ -218,8 +247,9 @@ export const STATIONS: StationDef[] = [
     x: -147,
     y: -1335,
     r: 60,
-    post: 0x2f5f8f,
-    fascia: 0x2f5f8f,
+    // very dark plum-navy steel (photos: South_Bank_busway_station,_South_Brisbane,_Queensland_01/02)
+    post: 0x312c38,
+    fascia: 0x312c38,
     roofTop: 0x8a8e90,
     soffit: 0xf0f0ec,
     paving: 0xc8c0b0,
@@ -230,6 +260,12 @@ export const STATIONS: StationDef[] = [
     canopyDepth: 6,
     louvres: 0xc9cdd0,
     median: 'fence',
+    // the lift/stair buildings at the platforms' south ends (OSM elevators, white roofs in imagery
+    // about 13 x 11 m centred (-139.3, -1369.7) and (-118.3, -1354.7))
+    towers: [
+      { x: -139.5, y: -1370, w: 8, d: 7.5, h: 5.6, frame: 0x312c38, banner: ORANGE, hat: [2.6, 1.9] },
+      { x: -118.5, y: -1356, w: 7.5, d: 7.5, h: 5.6, frame: 0x312c38, banner: ORANGE, hat: [2, 1.8] },
+    ],
     ownRoofs: 45,
   },
   {
@@ -248,7 +284,9 @@ export const STATIONS: StationDef[] = [
     tactile: 'charcoal',
     roof: 'flat',
     median: 'fence',
-    overbridges: [{ x: 469, y: -1730, len: [-16, 16], w: 3.6, glass: 0x8fb0bf, frame: 0x2f5f8f, towers: false, clear: 6.2 }],
+    // The glazed footbridge (OSM 508391959, (467,-1744)-(472,-1716)) with a glass lift shaft in a light-blue
+    // frame at each end, standing on the platforms. East of x 490 the station runs under the Mater buildings.
+    overbridges: [{ x: 469.5, y: -1730, ax: 0.176, ay: 0.984, len: [-16.05, 16.05], w: 3.6, glass: 0x8fb0bf, frame: 0x5f9fc8, towers: true, towerW: 3.2, towerLift: true, clear: 6.2 }],
   },
   {
     key: 'buranda',
@@ -266,6 +304,9 @@ export const STATIONS: StationDef[] = [
     tactile: 'charcoal',
     roof: 'flat',
     median: 'fence',
+    // The bright blue-steel glazed footbridge (photo BurandaStation.jpg) across the cutting at the platforms' south ends (OSM 458013390,
+    // (1573,-3171)-(1596,-3151), lifts at both ends); the white-roofed entrance building at its SW end.
+    overbridges: [{ x: 1584.5, y: -3161, ax: 0.754, ay: 0.656, len: [-19.5, 19.5], w: 3.6, glass: 0x9fc3c8, frame: 0x2d6db5, towers: true, towerW: 7, towerHat: [2.5, 1.5], clear: 6.4 }],
   },
   {
     key: 'gabba',
@@ -275,6 +316,8 @@ export const STATIONS: StationDef[] = [
     r: 60,
     ...SEB,
     roofTop: 0x3d4144,
+    // dark charcoal soffit with downlights (photo: Woolloongabba_Busway_station)
+    soffit: 0x4a4d50,
     paving: 0xb9b6ae,
     tile: 0.6,
     glass: 0x9fb7b0,
@@ -282,6 +325,10 @@ export const STATIONS: StationDef[] = [
     roof: 'flat',
     median: 'fence',
     medianLights: true,
+    // The footbridge at the platforms' west end (OSM 458014092) between two square towers with white hipped
+    // roofs (imagery: about 11.5 m square, centred (1091.2,-1888.5) and (1087,-1912.3)); the south tower's
+    // body sits back from the eastbound lane, its roof overhanging it.
+    overbridges: [{ x: 1089.1, y: -1902, ax: 0.152, ay: 0.988, len: [-17.9, 17.9], w: 4, glass: 0x9fb7b0, frame: 0x2b2f33, towers: true, towerW: 8, towerHat: [1.8, 1.8], towerRoof: 'pyramid', clear: 6.4 }],
   },
   {
     key: 'pah',
@@ -299,7 +346,10 @@ export const STATIONS: StationDef[] = [
     medianLights: true,
     // Lift towers on the platforms' east-end landings joined by the teal overbridge, on the line
     // of the OSM footbridge (building 36455, (1057,-3122)-(1061,-3096)).
-    overbridges: [{ x: 1059.2, y: -3108.9, ax: 0.164, ay: 0.987, len: [-16, 15.75], w: 4, glass: 0x3fa7a0, frame: 0x2b2f33, towers: true, clear: 6.4 }],
+    // Imagery (z20): hats about 21 m along the busway x 16 m, centred (1063.5,-3083) behind platform 1 and
+    // (1056.5,-3123) on platform 2's east end, the 4.6 m glazed bridge between them; OSM's elevators
+    // ((1062,-3094), (1056,-3125)) are the lift doors at the bridge ends.
+    overbridges: [{ x: 1059.2, y: -3108.9, ax: 0.164, ay: 0.987, len: [-19.15, 30.45], w: 4.4, glass: 0x3fa7a0, frame: 0x2b2f33, towers: true, towerW: 9, towerHat: [3.5, 6], clear: 6.4 }],
     // OSM boxes the model replaces: the north station building, the footbridge and the south building.
     ownBuildings: [
       [1062, -3089],
@@ -322,8 +372,23 @@ export const STATIONS: StationDef[] = [
     tactile: 'charcoal',
     roof: 'flat',
     median: 'fence',
-    // The "skyway" concourse bridge over busway and rail to the rail platforms (north).
-    overbridges: [{ x: 646, y: -2771, ax: 0.32, ay: 0.947, len: [-14, 40], w: 5, glass: 0x7fb3a0, frame: 0x2b2f33, towers: true, clear: 6.4 }],
+    // The "skyway": one straight glazed concourse over the busway, platform 4 and the rail line (OSM roof 36454
+    // and building 53591, about 3.6-3.9 m wide, centreline (651.8,-2757) + s (0.377,0.926), s -30.4..50), on
+    // round concrete columns, ending in a stair/lift box at Boggo Road (north). Two lift towers with white hat
+    // roofs stand on the busway platforms (imagery about 10-12 m square at (666.5,-2759) behind platform 4,
+    // with a short landing from the skyway, and (648.2,-2782.3) beside the skyway's south end behind
+    // platform 3); the north one sits a little south-west, clear of the rail line 5 m north-east.
+    overbridges: [
+      { x: 651.8, y: -2757, ax: 0.377, ay: 0.926, len: [-30.4, 44], w: 4, glass: 0x7fb3a0, frame: 0x2b2f33, towers: false, clear: 6.4 },
+      { x: 659.3, y: -2759, ax: 0.968, ay: -0.251, len: [-5.8, 4.5], w: 3.2, glass: 0x7fb3a0, frame: 0x2b2f33, towers: false, clear: 6.4 },
+    ],
+    towers: [
+      { x: 667, y: -2761, w: 8, d: 7, h: 12, frame: 0x2b2f33, banner: ORANGE, hat: [2, 2] },
+      { x: 648.5, y: -2782.5, w: 7, d: 7, h: 12, frame: 0x2b2f33, banner: ORANGE, hat: [2, 2.5] },
+      { x: 670, y: -2714.5, w: 7.7, d: 6.1, h: 12.8, heading: 0.386, frame: 0x2b2f33, hat: [0.6, 0.6] },
+    ],
+    // OSM's rail-side part of the skyway (a 7 m block from the ground over the tracks)
+    ownBuildings: [[660.6, -2729.1]],
     ownRoofs: 70,
   },
   {
@@ -341,6 +406,8 @@ export const STATIONS: StationDef[] = [
     glass: 0x9fb7b0,
     tactile: 'charcoal',
     roof: 'flat',
+    // full-height glazed rear screens up to the canopy (photos UQ_Lakes_busway_station_01-03)
+    screenH: 4.1,
     // 600 kW pantograph chargers at stops A and B and in the bus refuge.
     chargers: [
       { x: -520.1, y: -3211.9 },
@@ -355,7 +422,14 @@ export const STATIONS: StationDef[] = [
     x: 113,
     y: -3245,
     r: 35,
-    ...EB,
+    // the curved "wing" on tall dark grey posts: light grey panelled soffit, dark stacked fins on top
+    // (photo: Dutton_Park_Place_busway_station.jpeg)
+    post: 0x5a5e62,
+    fascia: 0x4e5256,
+    roofTop: 0x45494d,
+    soffit: 0xc9cdcf,
+    canopy: 'wing',
+    canopyH: 4.6,
     paving: 0xcfcbc2,
     tile: 0.6,
     glass: 0x8fb3ad,
@@ -376,7 +450,12 @@ export const STATIONS: StationDef[] = [
     tactile: 'yellow',
     roof: 'flat',
     median: 'fence',
-    towers: [{ x: 2012, y: -3236, w: 7, d: 7, h: 13, frame: 0x2b2f33, banner: ORANGE }],
+    // Lift/stair towers just past the platforms' east ends (OSM elevators (2090,-3215), (2084,-3240); imagery
+    // hats about 16 x 14 m). No overbridge: the platforms are linked under the viaduct.
+    towers: [
+      { x: 2091, y: -3214, w: 8, d: 8, h: 6.5, frame: 0x2b2f33, banner: ORANGE, hat: [4, 3] },
+      { x: 2085, y: -3240.5, w: 8, d: 7.5, h: 6.5, frame: 0x2b2f33, banner: ORANGE, hat: [3.5, 2.5] },
+    ],
     ownRoofs: 45,
   },
   {
@@ -394,7 +473,10 @@ export const STATIONS: StationDef[] = [
     canopyDepth: 4.5,
     median: 'fence',
     // lift towers on the landings behind both platforms (platform outlines), joined across the busway
-    overbridges: [{ x: 2579, y: -3304, ax: 0, ay: 1, len: [-22, 22], w: 3.6, glass: 0x8fb3ad, frame: 0x4a3b30, towers: true, clear: 6.2 }],
+    // charcoal frames, grey panels, green-tinted glass (photo Langlands_Park_busway_station)
+    // (imagery hats about 13.7 m square centred (2579.4,-3281.6) and (2578.2,-3318.5), on the platforms'
+    // landings; OSM elevators (2579,-3287), (2579,-3320))
+    overbridges: [{ x: 2579, y: -3303.3, ax: 0, ay: 1, len: [-19.2, 25.7], w: 3.6, glass: 0x8fb3ad, frame: 0x3a3c3f, towers: true, towerW: 7.5, towerHat: [3.1, 3.1], clear: 6.2 }],
     // the bronze entrance canopy with "Langlands Park" lettering on Old Cleveland Rd
     entrances: [{ x: 2556, y: -3326, fx: 0, fy: -1, len: 18, d: 5, h: 3.4 }],
     ownRoofs: 40,
@@ -412,7 +494,9 @@ export const STATIONS: StationDef[] = [
     tactile: 'charcoal',
     roof: 'flat',
     median: 'fence',
-    towers: [{ x: 1627, y: -4700, w: 8, d: 8, h: 11, frame: 0x22324a, banner: ORANGE, ground: true }],
+    // The footbridge at the platforms' south ends (OSM 683341103, (1655,-4715)-(1677,-4704), lifts at both
+    // ends) between two navy towers with big flat white roofs (imagery about 13 x 12 m).
+    overbridges: [{ x: 1666, y: -4709.5, ax: 0.894, ay: 0.447, len: [-16, 16], w: 3.6, glass: 0x9fb7b0, frame: 0x22324a, towers: true, towerW: 7, towerHat: [3, 2.5], clear: 6.4 }],
     ownRoofs: 60,
   },
   {
@@ -423,8 +507,9 @@ export const STATIONS: StationDef[] = [
     r: 45,
     // an open cutting below Kelvin Grove Rd (OSM's layer=-1 only means "below the road bridge")
     underground: false,
-    post: 0x2f5f8f,
-    fascia: 0xeeeeea,
+    // dark teal-grey posts and a dark fascia under white soffits with round downlights (photo Normanby_stn_looking_S)
+    post: 0x2f4f55,
+    fascia: 0x2e3134,
     roofTop: 0x8a8e90,
     soffit: 0xf0f0ec,
     paving: 0xbfb8aa,
@@ -432,7 +517,13 @@ export const STATIONS: StationDef[] = [
     glass: 0x8fb3ad,
     tactile: 'charcoal',
     roof: 'flat',
-    towers: [{ x: -848, y: 1082, w: 8, d: 8, h: 8, frame: 0x2f5f8f, banner: ORANGE, ground: true }],
+    // Two lift towers at the platforms' south ends, up to Kelvin Grove Rd (OSM roofs 480017429 / 480017430,
+    // roof:shape=pyramidal, 3 levels; imagery about 10-11 m square with an X of ridges; photo
+    // Normanby_stn_looking_S: teal steel, pale louvres, glass, a wide thin white roof).
+    towers: [
+      { x: -853.3, y: 1103.5, w: 7.5, d: 7.5, h: 9.5, frame: 0x2a4a50, banner: ORANGE, hat: [1.7, 1.7], roof: 'pyramid' },
+      { x: -834, y: 1081.5, w: 7.5, d: 7.5, h: 9.5, frame: 0x2a4a50, banner: ORANGE, hat: [1.7, 1.7], roof: 'pyramid' },
+    ],
     ownRoofs: 40,
   },
   {
@@ -449,6 +540,14 @@ export const STATIONS: StationDef[] = [
     roof: 'vault',
     vault: { rib: 0x2e4b3c, spacing: 6, paired: true, rise: 4.2, spring: 4.6 },
     median: 'fence',
+    // The overbridge past the platforms' north ends between two light-blue towers with white pyramid roofs
+    // (OSM elevators (-528,1918), (-504,1914), footbridge 521961062; imagery about 11.5 m square).
+    overbridges: [{ x: -516.8, y: 1917.7, ax: 0.992, ay: -0.127, len: [-16.75, 16.75], w: 4, glass: 0x9fb7b0, frame: 0x6a9cc0, towers: true, towerW: 8.5, towerHat: [1.5, 1.5], towerRoof: 'pyramid', clear: 6.4 }],
+    // OSM's 7 m boxes for those two towers
+    ownBuildings: [
+      [-527.7, 1921.6],
+      [-503.9, 1913.9],
+    ],
     ownRoofs: 110,
   },
   {
@@ -470,11 +569,15 @@ export const STATIONS: StationDef[] = [
     ownRoofs: 190,
     // The two lift towers at the platforms' east ends (OSM 53118 / 53116, ~10 m square) joined by a
     // glazed overbridge across the busway (photo: Herston_busway_station_and_Northern_Busway).
-    overbridges: [{ x: 185.05, y: 2120.2, ax: 0.15, ay: 0.989, len: [-17, 17], w: 3.6, glass: 0x8fb3ad, frame: 0x2b2f33, towers: true, towerW: 9, clear: 6.2 }],
+    // Dark teal steel with white louvres and thin flat white hats (photo: Overbridge,_lifts_and_stairs_at_
+    // north_portal_of_Herston_Bus_Station).
+    overbridges: [{ x: 185.05, y: 2120.2, ax: 0.15, ay: 0.989, len: [-17, 17], w: 3.6, glass: 0x8fb3ad, frame: 0x1f4d52, towers: true, towerW: 9, towerHat: [1.6, 1.6], clear: 6.2 }],
     ownBuildings: [
       [187, 2132],
       [183, 2108],
     ],
+    // the flat entrance canopy with "Herston" lettering against the south tower's east face (same photo)
+    entrances: [{ x: 190.4, y: 2107.7, fx: 0.988, fy: -0.153, len: 8, d: 4.4, h: 3.2 }],
   },
   {
     key: 'rbwh',
@@ -491,6 +594,7 @@ export const STATIONS: StationDef[] = [
     tactile: 'charcoal',
     roof: 'flat',
     median: 'fence',
+    medianLights: true,
     // the white-banded concourse over the busway at the south end (imagery: x 537-565, y 2351-2388)
     concourse: { x: 551, y: 2369.5, ax: 0, ay: 1, len: [-18.5, 18.5], w: 28, clear: 5.4, h: 5.2 },
   },
@@ -527,10 +631,12 @@ export const DEFAULT_STATION: StationDef = {
 
 /**
  * The Inner Northern Busway's glazed / wire-mesh enclosures (QUT Kelvin Grove
- * to Herston): OSM maps each as a large `building=roof` over the busway. They
- * become arched vaults (the vault style of the nearest listed station).
+ * to Herston): OSM maps each as a large `building=roof` over the busway; the data
+ * carries them as pieces of about 190-750 m2 (cut every ~20 m, clipped off the
+ * platforms). They become arched vaults (the vault style of the nearest listed
+ * station). The zone's other roofs are small shelters under 100 m2.
  */
-const ENCLOSURE_ZONE = { x0: -640, y0: 1690, x1: 210, y1: 2215, minArea: 900 };
+const ENCLOSURE_ZONE = { x0: -640, y0: 1690, x1: 210, y1: 2215, minArea: 150 };
 
 function ringInfo(p: Float32Array): { cx: number; cy: number; area: number } {
   const n = p.length / 2;
