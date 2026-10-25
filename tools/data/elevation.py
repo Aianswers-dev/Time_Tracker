@@ -1465,11 +1465,17 @@ def build(lines: list[Line], water_out: list[dict], buildings: list[dict], areas
     platforms, buildings, bays, bay_segs = stations.build(roads, platforms or [], buildings)
     roads.extend(bays)
     segs.extend(bay_segs)
+    # walled station cuttings: their carriageways are not burned in (the grid keeps the streets' level
+    # up to the walls; the floor is the cutting's own)
+    cuts = stations.station_cuts(roads, platforms)
+    segs, ncut = drop_in_cuts(segs, cuts)
+    log(f"{ncut} at-grade polylines left out of the burn inside {len(cuts)} walled station cuttings")
     burned = BT.Grid(burn(ground, segs, np.isfinite(level_grid)), ground.x0, ground.y0, ground.cell)
     log(f"burned {len(segs)} at-grade polylines into the terrain in {time.time() - t:.1f}s")
     BT.write(burned, BT.outer_grid(coarse, burned),
-             {"roads": "inner grid has the at-grade roads and rail burned in (cuttings, embankments); ground under bridges and over tunnels is natural"})
-    building_bases(buildings, burned)
+             {"roads": "inner grid has the at-grade roads and rail burned in (cuttings, embankments); ground under bridges and over tunnels is natural",
+              "cuts": cuts})
+    building_bases(buildings, burned, cuts)
     buildings = stations.bridge_bases(buildings, roads, rail)
     buildings = stations.roof_bases(buildings, roads, platforms)
     report(stats, check)
@@ -1477,9 +1483,42 @@ def build(lines: list[Line], water_out: list[dict], buildings: list[dict], areas
     return roads, rail, platforms, buildings
 
 
-def building_bases(buildings: list[dict], grid) -> None:
-    """b["z"]: terrain at the footprint centroid (dm). Building parts take the
-    base of the outline that contains them, so towers sit on their podiums."""
+def drop_in_cuts(segs, cuts: list[dict]):
+    """The burn polylines (xy, z, half width) with their stretches inside a walled station cutting's
+    outline left out: (kept polylines, how many were cut short)."""
+    import build_terrain as BT
+
+    if not cuts:
+        return segs, 0
+    rings = [np.asarray(c["p"], dtype=np.float64).reshape(-1, 2) * 0.1 for c in cuts]
+    lo = np.min([r.min(0) for r in rings], axis=0)
+    hi = np.max([r.max(0) for r in rings], axis=0)
+    out = []
+    n = 0
+    for xy, z, hw in segs:
+        xy = np.asarray(xy, dtype=np.float64)
+        z = np.asarray(z, dtype=np.float64)
+        if len(xy) < 2 or (xy.max(0) < lo).any() or (xy.min(0) > hi).any():
+            out.append((xy, z, hw))
+            continue
+        rx, rz, _ = _resample(xy, z, 1.0)
+        inside = np.isfinite(BT.cut_floor(cuts, rx[:, 0], rx[:, 1]))
+        if not inside.any():
+            out.append((xy, z, hw))
+            continue
+        n += 1
+        keep = np.flatnonzero(~inside)
+        if len(keep):
+            for run in np.split(keep, np.flatnonzero(np.diff(keep) > 1) + 1):
+                if len(run) >= 2:
+                    out.append((rx[run], rz[run], hw))
+    return out, n
+
+
+def building_bases(buildings: list[dict], grid, cuts: list[dict] | None = None) -> None:
+    """b["z"]: terrain at the footprint centroid (dm), or the floor of the walled station
+    cutting it stands in. Building parts take the base of the outline that contains them, so
+    towers sit on their podiums."""
     if not buildings:
         return
     polys = np.asarray([shapely.Polygon(np.asarray(b["p"], dtype=np.float64).reshape(-1, 2) * 0.1) for b in buildings], dtype=object)
@@ -1492,6 +1531,11 @@ def building_bases(buildings: list[dict], grid) -> None:
             cx[i], cy[i] = p.mean(axis=0)
         cen = shapely.points(np.stack([cx, cy], 1))
     z = grid.sample(cx, cy)
+    if cuts:
+        import build_terrain as BT
+
+        fz = BT.cut_floor(cuts, cx, cy)
+        z = np.where(np.isfinite(fz), fz, z)
     part = np.asarray([bool(b.get("pt")) for b in buildings])
     if part.any() and (~part).any():
         outl = np.flatnonzero(~part)

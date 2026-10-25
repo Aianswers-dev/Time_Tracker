@@ -26,7 +26,7 @@ import type { TerrainField } from './terrain';
 import { greenBridgeSpan, storyOutline } from './landmarks';
 import { makeRoadTextTexture, makeSignTextTexture, makeTunnelSignTexture } from './textures';
 import { MASK_RAIL, MASK_WATER, clamp, pointInRing, yieldFrame } from './util';
-import { onAnyPlatform } from '../data/stations';
+import { STATIONS, onAnyPlatform } from '../data/stations';
 import { signalsFor } from '../data/signals';
 
 export const KERB_H = 0.15;
@@ -658,6 +658,24 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   const roads = data.roads;
   const infos = roads.map((r, i) => prepRoad(r, i));
   const index = new RoadIndex(roads, data.bounds);
+  // walled station cuttings (src/data/cuts.ts): their own walls and floor (stationCuttings()), no
+  // earthworks of the roads inside them
+  const stationCuts = field.stationCuts;
+  const nearStationCut = (ri: RI) => {
+    if (!stationCuts.pieces.length) return false;
+    const p = ri.r.pts;
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    for (let i = 0; i < p.length; i += 2) {
+      x0 = Math.min(x0, p[i]);
+      x1 = Math.max(x1, p[i]);
+      y0 = Math.min(y0, p[i + 1]);
+      y1 = Math.max(y1, p[i + 1]);
+    }
+    return stationCuts.near(x0 - ri.hw - 2, y0 - ri.hw - 2, x1 + ri.hw + 2, y1 + ri.hw + 2);
+  };
   const tunnels = new RoadIndex(roads, data.bounds, (r) => r.tunnel);
   // the stop lines of the signals (src/data/signals.ts: every controlled incoming arm of a junction whose
   // lights anyone can see), [x, y, z, ...], for mouthClear()
@@ -1369,6 +1387,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   clearSurfaces();
   // ---- nor through a platform's slab
   platformCuts();
+  // ---- the walled station cuttings: walls on their outlines, floors (once the ground around is settled)
+  stationCuttings();
 
   // ---- meshes
   const roadMat = roadMaterial(ctx);
@@ -1457,6 +1477,30 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     // (the last sample exactly at the end: the earthworks meet the next road's at the mitre line)
     if (ss.length > 1 && ss[ss.length - 1] >= ri.len - 0.5) ss[ss.length - 1] = ri.len;
     else if (ss[ss.length - 1] < ri.len) ss.push(ri.len);
+    // (and one where the road crosses a walled station cutting's outline: the cutting's own walls and
+    // floor take over inside it, see earthworks() and stationCuttings())
+    if (nearStationCut(ri)) {
+      const inside = (s: number) => {
+        const c = roadAt(ri, s);
+        return stationCuts.has(c.x, c.y);
+      };
+      for (let k = 0; k + 1 < ss.length; k++) {
+        let a = ss[k];
+        let b = ss[k + 1];
+        const ia = inside(a);
+        if (ia === inside(b)) continue;
+        for (let it = 0; it < 20; it++) {
+          const m = (a + b) / 2;
+          if (inside(m) === ia) a = m;
+          else b = m;
+        }
+        const m = (a + b) / 2;
+        if (m - ss[k] > 0.05 && ss[k + 1] - m > 0.05) {
+          ss.splice(k + 1, 0, m);
+          k++;
+        }
+      }
+    }
     return ss;
   }
 
@@ -1809,6 +1853,14 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       if (nb || below || onLower || (inJ && t !== 2)) type[k] = 0;
       else type[k] = t;
       if (t === 2 && (nb || inJ)) type[k] = 4; // cutting but open toward a neighbour: floor only
+    }
+    // inside a walled station cutting: none, its own walls and floor stand there (stationCuttings();
+    // gradeSamples() put a sample where the road crosses its outline)
+    if (nearStationCut(ri)) {
+      for (let k = 0; k < n; k++) {
+        const b = P[Math.min(n - 1, k + 1)];
+        if (stationCuts.has((P[k].x + b.x) / 2, (P[k].y + b.y) / 2)) type[k] = 0;
+      }
     }
     // A cutting wall that would stand on another road's floor out to a mapped retaining wall (on the
     // inside of a turn off a busway whose wall stands on the mapped line, as into the Cultural Centre
@@ -3436,6 +3488,218 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
    * cut's earth face is the bank behind it. Never where the ground falls well below the slab (a deck on
    * fill or piers keeps the ground under it).
    */
+  /**
+   * The walled station cuttings (MapData.terrain.cuts, src/data/cuts.ts; the terrain is carved along
+   * their outlines): Buranda's and Mater Hill's busway stations stand between block walls (a dark base,
+   * buff block above, photo BurandaStation.jpg) from the floor up to 0.9 m over the ground outside,
+   * under any deck or footbridge crossing over, solid boxes 0.45 m thick astride the outline. None where
+   * the outline opens onto what runs on beyond it: a carriageway at the floor's level (its own cutting
+   * takes over) or a tunnel's box (its portal stands there). The floor between the walls is concrete,
+   * and the carriageways inside, which stand up to a few decimetres over the floor's plane, get a kerb
+   * face down to it along their open edges.
+   */
+  function stationCuttings(): void {
+    const IN = 0.3; // wall face this far inside the outline
+    const OUT = 0.15; // its back this far outside
+    const STEP = 2;
+    const isBus = (q: number) => roads[q].bus || roads[q].kind === RoadKind.Busway;
+    const carriageway = (q: number) => roads[q].kind !== RoadKind.Pedestrian;
+    for (let ci = 0; ci < stationCuts.cuts.length; ci++) {
+      const cut = stationCuts.cuts[ci];
+      const p = cut.pts;
+      const n = p.length / 2;
+      if (n < 3) continue;
+      const fl = (x: number, y: number) => stationCuts.floor(ci, x, y);
+      let cx = 0;
+      let cy = 0;
+      for (let k = 0; k < n; k++) {
+        cx += p[2 * k] / n;
+        cy += p[2 * k + 1] / n;
+      }
+      const L = layerFor(cx, cy);
+      const st = L.struct;
+      // footbridges over the cutting (src/data/stations.ts; their decks stand `clear` over the busway,
+      // src/game/stations.ts): the wall stops under the deck's slab
+      const decks: { x: number; y: number; ax: number; ay: number; s0: number; s1: number; w: number; under: number }[] = [];
+      for (const def of STATIONS) {
+        for (const o of def.overbridges ?? []) {
+          if (Math.hypot(o.x - cx, o.y - cy) > 150) continue;
+          const hit = index.nearest(o.x, o.y, 40, isBus);
+          const ax = o.ax ?? (hit ? -hit.dy : 0);
+          const ay = o.ay ?? (hit ? hit.dx : 0);
+          const zb = hit ? hit.z : fl(o.x, o.y);
+          decks.push({ x: o.x, y: o.y, ax, ay, s0: o.len[0], s1: o.len[1], w: o.w / 2 + 0.6, under: zb + (o.clear ?? 6.4) - 0.92 });
+        }
+      }
+      const deckOver = (x: number, y: number) => {
+        let z = Infinity;
+        for (const d of decks) {
+          const s = (x - d.x) * d.ax + (y - d.y) * d.ay;
+          const o = (x - d.x) * -d.ay + (y - d.y) * d.ax;
+          if (s >= d.s0 - 0.6 && s <= d.s1 + 0.6 && Math.abs(o) <= d.w) z = Math.min(z, d.under);
+        }
+        return z;
+      };
+      // outward unit normal of edge k (the outline is counter-clockwise: outward is to the right)
+      const nrm = (k: number): [number, number] => {
+        const k2 = (k + 1) % n;
+        const ex = p[2 * k2] - p[2 * k];
+        const ey = p[2 * k2 + 1] - p[2 * k + 1];
+        const l = Math.hypot(ex, ey) || 1;
+        return [ey / l, -ex / l];
+      };
+      /** Corner k offset outward by `off` along the mitre of its two edges. */
+      const corner = (k: number, off: number): [number, number] => {
+        const [ax, ay] = nrm((k + n - 1) % n);
+        const [bx, by] = nrm(k);
+        let mx = ax + bx;
+        let my = ay + by;
+        const ml = Math.hypot(mx, my);
+        if (ml < 1e-6) [mx, my] = [bx, by];
+        else [mx, my] = [mx / ml, my / ml];
+        const sc = Math.min(3, 1 / Math.max(0.33, mx * bx + my * by));
+        return [p[2 * k] + mx * off * sc, p[2 * k + 1] + my * off * sc];
+      };
+      /** Top of the wall at outline point (x, y) with outward normal (ox, oy): 0.9 m over the ground behind it, under a deck. */
+      const topAt = (x: number, y: number, ox: number, oy: number) => {
+        let g = -Infinity;
+        for (const o of [0.05, OUT, 0.6]) g = Math.max(g, groundAt(x + ox * o, y + oy * o));
+        const z0 = fl(x, y);
+        const deck = Math.min(deckOver(x, y), deckSoffit(x + ox * OUT, y + oy * OUT, z0));
+        return Math.max(z0 + 1.0, Math.min(Math.max(g + 0.9, z0 + 1.2), deck));
+      };
+      /** The outline opens at (x, y) (0.6 m outside it): onto another cutting, a tunnel's box, or a carriageway at the floor's level. */
+      const opens = (x: number, y: number) => {
+        const z = fl(x, y);
+        if (field.cutsAt(x, y).some((c) => !c.plane)) return true;
+        if (field.roofAt(x, y) > -Infinity) return true;
+        if (tunnels.penetrationZ(x, y, z, 2.5, -1, carriageway) > -0.3) return true;
+        return index.penetrationZ(x, y, z, 2.5, -1, carriageway) > -0.3;
+      };
+      // each corner's top: the higher of its two edges' (so the caps meet level at the mitre)
+      const cornerTop = Array.from({ length: n }, (_, k) => {
+        const [ax, ay] = nrm((k + n - 1) % n);
+        const [bx, by] = nrm(k);
+        return Math.max(topAt(p[2 * k], p[2 * k + 1], ax, ay), topAt(p[2 * k], p[2 * k + 1], bx, by));
+      });
+      // per edge: its pieces of up to STEP m, and which of them open
+      const opensOf = Array.from({ length: n }, (_, k) => {
+        const k2 = (k + 1) % n;
+        const ax = p[2 * k];
+        const ay = p[2 * k + 1];
+        const bx = p[2 * k2];
+        const by = p[2 * k2 + 1];
+        const len = Math.hypot(bx - ax, by - ay);
+        const [ox, oy] = nrm(k);
+        const m = Math.max(1, Math.ceil(len / STEP));
+        const open: boolean[] = [];
+        for (let q = 0; q < m; q++) {
+          const t = (q + 0.5) / m;
+          open.push(len < 0.05 || opens(ax + (bx - ax) * t + ox * 0.6, ay + (by - ay) * t + oy * 0.6));
+        }
+        return open;
+      });
+      let nWall = 0;
+      for (let k = 0; k < n; k++) {
+        const k2 = (k + 1) % n;
+        const ax = p[2 * k];
+        const ay = p[2 * k + 1];
+        const bx = p[2 * k2];
+        const by = p[2 * k2 + 1];
+        const len = Math.hypot(bx - ax, by - ay);
+        if (len < 0.05) continue;
+        const [ox, oy] = nrm(k);
+        const ux = (bx - ax) / len;
+        const uy = (by - ay) / len;
+        const [iax, iay] = corner(k, -IN);
+        const [ibx, iby] = corner(k2, -IN);
+        const [oax, oay] = corner(k, OUT);
+        const [obx, oby] = corner(k2, OUT);
+        const open = opensOf[k];
+        const m = open.length;
+        const tops: number[] = [];
+        for (let q = 0; q <= m; q++) {
+          const t = q / m;
+          tops.push(q === 0 ? cornerTop[k] : q === m ? cornerTop[k2] : topAt(ax + (bx - ax) * t, ay + (by - ay) * t, ox, oy));
+        }
+        const ptAt = (t: number) => {
+          const ix = iax + (ibx - iax) * t;
+          const iy = iay + (iby - iay) * t;
+          const qx = oax + (obx - oax) * t;
+          const qy = oay + (oby - oay) * t;
+          return { ix, iy, qx, qy, z: fl(ax + (bx - ax) * t, ay + (by - ay) * t) };
+        };
+        for (let q = 0; q < m; q++) {
+          if (open[q]) continue;
+          const A = ptAt(q / m);
+          const B = ptAt((q + 1) / m);
+          const ta = tops[q];
+          const tb = tops[q + 1];
+          const za = A.z - 0.2;
+          const zb = B.z - 0.2;
+          // face toward the station: a dark base to 1 m, buff block above
+          const da = Math.min(ta, A.z + 1.0);
+          const db = Math.min(tb, B.z + 1.0);
+          st.quad(st.vert(A.ix, za, A.iy, ...BASE_DARK), st.vert(B.ix, zb, B.iy, ...BASE_DARK), st.vert(B.ix, db, B.iy, ...BASE_DARK), st.vert(A.ix, da, A.iy, ...BASE_DARK), -ox, 0, oy);
+          if (ta > da + 0.01 || tb > db + 0.01) st.quad(st.vert(A.ix, da, A.iy, ...BUFF), st.vert(B.ix, db, B.iy, ...BUFF), st.vert(B.ix, tb, B.iy, ...BUFF), st.vert(A.ix, ta, A.iy, ...BUFF), -ox, 0, oy);
+          // cap, and the back (in the ground but for the parapet)
+          st.quad(st.vert(A.ix, ta, A.iy, ...CONC), st.vert(B.ix, tb, B.iy, ...CONC), st.vert(B.qx, tb, B.qy, ...CONC), st.vert(A.qx, ta, A.qy, ...CONC), 0, 1, 0);
+          st.quad(st.vert(A.qx, za, A.qy, ...WALL), st.vert(B.qx, zb, B.qy, ...WALL), st.vert(B.qx, tb, B.qy, ...WALL), st.vert(A.qx, ta, A.qy, ...WALL), ox, 0, -oy);
+          // ends of a run (beside an opening): close the box
+          const endFace = (E: typeof A, top: number, dx: number, dy: number) =>
+            st.quad(st.vert(E.ix, E.z - 0.2, E.iy, ...WALL), st.vert(E.qx, E.z - 0.2, E.qy, ...WALL), st.vert(E.qx, top, E.qy, ...WALL), st.vert(E.ix, top, E.iy, ...WALL), dx, 0, -dy);
+          // (at a corner, the neighbouring edge's piece there)
+          const before = opensOf[(k + n - 1) % n];
+          const prevOpen = q > 0 ? open[q - 1] : before[before.length - 1];
+          const nextOpen = q + 1 < m ? open[q + 1] : opensOf[k2][0];
+          if (prevOpen) endFace(A, ta, -ux, -uy);
+          if (nextOpen) endFace(B, tb, ux, uy);
+          wallLog.ramp(A.ix, A.iy, B.ix, B.iy, za - 0.2, ta, zb - 0.2, tb, EW_RETAINING, -1, false);
+          if (prevOpen) wallLog.add(A.ix, A.iy, A.qx, A.qy, za - 0.2, ta, EW_RETAINING, -1, false);
+          if (nextOpen) wallLog.add(B.ix, B.iy, B.qx, B.qy, zb - 0.2, tb, EW_RETAINING, -1, false);
+          nWall++;
+        }
+      }
+      // the floor: concrete, just under the carriageways (the plane is the lowest of them)
+      const fu = (x: number, y: number) => x * 0.6 + y * 0.8;
+      for (const pc of stationCuts.pieces) {
+        if (pc.cut !== ci) continue;
+        const v = pc.pts;
+        const vs: number[] = [];
+        for (let k = 0; k < v.length; k += 2) vs.push(L.foot.vert(v[k], fl(v[k], v[k + 1]) - 0.04, v[k + 1], 2, fu(v[k], v[k + 1]), 2));
+        for (let k = 1; k + 1 < vs.length; k++) L.foot.tri(vs[0], vs[k], vs[k + 1], 0, 1, 0);
+      }
+      // kerb faces down to the floor along the carriageways' open edges inside the cutting
+      let nKerb = 0;
+      for (const ri of infos) {
+        const r = ri.r;
+        if (r.tunnel || r.bridge || r.kind === RoadKind.Pedestrian || ri.n < 2 || !nearStationCut(ri)) continue;
+        for (const side of [1, -1]) {
+          let prev: { x: number; y: number; zt: number; zf: number } | null = null;
+          const steps = Math.max(1, Math.ceil(ri.len / 1.5));
+          for (let q = 0; q <= steps; q++) {
+            const c = roadAt(ri, (ri.len * q) / steps);
+            const x = c.x + c.nx * side * ri.hw;
+            const y = c.y + c.ny * side * ri.hw;
+            const bx2 = c.x + c.nx * side * (ri.hw + 0.25);
+            const by2 = c.y + c.ny * side * (ri.hw + 0.25);
+            const zt = c.z + ri.lift - 0.005;
+            const zf = stationCuts.at(x, y) === ci ? fl(x, y) - 0.05 : NaN;
+            // (not where another carriageway or a platform carries on beyond the edge)
+            const ok = zf === zf && zt - zf > 0.08 && index.penetrationZ(bx2, by2, c.z, 0.6, ri.i, carriageway) <= 0 && !onAnyPlatform(data.platforms, bx2, by2, 0);
+            const cur = ok ? { x, y, zt, zf } : null;
+            if (cur && prev) {
+              st.quad(st.vert(prev.x, prev.zf, prev.y, ...CONC), st.vert(cur.x, cur.zf, cur.y, ...CONC), st.vert(cur.x, cur.zt, cur.y, ...CONC), st.vert(prev.x, prev.zt, prev.y, ...CONC), c.nx * side, 0, -c.ny * side);
+              nKerb++;
+            }
+            prev = cur;
+          }
+        }
+      }
+      console.info(`[roads] station cutting ${cut.name}: ${nWall} wall pieces, ${nKerb} kerb faces`);
+    }
+  }
+
   function platformCuts(): void {
     const isBus = (q: number) => roads[q].bus || roads[q].kind === RoadKind.Busway;
     /** Carve one piece of a slab (3 or 4 corners) out of the ground where the ground rises through it. */

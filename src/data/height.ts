@@ -1,7 +1,8 @@
 /**
  * Height queries shared by the world, physics and traffic.
  *
- * - `ground(x, y)`: natural terrain (at-grade roads are burned into it).
+ * - `ground(x, y)`: natural terrain (at-grade roads are burned into it); inside a walled station
+ *   cutting's outline, its floor (src/data/cuts.ts).
  * - `surfaceAt(x, y, hintZ)`: the road surface a vehicle at (x, y) is on.
  *   Where roads stack (viaduct over a street, street over a tunnel) the hint
  *   (the vehicle's current height) picks the level, so a bus in the King
@@ -12,6 +13,7 @@
  * All heights are metres AHD; three.js y = height.
  */
 import type { MapData, Road, Route, TerrainGrids } from '../types';
+import { type CutIndex, cutIndexFor } from './cuts';
 
 export interface Surface {
   z: number;
@@ -36,9 +38,12 @@ export class Heights {
   /** Per cell: start offset into `segs`; segment entries are (road << 12 | vertex). */
   private readonly start: Uint32Array;
   private readonly segs: Uint32Array;
+  /** Walled station cuttings: the floor inside their outlines. */
+  readonly cuts: CutIndex;
 
   constructor(data: MapData) {
     this.t = data.terrain;
+    this.cuts = cutIndexFor(data.terrain);
     this.waterLevel = data.terrain.waterLevel;
     this.roads = data.roads;
     const [bx0, by0, bx1, by1] = data.bounds;
@@ -77,8 +82,10 @@ export class Heights {
     return Math.max(0, Math.min(this.ny - 1, Math.floor((y - this.y0) / CELL)));
   }
 
-  /** Terrain height (m AHD), bilinear; fine grid inside the map, coarse horizon grid outside. */
+  /** Terrain height (m AHD), bilinear; fine grid inside the map, coarse horizon grid outside; a walled station cutting's floor inside its outline. */
   ground(x: number, y: number): number {
+    const f = this.cuts.floorAt(x, y);
+    if (f === f) return f;
     for (const g of this.t.grids) {
       const fx = (x - g.x0) / g.cell;
       const fy = (y - g.y0) / g.cell;

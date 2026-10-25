@@ -6,8 +6,15 @@
  * rail corridors (so the ground never covers a carriageway), and cells under
  * deep cuttings are removed (`hole`) so open cuttings are really open; the
  * corridor builder covers the hole edges with walls and cap strips.
+ *
+ * The walled station cuttings (MapData.terrain.cuts, src/data/cuts.ts) are
+ * carved out exactly along their outlines, with the floor inside them as the
+ * ground (natAt, renAt, settledAt); the grid vertices inside an outline keep
+ * the natural ground (see settle()), so the ground outside runs level up to
+ * the walls (src/world/roads.ts stands them on the outlines).
  */
 import * as THREE from 'three';
+import { type CutIndex, type CutPiece, cutIndexFor } from '../data/cuts';
 import { AreaKind, type MapData } from '../types';
 import type { Ctx } from './ctx';
 import { NOISE_GLSL, patch } from './shaders';
@@ -34,6 +41,15 @@ export class TerrainField {
   readonly ony: number;
   readonly oh: Float32Array;
   readonly waterLevel: number;
+  /** Walled station cuttings: the floor is the ground inside their outlines. */
+  readonly stationCuts: CutIndex;
+  /**
+   * Per vertex: the lowest height a clamp from outside every station cutting allows (cap counts the
+   * clamps of the roads inside one too); and 1 for the vertices inside a cutting's outline, which
+   * settle() lifts back to the natural ground (or that cap).
+   */
+  private readonly capOut: Float32Array;
+  private readonly cutVert: Uint8Array;
 
   constructor(data: MapData) {
     const t = data.terrain;
@@ -56,6 +72,33 @@ export class TerrainField {
     this.ony = outer.ny;
     this.oh = outer.h;
     this.waterLevel = t.waterLevel;
+    this.stationCuts = cutIndexFor(t);
+    this.capOut = new Float32Array(this.stationCuts.pieces.length ? this.nx * this.ny : 0).fill(Infinity);
+    this.cutVert = new Uint8Array(this.stationCuts.pieces.length ? this.nx * this.ny : 0);
+    for (const p of this.stationCuts.pieces) this.carveStationPiece(p);
+  }
+
+  /** Carve one convex piece of a station cutting's outline exactly (earth faces down to its floor), and mark the grid vertices inside it. */
+  private carveStationPiece(p: CutPiece): void {
+    const c = this.cell;
+    const f = this.stationCuts.cuts[p.cut].floor;
+    const cut = makePolyCut(p.pts, f);
+    this.cutList.push(cut);
+    const i0 = Math.max(0, Math.floor((p.x0 - this.x0) / c));
+    const i1 = Math.min(this.nx - 2, Math.floor((p.x1 - this.x0) / c));
+    const j0 = Math.max(0, Math.floor((p.y0 - this.y0) / c));
+    const j1 = Math.min(this.ny - 2, Math.floor((p.y1 - this.y0) / c));
+    for (let j = j0; j <= j1; j++) {
+      for (let i = i0; i <= i1; i++) {
+        if (!squareMeetsPoly(p.pts, this.x0 + (i + 0.5) * c, this.y0 + (j + 0.5) * c, c / 2)) continue;
+        const k = j * (this.nx - 1) + i;
+        this.hole[k] = 1;
+        let l = this.cuts.get(k);
+        if (!l) this.cuts.set(k, (l = []));
+        l.push(cut);
+      }
+    }
+    for (let j = j0; j <= j1 + 1; j++) for (let i = i0; i <= i1 + 1; i++) if (cutHas(cut, this.x0 + i * c, this.y0 + j * c)) this.cutVert[j * this.nx + i] = 1;
   }
 
   /** Inner grid extent [x0, y0, x1, y1]. */
@@ -81,8 +124,10 @@ export class TerrainField {
     return (h[k] * (1 - tx) + h[k + 1] * tx) * (1 - ty) + (h[k + this.onx] * (1 - tx) + h[k + this.onx + 1] * tx) * ty;
   }
 
-  /** Natural ground (bilinear, as Heights.ground). */
+  /** Natural ground (bilinear, as Heights.ground; a station cutting's floor inside its outline). */
   natAt(x: number, y: number): number {
+    const sf = this.stationCuts.floorAt(x, y);
+    if (sf === sf) return sf;
     const fx = (x - this.x0) / this.cell;
     const fy = (y - this.y0) / this.cell;
     if (fx < 0 || fy < 0 || fx > this.nx - 1 || fy > this.ny - 1) return this.outerAt(x, y);
@@ -95,8 +140,10 @@ export class TerrainField {
     return (h[k] * (1 - tx) + h[k + 1] * tx) * (1 - ty) + (h[k + this.nx] * (1 - tx) + h[k + this.nx + 1] * tx) * ty;
   }
 
-  /** Rendered ground height, exactly matching the mesh triangulation (diagonal a-c). */
+  /** Rendered ground height, exactly matching the mesh triangulation (diagonal a-c); a station cutting's floor inside its outline. */
   renAt(x: number, y: number): number {
+    const sf = this.stationCuts.floorAt(x, y);
+    if (sf === sf) return sf;
     const fx = (x - this.x0) / this.cell;
     const fy = (y - this.y0) / this.cell;
     if (fx < 0 || fy < 0 || fx > this.nx - 1 || fy > this.ny - 1) return this.outerAt(x, y);
@@ -118,9 +165,12 @@ export class TerrainField {
   /**
    * The ground as settle() will leave it, given the clamps and buried roofs
    * recorded so far (later clamps can only lower it): never below the
-   * natural ground except where a road clamp holds it down.
+   * natural ground except where a road clamp holds it down. Inside a station
+   * cutting's outline, its floor.
    */
   settledAt(x: number, y: number): number {
+    const sf = this.stationCuts.floorAt(x, y);
+    if (sf === sf) return sf;
     const fx = (x - this.x0) / this.cell;
     const fy = (y - this.y0) / this.cell;
     if (fx < 0 || fy < 0 || fx > this.nx - 1 || fy > this.ny - 1) return this.outerAt(x, y);
@@ -129,17 +179,29 @@ export class TerrainField {
     const tx = fx - i;
     const ty = fy - j;
     const k = j * this.nx + i;
-    const v = (q: number) => {
-      const r = this.ren[q];
-      const f = this.floor[q] + 0.3;
-      return f > r ? Math.max(r, Math.min(f, this.cap[q])) : r;
-    };
-    const a = v(k);
-    const b = v(k + 1);
-    const c = v(k + this.nx + 1);
-    const d = v(k + this.nx);
+    const a = this.settledVert(k);
+    const b = this.settledVert(k + 1);
+    const c = this.settledVert(k + this.nx + 1);
+    const d = this.settledVert(k + this.nx);
     if (tx >= ty) return a + (b - a) * tx + (c - b) * ty;
     return a + (c - d) * tx + (d - a) * ty;
+  }
+
+  /** Grid vertex q as settle() will leave it (see settledAt). */
+  private settledVert(q: number): number {
+    const r = this.ren[q];
+    const f = this.floor[q] + 0.3;
+    let v = f > r ? Math.max(r, Math.min(f, this.cap[q])) : r;
+    // inside a station cutting's outline: the natural ground, unless a road outside holds it down
+    if (this.cutVert.length && this.cutVert[q]) v = Math.max(v, Math.min(this.nat[q], this.capOut[q]));
+    return v;
+  }
+
+  /** Record a clamp of grid vertex k to z: `outside` when what clamps it lies outside every station cutting. */
+  private clampVert(k: number, z: number, outside: boolean): void {
+    if (z < this.ren[k]) this.ren[k] = z;
+    if (z < this.cap[k]) this.cap[k] = z;
+    if (outside && this.capOut.length && z < this.capOut[k]) this.capOut[k] = z;
   }
 
   /** True if (x, y) falls in a carved-out cell. */
@@ -162,6 +224,8 @@ export class TerrainField {
     const j0 = Math.max(0, Math.ceil((Math.min(...ys) - this.y0) / this.cell));
     const j1 = Math.min(this.ny - 1, Math.floor((Math.max(...ys) - this.y0) / this.cell));
     if (i1 < i0 || j1 < j0) return;
+    // (a surface inside a station cutting holds the ground down only until settle(): see cutVert)
+    const outside = !this.stationCuts.has((xs[0] + xs[1] + xs[2] + xs[3]) / 4, (ys[0] + ys[1] + ys[2] + ys[3]) / 4);
     for (let j = j0; j <= j1; j++) {
       const y = this.y0 + j * this.cell;
       for (let i = i0; i <= i1; i++) {
@@ -169,10 +233,7 @@ export class TerrainField {
         let z = triZ(q, 0, 3, 6, x, y);
         if (z === null) z = triZ(q, 0, 6, 9, x, y);
         if (z === null) continue;
-        const k = j * this.nx + i;
-        const v = z - margin;
-        if (v < this.ren[k]) this.ren[k] = v;
-        if (v < this.cap[k]) this.cap[k] = v;
+        this.clampVert(j * this.nx + i, z - margin, outside);
       }
     }
   }
@@ -229,11 +290,7 @@ export class TerrainField {
     const j = Math.min(this.ny - 2, Math.floor(fy));
     const k = j * this.nx + i;
     const vs = fx - i >= fy - j ? [k, k + 1, k + this.nx + 1] : [k, k + this.nx + 1, k + this.nx];
-    const t = vs.map((q) => {
-      const r = this.ren[q];
-      const f = this.floor[q] + 0.3;
-      return (f > r ? Math.max(r, Math.min(f, this.cap[q])) : r) - d;
-    });
+    const t = vs.map((q) => this.settledVert(q) - d);
     const dr = (this.dropped ??= new Float32Array(this.nx * this.ny));
     const hw = this.nx - 1;
     for (let m = 0; m < 3; m++) {
@@ -244,21 +301,24 @@ export class TerrainField {
       for (let cj = Math.max(0, vj - 1); cj <= Math.min(this.ny - 2, vj); cj++)
         for (let ci = Math.max(0, vi - 1); ci <= Math.min(hw - 1, vi); ci++) if (this.hole[cj * hw + ci] === 1) return false;
     }
+    const outside = !this.stationCuts.has(x, y);
     for (let m = 0; m < 3; m++) {
       const q = vs[m];
       dr[q] += d;
-      if (t[m] < this.ren[q]) this.ren[q] = t[m];
-      if (t[m] < this.cap[q]) this.cap[q] = t[m];
+      this.clampVert(q, t[m], outside);
     }
     return true;
   }
 
-  /** After all earthworks: lift ground that sags into a shallow tunnel roof (never above a road clamp). */
+  /**
+   * After all earthworks: lift ground that sags into a shallow tunnel roof (never above a road clamp).
+   * The grid vertices inside a station cutting's outline go back up to the natural ground (unless a
+   * road outside the cutting holds one down): the roads inside clamped them, but the cutting is carved
+   * out exactly, and they only shape the ground outside the walls, which runs level up to them.
+   */
   settle(): void {
-    const { ren, floor, cap } = this;
-    for (let k = 0; k < ren.length; k++) {
-      if (floor[k] + 0.3 > ren[k]) ren[k] = Math.max(ren[k], Math.min(floor[k] + 0.3, cap[k]));
-    }
+    const { ren } = this;
+    for (let k = 0; k < ren.length; k++) ren[k] = this.settledVert(k);
   }
 
   /**
@@ -387,6 +447,65 @@ export interface Cut {
   y1: number;
   /** The quad as given (x, y, z per corner). */
   q: number[];
+  /** A station cutting's piece: its floor is this plane (z = a + b x + c y), not along a -> b. */
+  plane?: [number, number, number];
+}
+
+/** A convex piece (counter-clockwise corners, flat x, y) of a station cutting with floor plane f, as a Cut. */
+function makePolyCut(pts: number[], f: [number, number, number]): Cut {
+  const hx: number[] = [];
+  const hy: number[] = [];
+  const hd: number[] = [];
+  const n = pts.length / 2;
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  for (let k = 0; k < n; k++) {
+    const ax = pts[2 * k];
+    const ay = pts[2 * k + 1];
+    const ex = pts[(2 * k + 2) % pts.length] - ax;
+    const ey = pts[(2 * k + 3) % pts.length] - ay;
+    x0 = Math.min(x0, ax);
+    x1 = Math.max(x1, ax);
+    y0 = Math.min(y0, ay);
+    y1 = Math.max(y1, ay);
+    const l = Math.hypot(ex, ey);
+    if (l < 1e-6) continue;
+    hx.push(ey / l);
+    hy.push(-ex / l);
+    hd.push((ey * ax - ex * ay) / l);
+  }
+  const z = (x: number, y: number) => f[0] + f[1] * x + f[2] * y;
+  return { hx, hy, hd, ax: pts[0], ay: pts[1], bx: pts[2], by: pts[3], za: z(pts[0], pts[1]), zb: z(pts[2], pts[3]), roof: false, minor: false, x0: x0 - 0.01, y0: y0 - 0.01, x1: x1 + 0.01, y1: y1 + 0.01, q: [], plane: f };
+}
+
+/** Separating-axis test: does the axis-aligned square (centre, half size) overlap the convex polygon (flat x, y)? */
+function squareMeetsPoly(p: number[], cx: number, cy: number, half: number): boolean {
+  const axes: [number, number][] = [
+    [1, 0],
+    [0, 1],
+  ];
+  const n = p.length / 2;
+  for (let k = 0; k < n; k++) {
+    const ex = p[(2 * k + 2) % p.length] - p[2 * k];
+    const ey = p[(2 * k + 3) % p.length] - p[2 * k + 1];
+    const l = Math.hypot(ex, ey);
+    if (l > 1e-6) axes.push([-ey / l, ex / l]);
+  }
+  for (const [ax, ay] of axes) {
+    const c = cx * ax + cy * ay;
+    const r = half * (Math.abs(ax) + Math.abs(ay));
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let k = 0; k < p.length; k += 2) {
+      const v = p[k] * ax + p[k + 1] * ay;
+      lo = Math.min(lo, v);
+      hi = Math.max(hi, v);
+    }
+    if (c + r < lo || c - r > hi) return false;
+  }
+  return true;
 }
 
 function makeCut(q: number[], expand: number, roof: boolean, endExpand: number, minor = false): Cut | null {
@@ -474,8 +593,9 @@ function cutHas(c: Cut, x: number, y: number): boolean {
   return true;
 }
 
-/** Floor height of a cut at (x, y): along its first edge. */
+/** Floor height of a cut at (x, y): along its first edge (a station cutting's: its plane). */
 function cutFloor(c: Cut, x: number, y: number): number {
+  if (c.plane) return c.plane[0] + c.plane[1] * x + c.plane[2] * y;
   const dx = c.bx - c.ax;
   const dy = c.by - c.ay;
   const l2 = dx * dx + dy * dy;

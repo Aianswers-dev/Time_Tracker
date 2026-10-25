@@ -26,5 +26,77 @@
   }
  ],
  "attribution": "Terrain: Mapzen Terrain Tiles (AWS Open Data). Australia terrain data \u00a9 Commonwealth of Australia (Geoscience Australia) 2017; SRTM and GMTED2010 terrain data courtesy of the U.S. Geological Survey; ETOPO1 terrain data U.S. National Oceanic and Atmospheric Administration.",
- "roads": "inner grid has the at-grade roads and rail burned in (cuttings, embankments); ground under bridges and over tunnels is natural"
+ "roads": "inner grid has the at-grade roads and rail burned in (cuttings, embankments); ground under bridges and over tunnels is natural",
+ "cuts": [
+  {
+   "n": "Buranda",
+   "p": [
+    15439,
+    -31356,
+    15718,
+    -31690,
+    15752,
+    -31662,
+    15818,
+    -31729,
+    15926,
+    -31642,
+    15943,
+    -31664,
+    15998,
+    -31621,
+    15664,
+    -31208,
+    15627,
+    -31237,
+    15592,
+    -31206,
+    15461,
+    -31313,
+    15473,
+    -31328
+   ],
+   "f": [
+    96.2915,
+    -0.0154081,
+    0.0200926
+   ]
+  },
+  {
+   "n": "Mater Hill",
+   "p": [
+    4927,
+    -17402,
+    4912,
+    -17399,
+    4933,
+    -17272,
+    4951,
+    -17274,
+    4962,
+    -17199,
+    4648,
+    -17146,
+    4639,
+    -17146,
+    4630,
+    -17151,
+    4622,
+    -17175,
+    4590,
+    -17369,
+    4604,
+    -17372,
+    4594,
+    -17423,
+    4916,
+    -17478
+   ],
+   "f": [
+    24.7143,
+    -0.0178577,
+    -0.0009406
+   ]
+  }
+ ]
 }

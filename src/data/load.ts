@@ -142,6 +142,8 @@ interface RawTerrainHeader {
   waterLevel: number;
   attribution: string;
   grids: { name: string; x0: number; y0: number; cell: number; nx: number; ny: number; byteOffset: number }[];
+  /** Walled station cuttings: outline (dm, counter-clockwise) and floor plane [a, b, c] (m). */
+  cuts?: { n: string; p: number[]; f: [number, number, number] }[];
 }
 
 /** terrain.json header + terrain.bin (uint16 little-endian, h = v * scale + offset). */
@@ -161,5 +163,6 @@ async function loadTerrain(onBytes: (n: number) => void): Promise<TerrainGrids> 
       for (let i = 0; i < n; i++) h[i] = view.getUint16(g.byteOffset + i * 2, true) * header.scale + header.offset;
       return { name: g.name, x0: g.x0, y0: g.y0, cell: g.cell, nx: g.nx, ny: g.ny, h };
     }),
+    ...(header.cuts?.length ? { cuts: header.cuts.map((c) => ({ name: c.n, pts: dm(c.p), floor: c.f })) } : {}),
   };
 }

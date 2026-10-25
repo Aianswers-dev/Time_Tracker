@@ -234,6 +234,21 @@ export interface TerrainGrids {
   /** Fine grid over the map first, then a coarse horizon grid. */
   grids: { name: string; x0: number; y0: number; cell: number; nx: number; ny: number; h: Float32Array }[];
   attribution: string;
+  /**
+   * Walled station cuttings (Buranda, Mater Hill busway stations): inside each outline the ground is
+   * the cutting's floor, outside it the grids (which keep the streets' level up to the walls). Read
+   * through src/data/cuts.ts (Heights.ground, TerrainField); the walls stand on the outlines
+   * (src/world/roads.ts).
+   */
+  cuts?: StationCut[];
+}
+
+export interface StationCut {
+  name: string;
+  /** Outline, flat [x, y, ...] counter-clockwise (map metres). */
+  pts: Float32Array;
+  /** Floor plane: z = floor[0] + floor[1] * x + floor[2] * y (m AHD). */
+  floor: [number, number, number];
 }
 
 // ---------------------------------------------------------------------------

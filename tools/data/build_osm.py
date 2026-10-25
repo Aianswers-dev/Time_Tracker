@@ -809,8 +809,8 @@ def signal_roads(signal_nodes, lines, roads):
         ln = r.get("_ln")
         if ln is not None:
             recs_of.setdefault(id(ln), []).append(i)
-    inner, outer, _ = build_terrain.read_terrain()
-    ground = build_terrain.ground_sampler(inner, outer)
+    inner, outer, head = build_terrain.read_terrain()
+    ground = build_terrain.ground_sampler(inner, outer, head.get("cuts"))
     rr, dd, zz = [], [], []
     for nid, x, y, d in signal_nodes:
         best = None

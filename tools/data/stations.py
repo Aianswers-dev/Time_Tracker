@@ -1040,6 +1040,107 @@ def build(roads: list[dict], platforms: list[dict], buildings: list[dict]):
 
 
 # ---------------------------------------------------------------------------
+# Walled station cuttings
+
+# Busway stations in cuttings between vertical walls from the busway's level up to the streets
+# around: Buranda (block walls terraced up to the Pacific Motorway, photo BurandaStation.jpg) and
+# Mater Hill (buff block walls under Stanley Street and the Mater buildings).
+CUT_STATIONS = ("Buranda", "Mater Hill")
+CUT_GAP = 1.0  # m: the walls stand this far out from the platforms' backs and the carriageways' edges
+CUT_PORTAL = 12.0  # m: a bus tunnel's end this close beyond the platforms' ends closes the cutting there
+CUT_REACH = 25.0  # m: carriageways this close to the platforms belong to the station
+
+
+def station_cuts(roads: list[dict], platforms: list[dict]) -> list[dict]:
+    """Walled station cuttings, which a 10 m terrain grid can't hold: its cells slope the walls'
+    tops down to the busway. Each becomes an outline with a floor plane ("cuts" in terrain.json):
+    the grid keeps the real ground there (the station's carriageways are not burned into it, see
+    elevation.build), and the game reads the floor inside the outline (src/data/cuts.ts, for
+    Heights.ground and TerrainField) and stands the walls on its edge (src/world/roads.ts).
+
+    The outline: the station's platforms and its at-grade bus carriageways (busway and bays), CUT_GAP
+    m out, between the platforms' ends, or the bus tunnels' ends within CUT_PORTAL m beyond them (the
+    cutting ends at the portals). The floor: the plane through the carriageways, lowered to the lowest
+    of them. Returns [{"n": name, "p": ring (dm, counter-clockwise), "f": [a, b, c]}], the floor
+    z = a + b x + c y (m)."""
+    out = []
+    for name in CUT_STATIONS:
+        pls = [shapely.Polygon(ring(pl["p"])).buffer(0) for pl in platforms
+               if pl.get("a") and name.lower() in (pl.get("n") or "").lower() and len(pl["p"]) >= 6]
+        if not pls:
+            log(f"cut {name}: no platforms")
+            continue
+        P = shapely.union_all(pls)
+        # the station's axis: the long side of the platforms' minimum rotated rectangle
+        rc = np.asarray(P.minimum_rotated_rectangle.exterior.coords)[:4]
+        e1, e2 = rc[1] - rc[0], rc[2] - rc[1]
+        ax = e1 if np.hypot(*e1) >= np.hypot(*e2) else e2
+        ax = ax / np.hypot(*ax)
+        nv = np.array([-ax[1], ax[0]])
+        o = np.asarray(P.centroid.coords[0])
+        pv = np.concatenate([np.asarray(g.exterior.coords) for g in getattr(P, "geoms", [P])])
+        s0, s1 = float(((pv - o) @ ax).min()), float(((pv - o) @ ax).max())
+        near = P.buffer(CUT_REACH)
+        bands = []
+        pts = []
+        lo_end, hi_end = [], []
+        for r in roads:
+            if not (r.get("bus") or r["k"] == 7) or r.get("b"):
+                continue
+            xy = ring(r["p"])
+            if len(xy) < 2 or not shapely.LineString(xy).intersects(near):
+                continue
+            if r.get("t"):
+                for e in (xy[0], xy[-1]):
+                    if near.contains(shapely.Point(e)):
+                        se = float((e - o) @ ax)
+                        if s0 - CUT_PORTAL <= se <= s0 + 2.0:
+                            lo_end.append(se)
+                        if s1 - 2.0 <= se <= s1 + CUT_PORTAL:
+                            hi_end.append(se)
+                continue
+            bands.append(shapely.LineString(xy).buffer(0.5 * r["w"], cap_style="flat"))
+            rx, rz, _ = _resample_xy(xy, np.asarray(r["z"], dtype=np.float64) * 0.1, 2.0)
+            pts.append(np.column_stack([rx, rz]))
+        # (the cutting closes at the portal nearest the station at each end)
+        a0 = max(lo_end) if lo_end else s0 - CUT_GAP
+        a1 = min(hi_end) if hi_end else s1 + CUT_GAP
+        slab = shapely.Polygon([o + ax * a0 - nv * 200, o + ax * a1 - nv * 200, o + ax * a1 + nv * 200, o + ax * a0 + nv * 200])
+        body = shapely.union_all([P] + [b.intersection(slab) for b in bands]).buffer(CUT_GAP, join_style="mitre")
+        # (a portal mapped short of the platforms' ends closes the carriageways only: the platforms
+        # keep their CUT_GAP, so no wall stands on a platform)
+        poly = shapely.union_all([body.intersection(slab), P.buffer(CUT_GAP, join_style="mitre")])
+        if poly.geom_type != "Polygon":
+            poly = max(getattr(poly, "geoms", [poly]), key=lambda g: g.area)
+        poly = shapely.Polygon(poly.exterior).simplify(0.2)
+        poly = shapely.geometry.polygon.orient(poly, 1.0)
+        # the floor: least squares through the carriageways inside, lowered to the lowest of them
+        A = np.concatenate(pts) if pts else np.zeros((0, 3))
+        A = A[shapely.contains_xy(poly, A[:, 0], A[:, 1])] if len(A) else A
+        if len(A) < 3:
+            log(f"cut {name}: no carriageway inside")
+            continue
+        M = np.column_stack([np.ones(len(A)), A[:, 0], A[:, 1]])
+        f, *_ = np.linalg.lstsq(M, A[:, 2], rcond=None)
+        res = A[:, 2] - M @ f
+        f[0] += float(res.min())
+        rise = float((A[:, 2] - M @ f).max())
+        ring_xy = np.asarray(poly.exterior.coords)[:-1]
+        out.append({"n": name, "p": flat(ring_xy), "f": [round(float(f[0]), 4), round(float(f[1]), 7), round(float(f[2]), 7)]})
+        log(f"cut {name}: {len(ring_xy)}-gon {poly.area:.0f} m2, {a1 - a0:.0f} m along the axis"
+            f" ({'portal' if lo_end else 'open'} / {'portal' if hi_end else 'open'} ends), floor {float((M @ f).min()):.1f}..{float((M @ f).max()):.1f}"
+            f" with the carriageways up to {rise:.2f} m above it")
+    return out
+
+
+def _resample_xy(xy: np.ndarray, z: np.ndarray, step: float):
+    seg = np.hypot(*np.diff(xy, axis=0).T)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    s = np.linspace(0.0, cum[-1], max(2, int(math.ceil(cum[-1] / step)) + 1))
+    return np.stack([np.interp(s, cum, xy[:, 0]), np.interp(s, cum, xy[:, 1])], 1), np.interp(s, cum, z), s
+
+
+# ---------------------------------------------------------------------------
 # Canopy roofs
 
 
