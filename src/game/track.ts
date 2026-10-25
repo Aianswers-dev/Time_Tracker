@@ -4,7 +4,7 @@
 import { RoadKind, type MapData, type Road, type Route } from '../types';
 import { pointAlong, wrapAngle } from '../data/coords';
 import { drivable, roadIndexFor, speedLimitOf } from './roadIndex';
-import { isStationStop } from './routeMeta';
+import { busTypeForRoute, isStationStop } from './routeMeta';
 import { matchStopPlatform, platformEdgeAt, type PlatformZone } from './platforms';
 import { LEVEL_GAP, heightsOf } from './height';
 import { activeCollider } from '../sim/collider';
@@ -2269,7 +2269,7 @@ export class RouteTrack {
   }
 
   /**
-   * Drive the buses the routes use (a Metro and a rigid bus) along the lane as they are driven, the front
+   * Drive the route's buses (a rigid bus, and a Metro on a Metro route) along the lane as they are driven, the front
    * axle on the lane and the rest trailing it, and where a section sweeps into a wall (the rear and the
    * trailers cut the inside of a bend, the overhangs swing out) ease the lane away there a little at a
    * time, over a few samples either side. Walls on both sides of a sweep meet halfway.
@@ -2395,7 +2395,8 @@ export class RouteTrack {
         }
       }
     };
-    const specs = [specFor('metro'), specFor('rigid')];
+    // The route's own bus (a Metro route's) and a rigid bus, which any route may be driven with.
+    const specs = busTypeForRoute(this.route) === 'metro' ? [specFor('metro'), specFor('rigid')] : [specFor('rigid')];
     // The lane moves as one displacement field D along its normals as they were on the way in, so the
     // passes add up to a smooth bend: no sample moves more than SLOPE further than the next, a sample that
     // would leave the road or close on a wall keeps where it was, and no move makes a corner tighter than
@@ -2427,17 +2428,94 @@ export class RouteTrack {
       const t = Math.abs(wrapAngle(Math.atan2(rx - qx, ry - qy) - Math.atan2(qx - px, qy - py)));
       return t > 1e-4 ? Math.min(la, lb) / t : Infinity;
     };
+    // On a two-way road, outside junction boxes, how far left of the centre line a point is (Infinity
+    // where the lane may leave its own half): a move does not take the lane nearer the oncoming lane than
+    // OWN_MIN (or than it was). Each sample's nearest segment of its road.
+    const data = this.data;
+    const nodes = roadNodes(data);
+    const own = new Int32Array(n).fill(-1);
+    // (Not on a bend tighter than BEND, where a Metro's sweep needs more than its half of the road and two
+    // buses could not pass anyway.)
+    const BEND = 30;
+    const bendR = (k: number): number => {
+      const a = Math.max(0, k - 2);
+      const b = Math.min(n - 1, k + 2);
+      if (b - a < 2) return Infinity;
+      const h0 = Math.atan2(X0[k] - X0[a], Y0[k] - Y0[a]);
+      const h1 = Math.atan2(X0[b] - X0[k], Y0[b] - Y0[k]);
+      const t = Math.abs(wrapAngle(h1 - h0));
+      return t > 1e-4 ? (0.5 * (b - a) * TRACK_STEP) / t : Infinity;
+    };
+    for (let k = 0; k < n; k++) {
+      const ri = this.road[k];
+      if (ri < 0) continue;
+      let tight = false;
+      for (let q = Math.max(0, k - 3); q <= Math.min(n - 1, k + 3) && !tight; q++) tight = bendR(q) < BEND;
+      if (tight) continue;
+      const r = data.roads[ri];
+      if (r.oneway || r.width < 6) continue;
+      const p = r.pts;
+      let best = 12;
+      for (let q = 0; 2 * q + 3 < p.length; q++) {
+        const ex = p[2 * q + 2] - p[2 * q];
+        const ey = p[2 * q + 3] - p[2 * q + 1];
+        const t = Math.max(0, Math.min(1, ((X0[k] - p[2 * q]) * ex + (Y0[k] - p[2 * q + 1]) * ey) / (ex * ex + ey * ey || 1e-9)));
+        const d = Math.hypot(X0[k] - p[2 * q] - ex * t, Y0[k] - p[2 * q + 1] - ey * t);
+        if (d < best) {
+          best = d;
+          own[k] = q;
+        }
+      }
+    }
+    const sideOf = (k: number, x: number, y: number): number => {
+      const ri = this.road[k];
+      const p = data.roads[ri].pts;
+      const cum = nodes.cum[ri];
+      const ux = ny0[k];
+      const uy = -nx0[k];
+      let best = Infinity;
+      let lat = Infinity;
+      for (let q = Math.max(0, own[k] - 2); q <= Math.min(cum.length - 2, own[k] + 2); q++) {
+        const ex = p[2 * q + 2] - p[2 * q];
+        const ey = p[2 * q + 3] - p[2 * q + 1];
+        const l2 = ex * ex + ey * ey || 1e-9;
+        const t = Math.max(0, Math.min(1, ((x - p[2 * q]) * ex + (y - p[2 * q + 1]) * ey) / l2));
+        const d = Math.hypot(x - p[2 * q] - ex * t, y - p[2 * q + 1] - ey * t);
+        if (d >= best) continue;
+        best = d;
+        if (ownHalfFree(nodes, ri, cum[q] + (cum[q + 1] - cum[q]) * t)) {
+          lat = Infinity;
+          continue;
+        }
+        const sg = ex * ux + ey * uy >= 0 ? 1 : -1;
+        lat = (sg * (ex * (y - p[2 * q + 1]) - ey * (x - p[2 * q]))) / Math.sqrt(l2);
+      }
+      return lat;
+    };
     const fits = (k: number, v: number): boolean => {
       const qx = X0[k] + nx0[k] * v;
       const qy = Y0[k] + ny0[k] * v;
       if (!TW.drivable(qx, qy, this.z[k])) return false;
+      if (own[k] >= 0) {
+        const lat = sideOf(k, qx, qy);
+        if (lat < OWN_MIN && lat < sideOf(k, this.x[k], this.y[k]) - 1e-3) return false;
+      }
       const dNew = this.wallDist(W, G, qx, qy, this.z[k]);
       return !(dNew < WALL_CLEAR - 0.6 && dNew < this.wallDist(W, G, this.x[k], this.y[k], this.z[k]));
     };
+    // How far each sample's buses are into the walls (with the margin), from the pass that drove them.
+    const needNow = (): Float32Array => {
+      const out = new Float32Array(n);
+      for (let j = 0; j < n; j++) out[j] = Math.max(pushL[j], -pushR[j]);
+      return out;
+    };
+    const sim0 = Uint8Array.from(sim);
+    let need0: Float32Array | null = null;
     for (let pass = 0; pass < 10; pass++) {
       pushL.fill(0);
       pushR.fill(0);
       for (const spec of specs) drive(spec);
+      if (!need0) need0 = needNow();
       // Each sample's push: from walls one side, or halfway between where both sides press.
       const push = new Float32Array(n);
       for (let j = 0; j < n; j++) {
@@ -2523,6 +2601,36 @@ export class RouteTrack {
         if (!movedAt[k]) continue;
         for (let q = Math.max(0, k - WARM / TRACK_STEP - 4); q <= Math.min(n - 1, k + 10); q++) sim[q] = 1;
       }
+    }
+    // A move that got the buses no clearer of the walls (walls no line through this road clears, such as
+    // a junction its parapets close off) is undone, so the lane keeps its own line, in its own half,
+    // there; so is one that gained little for how far it swerved.
+    if (!need0 || !D.some((v) => v !== 0)) return;
+    sim.set(sim0);
+    pushL.fill(0);
+    pushR.fill(0);
+    for (const spec of specs) drive(spec);
+    const need1 = needNow();
+    for (let k = 0; k < n; ) {
+      if (D[k] === 0) {
+        k++;
+        continue;
+      }
+      let e = k;
+      while (e + 1 < n && D[e + 1] !== 0) e++;
+      // (Over the stretch and the buses' length either side: how much less the buses are into walls in all.)
+      let gain = 0;
+      let far = 0;
+      for (let q = Math.max(0, k - 12); q <= Math.min(n - 1, e + 12); q++) gain += need0[q] - need1[q];
+      for (let q = k; q <= e; q++) far = Math.max(far, Math.abs(D[q]));
+      if (gain < Math.max(0.1, 0.3 * far)) {
+        for (let q = k; q <= e; q++) {
+          D[q] = 0;
+          this.x[q] = X0[q];
+          this.y[q] = Y0[q];
+        }
+      }
+      k = e + 1;
     }
   }
 
