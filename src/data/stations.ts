@@ -247,9 +247,9 @@ export const STATIONS: StationDef[] = [
     x: -147,
     y: -1335,
     r: 60,
-    // very dark navy steel (photos: South_Bank_busway_station,_South_Brisbane,_Queensland_01/02)
-    post: 0x26344a,
-    fascia: 0x26344a,
+    // very dark plum-navy steel (photos: South_Bank_busway_station,_South_Brisbane,_Queensland_01/02)
+    post: 0x312c38,
+    fascia: 0x312c38,
     roofTop: 0x8a8e90,
     soffit: 0xf0f0ec,
     paving: 0xc8c0b0,
@@ -263,8 +263,8 @@ export const STATIONS: StationDef[] = [
     // the lift/stair buildings at the platforms' south ends (OSM elevators, white roofs in imagery
     // about 13 x 11 m centred (-139.3, -1369.7) and (-118.3, -1354.7))
     towers: [
-      { x: -139.5, y: -1370, w: 8, d: 7.5, h: 5.6, frame: 0x26344a, banner: ORANGE, hat: [2.6, 1.9] },
-      { x: -118.5, y: -1356, w: 7.5, d: 7.5, h: 5.6, frame: 0x26344a, banner: ORANGE, hat: [2, 1.8] },
+      { x: -139.5, y: -1370, w: 8, d: 7.5, h: 5.6, frame: 0x312c38, banner: ORANGE, hat: [2.6, 1.9] },
+      { x: -118.5, y: -1356, w: 7.5, d: 7.5, h: 5.6, frame: 0x312c38, banner: ORANGE, hat: [2, 1.8] },
     ],
     ownRoofs: 45,
   },
