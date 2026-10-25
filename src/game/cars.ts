@@ -2171,8 +2171,9 @@ export class CarTraffic {
         // Only into a gap.
         if (!list.some((o) => o !== c && !o.dead && o.laneIdx === to && Math.abs(o.u - c.u) < c.len + 6)) {
           c.laneIdx = to;
-          // (A turn chosen from the old lane is chosen again from the new one, unless we are committed to it.)
-          if (c.next >= 0 && !c.holds.some((h) => h.node === this.endNode(c.lane))) {
+          // (A turn chosen from the old lane is chosen again from the new one, unless we are committed to it,
+          // or to the junction after it, looking through.)
+          if (c.next >= 0 && !c.holds.some((h) => h.node === this.endNode(c.lane) || h.node === this.endNode(c.next))) {
             c.next = -1;
             c.next2 = -1;
           }
@@ -2254,6 +2255,34 @@ export class CarTraffic {
             const res = this.canGo(c, c.lane, c.next, stopAt, time, 0);
             if (res !== Wait.None) lim(idm(Math.max(0.05, stopAt), 0, 0.6), res, this.blockRef);
             else if (stopAt <= commitDist) this.commit(c, c.lane, c.next, stopAt, time, 0);
+          }
+        }
+      }
+      // The junction after that, when its line is closer past this node than we could stop in from our
+      // speed once there: we look through to it from here. (199/0 s 8659: a car at 47 km/h down a side
+      // street, its give-way line 2 m past a node where the street's width changes, came out across the
+      // player's bus on Vernon Tce. 61/1 s 157: a car at 54 km/h through a slip road's junction had 13 m
+      // to the line of the next and stopped 2 m over it, its nose in an AI bus's way, the bus and then
+      // the player's waiting on it for 45 s.) Through a link too short to stop on, canGo's look past it
+      // covers it; and not when one follows that junction (canGo would look past it from the wrong lane).
+      if (c.next >= 0 && !(sd > 0 && nd.deg >= 3 && this.shortLink(c.next, nd.boxR, c.len))) {
+        const L1 = c.next;
+        const N1 = this.endNode(L1);
+        const nd1 = this.nodes[N1];
+        const sd1 = this.stopD[L1];
+        const room = this.edges[L1 >> 1].len - sd1 - (c.len / 2 - 0.6);
+        if (sd1 > 0 && nd1.deg >= 3 && N1 !== N && room < commitDist) {
+          const stopAt = remain + room;
+          if (!nd1.sig && !this.minorIn[L1] && stopAt + sd1 < 25) this.markMajor(N1, time, L1);
+          if (stopAt < commitDist + 30 && !c.holds.some((h) => h.node === N1)) {
+            if (c.next2 < 0) c.next2 = this.chooseNext(L1, Math.min(c.laneIdx, this.lanesIn(L1) - 1));
+            if (c.next2 >= 0 && !this.shortLink(c.next2, nd1.boxR, c.len)) {
+              this.blockRef = 0;
+              const res = this.canGo(c, L1, c.next2, stopAt, time, 0);
+              if (res !== Wait.None) lim(idm(Math.max(0.05, stopAt), 0, 0.6), res, this.blockRef);
+              // (Committing to it only once through, or sure of, this one.)
+              else if (stopAt <= commitDist && (sd <= 0 || nd.deg < 3 || c.holds.some((h) => h.node === N))) this.commit(c, L1, c.next2, stopAt, time, 0);
+            }
           }
         }
       }
