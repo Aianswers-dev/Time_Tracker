@@ -304,9 +304,9 @@ export const STATIONS: StationDef[] = [
     tactile: 'charcoal',
     roof: 'flat',
     median: 'fence',
-    // The blue-steel glazed footbridge across the cutting at the platforms' south ends (OSM 458013390,
+    // The bright blue-steel glazed footbridge (photo BurandaStation.jpg) across the cutting at the platforms' south ends (OSM 458013390,
     // (1573,-3171)-(1596,-3151), lifts at both ends); the white-roofed entrance building at its SW end.
-    overbridges: [{ x: 1584.5, y: -3161, ax: 0.754, ay: 0.656, len: [-19.5, 19.5], w: 3.6, glass: 0x9fb7b0, frame: 0x2f5f8f, towers: true, towerW: 7, towerHat: [2.5, 1.5], clear: 6.4 }],
+    overbridges: [{ x: 1584.5, y: -3161, ax: 0.754, ay: 0.656, len: [-19.5, 19.5], w: 3.6, glass: 0x9fc3c8, frame: 0x2d6db5, towers: true, towerW: 7, towerHat: [2.5, 1.5], clear: 6.4 }],
   },
   {
     key: 'gabba',
