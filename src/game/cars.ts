@@ -118,10 +118,14 @@ interface PlayerApproach {
   y: number;
   inX: number;
   inY: number;
+  outX: number;
+  outY: number;
   cls: Turn;
   eta: number;
   /** Close enough that cars in the next lane do not turn across its lane in front of it. */
   near: boolean;
+  /** It has right of way here (its light is not red, or it is on the main road): crossing movements yield to it. */
+  prio: boolean;
 }
 
 /**
@@ -133,6 +137,9 @@ interface PlayerApproach {
 const ONCOMING_MARGIN = 1.5;
 /** Car acceleration (m/s^2). */
 const CAR_A = 1.7;
+/** Gap (s) to the next vehicle on a conflicting movement that one giving way waits for: merging left, and across. */
+export const GAP_LEFT = 4.5;
+export const GAP_ACROSS = 6.5;
 
 /** Seconds to cover `d` m from speed `v`: holding it, or accelerating at `a` from rest, whichever is sooner (an upper bound). */
 export function clearTime(v: number, d: number, a: number): number {
@@ -1141,24 +1148,44 @@ export class CarTraffic {
 
   /**
    * The player's bus is heading into `node` (lane point (x, y), direction (inX, inY), movement cls,
-   * there in `eta` s), until `until`: cars on the same approach do not turn across its lane in front
-   * of it (when `near`), and oncoming vehicles do not turn right across its path when it is close.
+   * there in `eta` s, out along (outX, outY)), until `until`: cars on the same approach do not turn
+   * across its lane in front of it (when `near`), and vehicles crossing its path do not cut in
+   * front of it (see playerConflict).
    */
-  claimApproach(node: number, x: number, y: number, inX: number, inY: number, cls: Turn, eta: number, until: number, near: boolean): void {
+  claimApproach(
+    node: number,
+    x: number,
+    y: number,
+    inX: number,
+    inY: number,
+    outX: number,
+    outY: number,
+    cls: Turn,
+    eta: number,
+    until: number,
+    near: boolean,
+    prio: boolean,
+  ): void {
     const nd = this.nodes[node];
-    if (nd.pc) Object.assign(nd.pc, { until, x, y, inX, inY, cls, eta, near });
-    else nd.pc = { until, x, y, inX, inY, cls, eta, near };
+    if (nd.pc) Object.assign(nd.pc, { until, x, y, inX, inY, outX, outY, cls, eta, near, prio });
+    else nd.pc = { until, x, y, inX, inY, outX, outY, cls, eta, near, prio };
   }
 
   /**
-   * Would a vehicle coming into `node` along (inX, inY) and turning `cls` cut
-   * across the player's bus coming the other way, which it would not clear
-   * in `clearT` s (plus a margin)?
+   * Would a vehicle coming into `node` along (inX, inY) and out along (outX,
+   * outY) cut across the player's bus, which it would not clear in `clearT` s
+   * (plus a margin)? Any movement crossing the bus's where the bus has right
+   * of way (a right-turner on the shared green, the far carriageway of a
+   * divided road crossed at the junction's second node, an arm with no light);
+   * a right turn across it coming the other way, always.
    */
-  playerOncoming(node: number, inX: number, inY: number, cls: Turn, time: number, clearT: number): boolean {
+  playerConflict(node: number, inX: number, inY: number, outX: number, outY: number, cls: Turn, time: number, clearT: number): boolean {
     const pc = this.nodes[node].pc;
-    if (!pc || pc.until <= time || cls !== Turn.Right || pc.cls === Turn.Right) return false;
-    return inX * pc.inX + inY * pc.inY < -0.8 && pc.eta < clearT + ONCOMING_MARGIN;
+    if (!pc || pc.until <= time || pc.eta >= clearT + ONCOMING_MARGIN) return false;
+    const dot = inX * pc.inX + inY * pc.inY;
+    if (dot > 0.8) return false; // the same approach: the next-lane rule
+    if (dot < -0.8 && cls === Turn.Right && pc.cls !== Turn.Right) return true;
+    return pc.prio && movementsConflict(inX, inY, outX, outY, cls, pc);
   }
 
   /**
@@ -1490,27 +1517,30 @@ export class CarTraffic {
     const [inX, inY] = this.laneEndDir(lane);
     const [outX, outY] = this.laneStartDir(next);
     const e0 = this.edges[lane >> 1];
+    const cls = classify(wrapAngle(Math.atan2(outX, outY) - Math.atan2(inX, inY)));
     if (nd.sig) {
       // On a short link between two nodes of one junction we are already in it:
       // its light was ours at the first node (asked again here with the link's
       // direction it would be some other arm's).
-      const st = this.insideLane[lane] ? null : this.signalFor(N, inX, inY, time, outX, outY);
+      const inside = this.insideLane[lane];
+      const st = inside ? null : this.signalFor(N, inX, inY, time, outX, outY);
       if (st === 'red') return Wait.Red;
       if (st === 'amber' && stopAt > (c.v * c.v) / (2 * 3.5)) return Wait.Red;
+      // No light for this movement (an arm no signal faces, a slip lane): give way to the cars that have one.
+      if (!inside && st === null && this.conflictEta(N, inX, inY, outX, outY, cls, cls === Turn.Left ? GAP_LEFT : GAP_ACROSS) < Infinity) return Wait.Junction;
     } else {
       if (e0.rank + 0.01 < nd.rank && nd.until > time && nd.holder !== lane) return nd.holder === PLAYER_HOLD ? Wait.Player : Wait.Junction;
     }
-    const cls = classify(wrapAngle(Math.atan2(outX, outY) - Math.atan2(inX, inY)));
     // The player's bus coming up on the same approach in the next lane: a car that would turn across
     // its lane in front of it (left from the lane on its right, right from the lane on its left) waits.
-    // An oncoming car turning right gives way to it (into the same road as its left turn, or across its path).
+    // A car crossing its path gives way to it (playerConflict).
     const pc = nd.pc;
     if (pc && pc.until > time) {
       const dot = inX * pc.inX + inY * pc.inY;
       if (dot > 0.8) {
         const side = (c.x - pc.x) * pc.inY - (c.y - pc.y) * pc.inX;
         if (pc.near && ((side > 1.8 && cls === Turn.Left && pc.cls !== Turn.Left) || (side < -1.8 && cls === Turn.Right && pc.cls !== Turn.Right))) return Wait.Player;
-      } else if (this.playerOncoming(N, inX, inY, cls, time, clearTime(c.v, Math.max(0, stopAt) + 2 * nd.boxR + c.len, CAR_A))) return Wait.Player;
+      } else if (this.playerConflict(N, inX, inY, outX, outY, cls, time, clearTime(c.v, Math.max(0, stopAt) + 2 * nd.boxR + c.len, CAR_A))) return Wait.Player;
     }
     // The player's bus in (or about to enter) the box: waiting for it is legitimate.
     if (!this.boxClear(N, c.id, inX, inY, outX, outY, cls, time)) return this.boxBy === PLAYER_HOLD ? Wait.Player : Wait.Junction;

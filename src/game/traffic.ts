@@ -11,7 +11,7 @@ import { busTypeForRoute, stopUsage } from './routeMeta';
 import { TRACK_STEP, hasTrack, trackFor, type RouteTrack, type TrackSample, type TrackSignal, type TrackStop } from './track';
 import type { MapMarker } from './minimap';
 import { brighten, rng } from './util';
-import { CarTraffic, PLAYER_HOLD, STALL_HIDDEN, STALL_VISIBLE, Turn, Wait, clearTime, type BusJunction } from './cars';
+import { CarTraffic, GAP_ACROSS, GAP_LEFT, PLAYER_HOLD, STALL_HIDDEN, STALL_VISIBLE, Turn, Wait, clearTime, type BusJunction } from './cars';
 import { TRAFFIC_CAPS, defaultTrafficLevel, type TrafficLevel } from './trafficLevel';
 import { makeBody, type Body } from './bodies';
 import { LEVEL_GAP, heightAt } from './height';
@@ -123,9 +123,6 @@ function idm(v: number, v0: number, gap: number, vLead: number, s0: number): num
 const MAJOR_GAP = 6;
 /** ...and how far ahead (s) oncoming right-turners see it coming (a bus from rest needs 6-7 s to clear its path). */
 const CLAIM_GAP = 9;
-/** Gap (s) to the next car on a conflicting movement the player's bus waits for where it gives way: merging left, and across. */
-const GAP_LEFT = 4.5;
-const GAP_ACROSS = 6.5;
 /** How far past a route's stop line a signalised junction's first node may lie and still be on that line's light (m). */
 const FAR_LINE = 70;
 
@@ -775,13 +772,17 @@ export class Traffic {
       if (!j.sig && !j.minor && v > 1 && j.s - s < ahead) this.cars.markMajor(j.node, time, PLAYER_HOLD);
       const inBox = s > j.s - j.boxR;
       const committed = v > 1 && j.stopS - s < (v * v) / (2 * 3) + 2;
+      const light = j.sig && !j.inside ? this.cars.signalFor(j.node, j.inX, j.inY, time, j.outX, j.outY) : null;
       // (Not on the way to a red light we can still stop at: the other way's green is its own.)
-      const red = j.sig && !j.inside && !inBox && !committed && this.cars.signalFor(j.node, j.inX, j.inY, time, j.outX, j.outY) === 'red';
-      // (Cars in the next lane do not turn across ours in front of us, oncoming ones not across our path.)
+      const red = light === 'red' && !inBox && !committed;
+      // Right of way: in the box, our light (or the light we entered the junction on), or the main road.
+      // (On an arm with no light, or from a side road, the autopilot gives way instead.)
+      const prio = inBox || (j.sig ? j.inside || light !== null : !j.minor);
+      // (Cars in the next lane do not turn across ours in front of us, crossing ones not across our path.)
       if (inBox || (v > 1 && !red && j.s - s < claim)) {
         g.track.sample(j.stopS, this.tmp);
         const eta = inBox ? 0 : (j.s - s) / Math.max(v, 1);
-        this.cars.claimApproach(j.node, this.tmp.x, this.tmp.y, j.inX, j.inY, j.cls, eta, time + 0.5, inBox || j.s - s < ahead);
+        this.cars.claimApproach(j.node, this.tmp.x, this.tmp.y, j.inX, j.inY, j.outX, j.outY, j.cls, eta, time + 0.5, inBox || j.s - s < ahead, prio);
       }
       if (inBox || committed) this.cars.enter(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time + 0.5);
     }
@@ -1133,9 +1134,11 @@ export class Traffic {
       const st = a ? (this.world.signalStateAt?.(a.x, a.y, time, a.dx, a.dy, a.z) ?? null) : this.cars.signalFor(j.node, j.inX, j.inY, time, j.outX, j.outY);
       if (st === 'red') return Wait.Red;
       if (st === 'amber' && stopAt > (b.v * b.v) / (2 * 3)) return Wait.Red;
+      // No light for this movement (an arm no signal faces): give way to the cars that have one.
+      if (st === null && this.cars.conflictEta(j.node, j.inX, j.inY, j.outX, j.outY, j.cls, j.cls === Turn.Left ? GAP_LEFT : GAP_ACROSS) < Infinity) return Wait.Junction;
     } else if (this.cars.giveWayBusy(j.node, j.minor, time)) return Wait.Junction;
-    // (Turning right across the player's bus coming the other way, as the cars do.)
-    if (this.cars.playerOncoming(j.node, j.inX, j.inY, j.cls, time, clearTime(b.v, Math.max(0, stopAt) + 2 * j.boxR + b.len, BUS_A))) return Wait.Player;
+    // (Not across the player's bus where it has right of way, nor turning right across it, as the cars do.)
+    if (this.cars.playerConflict(j.node, j.inX, j.inY, j.outX, j.outY, j.cls, time, clearTime(b.v, Math.max(0, stopAt) + 2 * j.boxR + b.len, BUS_A))) return Wait.Player;
     if (!this.cars.boxClear(j.node, -b.id, j.inX, j.inY, j.outX, j.outY, j.cls, time)) return this.cars.boxBlocker === PLAYER_HOLD ? Wait.Player : Wait.Junction;
     // Room on the far side for the whole bus to get out of the box (it never
     // stops with its tail across the junction). Waiting for a queue that is
