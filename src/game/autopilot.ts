@@ -62,6 +62,8 @@ const DECEL = 1.1;
 const SIGNAL_DECEL = 1.6;
 /** Stanley cross-track gain (1/s). */
 const STANLEY_K = 1.4;
+/** Ahead of the front within this (m), a car counts as a lead anywhere it would touch the bus. */
+const CLOSE = 12;
 
 function clamp(v: number, a: number, b: number): number {
   return v < a ? a : v > b ? b : v;
@@ -464,7 +466,11 @@ export class Autopilot {
     // Queued behind traffic for a long time: log it, then count only vehicles squarely on the lane
     // (a bus or car beside it can hold the sensor); only a queue that still hasn't moved after
     // two minutes is driven through (the traffic's own jam breaker should have cleared it).
-    if (why === 'traffic' && av < 0.5) this.queueT += dt;
+    // (Not while our light ahead is red: the queue in front is waiting for it. 222/0 s 2472 sat
+    // 66 s in the queue at a light that is green 40 s in 110.)
+    const held = !!g.signal && g.signal.state !== 'green' && g.signal.distance < 150;
+    if (why === 'traffic' && av < 0.5 && !held) this.queueT += dt;
+    else if (why === 'traffic' && av < 0.5) this.queueT = 0;
     else {
       this.queueT = 0;
       if (av > 3) this.blockedN = 0;
@@ -523,13 +529,16 @@ export class Autopilot {
     for (const b of tr.busBodies()) {
       if (Math.abs(b.body.fx - cx) < cr + b.len && Math.abs(b.body.fy - cy) < cr + b.len) near.push(b);
     }
-    for (let d = 2; d <= range; d += 2) {
+    // Cars: a point of one (0.3 of its length either side of its middle) near the lane centre. Close
+    // ahead, wherever its body would touch ours (half our width and half a car's): a slow car the lane
+    // turns away from, ~2 m to the side of it, was still in front of the bus's corner (61/1 s 4013).
+    for (let d = 1; d <= range; d += d < CLOSE ? 1 : 2) {
       T.sample(sFront + d, this.tmp);
       const pz = T.zAt(sFront + d);
       if (Math.abs(pz - z) > LEVEL_GAP + Math.abs(d * 0.08)) continue;
       const px = this.tmp.x;
       const py = this.tmp.y;
-      if (grid.nearest(px, py, strict ? 1.0 : 1.7, undefined, pz) >= 0) return d;
+      if (grid.nearest(px, py, strict ? 1.0 : d < CLOSE ? 2.0 : 1.7, undefined, pz) >= 0) return d;
       for (const b of near) {
         const B = b.body;
         for (let k = 0; k + 1 < B.n; k++) {
