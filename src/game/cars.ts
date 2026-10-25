@@ -1257,10 +1257,22 @@ export class CarTraffic {
     if (Math.abs(cr) < 0.48 || ax * bx + ay * by < -0.9) return; // not a turn of ~29 degrees or more
     const wx = p.x - wx0;
     const wy = p.y - wy0;
-    const ca = -(wx * by - wy * bx) / cr;
-    const cb = (wx * ay - wy * ax) / cr;
+    let ca = -(wx * by - wy * bx) / cr;
+    let cb = (wx * ay - wy * ax) / cr;
     const sd = this.stopD[a];
-    if (ca < 0.3 || cb < 0.3 || ca > Math.min(CUT_MAX, ea.len * 0.5, sd > 0 ? sd - 0.5 : Infinity) || cb > Math.min(CUT_MAX, eb.len * 0.5)) return;
+    if (ca < 0.3 || cb < 0.3 || ca > Math.min(CUT_MAX, ea.len * 0.5) || cb > Math.min(CUT_MAX, eb.len * 0.5)) return;
+    if (sd > 0 && ca > sd - 0.5) {
+      // The corner is behind the stop line (a hairpin turn from a wide road's lane): leave the lane at
+      // the line and join the next one at its nearest point, not pivot at the node (61/0 s 5046: a
+      // 130-degree left turn jumped the car 6.7 m, in front of the player's bus).
+      ca = sd - 0.5;
+      if (ca < 0.3) return;
+      // (Our lane's point there, from the node end back along it; the next lane's line from its start.)
+      const qx = wx0 - ax * ca - p.x;
+      const qy = wy0 - ay * ca - p.y;
+      cb = qx * bx + qy * by;
+      if (cb < 0.3 || cb > Math.min(CUT_MAX, eb.len * 0.5)) return;
+    }
     c.cutA = ca;
     c.cutB = cb;
   }
