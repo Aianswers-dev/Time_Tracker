@@ -411,6 +411,8 @@ export class CarTraffic {
    * to another node of the same junction: the light asked at the first node holds.
    */
   private insideLane: Uint8Array = new Uint8Array(0);
+  /** Per lane: 0 not yet known, 1 not on a roundabout's ring, 2 on one (see onRing). */
+  private ring: Int8Array = new Int8Array(0);
   /** Stop-line distance from the end node for each directed lane (0 = uncontrolled). */
   private stopD: Float32Array = new Float32Array(0);
   /** Junction nodes (3+ arms) on a coarse grid, for mapping bus routes onto them. */
@@ -1043,7 +1045,7 @@ export class CarTraffic {
         const on = op.length;
         const [ox, oy] = o & 1 ? [op[on - 4] - op[on - 2], op[on - 3] - op[on - 1]] : [op[2] - op[0], op[3] - op[1]];
         const signed = wrapAngle(Math.atan2(ox, oy) - hIn);
-        if (pass === 0 && lanes > 1) {
+        if (pass === 0 && lanes > 1 && !this.onRing(lane)) {
           if (signed < -0.5 && idx > 0) continue;
           if (signed > 0.5 && idx < lanes - 1) continue;
         }
@@ -1063,6 +1065,43 @@ export class CarTraffic {
       }
     }
     return best >= 0 ? best : opts[0][0];
+  }
+
+  /**
+   * Is `lane` on a roundabout's ring: one-way lanes, each bending a little right into the next, that
+   * come back round to it within a few hundred metres? (There a car leaves from whichever lane it is
+   * in: kept to the kerb lane to turn left, the inner lane's cars would go round for ever.)
+   */
+  private onRing(lane: number): boolean {
+    if (this.ring.length !== this.edges.length * 2) this.ring = new Int8Array(this.edges.length * 2);
+    let r = this.ring[lane];
+    if (r === 0) {
+      r = 1;
+      let cur = lane;
+      let len = 0;
+      for (let k = 0; k < 16 && len < 400 && this.edges[cur >> 1].oneway; k++) {
+        // The ring carries on bending right; ways off it leave to the left (or straight on).
+        let nx = -1;
+        let bestT = -Infinity;
+        for (const o of this.nodes[this.endNode(cur)].out) {
+          if (o >> 1 === cur >> 1 || this.edges[o >> 1].bus) continue;
+          const t = this.turnAngle(cur, o);
+          if (t > -0.15 && t < 1.2 && t > bestT) {
+            bestT = t;
+            nx = o;
+          }
+        }
+        if (nx < 0) break;
+        if (nx === lane) {
+          r = 2;
+          break;
+        }
+        len += this.edges[nx >> 1].len;
+        cur = nx;
+      }
+      this.ring[lane] = r;
+    }
+    return r === 2;
   }
 
   private turnAngle(from: number, to: number): number {
