@@ -11,7 +11,7 @@ import { busTypeForRoute, stopUsage } from './routeMeta';
 import { TRACK_STEP, hasTrack, trackFor, type RouteTrack, type TrackSample, type TrackSignal, type TrackStop } from './track';
 import type { MapMarker } from './minimap';
 import { brighten, rng } from './util';
-import { CarTraffic, PLAYER_HOLD, STALL_HIDDEN, STALL_VISIBLE, Turn, Wait, clearTime, type BusJunction } from './cars';
+import { CarTraffic, GAP_ACROSS, GAP_LEFT, PLAYER_HOLD, STALL_HIDDEN, STALL_VISIBLE, Turn, Wait, clearTime, type BusJunction } from './cars';
 import { TRAFFIC_CAPS, defaultTrafficLevel, type TrafficLevel } from './trafficLevel';
 import { makeBody, type Body } from './bodies';
 import { LEVEL_GAP, heightAt } from './height';
@@ -79,6 +79,10 @@ interface AiBus {
   marker: MapMarker;
   age: number;
   turnSign: number;
+  /** Where its lane comes in to the player's lane (for the player's track `joinFor`), and the next one. */
+  joins: Join[];
+  joinFor: RouteTrack | null;
+  joinNext: number;
 }
 
 /** Where and how a light is asked: the approach point and direction into its junction, and the level. */
@@ -123,9 +127,50 @@ function idm(v: number, v0: number, gap: number, vLead: number, s0: number): num
 const MAJOR_GAP = 6;
 /** ...and how far ahead (s) oncoming right-turners see it coming (a bus from rest needs 6-7 s to clear its path). */
 const CLAIM_GAP = 9;
-/** Gap (s) to the next car on a conflicting movement the player's bus waits for where it gives way: merging left, and across. */
-const GAP_LEFT = 4.5;
-const GAP_ACROSS = 6.5;
+/** The player's bus pulling away (m/s^2), as its claims time it, up to `PLAYER_A_V` m/s. */
+const PLAYER_A = 1.5;
+const PLAYER_A_V = 8;
+/** Stopped this close (m) behind its stop line on a green, the player's bus is about to go: it claims the junction. */
+const LAUNCH_D = 4;
+/** ...through the junction's nodes this far (m) ahead. */
+const LAUNCH_R = 60;
+
+/** Seconds until the player's bus gets d m ahead: at its speed, or picking up speed from a crawl. */
+function playerEta(d: number, v: number): number {
+  const a = PLAYER_A * Math.min(1, Math.max(0, (PLAYER_A_V - v) / 5));
+  if (a <= 0) return d / Math.max(v, 1);
+  return (Math.sqrt(v * v + 2 * a * d) - v) / a;
+}
+/**
+ * Lane centrelines this close (m) put two buses side by side touching (2.5 m bodies, a little room):
+ * where a bus's lane comes in beside the player's lane. Closer than JOIN_IN it is in it.
+ */
+const JOIN_D = 3.1;
+const JOIN_IN = 1.2;
+/** Two lanes this far apart in heading (cos) are not one coming in to the other (a crossing). */
+const JOIN_COS = 0.64;
+/** Grid cell (m) for finding the player's lane near a point. */
+const JOIN_CELL = 8;
+/** A bus merging in front of the player's bus has its tail in the lane this many seconds (s) before the player's front gets there. */
+const MERGE_GAP = 2.5;
+/**
+ * An AI bus stops for the player's bus coming the other way once its centreline is this close (m, squared)
+ * to the AI's path: touching distance, a little over the 2.5 m bodies (oncoming AI buses only from 1.8 m,
+ * so that the next lane never stops them). An articulated bus's tail cuts in on a bend.
+ */
+const ONCOMING_PLAYER_R2 = 2.6 * 2.6;
+
+/**
+ * Where a bus's lane comes in to the player's lane: on the bus's track it is alongside from a0
+ * (where it waits) and in the lane from a1; p0 and p1 are those places on the player's track.
+ */
+interface Join {
+  a0: number;
+  a1: number;
+  p0: number;
+  p1: number;
+}
+
 /** How far past a route's stop line a signalised junction's first node may lie and still be on that line's light (m). */
 const FAR_LINE = 70;
 
@@ -171,6 +216,13 @@ export class Traffic {
   private radius = 1100;
   private byId = new Map<number, AiBus>();
   private plans = new WeakMap<RouteTrack, { mids: TrackSignal[]; jAsk: (SignalAsk | null)[]; jLine: number[] }>();
+  /** Per bus track: where it comes in to the player's lane `p`. */
+  private joinCache = new WeakMap<RouteTrack, { p: RouteTrack; joins: Join[] }>();
+  /** The player's lane samples by grid cell. */
+  private pGrid: { p: RouteTrack; cells: Map<number, number[]> } | null = null;
+  /** The player's lane and its front's place on it (null off the route). */
+  private pTrack: RouteTrack | null = null;
+  private pS = 0;
   private asks = new WeakMap<TrackSignal, SignalAsk>();
   private bodiesOut: Body[] = [];
   private exemptOut: boolean[] = [];
@@ -439,6 +491,9 @@ export class Traffic {
       marker: { x: 0, y: 0, heading: 0, color: brighten(r.color, 0.25), length: len },
       age: 0,
       turnSign: 0,
+      joins: [],
+      joinFor: null,
+      joinNext: 0,
     };
     b.serve = this.decideServe(b);
     while (b.sigIdx < b.mids.length && b.mids[b.sigIdx].s < s) b.sigIdx++;
@@ -708,6 +763,9 @@ export class Traffic {
 
     this.byId.clear();
     for (const b of this.active) this.byId.set(b.id, b);
+    const g = session.guide;
+    this.pTrack = g?.track && g.state && !g.state.offRoute ? g.track : null;
+    this.pS = g?.state?.s ?? 0;
     this.claimJunctions(time, player);
     for (const b of this.active) this.step(b, dt, time);
     for (const b of this.active) this.updateBody(b);
@@ -769,19 +827,30 @@ export class Traffic {
     // ramp had already committed and pulled out in front).
     const ahead = Math.max(30, v * MAJOR_GAP);
     const claim = Math.max(ahead, v * CLAIM_GAP);
-    for (let k = lo; k < jl.length && jl[k].s - s < claim + 10; k++) {
+    // Stopped at the stop line of a green: about to pull away. (A right turn across our path from
+    // the other side, starting on the same green, would otherwise be on its way before we move.)
+    // (The line it waits at for the light: the route's, often well before the node's own box edge.)
+    const line = this.signalPlan(g.track).jLine;
+    let launch = false;
+    for (let k = lo; k < jl.length && jl[k].s - s < Math.max(claim, LAUNCH_R) + 10; k++) {
       const j = jl[k];
       if (j.s + j.boxR + len < s) continue;
       if (!j.sig && !j.minor && v > 1 && j.s - s < ahead) this.cars.markMajor(j.node, time, PLAYER_HOLD);
       const inBox = s > j.s - j.boxR;
       const committed = v > 1 && j.stopS - s < (v * v) / (2 * 3) + 2;
+      const light = j.sig && !j.inside ? this.cars.signalFor(j.node, j.inX, j.inY, time, j.outX, j.outY) : null;
       // (Not on the way to a red light we can still stop at: the other way's green is its own.)
-      const red = j.sig && !j.inside && !inBox && !committed && this.cars.signalFor(j.node, j.inX, j.inY, time, j.outX, j.outY) === 'red';
-      // (Cars in the next lane do not turn across ours in front of us, oncoming ones not across our path.)
-      if (inBox || (v > 1 && !red && j.s - s < claim)) {
+      const red = light === 'red' && !inBox && !committed;
+      // (Not to turn right across the oncoming flow: that it waits for.)
+      if (v <= 1 && light === 'green' && j.cls !== Turn.Right && Math.abs(line[k] - s) < LAUNCH_D) launch = true;
+      // Right of way: in the box, our light (or the light we entered the junction on), or the main road.
+      // (On an arm with no light, or from a side road, the autopilot gives way instead.)
+      const prio = inBox || (j.sig ? j.inside || light !== null : !j.minor);
+      // (Cars in the next lane do not turn across ours in front of us, crossing ones not across our path.)
+      if (inBox || (!red && ((v > 1 && j.s - s < claim) || (launch && j.s - s < LAUNCH_R)))) {
         g.track.sample(j.stopS, this.tmp);
-        const eta = inBox ? 0 : (j.s - s) / Math.max(v, 1);
-        this.cars.claimApproach(j.node, this.tmp.x, this.tmp.y, j.inX, j.inY, j.cls, eta, time + 0.5, inBox || j.s - s < ahead);
+        const eta = inBox ? 0 : playerEta(j.s - s, v);
+        this.cars.claimApproach(j.node, this.tmp.x, this.tmp.y, j.inX, j.inY, j.outX, j.outY, j.cls, eta, time + 0.5, inBox || j.s - s < ahead, prio);
       }
       if (inBox || committed) this.cars.enter(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time + 0.5);
     }
@@ -966,6 +1035,34 @@ export class Traffic {
       }
     }
 
+    // Our lane coming in to the player's (out of a platform, off a ramp, from the lane beside): we
+    // give way to the player's bus as at a junction, unless our tail is in well before it gets there.
+    const P = this.pTrack;
+    if (P) {
+      if (b.joinFor !== P) {
+        b.joins = this.joinsOf(tr, P);
+        b.joinFor = P;
+        b.joinNext = 0;
+      }
+      const joins = b.joins;
+      while (b.joinNext < joins.length && joins[b.joinNext].a0 < b.s - 1) b.joinNext++;
+      const J = joins[b.joinNext];
+      const dA = J ? J.a0 - b.s : Infinity;
+      // (Not once we could no longer stop short of it: then we are on our way in.)
+      if (J && dA < Math.max(40, b.v * 5) && dA > (b.v * b.v) / (2 * 3.5) - 1) {
+        const sp = this.pS;
+        const pv = Math.abs(this.playerBody.speed);
+        // (Its tail past where we are in the lane: we follow it.)
+        if (sp - this.playerLen < J.p1 + 4) {
+          const dP = J.p0 - sp;
+          // Beside us or in the lane there now; else on its way there (from a standstill only from close by).
+          let yieldTo = dP < 2;
+          if (!yieldTo && dP < Math.max(60, pv * 8)) yieldTo = pv < 1 ? dP < 8 : playerEta(dP, pv) < clearTime(b.v, J.a1 - b.s + b.len, BUS_A) + MERGE_GAP;
+          if (yieldTo) lim(idm(b.v, v0, Math.max(0.05, dA), 0, 0.8), Wait.Player);
+        }
+      }
+    }
+
     // Mid-block signals (pedestrian lights).
     const signalAt = this.world.signalStateAt;
     const mids = b.mids;
@@ -1022,7 +1119,7 @@ export class Traffic {
       if (other && other.obstacle === b.id && other.id < b.id) return;
       // Two 2.5 m wide bodies touch with their centrelines 2.5 m apart: look
       // wider than that, except at oncoming traffic in the next lane.
-      const r2 = Math.abs(rel) > 2.4 ? 3.4 : 2.8 * 2.8;
+      const r2 = Math.abs(rel) > 2.4 ? (other ? 3.4 : ONCOMING_PLAYER_R2) : 2.8 * 2.8;
       for (let k = 0; k < ns; k++) {
         const d = 1.5 + k * 2.5;
         if (d - 2.5 > bestGap) return;
@@ -1112,6 +1209,85 @@ export class Traffic {
     lights.indicatorRight = (!pullingIn && pullingOut) || (b.turnSign > 0 && !pullingIn);
   }
 
+  /**
+   * Where lane `a` comes in to the player's lane `p` (the same way, on the same level): from at
+   * least JOIN_D apart to alongside and then into it (a lane that only passes close is not one).
+   * Where that is in a junction it manages, a bus waits at that junction's line, unless the
+   * junction has lights (they keep the two movements apart and the player's claims hold the rest).
+   */
+  private joinsOf(a: RouteTrack, p: RouteTrack): Join[] {
+    const hit = this.joinCache.get(a);
+    if (hit && hit.p === p) return hit.joins;
+    const joins: Join[] = [];
+    this.joinCache.set(a, { p, joins });
+    if (a === p) return joins;
+    let G = this.pGrid;
+    if (!G || G.p !== p) {
+      const cells = new Map<number, number[]>();
+      for (let i = 0; i + 1 < p.n; i++) {
+        const k = (Math.floor(p.x[i] / JOIN_CELL) + 8192) * 16384 + Math.floor(p.y[i] / JOIN_CELL) + 8192;
+        const l = cells.get(k);
+        if (l) l.push(i);
+        else cells.set(k, [i]);
+      }
+      G = this.pGrid = { p, cells };
+    }
+    const n = a.n;
+    const d = new Float32Array(n).fill(Infinity);
+    const ps = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = a.x[i];
+      const y = a.y[i];
+      const cx = Math.floor(x / JOIN_CELL) + 8192;
+      const cy = Math.floor(y / JOIN_CELL) + 8192;
+      for (let gx = cx - 1; gx <= cx + 1; gx++) {
+        for (let gy = cy - 1; gy <= cy + 1; gy++) {
+          const l = G.cells.get(gx * 16384 + gy);
+          if (!l) continue;
+          for (const j of l) {
+            if (a.tx[i] * p.tx[j] + a.ty[i] * p.ty[j] < JOIN_COS || Math.abs(a.z[i] - p.z[j]) > LEVEL_GAP) continue;
+            const ax = p.x[j];
+            const ay = p.y[j];
+            const sx = p.x[j + 1] - ax;
+            const sy = p.y[j + 1] - ay;
+            const l2 = sx * sx + sy * sy || 1e-9;
+            const t = Math.max(0, Math.min(1, ((x - ax) * sx + (y - ay) * sy) / l2));
+            const e = Math.hypot(x - ax - sx * t, y - ay - sy * t);
+            if (e < d[i]) {
+              d[i] = e;
+              ps[i] = (j + t) * TRACK_STEP;
+            }
+          }
+        }
+      }
+    }
+    const jl = this.cars.junctionsAlong(a);
+    const line = this.signalPlan(a).jLine;
+    for (let i = 1; i < n; i++) {
+      if (!(d[i] < JOIN_D) || d[i - 1] < JOIN_D) continue;
+      let k = i;
+      while (k < n && d[k] < JOIN_D && d[k] > JOIN_IN) k++;
+      if (k < n && d[k] <= JOIN_IN) {
+        // (Where it gets within JOIN_D, between the two samples.)
+        const f = d[i - 1] < Infinity ? (d[i - 1] - JOIN_D) / Math.max(1e-6, d[i - 1] - d[i]) : 0;
+        let a0 = (i - 1 + Math.min(1, f)) * TRACK_STEP;
+        let sig = false;
+        for (let q = 0; q < jl.length; q++) {
+          const j = jl[q];
+          if (a0 > j.stopS - 2 && a0 < j.s + j.boxR + 3) {
+            if (j.sig) sig = true;
+            a0 = Math.min(a0, line[q]);
+          }
+        }
+        if (!sig) joins.push({ a0, a1: k * TRACK_STEP, p0: ps[i], p1: ps[k] });
+        // (On past the stretch in the lane.)
+        i = k;
+        while (i + 1 < n && d[i + 1] < JOIN_D) i++;
+      } else i = k - 1;
+    }
+    return joins;
+  }
+
   /** Keep reservations alive while the bus is in a box; release ones its tail has cleared. */
   private refreshHolds(b: AiBus, time: number): void {
     for (let k = b.holds.length - 1; k >= 0; k--) {
@@ -1133,9 +1309,13 @@ export class Traffic {
       const st = a ? (this.world.signalStateAt?.(a.x, a.y, time, a.dx, a.dy, a.z) ?? null) : this.cars.signalFor(j.node, j.inX, j.inY, time, j.outX, j.outY);
       if (st === 'red') return Wait.Red;
       if (st === 'amber' && stopAt > (b.v * b.v) / (2 * 3)) return Wait.Red;
+      // No light for this movement (an arm no signal faces): give way to the cars that have one.
+      if (st === null && this.cars.conflictEta(j.node, j.inX, j.inY, j.outX, j.outY, j.cls, j.cls === Turn.Left ? GAP_LEFT : GAP_ACROSS) < Infinity) return Wait.Junction;
     } else if (this.cars.giveWayBusy(j.node, j.minor, time)) return Wait.Junction;
-    // (Turning right across the player's bus coming the other way, as the cars do.)
-    if (this.cars.playerOncoming(j.node, j.inX, j.inY, j.cls, time, clearTime(b.v, Math.max(0, stopAt) + 2 * j.boxR + b.len, BUS_A))) return Wait.Player;
+    // (Not across the player's bus where it has right of way, nor turning right across it, as the cars do.)
+    // (Clear of the box: from a line drawn well back, as at the busway junctions, the node is further than a box on.)
+    const clearD = Math.max(Math.max(0, stopAt) + 2 * j.boxR, j.s - b.s + j.boxR) + b.len;
+    if (this.cars.playerConflict(j.node, j.inX, j.inY, j.outX, j.outY, j.cls, time, clearTime(b.v, clearD, BUS_A))) return Wait.Player;
     if (!this.cars.boxClear(j.node, -b.id, j.inX, j.inY, j.outX, j.outY, j.cls, time)) return this.cars.boxBlocker === PLAYER_HOLD ? Wait.Player : Wait.Junction;
     // Room on the far side for the whole bus to get out of the box (it never
     // stops with its tail across the junction). Waiting for a queue that is
