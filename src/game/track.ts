@@ -9,6 +9,7 @@ import { matchStopPlatform, platformEdgeAt, type PlatformZone } from './platform
 import { LEVEL_GAP, heightsOf } from './height';
 import { activeCollider } from '../sim/collider';
 import { specFor } from '../bus/spec';
+import { signalsFor } from '../data/signals';
 
 export const TRACK_STEP = 4;
 
@@ -1364,8 +1365,9 @@ export class RouteTrack {
     const idx = roadIndexFor(data);
     const grid = signalGrid(data);
     const sig = data.signals;
-    /** Per junction pass: the nodes' lane positions. */
-    const hits: { j: number; s: number }[] = [];
+    /** Per junction pass: the nodes' lane positions (and the signal model's junction of each). */
+    const hits: { j: number; s: number; mj: number }[] = [];
+    const model = signalsFor(data);
     /** Per node, the sample it was last looked at (a route can pass a node again, as a loop back to its start does). */
     const seen = new Map<number, number>();
     for (let i = 0; i < n; i++) {
@@ -1430,15 +1432,17 @@ export class RouteTrack {
             });
             if (dk && rk >= 0) applies = faces;
             if (onRoad ? !level || !applies : Math.abs(H.ground(sx, sy) - z) > LEVEL_GAP) continue;
-            hits.push({ j: J.id[k], s: i * TRACK_STEP + along });
+            hits.push({ j: J.id[k], s: i * TRACK_STEP + along, mj: model.nodeJunction[k] });
           }
         }
       }
     }
     hits.sort((p, q) => p.s - q.s);
     const out: TrackSignal[] = [];
+    let lastMj = -1;
     for (let h = 0; h < hits.length; h++) {
       const j = hits[h].j;
+      const mj = hits[h].mj;
       // The nodes of this junction on this pass.
       let s0 = hits[h].s;
       let s1 = s0;
@@ -1465,8 +1469,12 @@ export class RouteTrack {
       // junction centre can lie off to one side of a turning lane).
       const stop = Math.min(s0 - 7, best < 15 ? sc - junctionStop(data, J, j) : Infinity);
       const last = out[out.length - 1];
-      if (stop < 12 || (last && stop - last.s < 30)) continue;
+      // (one stop per junction: a second node group of the signal model's junction, which can span
+      // 70 m, is the same light; the next junction's, unless right on top of this one, is its own)
+      const gap = mj < 0 ? 30 : mj === lastMj ? 60 : 10;
+      if (stop < 12 || (last && stop - last.s < gap)) continue;
       out.push({ s: stop, x: cx, y: cy });
+      lastMj = mj;
     }
     return out;
   }
