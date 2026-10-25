@@ -167,9 +167,11 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
     for (const a of jn.arms) {
       // (an approach no signal faces has no light: src/data/signals.ts)
       if (!a.incoming || a.phase < 0) continue;
-      // Stop line clear of the widest other road, in the open (not inside a tunnel portal).
-      const ds = Math.min(a.stop, a.open - 1);
-      if (ds < 4) continue;
+      // Stop line clear of the widest other road, in the open (not inside a tunnel portal: on an arm that
+      // goes into a tunnel at its o, src/data/signals.ts already keeps it at o at the furthest), and out of
+      // the junction: at least 4 m from the centre along the arm.
+      const ds = a.mouth ? a.stop : Math.min(a.stop, a.open - 1);
+      if (a.mouth + ds < 4) continue;
       const lift = infos[a.road].lift;
       const sx = a.ox + a.ux * ds;
       const sy = a.oy + a.uy * ds;
@@ -196,8 +198,9 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       }
       // far-side right pole (across the junction) for major roads
       if (a.kind <= RoadKind.Secondary) {
-        // (across the box, not as far out as a set-back stop line)
-        const df = Math.min(ds, 22);
+        // (across the box, not as far out as a set-back stop line; mirrored about the centre from a
+        // tunnel mouth's line)
+        const df = a.mouth + Math.min(a.mouth + ds, 22);
         const fx = a.ox - a.ux * df - lx * (a.oneway ? a.hw + 0.9 : 1.5);
         const fy = a.oy - a.uy * df - ly * (a.oneway ? a.hw + 0.9 : 1.5);
         if (index.penetrationZ(fx, fy, a.z, 3) < -0.3) {

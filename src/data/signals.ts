@@ -52,8 +52,17 @@ export interface SignalArm {
   phase: number;
   /** Stop line distance from (ox, oy) along the arm. */
   stop: number;
-  /** Distance from the centre to where the arm goes into a tunnel (Infinity if it doesn't). */
+  /**
+   * Where the arm goes into a tunnel (Infinity if it doesn't): from the centre to the tunnel's nearer
+   * end, or 0 where (ox, oy) is that end out on the arm (`mouth`), measured from there.
+   */
   open: number;
+  /**
+   * How far out along the arm from the centre a tunnel the arm runs into has its mapped end, where
+   * (ox, oy) is that end (0 otherwise): the SEB under Stanley St (#6401) starts 11 m out from its
+   * junction. The stop line keeps its clearance from the centre, and stands at (ox, oy) at the nearest.
+   */
+  mouth: number;
 }
 
 export interface SignalPhase {
@@ -578,6 +587,8 @@ export class SignalModel {
         open = Math.min(Math.hypot(a.x - cx, a.y - cy), Math.hypot(b.x - cx, b.y - cy));
       }
       const p0 = pointAt(r, g, q.s);
+      // (the centre beyond the tunnel's end: the arm goes in at p0 itself, out on the arm)
+      const atEnd = r.tunnel && (q.s < 0.05 || q.s > g.len - 0.05);
       for (const dir of [1, -1]) {
         // Probe 16 m along the road, or as far as it goes (short links, pieces before a portal).
         const s = Math.max(0, Math.min(g.len, q.s + dir * ARM_PROBE));
@@ -593,7 +604,8 @@ export class SignalModel {
         ux /= l;
         uy /= l;
         const incoming = !r.oneway || dir === -1;
-        found.push({ ux, uy, ox: p0.x, oy: p0.y, road: ri, z: q.z, hw: r.width / 2, lanes: r.lanes, oneway: r.oneway, kind: r.kind, incoming, open, name: r.name });
+        const mouth = atEnd ? Math.max(0, (p0.x - cx) * ux + (p0.y - cy) * uy) : 0;
+        found.push({ ux, uy, ox: p0.x, oy: p0.y, road: ri, z: q.z, hw: r.width / 2, lanes: r.lanes, oneway: r.oneway, kind: r.kind, incoming, open, mouth, name: r.name });
       }
     });
     // Merge arms pointing the same way (the widest road names the arm).
@@ -603,16 +615,18 @@ export class SignalModel {
       const m = arms.find((b) => a.ux * b.ux + a.uy * b.uy > 0.86);
       if (m) {
         // (the stop line and heads go on the incoming carriageway)
-        if (!m.incoming && a.incoming) Object.assign(m, { ox: a.ox, oy: a.oy, road: a.road, z: a.z, hw: a.hw, lanes: a.lanes, oneway: a.oneway });
+        if (!m.incoming && a.incoming) Object.assign(m, { ox: a.ox, oy: a.oy, road: a.road, z: a.z, hw: a.hw, lanes: a.lanes, oneway: a.oneway, mouth: a.mouth });
         m.incoming = m.incoming || a.incoming;
         m.open = Math.min(m.open, a.open);
       } else arms.push({ ...a, phase: -1, stop: 6 });
     }
-    // Stop lines clear of the widest other road.
+    // Stop lines clear of the widest other road, measured from the centre: on an arm that goes into a
+    // tunnel out on the arm (`mouth`) the line stands that far out, and at the tunnel's mapped end at the
+    // nearest, never inside it (SEB #6401 under Stanley St, 11 m out, the street 4 m into the tunnel).
     for (const a of arms) {
       let ds = 6;
       for (const b of arms) if (b !== a) ds = Math.max(ds, b.hw + 2.5);
-      a.stop = Math.min(ds, 22);
+      a.stop = Math.max(0, Math.min(ds, 22) - a.mouth);
     }
     // The incoming arms the junction's signal nodes face. The pipeline gives each
     // node the road it stands on and the direction of the traffic it faces along
@@ -645,6 +659,8 @@ export class SignalModel {
     // underground bus station, where no heads are drawn) control nothing.
     const inc = arms.filter((a, i) => a.incoming && (controlled.has(i) || !controlled.size));
     if (inc.every((a) => a.open < 5)) inc.length = 0;
+    // (an arm that goes into a tunnel at its o does so right there)
+    for (const a of arms) if (a.mouth) a.open = 0;
     const pairs: { a: number; b: number; score: number }[] = [];
     for (let i = 0; i < inc.length; i++) {
       for (let k = i + 1; k < inc.length; k++) {

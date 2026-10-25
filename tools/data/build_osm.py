@@ -12,6 +12,7 @@ the map and simplified, and writes the terrain.
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -640,6 +641,100 @@ def name_bridges(h: "Handler") -> int:
     return n
 
 
+JOIN_GAP = 1.0  # m: way ends this close that share no node are one junction mapped twice
+SHORT_WAY = 1.0  # m: elevation.build drops output pieces shorter than this
+
+
+def join_near_ends(lines) -> tuple[list, dict[int, int], int, int]:
+    """Road junctions OSM maps as two nodes a hand's width apart become one node
+    (the lower id's), so the roads meet:
+    - a vehicle way shorter than SHORT_WAY between them (elevation.build drops
+      such pieces, which left the roads either side unjoined: the 0.92 m way
+      1216686378 between Macgregor Terrace and Latrobe Terrace at (-3442, 1045),
+      a car-graph dead end, 61/0 s 2296) is contracted to its first node;
+    - vehicle way ends within JOIN_GAP of another way's end on the same OSM
+      level, with no way between them (never a way's two ends to each other).
+    Returns (the lines left, merged node ids old -> kept, ways contracted,
+    ends joined)."""
+    PED = 8
+    road = [ln for ln in lines if ln.kind not in (elevation.RAIL, PED) and len(ln.nodes) >= 2]
+    to: dict[int, int] = {}
+
+    def root(n: int) -> int:
+        while n in to:
+            n = to[n]
+        return n
+
+    def union(a: int, b: int) -> bool:
+        a, b = root(a), root(b)
+        if a == b:
+            return False
+        to[max(a, b)] = min(a, b)
+        return True
+
+    pos: dict[int, tuple[float, float]] = {}
+    for ln in road:
+        for nid, xy in zip(ln.nodes, ln.xy):
+            pos.setdefault(nid, xy)
+    drop: set[int] = set()
+    for ln in road:
+        if len(set(ln.nodes)) < 2:
+            continue
+        length = sum(math.hypot(x1 - x0, y1 - y0) for (x0, y0), (x1, y1) in zip(ln.xy[:-1], ln.xy[1:]))
+        if length < SHORT_WAY:
+            for nid in ln.nodes[1:]:
+                union(ln.nodes[0], nid)
+            drop.add(id(ln))
+    contracted = len(drop)
+    ends: dict[int, tuple[float, float, int]] = {}
+    ways: dict[int, set[int]] = {}
+    linked: set[tuple[int, int]] = set()
+    for i, ln in enumerate(road):
+        if id(ln) in drop:
+            continue
+        for k in (0, len(ln.nodes) - 1):
+            ends.setdefault(ln.nodes[k], (ln.xy[k][0], ln.xy[k][1], ln.level))
+            ways.setdefault(ln.nodes[k], set()).add(i)
+        for a, b in zip(ln.nodes[:-1], ln.nodes[1:]):
+            linked.add((min(a, b), max(a, b)))
+    ids = sorted(ends)
+    cell: dict[tuple[int, int], list[int]] = {}
+    for nid in ids:
+        x, y, _ = ends[nid]
+        cell.setdefault((int(x // 2), int(y // 2)), []).append(nid)
+    joined = 0
+    for nid in ids:
+        x, y, lv = ends[nid]
+        gx, gy = int(x // 2), int(y // 2)
+        for ax in (-1, 0, 1):
+            for ay in (-1, 0, 1):
+                for m in cell.get((gx + ax, gy + ay), []):
+                    if m <= nid:
+                        continue
+                    x2, y2, lv2 = ends[m]
+                    if lv2 != lv or math.hypot(x2 - x, y2 - y) > JOIN_GAP or (nid, m) in linked or ways[nid] & ways[m]:
+                        continue
+                    if union(nid, m):
+                        joined += 1
+    out = {n: root(n) for n in to}
+    for ln in road:
+        if id(ln) in drop:
+            continue
+        nodes: list[int] = []
+        xy: list[tuple[float, float]] = []
+        for nid, p in zip(ln.nodes, ln.xy):
+            r = out.get(nid, nid)
+            if r != nid:
+                p = pos[r]
+            if nodes and nodes[-1] == r:
+                continue
+            nodes.append(r)
+            xy.append(p)
+        if len(nodes) >= 2:
+            ln.nodes, ln.xy = nodes, xy
+    return [ln for ln in lines if id(ln) not in drop], out, contracted, joined
+
+
 def cap_widths(lines, buildings, tagged: set[int]) -> None:
     """Default road widths (lanes x lane width) that do not fit between the
     buildings along the road are narrowed to the building-free corridor less a
@@ -753,6 +848,21 @@ def main():
     h.apply_file(PBF, locations=True, idx="flex_mem")
 
     print(f"road and rail ways {len(h.lines)} buildings {len(h.buildings)} areas {len(h.areas)} water {len(h.water_polys)}", file=sys.stderr)
+    h.lines, moved, n_short, n_near = join_near_ends(h.lines)
+    print(f"joins: {n_short} road ways under {SHORT_WAY} m contracted to a node, {n_near} way ends within {JOIN_GAP} m of another joined"
+          f" ({len(moved)} nodes merged at {len(set(moved.values()))} places)", file=sys.stderr)
+    # (a signal on a node joined away stands on the node it was joined to)
+    if moved:
+        kept = set(moved.values())
+        at = {nid: xy for ln in h.lines for nid, xy in zip(ln.nodes, ln.xy) if nid in kept}
+        sig = []
+        for nid, x, y, d in h.signal_nodes:
+            r = moved.get(nid, nid)
+            if r != nid and r in at:
+                x, y = at[r]
+            sig.append((r, x, y, d))
+        h.signal_nodes = sig
+        h.signals = [v for _, x, y, _ in sig for v in (q(x), q(y))]
 
     water = unary_union(h.water_polys).intersection(CLIP_PAD) if h.water_polys else None
     water_out = []
