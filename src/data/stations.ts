@@ -507,8 +507,9 @@ export const STATIONS: StationDef[] = [
     r: 45,
     // an open cutting below Kelvin Grove Rd (OSM's layer=-1 only means "below the road bridge")
     underground: false,
-    post: 0x2f5f8f,
-    fascia: 0xeeeeea,
+    // dark teal-grey posts and a dark fascia under white soffits with round downlights (photo Normanby_stn_looking_S)
+    post: 0x2f4f55,
+    fascia: 0x2e3134,
     roofTop: 0x8a8e90,
     soffit: 0xf0f0ec,
     paving: 0xbfb8aa,
