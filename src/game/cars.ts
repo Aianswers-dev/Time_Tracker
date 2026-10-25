@@ -2022,9 +2022,11 @@ export class CarTraffic {
       let target = this.laneOffset(c.lane, c.laneIdx);
       // Carrying straight on into a lane further left (a divided road's carriageway, whose centreline
       // bends in to the undivided road's at the node): move over before the node, not after it with
-      // the corner cut across the oncoming lane. (Further right waits for the far side.)
+      // the corner cut across the oncoming lane. (Further right waits for the far side. Where a one-way
+      // road only gains a lane, its kerb moves out at the node, not before it: so do its lanes.)
       const left = this.edges[c.lane >> 1].len - c.u;
-      if (c.next >= 0 && left < LANE_BLEND) {
+      const widens = c.next >= 0 && this.edges[c.lane >> 1].oneway && this.edges[c.next >> 1].oneway && this.lanesIn(c.next) > this.lanesIn(c.lane);
+      if (c.next >= 0 && left < LANE_BLEND && !widens) {
         const to = this.laneOffset(c.next, Math.min(c.laneIdx, this.lanesIn(c.next) - 1));
         if (to > target && Math.abs(this.turnAngle(c.lane, c.next)) < 0.5) target += (to - target) * (1 - left / LANE_BLEND);
       }
