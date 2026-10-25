@@ -27,6 +27,7 @@ import { greenBridgeSpan, storyOutline } from './landmarks';
 import { makeRoadTextTexture, makeSignTextTexture, makeTunnelSignTexture } from './textures';
 import { MASK_RAIL, MASK_WATER, clamp, pointInRing, yieldFrame } from './util';
 import { onAnyPlatform } from '../data/stations';
+import { signalsFor } from '../data/signals';
 
 export const KERB_H = 0.15;
 const ROAD_CHUNK = 2500;
@@ -658,6 +659,9 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   const infos = roads.map((r, i) => prepRoad(r, i));
   const index = new RoadIndex(roads, data.bounds);
   const tunnels = new RoadIndex(roads, data.bounds, (r) => r.tunnel);
+  // the stop lines of the signals (src/data/signals.ts: every controlled incoming arm of a junction whose
+  // lights anyone can see), [x, y, z, ...], for mouthClear()
+  let stopPts: number[] | null = null;
   // station stopping bays (pipeline roads beside the busway, under the platform's edge)
   const bays = new RoadIndex(roads, data.bounds, (r) => !!r.bay);
   const mask = ctx.mask;
@@ -1114,6 +1118,7 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         const c = g.vert(cx, cz + lift, cy, 0, surf, 0, ct);
         const segs = 6;
         let prev = -1;
+        const arc: number[] = [];
         for (let k = 0; k <= segs; k++) {
           const t = -Math.PI / 2 + (k / segs) * Math.PI;
           const dx = ux * Math.cos(t) - uy * Math.sin(t);
@@ -1121,6 +1126,16 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
           const vi = g.vert(cx + dx * hw, cz + lift, cy + dy * hw, 0, surf, 0, ct);
           if (prev >= 0) g.tri(c, prev, vi, 0, 1, 0);
           prev = vi;
+          arc.push(cx + dx * hw, cy + dy * hw);
+        }
+        if (r.tunnel && (nodes.get(nodeKey(cx, cy))?.surf ?? 0) > 0) {
+          // a tunnel road's end at a portal, where roads at grade run on: its cap is the carriageway in front
+          // of the mouth, so wherever the ground still shows through it, it comes off exactly, with earth
+          // faces down to it (clearSurfaces: the wedge left beside an approach meeting at an angle, or
+          // narrower than the tube where it forks, Clem7)
+          for (let k = 0; k + 2 <= segs; k += 2) {
+            surfQuads.push(cx, cy, cz, arc[2 * k], arc[2 * k + 1], cz, arc[2 * k + 2], arc[2 * k + 3], cz, arc[2 * k + 4], arc[2 * k + 5], cz, lift);
+          }
         }
         if (!r.tunnel) {
           field.clampQuad(
@@ -2478,6 +2493,55 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
   }
 
   /**
+   * How far in from a tunnel's end (0 start, 1 end) its tube has to stay open: past the stop line of a
+   * junction at the mouth, with the first car waiting there (5 m), and past a pedestrian crossing's paint
+   * (furniture.ts paints it on the nearest road in the open, 1.7 m either side, + 1 m), so neither is under
+   * the roof (the Cultural Centre tunnel's mapped NW end is the busway junction's signal node, its stop line
+   * 6 m in and a crossing 2 m out). -1 when nothing needs it.
+   */
+  function mouthClear(ri: RI, end: number): number {
+    if (!stopPts) {
+      stopPts = [];
+      for (const J of signalsFor(data).junctions) {
+        if (!J.phases.length) continue;
+        for (const a of J.arms) if (a.incoming && a.phase >= 0) stopPts.push(a.ox + a.ux * a.stop, a.oy + a.uy * a.stop, a.z);
+      }
+    }
+    const lim = Math.min(20, ri.len / 2);
+    const c0 = roadAt(ri, end === 0 ? 0 : ri.len);
+    // (inward along the road from the end)
+    const tx = end === 0 ? c0.ny : -c0.ny;
+    const ty = end === 0 ? -c0.nx : c0.nx;
+    let reach = -1;
+    const need = (x: number, y: number, z: number, pad: number) => {
+      const t = (x - c0.x) * tx + (y - c0.y) * ty;
+      if (t < -pad || t > lim + 2) return;
+      let c = c0;
+      let d = t;
+      if (t > 0) {
+        let bd = Infinity;
+        for (let s = 0; s <= lim + 2; s += 0.5) {
+          const q = roadAt(ri, end === 0 ? Math.min(s, ri.len) : Math.max(0, ri.len - s));
+          const dd = Math.hypot(q.x - x, q.y - y);
+          if (dd < bd) [bd, c, d] = [dd, q, s];
+        }
+      }
+      if (Math.abs((x - c.x) * c.nx + (y - c.y) * c.ny) > ri.hw + 1 || Math.abs(z - c.z) > 2) return;
+      reach = Math.max(reach, d + pad);
+    };
+    for (let k = 0; k < stopPts.length; k += 3) {
+      if (Math.abs(stopPts[k] - c0.x) < 30 && Math.abs(stopPts[k + 1] - c0.y) < 30) need(stopPts[k], stopPts[k + 1], stopPts[k + 2], 5);
+    }
+    const cr = data.crossings;
+    for (let k = 0; k + 1 < cr.length; k += 2) {
+      if (Math.abs(cr[k] - c0.x) > 12 || Math.abs(cr[k + 1] - c0.y) > 12) continue;
+      const nr = index.nearest(cr[k], cr[k + 1], 6);
+      if (nr) need(nr.px, nr.py, nr.z, 2.7);
+    }
+    return Math.min(reach, lim);
+  }
+
+  /**
    * Where a tunnel road is an enclosed box, sampled every 4 m: all along a
    * tunnel the pipeline boxed end to end, else under enough ground; and
    * under a street that crosses low over it (an underpass box, so
@@ -2554,8 +2618,17 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     // Nor at a fork at its mouth, where a branch at grade leaves at an angle and its carriageway runs
     // through the box's wall line (the SEB's branches to Woolloongabba station where its tunnel from
     // Mater Hill ends), or where a platform's end stands in that line (Buranda platform 3 at its bay's
-    // mouth): the approach is open until the line is clear, as before.
+    // mouth): the approach is open until the line is clear, as before. Nor, in any tunnel, over a
+    // junction's stop line or a pedestrian crossing at the mouth (mouthClear), even where the ground
+    // stands over the roof (an open cutting to a portal past them), though under a street over it; there
+    // the box runs on past the street to the next sample only, not a whole sample further (the busway
+    // out of the Mater Hill tunnel at Woolloongabba stops 6 m in, with Allen St's edge from 9.5 m).
     const forkOpen = new Uint8Array(n);
+    const clearOpen = new Uint8Array(n);
+    for (const end of [0, 1]) {
+      const reach = mouthClear(ri, end);
+      for (let k = 0; k < n && reach > 0; k++) if ((end === 0 ? ss[k] : ri.len - ss[k]) <= reach) clearOpen[k] = 1;
+    }
     if (r.boxed) {
       for (const end of [0, 1]) {
         const v = end === 0 ? 0 : ri.n - 1;
@@ -2591,7 +2664,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         for (let k = 0; k < n && reach > 0; k++) if ((end === 0 ? ss[k] : ri.len - ss[k]) <= reach) forkOpen[k] = 1;
       }
     }
-    const cov = P0.map((c, k) => (!!r.boxed && roomy(k) && !forkOpen[k]) || covered(ri, c) || over[k] || (k > 0 && over[k - 1]) || (k < n - 1 && over[k + 1]));
+    const near = (k: number) => (clearOpen[k] ? (k > 0 && street(ab[k - 1])) || (k < n - 1 && street(ab[k + 1])) : (k > 0 && over[k - 1]) || (k < n - 1 && over[k + 1]));
+    const cov = P0.map((c, k) => (!!r.boxed && roomy(k) && !forkOpen[k] && !clearOpen[k]) || (covered(ri, c) && !clearOpen[k]) || over[k] || near(k));
     // no 4-8 m slivers of open cutting between two boxes, and no lone covered sample
     for (let k = 1; k + 1 < n; k++) {
       if (!cov[k] && cov[k - 1] && (cov[k + 1] || (k + 2 < n && cov[k + 2]))) cov[k] = true;
@@ -3130,15 +3204,73 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         if (!clear(sd * (half - 0.3), 0.6)) continue;
         st.boxF(c.x + c.nx * sd * (half - 0.3) - tx * 0.3, c.y + c.ny * sd * (half - 0.3) - ty * 0.3, c.z - 0.2, roof, tx, ty, 0.3, 0.3, ...CONC);
         wallLog.box(c.x + c.nx * sd * (half - 0.3) - tx * 0.3, c.y + c.ny * sd * (half - 0.3) - ty * 0.3, c.z - 0.4, Math.min(roof, c.z + TUBE_WALL_H), tx, ty, 0.3, 0.3, EW_TUNNEL, ri.i, true);
-        // the headwall's face beside the opening, from the approach's wall line (hw + 0.3) across the
-        // walkway and the tube's wall to the pilaster, so the mouth never shows a slot into the earth behind
-        // the wall or under the ground beside a wall-less approach
-        const o0 = hw + 0.3;
-        const o1 = half - 0.6;
-        const oc = (o0 + o1) / 2;
-        if (seg < 0 || openSide[sd > 0 ? 0 : 1][seg] || !clear(sd * (o0 + 0.15), 0.3) || !clear(sd * oc, 0.6) || !clear(sd * (o1 - 0.15), 0.6)) continue;
-        st.boxF(c.x + c.nx * sd * oc - tx * 0.3, c.y + c.ny * sd * oc - ty * 0.3, c.z - 0.2, roof, tx, ty, 0.3, (o1 - o0) / 2, ...PORTAL);
-        wallLog.box(c.x + c.nx * sd * oc - tx * 0.3, c.y + c.ny * sd * oc - ty * 0.3, c.z - 0.4, Math.min(roof, c.z + TUBE_WALL_H), tx, ty, 0.3, (o1 - o0) / 2, EW_TUNNEL, ri.i, true);
+      }
+      // the headwall's face beside the opening, across the mouth wherever no carriageway runs out of it:
+      // from the edge of the one that does across the walkway and the tube's wall to the pilaster, so the
+      // mouth never shows a slot into the earth behind the wall, under the ground beside a wall-less
+      // approach, or beside an approach wider than the tube or a carriageway alongside
+      // (the platforms whose outline's box comes within the mouth's width; one runs out only where it runs on
+      // into the box as well: at Mater Hill platform 1 ends at the bay's portal, its headwall standing on its end)
+      const pfs = data.platforms.filter((pf) => {
+        if (!pf.area) return false;
+        let x0 = Infinity;
+        let y0 = Infinity;
+        let x1 = -Infinity;
+        let y1 = -Infinity;
+        for (let i = 0; i + 1 < pf.pts.length; i += 2) {
+          x0 = Math.min(x0, pf.pts[i]);
+          x1 = Math.max(x1, pf.pts[i]);
+          y0 = Math.min(y0, pf.pts[i + 1]);
+          y1 = Math.max(y1, pf.pts[i + 1]);
+        }
+        return c.x > x0 - half - 2 && c.x < x1 + half + 2 && c.y > y0 - half - 2 && c.y < y1 + half + 2;
+      });
+      // (the tunnel road's own carriageway always runs out: in its open cutting, or at its end on its cap,
+      // carved clear in front of the mouth; the face stands 5 cm over the edge of each carriageway)
+      const runsOut = (o: number) => {
+        if (Math.abs(o) < hw - 0.05) return true;
+        for (const d of [0.05, 0.3, 0.55]) {
+          const x = c.x + c.nx * o - tx * d;
+          const y = c.y + c.ny * o - ty * d;
+          if (otherAt(x, y, c.z, ri.i, 1.5) > 0.05 || tubeNb(x, y, c.z) > 0.05) return true;
+          if (pfs.some((pf) => pointInRing(x, y, pf.pts) && pointInRing(x + tx * (d + 0.3), y + ty * (d + 0.3), pf.pts))) return true;
+        }
+        return false;
+      };
+      const face = (a: number, b: number) => {
+        if (b - a < 0.05) return;
+        const oc = (a + b) / 2;
+        st.boxF(c.x + c.nx * oc - tx * 0.3, c.y + c.ny * oc - ty * 0.3, c.z - 0.2, roof, tx, ty, 0.3, (b - a) / 2, ...PORTAL);
+        wallLog.box(c.x + c.nx * oc - tx * 0.3, c.y + c.ny * oc - ty * 0.3, c.z - 0.4, Math.min(roof, c.z + TUBE_WALL_H), tx, ty, 0.3, (b - a) / 2, EW_TUNNEL, ri.i, true);
+      };
+      // (on a side open toward a carriageway beside it as well, between the two: a pier at the mouth)
+      if (seg >= 0) {
+        const lo = -(half - 0.6);
+        const hi = half - 0.6;
+        // (shut and open stretches every 0.1 m, each change found to 1 cm)
+        const edge = (a: number, b: number) => {
+          const sa = runsOut(a);
+          for (let q = 0; q < 4; q++) {
+            const m = (a + b) / 2;
+            if (runsOut(m) === sa) a = m;
+            else b = m;
+          }
+          return (a + b) / 2;
+        };
+        const step = 0.1;
+        let a0 = runsOut(lo) ? NaN : lo;
+        let prev = lo;
+        for (let o = lo + step; o < hi + step - 1e-6; o += step) {
+          const at = Math.min(o, hi);
+          const shut = !runsOut(at);
+          if (shut && Number.isNaN(a0)) a0 = edge(prev, at);
+          else if (!shut && !Number.isNaN(a0)) {
+            face(a0, edge(prev, at));
+            a0 = NaN;
+          }
+          prev = at;
+        }
+        if (!Number.isNaN(a0)) face(a0, hi);
       }
       const N = Math.max(4, Math.round((2 * half) / 1.2));
       const w = (2 * half) / N;
