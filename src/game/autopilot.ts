@@ -340,6 +340,20 @@ export class Autopilot {
       }
     }
 
+    // Coming out of a side road at an unsignalised junction: give way to the main road (only
+    // while there is still room to stop at the line).
+    if (this.traffic && this.time > this.ignoreTrafficUntil) {
+      const d = this.traffic.giveWayAhead(T, sFront, 12 + (v * v) / (2 * SIGNAL_DECEL));
+      if (d < Infinity && d > (v * v) / (2 * 3.5)) {
+        const vs = Math.sqrt(2 * SIGNAL_DECEL * Math.max(0, d - 1));
+        if (vs < target) {
+          target = vs;
+          why = 'traffic';
+          limitDist = d;
+        }
+      }
+    }
+
     // Vehicles ahead on the lane.
     if (this.traffic && this.time > this.ignoreTrafficUntil) {
       const lead = this.leadDistance(sFront, z, Math.min(70, 12 + v * v / (2 * DECEL) + v * 2), this.time < this.strictLeadUntil);

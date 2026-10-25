@@ -622,6 +622,7 @@ export class Traffic {
 
   /** One simulation step of the buses and cars (no drawing). */
   private simulate(dt: number, time: number, player: BusPose): void {
+    this.simTime = time;
     const px = player.x;
     const py = player.y;
     this.updatePlayerBody(player);
@@ -1408,6 +1409,23 @@ export class Traffic {
     return out;
   }
   private readonly busBodiesOut: { body: Body; half: number; len: number }[] = [];
+  private simTime = 0;
+
+  /**
+   * Distance from `s` to the stop line of the next unsignalised junction within `range` where the
+   * player's route comes in from a side road while main-road traffic is passing or a crossing
+   * movement holds the box (a driver gives way there); Infinity when there is none.
+   */
+  giveWayAhead(track: RouteTrack, s: number, range: number): number {
+    const time = this.simTime;
+    for (const j of this.cars.junctionsAlong(track)) {
+      if (j.stopS < s - 1) continue;
+      if (j.stopS - s > range) break;
+      if (j.sig || !j.minor) continue;
+      if (this.cars.giveWayBusy(j.node, true, time) || !this.cars.boxClear(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time)) return j.stopS - s;
+    }
+    return Infinity;
+  }
 
   /** AI buses and cars within r of (x, y) with their state, and recent valve events (diagnostics). */
   debugNear(x: number, y: number, r = 60): object {
