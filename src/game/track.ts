@@ -2063,8 +2063,17 @@ export class RouteTrack {
           if (!TW.drivable(nxp, nyp, this.z[k])) continue;
           const dNew = this.wallDist(W, G, nxp, nyp, this.z[k]);
           if (dNew < WALL_CLEAR - 0.6 && dNew < this.wallDist(W, G, this.x[k], this.y[k], this.z[k])) continue;
+          // (Not into a corner tighter than R_OK, or than it was: the push bends the lane, it does not kink it.)
+          const ox = this.x[k];
+          const oy = this.y[k];
+          const r0 = Math.min(this.radiusAt(k - 1), this.radiusAt(k), this.radiusAt(k + 1));
           this.x[k] = nxp;
           this.y[k] = nyp;
+          if (Math.min(this.radiusAt(k - 1), this.radiusAt(k), this.radiusAt(k + 1)) < Math.min(R_OK, r0) - 1e-6) {
+            this.x[k] = ox;
+            this.y[k] = oy;
+            continue;
+          }
           moved = true;
           for (let q = Math.max(0, k - 2); q <= Math.min(n - 1, k + 2); q++) next[q] = 1;
         }
