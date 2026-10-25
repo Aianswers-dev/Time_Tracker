@@ -137,6 +137,8 @@ interface PlayerApproach {
 const ONCOMING_MARGIN = 1.5;
 /** Car acceleration (m/s^2). */
 const CAR_A = 1.7;
+/** Distance (m) before a node over which a car going straight on eases to the next lane's offset. */
+const LANE_BLEND = 14;
 /** Gap (s) to the next vehicle on a conflicting movement that one giving way waits for: merging left, and across. */
 export const GAP_LEFT = 4.5;
 export const GAP_ACROSS = 6.5;
@@ -1853,7 +1855,15 @@ export class CarTraffic {
         c.laneIdx = Math.min(c.laneIdx, this.lanesIn(c.lane) - 1);
       }
       if (c.dead) continue;
-      const target = this.laneOffset(c.lane, c.laneIdx);
+      let target = this.laneOffset(c.lane, c.laneIdx);
+      // Carrying straight on into a lane further left (a divided road's carriageway, whose centreline
+      // bends in to the undivided road's at the node): move over before the node, not after it with
+      // the corner cut across the oncoming lane. (Further right waits for the far side.)
+      const left = this.edges[c.lane >> 1].len - c.u;
+      if (c.next >= 0 && left < LANE_BLEND) {
+        const to = this.laneOffset(c.next, Math.min(c.laneIdx, this.lanesIn(c.next) - 1));
+        if (to > target && Math.abs(this.turnAngle(c.lane, c.next)) < 0.5) target += (to - target) * (1 - left / LANE_BLEND);
+      }
       c.lat += Math.max(-dt * 1.2, Math.min(dt * 1.2, target - c.lat));
       this.at(c.lane, c.u, c.lat, pt);
       c.x = pt.x;
