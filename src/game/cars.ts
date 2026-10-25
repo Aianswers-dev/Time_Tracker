@@ -1527,8 +1527,9 @@ export class CarTraffic {
    * another arm's line moves that line back until it is clear, up to SWEEP_MAX from the node. A bus
    * turning left out of one narrow road into another swings over the far half of the one it turns
    * into, where cars wait at their red (199/0 s 1926, s 7070). Returns the number of lines moved.
+   * With `only`, just the route's junction of that index (an AI bus coming up to it).
    */
-  holdBackFor(track: RouteTrack, spec: BusSpec): number {
+  holdBackFor(track: RouteTrack, spec: BusSpec, only = -1): number {
     const secs = spec.sections;
     const ns = secs.length;
     // Section i: its axle, its hitch to the one in front (section 0: the front axle), unit heading.
@@ -1542,7 +1543,9 @@ export class CarTraffic {
     const smp = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
     const pt = this.pt2;
     let moved = 0;
-    for (const j of this.junctionsAlong(track)) {
+    const jl = this.junctionsAlong(track);
+    for (let q = only < 0 ? 0 : only; q < (only < 0 ? jl.length : Math.min(jl.length, only + 1)); q++) {
+      const j = jl[q];
       const nd = this.nodes[j.node];
       // Arms with a line cars wait at; the one the bus comes in on too, for the lanes beside the
       // bus's (it may cross them before the node).

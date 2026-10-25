@@ -206,6 +206,9 @@ const NARROW_K = 0.01;
 /** How far past a route's stop line a signalised junction's first node may lie and still be on that line's light (m). */
 const FAR_LINE = 70;
 
+/** How far ahead (m) of an AI bus the car stop lines at its junctions are held back from its swept path. */
+const AI_HOLD_AHEAD = 200;
+
 export class Traffic {
   private active: AiBus[] = [];
   private pool = new Map<string, BusMesh[]>();
@@ -258,6 +261,8 @@ export class Traffic {
   private pTrack: RouteTrack | null = null;
   /** The player's track the car stop lines were held back for (holdBackFor). */
   private heldFor: RouteTrack | null = null;
+  /** Per AI bus track: its junctions (by index) whose stop lines have been held back from its swept path. */
+  private aiHeld = new WeakMap<RouteTrack, Uint8Array>();
   private pS = 0;
   private asks = new WeakMap<TrackSignal, SignalAsk>();
   private bodiesOut: Body[] = [];
@@ -808,6 +813,23 @@ export class Traffic {
     if (this.pTrack && this.pTrack !== this.heldFor && this.playerSpec) {
       this.heldFor = this.pTrack;
       this.events.push(`stop lines held back from the route's swept path: ${this.cars.holdBackFor(this.pTrack, this.playerSpec)}`);
+    }
+    // ...and from each AI bus's, at the junctions it is coming up to (one junction a frame, about a
+    // millisecond). 199/0 s 2309: a 60/0 turning left at Boundary St swept the line of the arm beside its
+    // way out, stopped in the box behind a car waiting at its red there, and the box then held up the
+    // player's lane through it for two minutes.
+    let holdBudget = 1;
+    for (const b of this.active) {
+      if (holdBudget <= 0) break;
+      if (b.dead) continue;
+      let done = this.aiHeld.get(b.track);
+      if (!done) this.aiHeld.set(b.track, (done = new Uint8Array(b.jl.length)));
+      for (let q = b.jNext; q < b.jl.length && b.jl[q].s < b.s + AI_HOLD_AHEAD && holdBudget > 0; q++) {
+        if (done[q]) continue;
+        done[q] = 1;
+        holdBudget--;
+        this.cars.holdBackFor(b.track, b.spec, q);
+      }
     }
     this.claimJunctions(time, player);
     for (const b of this.active) this.step(b, dt, time);
