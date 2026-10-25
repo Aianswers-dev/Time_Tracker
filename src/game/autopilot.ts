@@ -118,6 +118,8 @@ export class Autopilot {
   private strictLeadUntil = -1;
   /** Consecutive 40 s blocked spells without moving on. */
   private blockedN = 0;
+  /** Rescues put off in a row because the lane was full. */
+  private noRescueN = 0;
   private levelBadT = 0;
   private lastProblem = new Map<string, number>();
   private readonly near: { body: Body; half: number; len: number }[] = [];
@@ -137,16 +139,70 @@ export class Autopilot {
     this.pull = 0;
   }
 
-  /** Put the bus back on the lane `jump` metres on, but not past the stop it's heading for. */
-  private rescueTo(jump: number, stopTarget: number): void {
+  /**
+   * Put the bus back on the lane `jump` metres on, but not past the stop it's heading for, and
+   * only where its whole length is clear of AI vehicles (teleporting into a queue gets the bus
+   * shoved sideways, over a kerb or parapet). Nowhere clear: put it straight on the lane where it
+   * is, or, if even that is taken, leave it and try again later (twice; then go anyway).
+   */
+  private rescueTo(jump: number, stopTarget: number): boolean {
     const T = this.track;
     const rearTarget = stopTarget - this.spec.sections[0].axleFromFront - 0.5;
     const cap = rearTarget > this.sRear ? rearTarget : Infinity;
-    const s = Math.max(this.sRear + 3, Math.min(this.sRear + jump, cap));
+    const want = Math.max(this.sRear + 3, Math.min(this.sRear + jump, cap));
+    let s = NaN;
+    for (let c = want; c >= this.sRear - 0.01; c -= 2) {
+      if (this.clearAt(c)) {
+        s = c;
+        break;
+      }
+    }
+    if (!Number.isFinite(s)) {
+      if (++this.noRescueN < 3) return false;
+      s = want;
+    }
+    this.noRescueN = 0;
     T.sample(s, this.tmp, this.pull);
     this.rescues++;
     this.rescue = { x: this.tmp.x, y: this.tmp.y, heading: this.tmp.heading, z: T.zAt(s) };
     this.sRear = s;
+    return true;
+  }
+
+  /** Is the lane clear of AI buses and cars for the whole bus with its rear axle at s? */
+  private clearAt(sRear: number): boolean {
+    if (!this.traffic) return true;
+    const T = this.track;
+    const front = sRear + this.spec.sections[0].axleFromFront;
+    let len = 0;
+    for (const sec of this.spec.sections) len += sec.length;
+    const R = this.spec.width / 2;
+    const grid = this.traffic.cars.grid;
+    const bodies = this.traffic.busBodies();
+    for (let d = 0; d <= len + 1; d += 1.5) {
+      const ss = front + 1 - d;
+      T.sample(ss, this.tmp, this.pull);
+      const pz = T.zAt(ss);
+      const px = this.tmp.x;
+      const py = this.tmp.y;
+      if (grid.nearest(px, py, R + 1.0, undefined, pz) >= 0) return false;
+      for (const b of bodies) {
+        const B = b.body;
+        if (Math.abs(B.fx - px) > b.len + 4 || Math.abs(B.fy - py) > b.len + 4) continue;
+        for (let k = 0; k + 1 < B.n; k++) {
+          if (Math.abs(B.z[k] - pz) > LEVEL_GAP && Math.abs(B.z[k + 1] - pz) > LEVEL_GAP) continue;
+          const ax = B.x[k];
+          const ay = B.y[k];
+          const sx = B.x[k + 1] - ax;
+          const sy = B.y[k + 1] - ay;
+          const l2 = sx * sx + sy * sy;
+          const t = l2 > 1e-6 ? clamp(((px - ax) * sx + (py - ay) * sy) / l2, 0, 1) : 0;
+          const r = R + b.half + 0.1;
+          if ((px - ax - sx * t) ** 2 + (py - ay - sy * t) ** 2 < r * r) return false;
+        }
+      }
+    }
+    return true;
   }
 
   private project(x: number, y: number, from: number, to: number): number {
@@ -413,7 +469,7 @@ export class Autopilot {
     if (this.stuckT > 8 && !g.finished) {
       this.problem('stuck', `no progress for 8 s (target ${target.toFixed(1)} m/s, why=${why}, hit=${a.hit?.hit ? (a.hit.wall ? 'wall' : 'body') : 'none'})`, at, 1);
       this.stuckT = 0;
-      this.rescueTo(14, stopTarget);
+      if (!this.rescueTo(14, stopTarget)) this.problem('no-rescue', 'stuck, but the lane ahead is full of traffic: waiting', at, 1);
     }
     if (a.hit?.hit && a.hit.impact > 0.4) {
       this.problem(a.hit.wall ? 'hit-wall' : 'hit', `impact ${a.hit.impact.toFixed(1)} m/s${a.hit.wall ? ` wall #${a.hit.wallIndex}` : ''} at ${(v * 3.6).toFixed(0)} km/h, lateral ${this.frame.lateral.toFixed(2)} m`, at, 2);
@@ -429,7 +485,7 @@ export class Autopilot {
     if (this.levelBadT > 3 && !this.rescue) {
       this.problem('wrong-level', `on the wrong level for 3 s (Δ ${(z - tz).toFixed(1)} m): put back on the lane`, at, 1);
       this.levelBadT = 0;
-      this.rescueTo(6, stopTarget);
+      if (!this.rescueTo(6, stopTarget)) this.problem('no-rescue', 'on the wrong level, but the lane ahead is full of traffic: waiting', at, 1);
     }
     if (Number.isFinite(this.lastZ) && Math.abs(z - this.lastZ) > Math.max(0.25, av * dt * 0.25)) this.problem('z-jump', `road height jumped ${(z - this.lastZ).toFixed(2)} m in one frame at ${(v * 3.6).toFixed(0)} km/h`, at, 2);
     // A rescue teleports the bus before the next frame: don't count that as a jump.
