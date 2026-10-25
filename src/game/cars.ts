@@ -2222,11 +2222,16 @@ export class CarTraffic {
           mEnd = remain + this.edges[c.next >> 1].len;
           mLane = c.next2;
         }
-        if (mEnd < LANE_BLEND + 8) {
+        const hold = mLane === c.next ? LANE_BLEND : 0;
+        if (mEnd < LANE_BLEND + 8 + hold) {
           // Where we would be in the lane we merge into: beside our tail (and a bus length's gap behind it) to our nose.
           // (A bus standing behind our tail is not coming along it: it waits for us. 61/1 s 954: the
           // player's bus, moving over from the kerb lane to turn right into the Eastern Busway, stopped
           // 2 m behind a car whose lane ended at the node, which was in its way; the car waited for it.)
+          // (Where the road narrows at the node, we wait short of the last LANE_BLEND m, over which the
+          // lanes come together: the bus's track moves over there too. On Given Tce (node 12497, two
+          // lanes to one, 61/1 s 10188) a car in the second lane stopped 7 m short of the node beside
+          // the player's bus, whose track ran 2.2 m from it there, and the bus's side ran into it.)
           const to = this.laneOffset(c.lane, Math.max(0, this.lanesIn(mLane) - 1));
           const chx = Math.sin(c.heading);
           const chy = Math.cos(c.heading);
@@ -2236,7 +2241,7 @@ export class CarTraffic {
             const hb = bg.nearest(pt.x, pt.y, 2.2, undefined, pt.z);
             if (hb >= 0 && (bg.pv[hb] >= 1 || (bg.px[hb] - c.x) * chx + (bg.py[hb] - c.y) * chy > -c.len / 2)) {
               mergeBlocked = true;
-              lim(idm(Math.max(0.05, mEnd - c.len / 2 - 1), 0, 0.6), bg.pid[hb] === -1 ? Wait.Player : Wait.Bus, bg.pid[hb]);
+              lim(idm(Math.max(0.05, mEnd - c.len / 2 - 1 - hold), 0, 0.6), bg.pid[hb] === -1 ? Wait.Player : Wait.Bus, bg.pid[hb]);
             }
           }
         }
