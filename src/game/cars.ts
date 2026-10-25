@@ -152,6 +152,11 @@ export function clearTime(v: number, d: number, a: number): number {
   return Math.min(d / Math.max(v, 0.1), Math.sqrt((2 * Math.max(0, d)) / a));
 }
 
+/** The speed (m/s) a car slows to for a turn of `turn` rad (more than 0.5) at the end of its lane. */
+function turnSpeed(turn: number): number {
+  return 4.5 + 7 * (1 - Math.min(1, turn / 2));
+}
+
 interface Hold {
   node: number;
   /** Distance travelled past the node (-1 until reached). */
@@ -1686,7 +1691,7 @@ export class CarTraffic {
       if (dot > 0.8) {
         const side = (c.x - pc.x) * pc.inY - (c.y - pc.y) * pc.inX;
         if (pc.near && ((side > 1.8 && cls === Turn.Left && pc.cls !== Turn.Left) || (side < -1.8 && cls === Turn.Right && pc.cls !== Turn.Right))) return Wait.Player;
-      } else if (this.playerConflict(N, inX, inY, outX, outY, cls, time, clearTime(c.v, Math.max(0, stopAt) + 2 * nd.boxR + c.len, CAR_A))) return Wait.Player;
+      } else if (this.playerConflict(N, inX, inY, outX, outY, cls, time, this.turnClear(c, lane, next, stopAt, nd.boxR))) return Wait.Player;
     }
     // The player's bus in (or about to enter) the box: waiting for it is legitimate.
     // (A car holding it from the queue in its exit, its tail still in the box, names the wait: as
@@ -1727,6 +1732,21 @@ export class CarTraffic {
       if (c.next2 >= 0) return this.canGo(c, next, c.next2, stopAt + ne.len, time, 1);
     }
     return Wait.None;
+  }
+
+  /**
+   * Seconds for car `c`, `stopAt` m short of its stop line on `lane`, to be through the box (radius boxR)
+   * into `next`: slowing for the turn on the way, as simulate has it, and through the box at that speed.
+   * (Timed at the speed it comes in with, a car 40 m out at 50 km/h turned right in front of the
+   * player's bus 60 m off: it then slowed to 22 km/h for the turn.)
+   */
+  private turnClear(c: Car, lane: number, next: number, stopAt: number, boxR: number): number {
+    const d0 = Math.max(0, stopAt);
+    const d1 = 2 * boxR + c.len;
+    const turn = Math.abs(this.turnAngle(lane, next));
+    const vt = turn > 0.5 ? turnSpeed(turn) : Infinity;
+    if (c.v <= vt) return clearTime(c.v, d0 + d1, CAR_A);
+    return d0 / ((c.v + vt) / 2) + clearTime(vt, d1, CAR_A);
   }
 
   private commit(c: Car, lane: number, next: number, stopAt: number, time: number, depth: number): void {
@@ -1860,7 +1880,7 @@ export class CarTraffic {
       if (c.next >= 0 && remain < 50) {
         const turn = Math.abs(this.turnAngle(c.lane, c.next));
         if (turn > 0.5) {
-          const vt = 4.5 + 7 * (1 - Math.min(1, turn / 2));
+          const vt = turnSpeed(turn);
           const need = (c.v * c.v - vt * vt) / (2 * Math.max(4, remain - 3));
           if (need > 0) acc = Math.min(acc, -need * 1.1);
         }
