@@ -111,8 +111,11 @@ async function main() {
   if (startS > 0) Object.assign(start, guide.trackPose(startS));
   const rearOffset = bus.spec.sections[0].axleFromFront;
   const [fx, fy] = headingDir(start.heading);
-  // The route height picks the level (stays in a tunnel / up on a viaduct when starting there).
-  physics.reset(start.x - fx * rearOffset, start.y - fy * rearOffset, start.heading, start.z);
+  // The route height picks the level (stays in a tunnel / up on a viaduct when starting there): the
+  // height at the rear axle, where the physics puts it (the front's, on a slope, is settled from with a
+  // jump on the first step).
+  const rearZ = (sFront: number) => guide.trackPose(sFront - rearOffset).z;
+  physics.reset(start.x - fx * rearOffset, start.y - fy * rearOffset, start.heading, rearZ(startS > 0 ? startS : guide.state.s));
   auto?.reset(physics.pose);
   controls.lights.headlights = choice.hours < 6.5 || choice.hours > 18;
 
@@ -236,7 +239,7 @@ async function main() {
       place(s: number) {
         const p = guide.trackPose(s);
         const [px, py] = headingDir(p.heading);
-        physics.reset(p.x - px * rearOffset, p.y - py * rearOffset, p.heading, p.z);
+        physics.reset(p.x - px * rearOffset, p.y - py * rearOffset, p.heading, rearZ(s));
         auto?.reset(physics.pose);
         return api.state();
       },

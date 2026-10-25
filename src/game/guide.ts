@@ -526,9 +526,12 @@ export class RouteGuide {
 
     if (!this.initialised) {
       this.initialised = true;
-      // Stops behind the start are skipped; the stop we start at is the departure stop.
+      // Stops behind the start are skipped; the stop we start at is the departure stop. At the start
+      // pose that is the first stop, even where the bus has to stand past it to have all of its length
+      // on the route (a Metro at a busway platform the route's shape starts at the end of).
+      const atStart = Math.abs(st.s - this.startS()) < 3;
       for (let i = 0; i < stops.length; i++) {
-        if ((Math.abs(stops[i].s - st.s) < 20 || (st.s >= this.zoneFrom(i) && st.s <= this.zoneTo(i))) && this.departIndex < 0) {
+        if (((i === 0 && atStart) || Math.abs(stops[i].s - st.s) < 20 || (st.s >= this.zoneFrom(i) && st.s <= this.zoneTo(i))) && this.departIndex < 0) {
           this.departIndex = i;
           break;
         }
