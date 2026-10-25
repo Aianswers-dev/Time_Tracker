@@ -2219,12 +2219,17 @@ export class CarTraffic {
         }
         if (mEnd < LANE_BLEND + 8) {
           // Where we would be in the lane we merge into: beside our tail (and a bus length's gap behind it) to our nose.
+          // (A bus standing behind our tail is not coming along it: it waits for us. 61/1 s 954: the
+          // player's bus, moving over from the kerb lane to turn right into the Eastern Busway, stopped
+          // 2 m behind a car whose lane ended at the node, which was in its way; the car waited for it.)
           const to = this.laneOffset(c.lane, Math.max(0, this.lanesIn(mLane) - 1));
+          const chx = Math.sin(c.heading);
+          const chy = Math.cos(c.heading);
           for (let q = -c.len / 2 - 4; q <= c.len / 2 + 1 && !mergeBlocked; q += 2.5) {
             const u = Math.min(e.len, Math.max(0, c.u + q));
             this.at(c.lane, u, to, pt);
             const hb = bg.nearest(pt.x, pt.y, 2.2, undefined, pt.z);
-            if (hb >= 0) {
+            if (hb >= 0 && (bg.pv[hb] >= 1 || (bg.px[hb] - c.x) * chx + (bg.py[hb] - c.y) * chy > -c.len / 2)) {
               mergeBlocked = true;
               lim(idm(Math.max(0.05, mEnd - c.len / 2 - 1), 0, 0.6), bg.pid[hb] === -1 ? Wait.Player : Wait.Bus, bg.pid[hb]);
             }
