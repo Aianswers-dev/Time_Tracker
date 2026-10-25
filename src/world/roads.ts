@@ -972,7 +972,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       const o = wallOff + 0.6;
       const q = [A.x + A.nx * o, A.y + A.ny * o, A.z + hc[k] + 0.15, B.x + B.nx * o, B.y + B.ny * o, B.z + hc[k + 1] + 0.15, B.x - B.nx * o, B.y - B.ny * o, B.z + hc[k + 1] + 0.15, A.x - A.nx * o, A.y - A.ny * o, A.z + hc[k] + 0.15];
       // keep the ground (and terrain skirts) above the roof; earth faces and ground strips stop at it
-      field.protectQuad(q, 10);
+      // (not under a platform's slab beside a portal: Mater Hill platform 2 ends at its mouth)
+      field.protectQuad(q, 10, underSurfacePlatform);
       field.addRoof(q, Math.max(A.z + hc[k], B.z + hc[k + 1]) + 0.15);
     }
   }
@@ -2550,7 +2551,47 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
     // busway under the Cultural Centre and Victoria Park). Not under a deck or a railway too low for
     // the roof, which leaves the tube open there.
     const roomy = (k: number) => Math.min(lim(ab[k]), k > 0 ? lim(abm[k - 1]) : Infinity, k < n - 1 ? lim(abm[k]) : Infinity) >= 4.6;
-    const cov = P0.map((c, k) => (!!r.boxed && roomy(k)) || covered(ri, c) || over[k] || (k > 0 && over[k - 1]) || (k < n - 1 && over[k + 1]));
+    // Nor at a fork at its mouth, where a branch at grade leaves at an angle and its carriageway runs
+    // through the box's wall line (the SEB's branches to Woolloongabba station where its tunnel from
+    // Mater Hill ends), or where a platform's end stands in that line (Buranda platform 3 at its bay's
+    // mouth): the approach is open until the line is clear, as before.
+    const forkOpen = new Uint8Array(n);
+    if (r.boxed) {
+      for (const end of [0, 1]) {
+        const v = end === 0 ? 0 : ri.n - 1;
+        const w = end === 0 ? 1 : ri.n - 2;
+        const ex = r.pts[2 * v];
+        const ey = r.pts[2 * v + 1];
+        const ax = r.pts[2 * w] - ex;
+        const ay = r.pts[2 * w + 1] - ey;
+        const branches = new Set<number>();
+        index.roadsNear(ex, ey, 0.05, (q) => {
+          const o = roads[q];
+          if (q === ri.i || o.tunnel || o.bay || o.kind === RoadKind.Pedestrian) return;
+          const t = o.pts;
+          const m = t.length >> 1;
+          const at0 = Math.hypot(t[0] - ex, t[1] - ey) < 0.05;
+          if (!at0 && Math.hypot(t[2 * m - 2] - ex, t[2 * m - 1] - ey) >= 0.05) return;
+          const bx = at0 ? t[2] - t[0] : t[2 * m - 4] - t[2 * m - 2];
+          const by = at0 ? t[3] - t[1] : t[2 * m - 3] - t[2 * m - 1];
+          // (not the road running straight on out of the mouth, nearly opposite at the shared node)
+          if ((ax * bx + ay * by) / ((Math.hypot(ax, ay) || 1) * (Math.hypot(bx, by) || 1)) >= -0.7) branches.add(q);
+        });
+        let reach = -1;
+        for (let d = 0.5; d <= Math.min(16, ri.len / 2); d += 0.5) {
+          const c = roadAt(ri, end === 0 ? d : ri.len - d);
+          for (const side of [1, -1]) {
+            for (const o of [ri.hw + 0.6, wallOff]) {
+              const x = c.x + c.nx * side * o;
+              const y = c.y + c.ny * side * o;
+              if ((branches.size && index.penetrationZ(x, y, c.z, 1.5, ri.i, (q) => branches.has(q)) > -0.4) || underSurfacePlatform(x, y)) reach = d;
+            }
+          }
+        }
+        for (let k = 0; k < n && reach > 0; k++) if ((end === 0 ? ss[k] : ri.len - ss[k]) <= reach) forkOpen[k] = 1;
+      }
+    }
+    const cov = P0.map((c, k) => (!!r.boxed && roomy(k) && !forkOpen[k]) || covered(ri, c) || over[k] || (k > 0 && over[k - 1]) || (k < n - 1 && over[k + 1]));
     // no 4-8 m slivers of open cutting between two boxes, and no lone covered sample
     for (let k = 1; k + 1 < n; k++) {
       if (!cov[k] && cov[k - 1] && (cov[k + 1] || (k + 2 < n && cov[k + 2]))) cov[k] = true;
@@ -2929,8 +2970,10 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         }
         const cp = hall && pal === TUBE_PAL.kgs ? 8 : 1;
         t.quad(V(A, 0, hA, pal.ceil, sA, cp), V(B, 0, hB, pal.ceil, sB, cp), V(B, ceilB, hB, pal.ceil, sB, cp), V(A, ceilA, hA, pal.ceil, sA, cp), 0, -1, 0);
-        // shallow cover: a grassed mound over the box so its roof never shows
-        if (cover[k] < 0.6 || cover[k + 1] < 0.6) {
+        // shallow cover: a grassed mound over the box so its roof never shows (not on a side open toward
+        // a neighbouring tube, where it would slope down through that tube: Mater Hill's station bays run
+        // on into the box beside the busway's; the roofs over the boxes cover the gap)
+        if (!isOpen && (cover[k] < 0.6 || cover[k + 1] < 0.6)) {
           const g = L.strip;
           const mound = (c: typeof A, o: number, hh: number) => {
             const x = c.x + c.nx * side * o;
@@ -3263,35 +3306,60 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
    */
   function platformCuts(): void {
     const isBus = (q: number) => roads[q].bus || roads[q].kind === RoadKind.Busway;
+    /** Carve one piece of a slab (3 or 4 corners) out of the ground where the ground rises through it. */
+    const piece = (cs: [number, number][]) => {
+      let cx = 0;
+      let cy = 0;
+      for (const [x, y] of cs) {
+        cx += x / cs.length;
+        cy += y / cs.length;
+      }
+      const near = index.nearest(cx, cy, 25, isBus);
+      if (!near) return;
+      const top = near.z + 0.3;
+      let hi = -Infinity;
+      let lo = Infinity;
+      for (const [x, y] of [...cs, [cx, cy]]) {
+        const gz = field.settledAt(x, y);
+        hi = Math.max(hi, gz);
+        lo = Math.min(lo, gz);
+      }
+      if (hi < top + 0.02 || lo < top - 0.8) return;
+      const fz = top - 0.05;
+      const d = cs[cs.length - 1];
+      field.holeQuad([cs[0][0], cs[0][1], fz, cs[1][0], cs[1][1], fz, cs[2][0], cs[2][1], fz, (cs[3] ?? d)[0], (cs[3] ?? d)[1], fz], 0, false, 0);
+    };
     for (const g of gradePlatforms) {
       const p = g.p.pts;
       let m = p.length / 2;
-      if (m > 4 && p[0] === p[2 * m - 2] && p[1] === p[2 * m - 1]) m--;
-      if (!g.p.area || m !== 4) continue;
-      const P = (u: number, v: number): [number, number] => [
-        (1 - u) * (1 - v) * p[0] + u * (1 - v) * p[2] + u * v * p[4] + (1 - u) * v * p[6],
-        (1 - u) * (1 - v) * p[1] + u * (1 - v) * p[3] + u * v * p[5] + (1 - u) * v * p[7],
-      ];
-      const nu = Math.max(1, Math.ceil(Math.hypot(p[2] - p[0], p[3] - p[1]) / 2));
-      const nv = Math.max(1, Math.ceil(Math.hypot(p[4] - p[2], p[5] - p[3]) / 2));
-      for (let i = 0; i < nu; i++) {
-        for (let j = 0; j < nv; j++) {
-          const cs = [P(i / nu, j / nv), P((i + 1) / nu, j / nv), P((i + 1) / nu, (j + 1) / nv), P(i / nu, (j + 1) / nv)];
-          const cx = (cs[0][0] + cs[1][0] + cs[2][0] + cs[3][0]) / 4;
-          const cy = (cs[0][1] + cs[1][1] + cs[2][1] + cs[3][1]) / 4;
-          const near = index.nearest(cx, cy, 25, isBus);
-          if (!near) continue;
-          const top = near.z + 0.3;
-          let hi = -Infinity;
-          let lo = Infinity;
-          for (const [x, y] of [...cs, [cx, cy]]) {
-            const gz = field.settledAt(x, y);
-            hi = Math.max(hi, gz);
-            lo = Math.min(lo, gz);
+      if (m > 3 && p[0] === p[2 * m - 2] && p[1] === p[2 * m - 1]) m--;
+      if (!g.p.area || m < 3) continue;
+      if (m === 4) {
+        const P = (u: number, v: number): [number, number] => [
+          (1 - u) * (1 - v) * p[0] + u * (1 - v) * p[2] + u * v * p[4] + (1 - u) * v * p[6],
+          (1 - u) * (1 - v) * p[1] + u * (1 - v) * p[3] + u * v * p[5] + (1 - u) * v * p[7],
+        ];
+        const nu = Math.max(1, Math.ceil(Math.hypot(p[2] - p[0], p[3] - p[1]) / 2));
+        const nv = Math.max(1, Math.ceil(Math.hypot(p[4] - p[2], p[5] - p[3]) / 2));
+        for (let i = 0; i < nu; i++) {
+          for (let j = 0; j < nv; j++) piece([P(i / nu, j / nv), P((i + 1) / nu, j / nv), P((i + 1) / nu, (j + 1) / nv), P(i / nu, (j + 1) / nv)]);
+        }
+        continue;
+      }
+      // any other outline: its triangles, each cut into triangles of about 2 m
+      const ring: THREE.Vector2[] = [];
+      for (let i = 0; i < m; i++) ring.push(new THREE.Vector2(p[2 * i], p[2 * i + 1]));
+      for (const [a, b, c] of THREE.ShapeUtils.triangulateShape(ring, [])) {
+        const A = ring[a];
+        const B = ring[b];
+        const C = ring[c];
+        const n = Math.max(1, Math.ceil(Math.max(A.distanceTo(B), B.distanceTo(C), C.distanceTo(A)) / 2));
+        const P = (i: number, j: number): [number, number] => [A.x + ((B.x - A.x) * i + (C.x - A.x) * j) / n, A.y + ((B.y - A.y) * i + (C.y - A.y) * j) / n];
+        for (let i = 0; i < n; i++) {
+          for (let j = 0; i + j < n; j++) {
+            piece([P(i, j), P(i + 1, j), P(i, j + 1)]);
+            if (i + j < n - 1) piece([P(i + 1, j), P(i + 1, j + 1), P(i, j + 1)]);
           }
-          if (hi < top + 0.02 || lo < top - 0.8) continue;
-          const fz = top - 0.05;
-          field.holeQuad([cs[0][0], cs[0][1], fz, cs[1][0], cs[1][1], fz, cs[2][0], cs[2][1], fz, cs[3][0], cs[3][1], fz], 0, false, 0);
         }
       }
     }

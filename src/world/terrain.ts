@@ -180,9 +180,10 @@ export class TerrainField {
   /**
    * Mark a buried structure (a tunnel roof segment, convex quad of x,y,z corners):
    * vertices within `expand` metres keep the ground, and terrain skirts, above
-   * its highest corner.
+   * its highest corner, except where `keep(x, y)` (ground that belongs to
+   * something else at its own level, such as a platform's slab).
    */
-  protectQuad(q: number[], expand: number): void {
+  protectQuad(q: number[], expand: number, keep?: (x: number, y: number) => boolean): void {
     const xs = [q[0], q[3], q[6], q[9]];
     const ys = [q[1], q[4], q[7], q[10]];
     const top = Math.max(q[2], q[5], q[8], q[11]);
@@ -195,7 +196,7 @@ export class TerrainField {
       for (let i = i0; i <= i1; i++) {
         const x = this.x0 + i * this.cell;
         const k = j * this.nx + i;
-        if (top > this.floor[k] && quadDist(q, x, y) <= expand) this.floor[k] = top;
+        if (top > this.floor[k] && quadDist(q, x, y) <= expand && !keep?.(x, y)) this.floor[k] = top;
       }
     }
   }
