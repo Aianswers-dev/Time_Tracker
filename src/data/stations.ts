@@ -540,6 +540,11 @@ export const STATIONS: StationDef[] = [
     // The overbridge past the platforms' north ends between two light-blue towers with white pyramid roofs
     // (OSM elevators (-528,1918), (-504,1914), footbridge 521961062; imagery about 11.5 m square).
     overbridges: [{ x: -516.8, y: 1917.7, ax: 0.992, ay: -0.127, len: [-16.75, 16.75], w: 4, glass: 0x9fb7b0, frame: 0x6a9cc0, towers: true, towerW: 8.5, towerHat: [1.5, 1.5], towerRoof: 'pyramid', clear: 6.4 }],
+    // OSM's 7 m boxes for those two towers
+    ownBuildings: [
+      [-527.7, 1921.6],
+      [-503.9, 1913.9],
+    ],
     ownRoofs: 110,
   },
   {
