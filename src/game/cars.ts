@@ -141,6 +141,8 @@ const CAR_A = 1.7;
 const CAR_HALF_W = 0.92;
 /** Distance (m) before a node over which a car going straight on eases to the next lane's offset. */
 const LANE_BLEND = 14;
+/** Longest corner cut (m) of a left turn, on either lane. */
+const CUT_MAX = 8;
 /** Gap (s) to the next vehicle on a conflicting movement that one giving way waits for: merging left, and across. */
 export const GAP_LEFT = 4.5;
 export const GAP_ACROSS = 6.5;
@@ -187,6 +189,16 @@ interface Car {
   xsI: number;
   xsCommit: number;
   holds: Hold[];
+  /**
+   * The corner of a left turn into `next` (see cutOf): leave this lane cutA m before its end and join
+   * the next cutB m after its start, at its offset cutLat; for the lane, next lane and lane index keyed.
+   */
+  cutLane: number;
+  cutNext: number;
+  cutIdx: number;
+  cutA: number;
+  cutB: number;
+  cutLat: number;
   /** Seconds held up by a bus (for overtaking on multi-lane roads). */
   busWait: number;
   /** Seconds stationary while not legitimately waiting. */
@@ -425,6 +437,7 @@ export class CarTraffic {
   /** The car whose queue fills a junction exit (set by canGo when it returns Junction for that reason). */
   private blockRef = 0;
   private pt2: LanePt = { x: 0, y: 0, hx: 0, hy: 0, z: 0, g: 0 };
+  private pt3: LanePt = { x: 0, y: 0, hx: 0, hy: 0, z: 0, g: 0 };
   readonly stats: CarStats = { overlapDespawns: 0, stuckDespawns: 0, stallDespawns: 0, waitingRed: 0, waitingJunction: 0, stationary: 0 };
   /** Id of the holder that made the last boxClear() fail. */
   private boxBy = 0;
@@ -1090,6 +1103,48 @@ export class CarTraffic {
     return [dx / l, dy / l];
   }
 
+  /**
+   * A left turn's corner: where the car's lane line crosses the next lane's. The car leaves its lane
+   * there, before the node, and joins the next lane past it, at the same point. Driving out to the
+   * node and pivoting on it instead puts the car's centre on the centreline of the road it turns into
+   * and swings its tail across the far half of the road it leaves, into the oncoming traffic going
+   * straight on. No cut for other movements, or where the corner is behind the stop line.
+   */
+  private cutOf(c: Car): void {
+    if (c.cutLane === c.lane && c.cutNext === c.next && c.cutIdx === c.laneIdx) return;
+    c.cutLane = c.lane;
+    c.cutNext = c.next;
+    c.cutIdx = c.laneIdx;
+    c.cutA = 0;
+    c.cutB = 0;
+    const a = c.lane;
+    const b = c.next;
+    if (b < 0) return;
+    const latB = this.laneOffset(b, Math.min(c.laneIdx, this.lanesIn(b) - 1));
+    c.cutLat = latB;
+    const ea = this.edges[a >> 1];
+    const eb = this.edges[b >> 1];
+    const p = this.pt3;
+    this.at(a, ea.len, this.laneOffset(a, c.laneIdx), p);
+    const ax = p.hx;
+    const ay = p.hy;
+    const wx0 = p.x;
+    const wy0 = p.y;
+    this.at(b, 0, latB, p);
+    const bx = p.hx;
+    const by = p.hy;
+    const cr = ax * by - ay * bx;
+    if (cr < 0.48 || ax * bx + ay * by < -0.9) return; // not a left turn (of ~29 degrees or more)
+    const wx = p.x - wx0;
+    const wy = p.y - wy0;
+    const ca = -(wx * by - wy * bx) / cr;
+    const cb = (wx * ay - wy * ax) / cr;
+    const sd = this.stopD[a];
+    if (ca < 0.3 || cb < 0.3 || ca > Math.min(CUT_MAX, ea.len * 0.5, sd > 0 ? sd - 0.5 : Infinity) || cb > Math.min(CUT_MAX, eb.len * 0.5)) return;
+    c.cutA = ca;
+    c.cutB = cb;
+  }
+
   /** The signal-model junction (src/data/signals.ts) a vehicle travelling (dirX, dirY) into `node` asks, or -1. */
   signalJunction(node: number, dirX: number, dirY: number): number {
     const nd = this.nodes[node];
@@ -1437,6 +1492,12 @@ export class CarTraffic {
       xsI: 0,
       xsCommit: -1,
       holds: [],
+      cutLane: -1,
+      cutNext: -1,
+      cutIdx: -1,
+      cutA: 0,
+      cutB: 0,
+      cutLat: 0,
       busWait: 0,
       idle: 0,
       odo: 0,
@@ -1713,6 +1774,7 @@ export class CarTraffic {
       const e = this.edges[c.lane >> 1];
       const remain = e.len - c.u;
       if (c.next < 0 && remain < 70) c.next = this.chooseNext(c.lane);
+      this.cutOf(c);
       const v0 = (e.limit / 3.6) * c.vWant;
       const A = CAR_A;
       const B = 2.6;
@@ -1760,7 +1822,7 @@ export class CarTraffic {
         if (nl) {
           for (const o of nl) {
             if (o.dead || (o.laneIdx !== Math.min(c.laneIdx, this.lanesIn(c.next) - 1) && this.lanesIn(c.next) > 1)) continue;
-            gap = remain + o.u - (o.len + c.len) / 2;
+            gap = remain - c.cutA + o.u - c.cutB - (o.len + c.len) / 2;
             vLead = o.v;
             leadId = o.id;
             break;
@@ -1857,21 +1919,27 @@ export class CarTraffic {
           c.holds.splice(k, 1);
         } else this.enter(h.node, c.id, h.inX, h.inY, h.outX, h.outY, h.cls, time + 3);
       }
-      // Advance onto the next lane.
+      // Advance onto the next lane (at a left turn's corner, short of the node).
       let guard = 0;
-      while (c.u > this.edges[c.lane >> 1].len && guard++ < 4) {
-        const over = c.u - this.edges[c.lane >> 1].len;
+      for (;;) {
+        this.cutOf(c);
+        const end = this.edges[c.lane >> 1].len - c.cutA;
+        if (c.u <= end || guard++ >= 4) break;
+        const over = c.u - end;
         const passed = this.endNode(c.lane);
         if (c.next < 0) c.next = this.chooseNext(c.lane);
         if (c.next < 0) {
           this.kill(c);
           break;
         }
-        for (const h of c.holds) if (h.node === passed && h.d < 0) h.d = 0;
+        const cut = c.cutA > 0 && c.cutNext === c.next;
+        const join = cut ? c.cutB : 0;
+        for (const h of c.holds) if (h.node === passed && h.d < 0) h.d = join;
+        if (cut) c.lat = c.cutLat;
         c.lane = c.next;
         c.next = c.next2;
         c.next2 = -1;
-        c.u = over;
+        c.u = over + join;
         c.sigI = 0;
         c.sigState = null;
         c.xsI = 0;
@@ -1997,8 +2065,10 @@ export class CarTraffic {
   private sampleAhead(c: Car, d: number, out: LanePt): void {
     const e = this.edges[c.lane >> 1];
     const u = c.u + d;
-    if (u <= e.len || c.next < 0) this.at(c.lane, Math.min(u, e.len), c.lat, out);
-    else this.at(c.next, Math.min(u - e.len, this.edges[c.next >> 1].len), this.laneOffset(c.next, Math.min(c.laneIdx, this.lanesIn(c.next) - 1)), out);
+    // (cutOf is current: the car's update has just called it)
+    const end = e.len - c.cutA;
+    if (u <= end || c.next < 0) this.at(c.lane, Math.min(u, e.len), c.lat, out);
+    else this.at(c.next, Math.min(u - end + c.cutB, this.edges[c.next >> 1].len), this.laneOffset(c.next, Math.min(c.laneIdx, this.lanesIn(c.next) - 1)), out);
   }
 
   render(frustum: THREE.Frustum, cam: THREE.Vector3, hours: number): void {
