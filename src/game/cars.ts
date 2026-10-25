@@ -137,6 +137,8 @@ interface PlayerApproach {
 const ONCOMING_MARGIN = 1.5;
 /** A car whose lane ends at a node merges in front of the player's bus only this far (s) ahead of it. */
 const MERGE_MARGIN = 1;
+/** Two ways out of a junction this far apart (rad) cross, for vehicles side by side going in. */
+const ACROSS = 0.3;
 /** Car acceleration (m/s^2). */
 const CAR_A = 1.7;
 /** Half a car's width (m), as the overlap checks take it. */
@@ -1727,15 +1729,21 @@ export class CarTraffic {
     } else {
       if (this.minorIn[lane] && nd.until > time && nd.holder !== lane) return nd.holder === PLAYER_HOLD ? Wait.Player : Wait.Junction;
     }
-    // The player's bus coming up on the same approach in the next lane: a car that would turn across
-    // its lane in front of it (left from the lane on its right, right from the lane on its left) waits.
-    // A car crossing its path gives way to it (playerConflict).
+    // The player's bus coming up on the same approach in the next lane: a car whose way and the bus's
+    // cross waits. It would turn across the bus's lane in front of it (left from the lane on its right,
+    // right from the lane on its left), or the bus goes out across the car's (a busway leaving on the
+    // right from the kerb lane: 222/0 s 2521); or the car is on the inside of the bus's turn, which its
+    // tail cuts across (turning right beside it: 199/0 s 5062). A car crossing its path from another
+    // arm gives way to it (playerConflict).
     const pc = nd.pc;
     if (pc && pc.until > time) {
       const dot = inX * pc.inX + inY * pc.inY;
       if (dot > 0.8) {
         const side = (c.x - pc.x) * pc.inY - (c.y - pc.y) * pc.inX;
-        if (pc.near && ((side > 1.8 && cls === Turn.Left && pc.cls !== Turn.Left) || (side < -1.8 && cls === Turn.Right && pc.cls !== Turn.Right))) return Wait.Player;
+        // (+: the bus's way out is to the right of ours.)
+        const across = wrapAngle(Math.atan2(pc.outX, pc.outY) - Math.atan2(outX, outY));
+        if (pc.near && ((side > 1.8 && (across > ACROSS || (cls === Turn.Right && pc.cls === Turn.Right))) || (side < -1.8 && (across < -ACROSS || (cls === Turn.Left && pc.cls === Turn.Left)))))
+          return Wait.Player;
         // Our lane ends here (the road narrows by its offside lane) and the bus is coming along the one we
         // merge into: unless we are in, tail and all, a second before it gets there, we fall in behind it.
         if (
