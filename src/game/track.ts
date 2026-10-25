@@ -62,10 +62,11 @@ const PULL_HOLD = 0.6;
  */
 const WALL_CLEAR = 2.1;
 /**
- * Room kept between a Metro's sweep (front axle on the lane, the rest trailing it) and the walls: the
- * driver's (or autopilot's) line and the body's sway are not exact.
+ * Room kept between a bus's sweep (front axle on the lane, the rear and any trailers trailing it inside
+ * the bend) and the walls: with half a rigid bus, WALL_CLEAR, so a wall corner on the inside of a bend
+ * gets WALL_CLEAR plus the offtracking. The driver's (or autopilot's) line and the body's sway are not exact.
  */
-const SWEEP_MARGIN = Number((globalThis as { __SWEEP?: number }).__SWEEP ?? 0.45);
+const SWEEP_MARGIN = 0.85;
 /** The bus body's vertical span above the road (m; the collider's sections start 0.25 m up): walls outside it are not in the way. */
 const BUS_LO = 0.25;
 const BUS_HI = 3.4;
@@ -2395,6 +2396,44 @@ export class RouteTrack {
       }
     };
     const specs = [specFor('metro'), specFor('rigid')];
+    // The lane moves as one displacement field D along its normals as they were on the way in, so the
+    // passes add up to a smooth bend: no sample moves more than SLOPE further than the next, a sample that
+    // would leave the road or close on a wall keeps where it was, and no move makes a corner tighter than
+    // R_OK (or than it was).
+    const SLOPE = 0.5;
+    const X0 = Float64Array.from(this.x);
+    const Y0 = Float64Array.from(this.y);
+    const nx0 = new Float64Array(n);
+    const ny0 = new Float64Array(n);
+    for (let k = 0; k < n; k++) {
+      const a = Math.max(0, k - 1);
+      const b = Math.min(n - 1, k + 1);
+      const tl = Math.hypot(X0[b] - X0[a], Y0[b] - Y0[a]) || 1;
+      nx0[k] = -(Y0[b] - Y0[a]) / tl;
+      ny0[k] = (X0[b] - X0[a]) / tl;
+    }
+    const D = new Float64Array(n);
+    const radius = (k: number, dd: Float64Array): number => {
+      if (k < 1 || k + 1 >= n) return Infinity;
+      const px = X0[k - 1] + nx0[k - 1] * dd[k - 1];
+      const py = Y0[k - 1] + ny0[k - 1] * dd[k - 1];
+      const qx = X0[k] + nx0[k] * dd[k];
+      const qy = Y0[k] + ny0[k] * dd[k];
+      const rx = X0[k + 1] + nx0[k + 1] * dd[k + 1];
+      const ry = Y0[k + 1] + ny0[k + 1] * dd[k + 1];
+      const la = Math.hypot(qx - px, qy - py);
+      const lb = Math.hypot(rx - qx, ry - qy);
+      if (la < 0.25 * TRACK_STEP || lb < 0.25 * TRACK_STEP) return 0;
+      const t = Math.abs(wrapAngle(Math.atan2(rx - qx, ry - qy) - Math.atan2(qx - px, qy - py)));
+      return t > 1e-4 ? Math.min(la, lb) / t : Infinity;
+    };
+    const fits = (k: number, v: number): boolean => {
+      const qx = X0[k] + nx0[k] * v;
+      const qy = Y0[k] + ny0[k] * v;
+      if (!TW.drivable(qx, qy, this.z[k])) return false;
+      const dNew = this.wallDist(W, G, qx, qy, this.z[k]);
+      return !(dNew < WALL_CLEAR - 0.6 && dNew < this.wallDist(W, G, this.x[k], this.y[k], this.z[k]));
+    };
     for (let pass = 0; pass < 10; pass++) {
       pushL.fill(0);
       pushR.fill(0);
@@ -2417,24 +2456,63 @@ export class RouteTrack {
           if (v < mvR[k]) mvR[k] = v;
         }
       }
+      const Dn = Float64Array.from(D);
+      let any = false;
+      for (let k = 0; k < n; k++) {
+        const v = mvL[k] + mvR[k];
+        if (Math.abs(v) < 1e-3) continue;
+        Dn[k] += v;
+        any = true;
+      }
+      if (!any) break;
+      // Where two neighbours differ by more than SLOPE, the one that moves further this pass gives way
+      // (D itself is within the limit, so this ends at worst at D).
+      const ease = (): void => {
+        for (let sweep = 0; sweep < 40; sweep++) {
+          let changed = false;
+          for (let k = 0; k + 1 < n; k++) {
+            const gap = Dn[k + 1] - Dn[k];
+            if (Math.abs(gap) <= SLOPE + 1e-9) continue;
+            const over = Math.abs(gap) - SLOPE;
+            const ik = Math.abs(Dn[k] - D[k]);
+            const iq = Math.abs(Dn[k + 1] - D[k + 1]);
+            // Move the one with the larger move this pass towards the other, no further back than D.
+            const j = ik >= iq ? k : k + 1;
+            const toward = j === k ? Math.sign(gap) : -Math.sign(gap);
+            const room = Math.abs(Dn[j] - D[j]);
+            const back = Math.sign(D[j] - Dn[j]);
+            const amt = back === toward || room === 0 ? Math.min(over, room) : 0;
+            if (amt <= 0) continue;
+            Dn[j] += toward * amt;
+            changed = true;
+          }
+          if (!changed) break;
+        }
+      };
+      for (let round = 0; round < 6; round++) {
+        ease();
+        let held = false;
+        for (let k = 0; k < n; k++) {
+          if (Math.abs(Dn[k] - D[k]) < 1e-3) continue;
+          let ok = fits(k, Dn[k]);
+          if (ok) {
+            for (let q = Math.max(1, k - 1); q <= Math.min(n - 2, k + 1) && ok; q++) {
+              if (radius(q, Dn) < Math.min(R_OK, radius(q, D)) - 1e-6) ok = false;
+            }
+          }
+          if (ok) continue;
+          Dn[k] = D[k];
+          held = true;
+        }
+        if (!held) break;
+      }
       let moved = false;
       const movedAt = new Uint8Array(n);
       for (let k = 0; k < n; k++) {
-        const step = mvL[k] + mvR[k];
-        if (Math.abs(step) < 1e-3) continue;
-        const a = Math.max(0, k - 1);
-        const b = Math.min(n - 1, k + 1);
-        const tl = Math.hypot(this.x[b] - this.x[a], this.y[b] - this.y[a]) || 1;
-        const nlx = -(this.y[b] - this.y[a]) / tl;
-        const nly = (this.x[b] - this.x[a]) / tl;
-        const qx = this.x[k] + nlx * step;
-        const qy = this.y[k] + nly * step;
-        // Into drivable space, and not closer to a wall than it was (or than a bus allows).
-        if (!TW.drivable(qx, qy, this.z[k])) continue;
-        const dNew = this.wallDist(W, G, qx, qy, this.z[k]);
-        if (dNew < WALL_CLEAR - 0.6 && dNew < this.wallDist(W, G, this.x[k], this.y[k], this.z[k])) continue;
-        this.x[k] = qx;
-        this.y[k] = qy;
+        if (Math.abs(Dn[k] - D[k]) < 1e-3 || !fits(k, Dn[k])) continue;
+        D[k] = Dn[k];
+        this.x[k] = X0[k] + nx0[k] * D[k];
+        this.y[k] = Y0[k] + ny0[k] * D[k];
         moved = true;
         movedAt[k] = 1;
       }
