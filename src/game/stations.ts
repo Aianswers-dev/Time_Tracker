@@ -281,16 +281,23 @@ export function buildStations(scene: THREE.Scene, data: MapData, geoms: Platform
     if (b.def.concourse) buildConcourse(c, b, b.def.concourse);
     for (const e of b.def.entrances ?? []) buildEntrance(c, b, e);
   }
-  // INB enclosures (QUT Kelvin Grove to Herston)
+  // INB enclosures (QUT Kelvin Grove to Herston). OSM's roofs reach the data in pieces (the pipeline cuts
+  // them about every 20 m and clips them off the platforms), so each station's pieces make one vault.
+  const encl = new Map<StationDef, Float32Array[]>();
   for (const bld of data.buildings) {
     const def = enclosureStyle(bld);
     if (!def) continue;
-    const b = builds.get(def.key) ?? mk(def);
-    if (!builds.has(def.key)) {
-      builds.set(def.key, b);
+    const list = encl.get(def);
+    if (list) list.push(bld.pts);
+    else encl.set(def, [bld.pts]);
+  }
+  for (const [def, pieces] of encl) {
+    let b = builds.get(def.key);
+    if (!b) {
+      builds.set(def.key, (b = mk(def)));
       all.push(b);
     }
-    buildVault(c, b, bld.pts);
+    buildVault(c, b, pieces);
   }
   c.atlas.build();
   const opaque = stationMaterial(c.atlas);
@@ -2167,74 +2174,133 @@ function buildRomaP1(c: Ctx, b: StationBuild): void {
   }
 }
 
-/** QUT Kelvin Grove / Herston / INB enclosures: an arched vault over the busway and platforms, from the OSM roof footprint. */
-function buildVault(c: Ctx, b: StationBuild, foot: Float32Array): void {
+/**
+ * QUT Kelvin Grove / Herston / INB enclosures: an arched vault over the busway and platforms, over the OSM
+ * roof pieces. The ribs spring from the platform backs where there are platforms (the pieces stop at the
+ * platform kerbs) and from the pieces' outer edges elsewhere; they stop at overbridges and lift towers.
+ */
+function buildVault(c: Ctx, b: StationBuild, pieces: Float32Array[]): void {
   const v = b.def.vault;
   if (!v) return;
   const geo = b.geo;
   const glass = b.glass;
-  // the busway through the footprint: the bus road with the longest run inside it
-  let bestRoad = -1;
-  let bestLen = 0;
-  let x0 = Infinity;
-  let y0 = Infinity;
-  let x1 = -Infinity;
-  let y1 = -Infinity;
-  for (let i = 0; i < foot.length; i += 2) {
-    x0 = Math.min(x0, foot[i]);
-    x1 = Math.max(x1, foot[i]);
-    y0 = Math.min(y0, foot[i + 1]);
-    y1 = Math.max(y1, foot[i + 1]);
-  }
+  const boxes = pieces.map((p) => {
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    for (let i = 0; i < p.length; i += 2) {
+      x0 = Math.min(x0, p[i]);
+      x1 = Math.max(x1, p[i]);
+      y0 = Math.min(y0, p[i + 1]);
+      y1 = Math.max(y1, p[i + 1]);
+    }
+    return [x0, y0, x1, y1];
+  });
+  const pieceAt = (x: number, y: number): number => {
+    for (let k = 0; k < pieces.length; k++) {
+      const q = boxes[k];
+      if (x >= q[0] && x <= q[2] && y >= q[1] && y <= q[3] && pointInRing(pieces[k], x, y)) return k;
+    }
+    return -1;
+  };
+  // how far the pieces reach from (x, y) along (dx, dy), across the cuts between them
+  const reach = (x: number, y: number, dx: number, dy: number): number => {
+    let t = 0;
+    for (let n = 0; n < 12 && t < 40; n++) {
+      const px = x + dx * (t + 0.05);
+      const py = y + dy * (t + 0.05);
+      const k = pieceAt(px, py);
+      if (k < 0) break;
+      const e = rayRing(pieces[k], px, py, dx, dy, 40);
+      if (!Number.isFinite(e)) break;
+      t += 0.05 + e;
+    }
+    return t;
+  };
+  // the back of a platform along (dx, dy), up to 22 m out
+  const plats = b.plats.filter((g) => !isUnder(b.def, g));
+  const back = (x: number, y: number, dx: number, dy: number): number => {
+    let best = 0;
+    for (const g of plats) {
+      const f = rayRing(g.outline, x + dx * 30, y + dy * 30, -dx, -dy, 30);
+      if (Number.isFinite(f) && 30 - f < 22) best = Math.max(best, 30 - f);
+    }
+    return best;
+  };
+  // overbridge decks and tower footprints the vault stops at
+  const bridges = (b.def.overbridges ?? []).flatMap((o) => {
+    const a = bridgeAxis(c, o);
+    return a ? [{ o, ax: a.ax, ay: a.ay }] : [];
+  });
+  const blocked = (x: number, y: number): boolean => {
+    if (inFoot(b.feet, x, y, 0.8)) return true;
+    for (const { o, ax, ay } of bridges) {
+      const dx = x - o.x;
+      const dy = y - o.y;
+      const q = dx * ax + dy * ay;
+      if (q > o.len[0] - 1 && q < o.len[1] + 1 && Math.abs(-dx * ay + dy * ax) < o.w / 2 + 1.5) return true;
+    }
+    return false;
+  };
+  // the bus roads through the pieces, longest first; each vaults only the pieces no earlier road did
+  const cands: [number, number][] = [];
   c.data.roads.forEach((r, ri) => {
     if (!isBus(r) || r.tunnel) return;
     let len = 0;
     for (let i = 0; i + 3 < r.pts.length; i += 2) {
-      const mx = (r.pts[i] + r.pts[i + 2]) / 2;
-      const my = (r.pts[i + 1] + r.pts[i + 3]) / 2;
-      if (mx < x0 || mx > x1 || my < y0 || my > y1) continue;
-      if (pointInRing(foot, mx, my)) len += Math.hypot(r.pts[i + 2] - r.pts[i], r.pts[i + 3] - r.pts[i + 1]);
+      if (pieceAt((r.pts[i] + r.pts[i + 2]) / 2, (r.pts[i + 1] + r.pts[i + 3]) / 2) >= 0) len += Math.hypot(r.pts[i + 2] - r.pts[i], r.pts[i + 3] - r.pts[i + 1]);
     }
-    if (len > bestLen) {
-      bestLen = len;
-      bestRoad = ri;
-    }
+    if (len >= 8) cands.push([ri, len]);
   });
-  if (bestRoad < 0 || bestLen < 20) return;
-  const r = c.data.roads[bestRoad];
-  // walk the road, keep samples inside the footprint
-  const ribs: { x: number; y: number; z: number; tx: number; ty: number; L: [number, number]; R: [number, number] }[] = [];
-  let acc = 0;
-  let next = 0;
-  for (let i = 0; i + 3 < r.pts.length; i += 2) {
-    const ax = r.pts[i];
-    const ay = r.pts[i + 1];
-    const bx = r.pts[i + 2];
-    const by = r.pts[i + 3];
-    const sl = Math.hypot(bx - ax, by - ay);
-    if (sl < 1e-3) continue;
-    const tx = (bx - ax) / sl;
-    const ty = (by - ay) / sl;
-    while (next <= acc + sl) {
-      const t = (next - acc) / sl;
-      const x = ax + (bx - ax) * t;
-      const y = ay + (by - ay) * t;
-      next += v.spacing;
-      if (!pointInRing(foot, x, y)) continue;
-      const nx = -ty;
-      const ny = tx;
-      const dl = rayRing(foot, x, y, nx, ny, 40);
-      const dr = rayRing(foot, x, y, -nx, -ny, 40);
-      if (!Number.isFinite(dl) || !Number.isFinite(dr) || dl + dr < 8) continue;
-      const z = r.z[i / 2] + (r.z[i / 2 + 1] - r.z[i / 2]) * t;
-      ribs.push({ x, y, z, tx, ty, L: [x + nx * (dl - 0.3), y + ny * (dl - 0.3)], R: [x - nx * (dr - 0.3), y - ny * (dr - 0.3)] });
+  cands.sort((p, q) => q[1] - p[1]);
+  const ribs: { x: number; y: number; z: number; tx: number; ty: number; L: [number, number]; R: [number, number]; metal: boolean; run: number }[] = [];
+  const done = new Set<number>();
+  let run = 0;
+  for (const [ri] of cands) {
+    const r = c.data.roads[ri];
+    const got = new Set<number>();
+    let acc = 0;
+    let next = 0;
+    run++;
+    for (let i = 0; i + 3 < r.pts.length; i += 2) {
+      const ax = r.pts[i];
+      const ay = r.pts[i + 1];
+      const bx = r.pts[i + 2];
+      const by = r.pts[i + 3];
+      const sl = Math.hypot(bx - ax, by - ay);
+      if (sl < 1e-3) continue;
+      const tx = (bx - ax) / sl;
+      const ty = (by - ay) / sl;
+      while (next <= acc + sl) {
+        const t = (next - acc) / sl;
+        const x = ax + (bx - ax) * t;
+        const y = ay + (by - ay) * t;
+        next += v.spacing;
+        const k = pieceAt(x, y);
+        const nx = -ty;
+        const ny = tx;
+        const bl = k < 0 || done.has(k) ? 0 : back(x, y, nx, ny);
+        const br = k < 0 || done.has(k) ? 0 : back(x, y, -nx, -ny);
+        const dl = k < 0 || done.has(k) ? 0 : Math.max(reach(x, y, nx, ny), bl);
+        const dr = k < 0 || done.has(k) ? 0 : Math.max(reach(x, y, -nx, -ny), br);
+        const L: [number, number] = [x + nx * (dl - 0.3), y + ny * (dl - 0.3)];
+        const R: [number, number] = [x - nx * (dr - 0.3), y - ny * (dr - 0.3)];
+        if (dl + dr < 8 || blocked(x, y) || blocked(...L) || blocked(...R)) {
+          run++;
+          continue;
+        }
+        const z = r.z[i / 2] + (r.z[i / 2 + 1] - r.z[i / 2]) * t;
+        ribs.push({ x, y, z, tx, ty, L, R, metal: bl > 0 || br > 0, run });
+        got.add(k);
+      }
+      acc += sl;
     }
-    acc += sl;
+    for (const k of got) done.add(k);
   }
   if (ribs.length < 2) return;
-  // over the stations the vault is sheeted in metal over the platforms with a
-  // glazed crown; between them (the INB enclosures) it is glazed throughout
-  const atStation = Math.hypot((x0 + x1) / 2 - b.def.x, (y0 + y1) / 2 - b.def.y) < b.def.r + 10;
+  // over the platforms the vault is sheeted in metal with a glazed crown; elsewhere (the INB enclosures)
+  // it is glazed throughout
   const N = 12;
   const arch = (rb: (typeof ribs)[number], k: number): V3 => {
     const u = k / N;
@@ -2264,7 +2330,7 @@ function buildVault(c: Ctx, b: StationBuild, foot: Float32Array): void {
   for (let i = 0; i + 1 < ribs.length; i++) {
     const a = ribs[i];
     const e = ribs[i + 1];
-    if (Math.hypot(a.x - e.x, a.y - e.y) > v.spacing * 2.5) continue;
+    if (a.run !== e.run || Math.hypot(a.x - e.x, a.y - e.y) > v.spacing * 2.5) continue;
     for (let k = 0; k <= N; k += 2) {
       geo.paint(0xb8bcbd);
       geo.beam(arch(a, k), arch(e, k), 0.05, false);
@@ -2276,7 +2342,7 @@ function buildVault(c: Ctx, b: StationBuild, foot: Float32Array): void {
       const q1 = arch(e, k + 1);
       const quad: V3[] = [p0, p1, q1, q0];
       const centre = Math.abs((k + 0.5) / N - 0.5) < 0.2;
-      if (atStation && !centre) {
+      if ((a.metal || e.metal) && !centre) {
         // corrugated metal deck over the platforms (both faces)
         geo.paint(0xb9bcbc, Pat.Louvre, 0.25);
         geo.panel(quad, 0, 0, 1);

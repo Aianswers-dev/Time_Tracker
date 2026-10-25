@@ -631,10 +631,12 @@ export const DEFAULT_STATION: StationDef = {
 
 /**
  * The Inner Northern Busway's glazed / wire-mesh enclosures (QUT Kelvin Grove
- * to Herston): OSM maps each as a large `building=roof` over the busway. They
- * become arched vaults (the vault style of the nearest listed station).
+ * to Herston): OSM maps each as a large `building=roof` over the busway; the data
+ * carries them as pieces of about 190-750 m2 (cut every ~20 m, clipped off the
+ * platforms). They become arched vaults (the vault style of the nearest listed
+ * station). The zone's other roofs are small shelters under 100 m2.
  */
-const ENCLOSURE_ZONE = { x0: -640, y0: 1690, x1: 210, y1: 2215, minArea: 900 };
+const ENCLOSURE_ZONE = { x0: -640, y0: 1690, x1: 210, y1: 2215, minArea: 150 };
 
 function ringInfo(p: Float32Array): { cx: number; cy: number; area: number } {
   const n = p.length / 2;
