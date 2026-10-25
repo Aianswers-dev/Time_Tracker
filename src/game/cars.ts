@@ -168,6 +168,8 @@ const CAR_A = 1.7;
 const CAR_HALF_W = 0.92;
 /** Distance (m) before a node over which a car going straight on eases to the next lane's offset. */
 const LANE_BLEND = 14;
+/** A link this short (m) before a lane ends: a car merges as if its own lane ended at the node before it. */
+const MERGE_SHORT = 6;
 /** Longest corner cut (m) of a left turn, on either lane. */
 const CUT_MAX = 8;
 /** Gap (s) to the next vehicle on a conflicting movement that one giving way waits for: merging left, and across. */
@@ -1890,14 +1892,23 @@ export class CarTraffic {
           return Wait.Player;
         // Our lane ends here (the road narrows by its offside lane) and the bus is coming along the one we
         // merge into: unless we are in, tail and all, a second before it gets there, we fall in behind it.
+        // (Or just after, past a link too short to stop on: 61/0 s 4332 lost its lane 2.5 m on and
+        // cut in across the bus's front.)
+        let ends = c.laneIdx >= this.lanesIn(next);
+        let extra = 0;
+        if (!ends && depth === 0 && this.shortLink(next, nd.boxR, c.len)) {
+          if (c.next2 < 0) c.next2 = this.chooseNext(next, Math.min(c.laneIdx, this.lanesIn(next) - 1));
+          ends = c.next2 >= 0 && c.laneIdx >= this.lanesIn(c.next2);
+          extra = this.edges[next >> 1].len;
+        }
         if (
           depth === 0 &&
           side > 1.8 &&
           cls === Turn.Straight &&
           pc.cls === Turn.Straight &&
-          c.laneIdx >= this.lanesIn(next) &&
+          ends &&
           outX * pc.outX + outY * pc.outY > 0.8 &&
-          pc.eta < clearTime(c.v, Math.max(0, stopAt) + this.stopD[lane] + c.len, CAR_A) + MERGE_MARGIN
+          pc.eta < clearTime(c.v, Math.max(0, stopAt) + this.stopD[lane] + extra + c.len, CAR_A) + MERGE_MARGIN
         )
           return Wait.Player;
       } else if (this.playerConflict(N, inX, inY, outX, outY, cls, time, this.turnClear(c, lane, next, stopAt, nd.boxR))) return Wait.Player;
@@ -2156,6 +2167,35 @@ export class CarTraffic {
         }
         c.busWait = 0;
       }
+      // Our lane ends just ahead (the road narrows by it; or past a link too short to stop on, the one
+      // after: 61/0 s 4332): we move over only into a gap, behind a bus alongside in the lane we merge
+      // into, not across its front (a car merges in front of the player's bus at a junction only if it
+      // is through in time: canGo).
+      let mergeBlocked = false;
+      if (c.next >= 0) {
+        let mEnd = Infinity;
+        let mLane = -1;
+        if (c.laneIdx >= this.lanesIn(c.next)) {
+          mEnd = remain;
+          mLane = c.next;
+        } else if (c.next2 >= 0 && this.edges[c.next >> 1].len < MERGE_SHORT && c.laneIdx >= this.lanesIn(c.next2)) {
+          mEnd = remain + this.edges[c.next >> 1].len;
+          mLane = c.next2;
+        }
+        if (mEnd < LANE_BLEND + 8) {
+          // Where we would be in the lane we merge into: beside our tail (and a bus length's gap behind it) to our nose.
+          const to = this.laneOffset(c.lane, Math.max(0, this.lanesIn(mLane) - 1));
+          for (let q = -c.len / 2 - 4; q <= c.len / 2 + 1 && !mergeBlocked; q += 2.5) {
+            const u = Math.min(e.len, Math.max(0, c.u + q));
+            this.at(c.lane, u, to, pt);
+            const hb = bg.nearest(pt.x, pt.y, 2.2, undefined, pt.z);
+            if (hb >= 0) {
+              mergeBlocked = true;
+              lim(idm(Math.max(0.05, mEnd - c.len / 2 - 1), 0, 0.6), bg.pid[hb] === -1 ? Wait.Player : Wait.Bus, bg.pid[hb]);
+            }
+          }
+        }
+      }
       // Mid-block signals (pedestrian lights).
       const sig = e.sig[c.lane & 1];
       if (c.sigI < sig.length) {
@@ -2255,7 +2295,7 @@ export class CarTraffic {
       // road only gains a lane, its kerb moves out at the node, not before it: so do its lanes.)
       const left = this.edges[c.lane >> 1].len - c.u;
       const widens = c.next >= 0 && this.edges[c.lane >> 1].oneway && this.edges[c.next >> 1].oneway && this.lanesIn(c.next) > this.lanesIn(c.lane);
-      if (c.next >= 0 && left < LANE_BLEND && !widens) {
+      if (c.next >= 0 && left < LANE_BLEND && !widens && !mergeBlocked) {
         const to = this.laneOffset(c.next, Math.min(c.laneIdx, this.lanesIn(c.next) - 1));
         const straight = Math.abs(this.turnAngle(c.lane, c.next)) < 0.5;
         if (to > target && straight) target += (to - target) * (1 - left / LANE_BLEND);
