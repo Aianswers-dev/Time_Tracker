@@ -1814,10 +1814,11 @@ function buildTower(c: Ctx, b: StationBuild, t: TowerDef, base: number | null): 
   }
   const [ow, od] = t.hat ?? [1.8, 1.8];
   if (t.roof === 'pyramid') {
-    // white hipped roof on a thin eave (Woolloongabba, QUT Kelvin Grove)
+    // low white hipped roof on a thin eave (Woolloongabba, QUT Kelvin Grove, Normanby): an X of ridges from
+    // above, a flat cantilevered hat from the platform
     geo.paint(WHITE);
     geo.box(t.x, t.y, z1, z1 + 0.3, hx, hy, hw + ow, hd + od, true);
-    const rise = Math.min(hw, hd) * 0.55;
+    const rise = Math.min(hw + ow, hd + od) * 0.2;
     const ring = cs.map(([i, j]) => [t.x + hx * (hw + ow) * i + vx * (hd + od) * j, t.y + hy * (hw + ow) * i + vy * (hd + od) * j] as [number, number]);
     for (let i = 0; i < 4; i++) {
       const p = ring[i];

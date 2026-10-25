@@ -516,11 +516,12 @@ export const STATIONS: StationDef[] = [
     glass: 0x8fb3ad,
     tactile: 'charcoal',
     roof: 'flat',
-    // Two lift towers with white pyramid roofs at the platforms' south ends, up to Kelvin Grove Rd (OSM roofs
-    // 480017429 / 480017430, roof:shape=pyramidal, 3 levels; imagery about 10-11 m square).
+    // Two lift towers at the platforms' south ends, up to Kelvin Grove Rd (OSM roofs 480017429 / 480017430,
+    // roof:shape=pyramidal, 3 levels; imagery about 10-11 m square with an X of ridges; photo
+    // Normanby_stn_looking_S: teal steel, pale louvres, glass, a wide thin white roof).
     towers: [
-      { x: -853.3, y: 1103.5, w: 8.5, d: 8.5, h: 9.5, frame: 0x2f5f8f, banner: ORANGE, hat: [1.2, 1.2], roof: 'pyramid' },
-      { x: -834, y: 1081.5, w: 8.5, d: 8.5, h: 9.5, frame: 0x2f5f8f, banner: ORANGE, hat: [1.2, 1.2], roof: 'pyramid' },
+      { x: -853.3, y: 1103.5, w: 7.5, d: 7.5, h: 9.5, frame: 0x2b6a6e, banner: ORANGE, hat: [1.7, 1.7], roof: 'pyramid' },
+      { x: -834, y: 1081.5, w: 7.5, d: 7.5, h: 9.5, frame: 0x2b6a6e, banner: ORANGE, hat: [1.7, 1.7], roof: 'pyramid' },
     ],
     ownRoofs: 40,
   },
