@@ -1782,21 +1782,27 @@ export class Traffic {
    * went on the green the player's bus stood at the line for to turn right, and the bus pulled
    * out into it (199/0 s 1448). On the main road at a junction with no light, the same: a car
    * from the side road went while the bus stood at a stop 20 m short of it, and the bus pulled
-   * away into it (199/0 s 375, node 7563). Infinity when there is none.
+   * away into it (199/0 s 375, node 7563). A vehicle standing in the box waiting for the player's
+   * bus does not count: an oncoming 60/1 stood there for the bus turning right into Morry St, and
+   * the bus for it (199/0 s 22). Infinity when there is none.
    */
   giveWayAhead(track: RouteTrack, s: number, range: number): number {
     const time = this.simTime;
+    const waitsForUs = (holder: number): boolean => {
+      const b = holder < 0 && holder !== PLAYER_HOLD ? this.byId.get(-holder) : undefined;
+      return !!b && !b.dead && b.v < 0.5 && b.wait === Wait.Player;
+    };
     for (const j of this.cars.junctionsAlong(track)) {
       if (j.stopS < s - 1) continue;
       if (j.stopS - s > range) break;
       if (j.inside) continue;
       if (j.sig ? this.cars.signalFor(j.node, j.inX, j.inY, time, j.outX, j.outY) !== null : !j.minor) {
-        if (!this.cars.boxClear(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time)) return j.stopS - s;
+        if (!this.cars.boxClear(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time, waitsForUs)) return j.stopS - s;
         continue;
       }
       if (
         this.cars.giveWayBusy(j.node, true, time) ||
-        !this.cars.boxClear(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time) ||
+        !this.cars.boxClear(j.node, PLAYER_HOLD, j.inX, j.inY, j.outX, j.outY, j.cls, time, waitsForUs) ||
         this.cars.conflictEta(j.node, j.inX, j.inY, j.outX, j.outY, j.cls, j.cls === Turn.Left ? GAP_LEFT : GAP_ACROSS) < Infinity
       )
         return j.stopS - s;

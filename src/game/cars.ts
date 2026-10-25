@@ -1318,8 +1318,11 @@ export class CarTraffic {
     return facing;
   }
 
-  /** Is the box clear of movements that conflict with this one? (Expired holders are dropped.) */
-  boxClear(node: number, id: number, inX: number, inY: number, outX: number, outY: number, cls: Turn, time: number): boolean {
+  /**
+   * Is the box clear of movements that conflict with this one? (Expired holders are dropped.)
+   * `waitsForUs` names other holders (AI buses) standing in the box for us, which do not count.
+   */
+  boxClear(node: number, id: number, inX: number, inY: number, outX: number, outY: number, cls: Turn, time: number, waitsForUs?: (holder: number) => boolean): boolean {
     const nd = this.nodes[node];
     let w = 0;
     for (let i = 0; i < nd.occ.length; i++) {
@@ -1330,9 +1333,11 @@ export class CarTraffic {
     for (const o of nd.occ) {
       if (o.id !== id && movementsConflict(inX, inY, outX, outY, cls, o)) {
         // (A car holding the box but stopped for us, our nose already in its way out (we came
-        // through the junction's inside link), lets us out first: else the two wait for good.)
+        // through the junction's inside link), lets us out first: else the two wait for good.
+        // So does one stopped there for the player's bus, when it is the player asking.)
         const h = o.id > 0 ? this.byId.get(o.id) : undefined;
-        if (h && !h.dead && h.v < 0.5 && h.why === Wait.Car && h.ref === id) continue;
+        if (h && !h.dead && h.v < 0.5 && ((h.why === Wait.Car && h.ref === id) || (id === PLAYER_HOLD && h.why === Wait.Player))) continue;
+        if (waitsForUs?.(o.id)) continue;
         this.boxBy = o.id;
         return false;
       }
