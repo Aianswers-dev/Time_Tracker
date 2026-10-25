@@ -9,6 +9,7 @@ import { matchStopPlatform, platformEdgeAt, type PlatformZone } from './platform
 import { LEVEL_GAP, heightsOf } from './height';
 import { activeCollider } from '../sim/collider';
 import { specFor } from '../bus/spec';
+import { signalsFor } from '../data/signals';
 
 export const TRACK_STEP = 4;
 
@@ -1364,9 +1365,11 @@ export class RouteTrack {
     const idx = roadIndexFor(data);
     const grid = signalGrid(data);
     const sig = data.signals;
-    /** Per junction pass: the nodes' lane positions. */
-    const hits: { j: number; s: number }[] = [];
-    const seen = new Set<number>();
+    /** Per junction pass: the nodes' lane positions (and the signal model's junction of each). */
+    const hits: { j: number; s: number; mj: number }[] = [];
+    const model = signalsFor(data);
+    /** Per node, the sample it was last looked at (a route can pass a node again, as a loop back to its start does). */
+    const seen = new Map<number, number>();
     for (let i = 0; i < n; i++) {
       const gx = Math.floor(X[i] / 40) + 1000;
       const gy = Math.floor(Y[i] / 40) + 1000;
@@ -1375,13 +1378,15 @@ export class RouteTrack {
           const list = grid.get((gx + ox) * 4096 + gy + oy);
           if (!list) continue;
           for (const k of list) {
-            if (seen.has(k)) continue;
+            if (i - (seen.get(k) ?? -Infinity) < 25) continue;
             const sx = sig[2 * k];
             const sy = sig[2 * k + 1];
             if (Math.hypot(sx - X[i], sy - Y[i]) > 9) continue;
             const along = (sx - X[i]) * this.tx[i] + (sy - Y[i]) * this.ty[i];
-            if (Math.abs(along) > TRACK_STEP * 0.75) continue;
-            seen.add(k);
+            // (samples can stand further apart than TRACK_STEP where the lane is fitted round a corner)
+            const gap = Math.max(TRACK_STEP, Math.hypot(X[Math.min(n - 1, i + 1)] - X[i], Y[Math.min(n - 1, i + 1)] - Y[i]), Math.hypot(X[i] - X[Math.max(0, i - 1)], Y[i] - Y[Math.max(0, i - 1)]));
+            if (Math.abs(along) > gap * 0.75) continue;
+            seen.set(k, i);
             const z = this.z[i];
             // The roads the node is on (streets first: a busway tunnel may pass right under it).
             let level = false;
@@ -1391,8 +1396,19 @@ export class RouteTrack {
             idx.forEachNear(sx, sy, 1.2, (ri) => {
               if (!data.roads[ri].tunnel) tunnelOnly = false;
             });
+            // The traffic the node faces along its own road (OSM traffic_signals:direction, from the
+            // pipeline), against the lane's way in over the last 12 m (before any turn at the node).
+            const rk = data.signalRoad?.[k] ?? -1;
+            const dk = data.signalDir?.[k] ?? 0;
+            const i0 = Math.max(0, i - 3);
+            const inL = Math.hypot(X[i] - X[i0], Y[i] - Y[i0]);
+            const inX = inL > 1 ? (X[i] - X[i0]) / inL : this.tx[i];
+            const inY = inL > 1 ? (Y[i] - Y[i0]) / inL : this.ty[i];
+            let faces = false;
             idx.forEachNear(sx, sy, 1.2, (ri, _ax, _ay, ux, uy, _len, _d, zz) => {
               const r = data.roads[ri];
+              // (its own road at the lane's level, even where that is the tunnel starting at the node)
+              if (ri === rk && Math.abs(zz - z) <= LEVEL_GAP) faces ||= (ux * inX + uy * inY) * dk > 0.5;
               if (r.tunnel && !tunnelOnly) return;
               onRoad = true;
               if (Math.abs(zz - z) > LEVEL_GAP || r.kind === RoadKind.Pedestrian) return;
@@ -1400,6 +1416,9 @@ export class RouteTrack {
               const fwd = ux * this.tx[i] + uy * this.ty[i];
               // (A one-way carriageway the other way: the general lanes beside a contraflow bus lane.)
               if (r.oneway && fwd < -0.5) return;
+              // A node facing one way controls the lane coming in that way, as the signal model has it
+              // (src/data/signals.ts): not the opposing lane past it, nor a cross street at its vertex.
+              if (dk && rk >= 0) return;
               // A node out on an approach to a junction controls the traffic heading into it: not the
               // traffic leaving it (the signal for the other direction, on the arm the lane turns into).
               const cum = roadCum(r);
@@ -1411,16 +1430,19 @@ export class RouteTrack {
               else if (d0 < d1) applies ||= fwd < 0;
               else applies ||= fwd > 0;
             });
+            if (dk && rk >= 0) applies = faces;
             if (onRoad ? !level || !applies : Math.abs(H.ground(sx, sy) - z) > LEVEL_GAP) continue;
-            hits.push({ j: J.id[k], s: i * TRACK_STEP + along });
+            hits.push({ j: J.id[k], s: i * TRACK_STEP + along, mj: model.nodeJunction[k] });
           }
         }
       }
     }
     hits.sort((p, q) => p.s - q.s);
     const out: TrackSignal[] = [];
+    let lastMj = -1;
     for (let h = 0; h < hits.length; h++) {
       const j = hits[h].j;
+      const mj = hits[h].mj;
       // The nodes of this junction on this pass.
       let s0 = hits[h].s;
       let s1 = s0;
@@ -1447,8 +1469,12 @@ export class RouteTrack {
       // junction centre can lie off to one side of a turning lane).
       const stop = Math.min(s0 - 7, best < 15 ? sc - junctionStop(data, J, j) : Infinity);
       const last = out[out.length - 1];
-      if (stop < 12 || (last && stop - last.s < 30)) continue;
+      // (one stop per junction: a second node group of the signal model's junction, which can span
+      // 70 m, is the same light; the next junction's, unless right on top of this one, is its own)
+      const gap = mj < 0 ? 30 : mj === lastMj ? 60 : 10;
+      if (stop < 12 || (last && stop - last.s < gap)) continue;
       out.push({ s: stop, x: cx, y: cy });
+      lastMj = mj;
     }
     return out;
   }
