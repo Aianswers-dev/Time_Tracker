@@ -197,7 +197,7 @@ interface Car {
   xsCommit: number;
   holds: Hold[];
   /**
-   * The corner of a left turn into `next` (see cutOf): leave this lane cutA m before its end and join
+   * The inside corner of a turn into `next` (see cutOf): leave this lane cutA m before its end and join
    * the next cutB m after its start, at its offset cutLat; for the lane, next lane and lane index keyed.
    */
   cutLane: number;
@@ -1164,11 +1164,14 @@ export class CarTraffic {
   }
 
   /**
-   * A left turn's corner: where the car's lane line crosses the next lane's. The car leaves its lane
+   * A turn's inside corner: where the car's lane line crosses the next lane's. The car leaves its lane
    * there, before the node, and joins the next lane past it, at the same point. Driving out to the
    * node and pivoting on it instead puts the car's centre on the centreline of the road it turns into
    * and swings its tail across the far half of the road it leaves, into the oncoming traffic going
-   * straight on. No cut for other movements, or where the corner is behind the stop line.
+   * straight on (a left turn); or jumps it sideways at the node by twice its offset times the sine of
+   * half the turn (61/0 s 4851: 1.8 m, into the player's bus, on a sharp right turn from a one-way's
+   * offside lane). No cut going straight on, where the lines cross past the node, or where the corner
+   * is behind the stop line.
    */
   private cutOf(c: Car): void {
     if (c.cutLane === c.lane && c.cutNext === c.next && c.cutIdx === c.laneIdx) return;
@@ -1194,7 +1197,9 @@ export class CarTraffic {
     const bx = p.hx;
     const by = p.hy;
     const cr = ax * by - ay * bx;
-    if (cr < 0.48 || ax * bx + ay * by < -0.9) return; // not a left turn (of ~29 degrees or more)
+    // (A right turn's lines cross before the node too where both lanes are on the right of their roads,
+    // the offside lanes of one-way roads: the inside of the turn. Elsewhere they cross past it, no cut.)
+    if (Math.abs(cr) < 0.48 || ax * bx + ay * by < -0.9) return; // not a turn of ~29 degrees or more
     const wx = p.x - wx0;
     const wy = p.y - wy0;
     const ca = -(wx * by - wy * bx) / cr;
