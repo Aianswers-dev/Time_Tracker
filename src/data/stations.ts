@@ -340,9 +340,10 @@ export const STATIONS: StationDef[] = [
     medianLights: true,
     // Lift towers on the platforms' east-end landings joined by the teal overbridge, on the line
     // of the OSM footbridge (building 36455, (1057,-3122)-(1061,-3096)).
-    // Towers on the OSM elevators ((1062,-3094), (1056,-3125)); imagery: hats about 17-20 m square centred
-    // (1061,-3086) and (1057,-3125), towers about 9 m.
-    overbridges: [{ x: 1059.2, y: -3108.9, ax: 0.164, ay: 0.987, len: [-22, 27], w: 4, glass: 0x3fa7a0, frame: 0x2b2f33, towers: true, towerW: 9, towerHat: [3.75, 5.5], clear: 6.4 }],
+    // Imagery (z20): hats about 21 m along the busway x 16 m, centred (1063.5,-3083) behind platform 1 and
+    // (1056.5,-3123) on platform 2's east end, the 4.6 m glazed bridge between them; OSM's elevators
+    // ((1062,-3094), (1056,-3125)) are the lift doors at the bridge ends.
+    overbridges: [{ x: 1059.2, y: -3108.9, ax: 0.164, ay: 0.987, len: [-19.15, 30.45], w: 4.4, glass: 0x3fa7a0, frame: 0x2b2f33, towers: true, towerW: 9, towerHat: [3.5, 6], clear: 6.4 }],
     // OSM boxes the model replaces: the north station building, the footbridge and the south building.
     ownBuildings: [
       [1062, -3089],
@@ -466,9 +467,9 @@ export const STATIONS: StationDef[] = [
     canopyDepth: 4.5,
     median: 'fence',
     // lift towers on the landings behind both platforms (platform outlines), joined across the busway
-    // (OSM elevators (2579,-3287), (2579,-3320); imagery hats about 13.5 m square centred (2580,-3286) and
-    // (2578.5,-3327))
-    overbridges: [{ x: 2579, y: -3304, ax: 0, ay: 1, len: [-27, 22], w: 3.6, glass: 0x8fb3ad, frame: 0x4a3b30, towers: true, towerW: 7.5, towerHat: [3, 3], clear: 6.2 }],
+    // (imagery hats about 13.7 m square centred (2579.4,-3281.6) and (2578.2,-3318.5), on the platforms'
+    // landings; OSM elevators (2579,-3287), (2579,-3320))
+    overbridges: [{ x: 2579, y: -3303.3, ax: 0, ay: 1, len: [-19.2, 25.7], w: 3.6, glass: 0x8fb3ad, frame: 0x4a3b30, towers: true, towerW: 7.5, towerHat: [3.1, 3.1], clear: 6.2 }],
     // the bronze entrance canopy with "Langlands Park" lettering on Old Cleveland Rd
     entrances: [{ x: 2556, y: -3326, fx: 0, fy: -1, len: 18, d: 5, h: 3.4 }],
     ownRoofs: 40,
