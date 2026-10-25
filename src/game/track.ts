@@ -121,6 +121,8 @@ const TURN_LANE_EASE = 9;
 const TURN_LANE_HELD = 16;
 /** Samples past a turn's node its turn lane may carry on straight for, to meet the lane it turns into. */
 const TURN_CARRY = 6;
+/** Samples on into the lane turned into that a carried turn lane is held for too. */
+const TURN_CARRY_ON = 3;
 /** How hard the corner solve holds a turn lane's held samples sideways where they were (against bending). */
 const TURN_HOLD_W = 1;
 /**
@@ -1421,7 +1423,7 @@ export class RouteTrack {
   readonly signals: TrackSignal[];
   /** Every 40 m: [s, x, y] triples, for quick "is this route near me" tests. */
   readonly coarse: Float32Array;
-  /** Samples held in a turn lane (the corner solve keeps them there). */
+  /** Samples held in a turn lane, and on past its node into the lane turned into (the corner solve keeps them there). */
   private turnHeld: Uint8Array;
 
   constructor(
@@ -1739,8 +1741,10 @@ export class RouteTrack {
         end = k;
       }
       if (end < 0) continue;
-      // (Unsmoothed there and just before: smoothing would round off the corner it makes.)
-      unsmoothed.fill(1, Math.max(0, k0 - 3), end + 1);
+      // (Unsmoothed there, just before and on into the lane turned into, and held there by the corner solve as the
+      // turn lane is: smoothing, or the solve spreading the turn out, would cut the corner across the junction.)
+      unsmoothed.fill(1, Math.max(0, k0 - 3), Math.min(n, end + 1 + TURN_CARRY_ON));
+      this.turnHeld.fill(1, k0 + 1, Math.min(n, end + 1 + TURN_CARRY_ON));
     }
     // The lane is the matched road's own lane: where the road is (exactly: a GTFS shape that wanders
     // 10 m off a curving tunnel must not drag the lane across the centreline), plus the road's lane
