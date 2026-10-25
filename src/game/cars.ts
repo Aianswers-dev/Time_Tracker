@@ -480,6 +480,18 @@ export class CarTraffic {
   private blockRef = 0;
   private pt2: LanePt = { x: 0, y: 0, hx: 0, hy: 0, z: 0, g: 0 };
   private pt3: LanePt = { x: 0, y: 0, hx: 0, hy: 0, z: 0, g: 0 };
+  // holdBackFor's scratch (sections' axles, headings and links; the rectangles, and those near one lane; lanes).
+  private hbAx = new Float64Array(0);
+  private hbAy = new Float64Array(0);
+  private hbHx = new Float64Array(0);
+  private hbHy = new Float64Array(0);
+  private hbLink = new Float64Array(0);
+  private hbRects = new Float64Array(0);
+  private hbSel = new Float64Array(0);
+  private hbSmp = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
+  private hbLanes: number[] = [];
+  private hbSame: boolean[] = [];
+  private hbKs: number[] = [];
   readonly stats: CarStats = { overlapDespawns: 0, stuckDespawns: 0, stallDespawns: 0, waitingRed: 0, waitingJunction: 0, stationary: 0 };
   /** Id of the holder that made the last boxClear() fail. */
   private boxBy = 0;
@@ -1533,20 +1545,38 @@ export class CarTraffic {
    * turning left out of one narrow road into another swings over the far half of the one it turns
    * into, where cars wait at their red (199/0 s 1926, s 7070). Returns the number of lines moved.
    * With `only`, just the route's junction of that index (an AI bus coming up to it).
+   * (Each lane tests only the section rectangles that could reach a car anywhere it might be placed
+   * there, and nothing is allocated per call: the AI buses make one call a frame.)
    */
   holdBackFor(track: RouteTrack, spec: BusSpec, only = -1): number {
     const secs = spec.sections;
     const ns = secs.length;
+    if (this.hbAx.length < ns) {
+      this.hbAx = new Float64Array(ns);
+      this.hbAy = new Float64Array(ns);
+      this.hbHx = new Float64Array(ns);
+      this.hbHy = new Float64Array(ns);
+      this.hbLink = new Float64Array(ns);
+    }
     // Section i: its axle, its hitch to the one in front (section 0: the front axle), unit heading.
-    const ax = new Float64Array(ns);
-    const ay = new Float64Array(ns);
-    const hx = new Float64Array(ns);
-    const hy = new Float64Array(ns);
-    const link = secs.map((s, i) => (i === 0 ? spec.wheelbase : Math.max(0.5, s.axleFromFront - s.hitchFromFront)));
+    const ax = this.hbAx;
+    const ay = this.hbAy;
+    const hx = this.hbHx;
+    const hy = this.hbHy;
+    const link = this.hbLink;
+    let maxBl = 0;
+    for (let i = 0; i < ns; i++) {
+      link[i] = i === 0 ? spec.wheelbase : Math.max(0.5, secs[i].axleFromFront - secs[i].hitchFromFront);
+      const f = secs[i].axleFromFront;
+      maxBl = Math.max(maxBl, (f + (secs[i].length - f)) / 2);
+    }
     const halfW = spec.width / 2 + SWEEP_MARGIN;
-    const rects: number[] = [];
-    const smp = { x: 0, y: 0, hx: 0, hy: 1, heading: 0 };
-    const pt = this.pt2;
+    // Centre to centre, a waiting car and a section rectangle further apart than this cannot touch (boxesTouch).
+    const reach = SWEEP_CAR_L / 2 + SWEEP_CAR_W / 2 + maxBl + halfW;
+    const smp = this.hbSmp;
+    const lanes = this.hbLanes;
+    const same = this.hbSame;
+    const ks = this.hbKs;
     let moved = 0;
     const jl = this.junctionsAlong(track);
     for (let q = only < 0 ? 0 : only; q < (only < 0 ? jl.length : Math.min(jl.length, only + 1)); q++) {
@@ -1554,8 +1584,8 @@ export class CarTraffic {
       const nd = this.nodes[j.node];
       // Arms with a line cars wait at; the one the bus comes in on too, for the lanes beside the
       // bus's (it may cross them before the node).
-      const lanes: number[] = [];
-      const same: boolean[] = [];
+      lanes.length = 0;
+      same.length = 0;
       for (const ei of nd.edges) {
         const e = this.edges[ei];
         if (e.bus) continue;
@@ -1567,9 +1597,15 @@ export class CarTraffic {
       }
       if (!lanes.length) continue;
       // The bus's body over its way through: section rectangles (centre, unit axis, half length).
-      rects.length = 0;
       const s0 = Math.max(0, j.s - 50);
       const s1 = Math.min(track.length, j.s + 50);
+      const need = 5 * ns * (Math.floor(s1 - s0) + 2);
+      if (this.hbRects.length < need) {
+        this.hbRects = new Float64Array(need);
+        this.hbSel = new Float64Array(need);
+      }
+      const R = this.hbRects;
+      let nr = 0;
       for (let s = s0; s <= s1; s += 1) {
         track.sample(s, smp);
         for (let i = 0; i < ns; i++) {
@@ -1597,7 +1633,13 @@ export class CarTraffic {
           const b = secs[i].length - f;
           const cx = ax[i] + (dx * (f - b)) / 2;
           const cy = ay[i] + (dy * (f - b)) / 2;
-          if (Math.hypot(cx - nd.x, cy - nd.y) < 45) rects.push(cx, cy, dx, dy, (f + b) / 2);
+          if (Math.hypot(cx - nd.x, cy - nd.y) < 45) {
+            R[nr++] = cx;
+            R[nr++] = cy;
+            R[nr++] = dx;
+            R[nr++] = dy;
+            R[nr++] = (f + b) / 2;
+          }
         }
       }
       for (let li = 0; li < lanes.length; li++) {
@@ -1605,25 +1647,17 @@ export class CarTraffic {
         const e = this.edges[L >> 1];
         const cap = Math.min(SWEEP_MAX, e.len - 2);
         const n = this.lanesIn(L);
-        const hitK = (sd: number, k: number): boolean => {
-          for (let q = 0; q < 2; q++) {
-            const dc = sd + SWEEP_CAR_L / 2 - 0.6 + q * (SWEEP_CAR_L + 2);
-            if (dc > e.len) break;
-            this.at(L, e.len - dc, this.laneOffset(L, k), pt);
-            for (let r = 0; r < rects.length; r += 5) {
-              if (boxesTouch(pt.x, pt.y, pt.hx, pt.hy, SWEEP_CAR_L / 2, SWEEP_CAR_W / 2, rects[r], rects[r + 1], rects[r + 2], rects[r + 3], rects[r + 4], halfW)) return true;
-            }
-          }
-          return false;
-        };
+        const sd0 = this.stopD[L];
+        // The rectangles that could touch a car placed anywhere it is tried below (a line from sd0 to cap).
+        const nSel = this.sweepNear(L, n, Math.min(sd0, cap) + SWEEP_CAR_L / 2 - 0.6 - 0.01, Math.max(sd0, cap) + SWEEP_CAR_L / 2 - 0.6 + SWEEP_CAR_L + 2 + 0.01, reach, nr);
+        if (!nSel) continue;
         // (On the bus's own approach, not the lane it comes along, which it covers however far back.)
-        const ks: number[] = [];
-        for (let k = 0; k < n; k++) if (!same[li] || !hitK(cap, k)) ks.push(k);
+        ks.length = 0;
+        for (let k = 0; k < n; k++) if (!same[li] || !this.sweepHitK(L, cap, k, nSel, halfW)) ks.push(k);
         if (!ks.length) continue;
-        const hit = (sd: number): boolean => ks.some((k) => hitK(sd, k));
-        let sd = this.stopD[L];
-        if (!hit(sd)) continue;
-        while (sd < cap && hit(sd)) sd += 0.5;
+        let sd = sd0;
+        if (!this.sweepHit(L, sd, nSel, halfW)) continue;
+        while (sd < cap && this.sweepHit(L, sd, nSel, halfW)) sd += 0.5;
         if (sd < cap) {
           this.stopD[L] = sd;
           moved++;
@@ -1631,6 +1665,87 @@ export class CarTraffic {
       }
     }
     return moved;
+  }
+
+  /**
+   * holdBackFor: copy into hbSel the rectangles (of the first `nr` numbers of hbRects) centred within
+   * `reach` of some point of lane L, in any of its n lanes, `dcLo` to `dcHi` m back from its end;
+   * returns how many numbers it copied. (Bounded by the box around the lane's centreline over that
+   * stretch, its vertices and ends, widened by the largest lane offset: a lane point is the
+   * centreline point beside it plus the offset along a unit normal.)
+   */
+  private sweepNear(L: number, n: number, dcLo: number, dcHi: number, reach: number, nr: number): number {
+    const e = this.edges[L >> 1];
+    let off = 0;
+    for (let k = 0; k < n; k++) off = Math.max(off, Math.abs(this.laneOffset(L, k)));
+    const uLo = Math.max(0, e.len - dcHi);
+    const uHi = Math.max(uLo, e.len - dcLo);
+    const pt = this.pt2;
+    this.at(L, uLo, 0, pt);
+    let x0 = pt.x;
+    let x1 = pt.x;
+    let y0 = pt.y;
+    let y1 = pt.y;
+    this.at(L, uHi, 0, pt);
+    x0 = Math.min(x0, pt.x);
+    x1 = Math.max(x1, pt.x);
+    y0 = Math.min(y0, pt.y);
+    y1 = Math.max(y1, pt.y);
+    const rev = (L & 1) === 1;
+    const sA = rev ? e.len - uHi : uLo;
+    const sB = rev ? e.len - uLo : uHi;
+    const c = e.cum;
+    const p = e.pts;
+    for (let i = 0; i < c.length; i++) {
+      if (c[i] <= sA || c[i] >= sB) continue;
+      x0 = Math.min(x0, p[2 * i]);
+      x1 = Math.max(x1, p[2 * i]);
+      y0 = Math.min(y0, p[2 * i + 1]);
+      y1 = Math.max(y1, p[2 * i + 1]);
+    }
+    const m = off + reach + 0.01;
+    x0 -= m;
+    x1 += m;
+    y0 -= m;
+    y1 += m;
+    const Rs = this.hbRects;
+    const S = this.hbSel;
+    let w = 0;
+    for (let r = 0; r < nr; r += 5) {
+      const cx = Rs[r];
+      const cy = Rs[r + 1];
+      if (cx < x0 || cx > x1 || cy < y0 || cy > y1) continue;
+      S[w] = cx;
+      S[w + 1] = cy;
+      S[w + 2] = Rs[r + 2];
+      S[w + 3] = Rs[r + 3];
+      S[w + 4] = Rs[r + 4];
+      w += 5;
+    }
+    return w;
+  }
+
+  /** holdBackFor: does a car in lane L's lane k, first or second at a line sd m back, touch a rectangle in hbSel? */
+  private sweepHitK(L: number, sd: number, k: number, nSel: number, halfW: number): boolean {
+    const e = this.edges[L >> 1];
+    const S = this.hbSel;
+    const pt = this.pt2;
+    for (let q = 0; q < 2; q++) {
+      const dc = sd + SWEEP_CAR_L / 2 - 0.6 + q * (SWEEP_CAR_L + 2);
+      if (dc > e.len) break;
+      this.at(L, e.len - dc, this.laneOffset(L, k), pt);
+      for (let r = 0; r < nSel; r += 5) {
+        if (boxesTouch(pt.x, pt.y, pt.hx, pt.hy, SWEEP_CAR_L / 2, SWEEP_CAR_W / 2, S[r], S[r + 1], S[r + 2], S[r + 3], S[r + 4], halfW)) return true;
+      }
+    }
+    return false;
+  }
+
+  /** holdBackFor: sweepHitK in any of the lanes in hbKs. */
+  private sweepHit(L: number, sd: number, nSel: number, halfW: number): boolean {
+    const ks = this.hbKs;
+    for (let i = 0; i < ks.length; i++) if (this.sweepHitK(L, sd, ks[i], nSel, halfW)) return true;
+    return false;
   }
 
   /** Does `track` come in on one of `node`'s arms and leave on another, around its sample `i` (12 m either side)? */

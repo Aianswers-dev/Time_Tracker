@@ -814,10 +814,11 @@ export class Traffic {
       this.heldFor = this.pTrack;
       this.events.push(`stop lines held back from the route's swept path: ${this.cars.holdBackFor(this.pTrack, this.playerSpec)}`);
     }
-    // ...and from each AI bus's, at the junctions it is coming up to (one junction a frame, about a
-    // millisecond). 199/0 s 2309: a 60/0 turning left at Boundary St swept the line of the arm beside its
-    // way out, stopped in the box behind a car waiting at its red there, and the box then held up the
-    // player's lane through it for two minutes.
+    // ...and from each AI bus's, at the junctions it is coming up to (one junction a frame: 0.02-0.03 ms
+    // on average, under 0.5 ms for the costliest of every route's junctions). 199/0 s 2309: a 60/0
+    // turning left at Boundary St swept the line of the arm beside its way out, stopped in the box
+    // behind a car waiting at its red there, and the box then held up the player's lane through it
+    // for two minutes.
     let holdBudget = 1;
     for (const b of this.active) {
       if (holdBudget <= 0) break;
