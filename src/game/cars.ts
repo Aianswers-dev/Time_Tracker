@@ -120,10 +120,24 @@ interface PlayerApproach {
   inY: number;
   cls: Turn;
   eta: number;
+  /** Close enough that cars in the next lane do not turn across its lane in front of it. */
+  near: boolean;
 }
 
-/** An oncoming car turning right across the player's bus waits when the bus is this close (s). */
-const ONCOMING_GAP = 4.5;
+/**
+ * An oncoming vehicle turning right across the player's bus goes only when the
+ * bus is further off than its own time to clear the bus's path plus this (s).
+ * (A flat 4.5 s let a car waiting at the line pull out with the bus a few
+ * metres short: from rest it takes about 4.5 s to clear.)
+ */
+const ONCOMING_MARGIN = 1.5;
+/** Car acceleration (m/s^2). */
+const CAR_A = 1.7;
+
+/** Seconds to cover `d` m from speed `v`: holding it, or accelerating at `a` from rest, whichever is sooner (an upper bound). */
+export function clearTime(v: number, d: number, a: number): number {
+  return Math.min(d / Math.max(v, 0.1), Math.sqrt((2 * Math.max(0, d)) / a));
+}
 
 interface Hold {
   node: number;
@@ -1128,12 +1142,23 @@ export class CarTraffic {
   /**
    * The player's bus is heading into `node` (lane point (x, y), direction (inX, inY), movement cls,
    * there in `eta` s), until `until`: cars on the same approach do not turn across its lane in front
-   * of it, and oncoming cars do not turn right across its path when it is close.
+   * of it (when `near`), and oncoming vehicles do not turn right across its path when it is close.
    */
-  claimApproach(node: number, x: number, y: number, inX: number, inY: number, cls: Turn, eta: number, until: number): void {
+  claimApproach(node: number, x: number, y: number, inX: number, inY: number, cls: Turn, eta: number, until: number, near: boolean): void {
     const nd = this.nodes[node];
-    if (nd.pc) Object.assign(nd.pc, { until, x, y, inX, inY, cls, eta });
-    else nd.pc = { until, x, y, inX, inY, cls, eta };
+    if (nd.pc) Object.assign(nd.pc, { until, x, y, inX, inY, cls, eta, near });
+    else nd.pc = { until, x, y, inX, inY, cls, eta, near };
+  }
+
+  /**
+   * Would a vehicle coming into `node` along (inX, inY) and turning `cls` cut
+   * across the player's bus coming the other way, which it would not clear
+   * in `clearT` s (plus a margin)?
+   */
+  playerOncoming(node: number, inX: number, inY: number, cls: Turn, time: number, clearT: number): boolean {
+    const pc = this.nodes[node].pc;
+    if (!pc || pc.until <= time || cls !== Turn.Right || pc.cls === Turn.Right) return false;
+    return inX * pc.inX + inY * pc.inY < -0.8 && pc.eta < clearT + ONCOMING_MARGIN;
   }
 
   /** Main-road vehicle approaching an unsignalised junction: mark it busy. */
@@ -1465,8 +1490,8 @@ export class CarTraffic {
       const dot = inX * pc.inX + inY * pc.inY;
       if (dot > 0.8) {
         const side = (c.x - pc.x) * pc.inY - (c.y - pc.y) * pc.inX;
-        if ((side > 1.8 && cls === Turn.Left && pc.cls !== Turn.Left) || (side < -1.8 && cls === Turn.Right && pc.cls !== Turn.Right)) return Wait.Player;
-      } else if (dot < -0.8 && cls === Turn.Right && pc.cls !== Turn.Right && pc.eta < ONCOMING_GAP) return Wait.Player;
+        if (pc.near && ((side > 1.8 && cls === Turn.Left && pc.cls !== Turn.Left) || (side < -1.8 && cls === Turn.Right && pc.cls !== Turn.Right))) return Wait.Player;
+      } else if (this.playerOncoming(N, inX, inY, cls, time, clearTime(c.v, Math.max(0, stopAt) + 2 * nd.boxR + c.len, CAR_A))) return Wait.Player;
     }
     // The player's bus in (or about to enter) the box: waiting for it is legitimate.
     if (!this.boxClear(N, c.id, inX, inY, outX, outY, cls, time)) return this.boxBy === PLAYER_HOLD ? Wait.Player : Wait.Junction;
@@ -1612,7 +1637,7 @@ export class CarTraffic {
       const remain = e.len - c.u;
       if (c.next < 0 && remain < 70) c.next = this.chooseNext(c.lane);
       const v0 = (e.limit / 3.6) * c.vWant;
-      const A = 1.7;
+      const A = CAR_A;
       const B = 2.6;
       const T = 1.15;
       const idm = (gap: number, vLead: number, s0: number) => {
