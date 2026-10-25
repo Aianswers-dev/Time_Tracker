@@ -1015,7 +1015,13 @@ export class CarTraffic {
     return lane & 1 ? e.a : e.b;
   }
 
-  private chooseNext(lane: number): number {
+  /**
+   * The lane after `lane` for a car in lane index `idx` of it: turning left only from the kerb lane
+   * and right only from the offside one (across the lane beside it, in front of whoever is in that
+   * one, only where nothing else is open to it). OSM rarely says which lanes turn; a wide way out
+   * is no sign of a double turn lane (inside a big junction every link is wide).
+   */
+  private chooseNext(lane: number, idx = 0): number {
     const node = this.nodes[this.endNode(lane)];
     const e = this.edges[lane >> 1];
     const rev = lane & 1;
@@ -1024,20 +1030,28 @@ export class CarTraffic {
     const n = p.length;
     const [hx, hy] = rev ? [p[0] - p[2], p[1] - p[3]] : [p[n - 2] - p[n - 4], p[n - 1] - p[n - 3]];
     const hIn = Math.atan2(hx, hy);
+    const lanes = this.lanesIn(lane);
     let best = -1;
     let sum = 0;
     const opts: [number, number][] = [];
-    for (const o of node.out) {
-      if (o >> 1 === lane >> 1) continue;
-      const oe = this.edges[o >> 1];
-      if (oe.bus) continue;
-      const op = oe.pts;
-      const on = op.length;
-      const [ox, oy] = o & 1 ? [op[on - 4] - op[on - 2], op[on - 3] - op[on - 1]] : [op[2] - op[0], op[3] - op[1]];
-      const turn = Math.abs(wrapAngle(Math.atan2(ox, oy) - hIn));
-      const w = (Math.cos(turn) + 1.25) * (CLASS_W[oe.kind] ?? 0.3) * (oe.len < 15 ? 0.6 : 1);
-      opts.push([o, w]);
-      sum += w;
+    for (let pass = 0; pass < 2 && !opts.length; pass++) {
+      for (const o of node.out) {
+        if (o >> 1 === lane >> 1) continue;
+        const oe = this.edges[o >> 1];
+        if (oe.bus) continue;
+        const op = oe.pts;
+        const on = op.length;
+        const [ox, oy] = o & 1 ? [op[on - 4] - op[on - 2], op[on - 3] - op[on - 1]] : [op[2] - op[0], op[3] - op[1]];
+        const signed = wrapAngle(Math.atan2(ox, oy) - hIn);
+        if (pass === 0 && lanes > 1) {
+          if (signed < -0.5 && idx > 0) continue;
+          if (signed > 0.5 && idx < lanes - 1) continue;
+        }
+        const turn = Math.abs(signed);
+        const w = (Math.cos(turn) + 1.25) * (CLASS_W[oe.kind] ?? 0.3) * (oe.len < 15 ? 0.6 : 1);
+        opts.push([o, w]);
+        sum += w;
+      }
     }
     if (!opts.length) return e.oneway ? -1 : lane ^ 1;
     let r = this.rand() * sum;
@@ -1660,7 +1674,7 @@ export class CarTraffic {
     }
     // A link too short to stop on: the junction after it must be enterable too.
     if (depth === 0 && this.shortLink(next, nd.boxR, c.len)) {
-      if (c.next2 < 0) c.next2 = this.chooseNext(next);
+      if (c.next2 < 0) c.next2 = this.chooseNext(next, Math.min(c.laneIdx, this.lanesIn(next) - 1));
       if (c.next2 >= 0) return this.canGo(c, next, c.next2, stopAt + ne.len, time, 1);
     }
     return Wait.None;
@@ -1773,7 +1787,7 @@ export class CarTraffic {
       if (c.dead) continue;
       const e = this.edges[c.lane >> 1];
       const remain = e.len - c.u;
-      if (c.next < 0 && remain < 70) c.next = this.chooseNext(c.lane);
+      if (c.next < 0 && remain < 70) c.next = this.chooseNext(c.lane, c.laneIdx);
       this.cutOf(c);
       const v0 = (e.limit / 3.6) * c.vWant;
       const A = CAR_A;
@@ -1854,7 +1868,14 @@ export class CarTraffic {
       if (c.busWait > 2.5 && this.lanesIn(c.lane) > 1) {
         const to = (c.laneIdx + 1) % this.lanesIn(c.lane);
         // Only into a gap.
-        if (!list.some((o) => o !== c && !o.dead && o.laneIdx === to && Math.abs(o.u - c.u) < c.len + 6)) c.laneIdx = to;
+        if (!list.some((o) => o !== c && !o.dead && o.laneIdx === to && Math.abs(o.u - c.u) < c.len + 6)) {
+          c.laneIdx = to;
+          // (A turn chosen from the old lane is chosen again from the new one, unless we are committed to it.)
+          if (c.next >= 0 && !c.holds.some((h) => h.node === this.endNode(c.lane))) {
+            c.next = -1;
+            c.next2 = -1;
+          }
+        }
         c.busWait = 0;
       }
       // Mid-block signals (pedestrian lights).
@@ -1927,7 +1948,7 @@ export class CarTraffic {
         if (c.u <= end || guard++ >= 4) break;
         const over = c.u - end;
         const passed = this.endNode(c.lane);
-        if (c.next < 0) c.next = this.chooseNext(c.lane);
+        if (c.next < 0) c.next = this.chooseNext(c.lane, c.laneIdx);
         if (c.next < 0) {
           this.kill(c);
           break;
