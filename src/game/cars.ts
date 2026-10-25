@@ -18,7 +18,7 @@ import { PointGrid, type Body } from './bodies';
 import { LEVEL_GAP, heightsOf } from './height';
 import { TRACK_STEP, type RouteTrack } from './track';
 import { rng } from './util';
-import { signalsFor } from '../data/signals';
+import { nodeFacing, signalsFor } from '../data/signals';
 
 const VIEW = 600;
 /** Reservation id the player's bus holds junction boxes with (AI buses use -id, cars +id). */
@@ -102,6 +102,8 @@ interface Node {
   rank: number;
   /** A traffic signal controls this junction. */
   sig: boolean;
+  /** The directed signal nodes that make it signalised: [x, y, fx, fy, ...], f the way the traffic each faces heads. */
+  faces: number[] | null;
   /** Junction box radius from the node, metres. */
   boxR: number;
   occ: Occupant[];
@@ -489,7 +491,7 @@ export class CarTraffic {
       const hit = l.find((n) => Math.abs(this.nodes[n].z - z) < LEVEL_GAP);
       if (hit !== undefined) return hit;
       const n = this.nodes.length;
-      this.nodes.push({ x, y, z, out: [], edges: [], deg: 0, until: -1, holder: -1, rank: 0, sig: false, boxR: 4, occ: [], pc: null });
+      this.nodes.push({ x, y, z, out: [], edges: [], deg: 0, until: -1, holder: -1, rank: 0, sig: false, faces: null, boxR: 4, occ: [], pc: null });
       l.push(n);
       return n;
     };
@@ -616,13 +618,16 @@ export class CarTraffic {
         const sx = k < 0 ? j.x : sg[2 * k];
         const sy = k < 0 ? j.y : sg[2 * k + 1];
         const near = k < 0 ? 6 : 10;
+        const f = k < 0 ? null : nodeFacing(this.data, k);
         const gx = Math.floor(sx / 50);
         const gy = Math.floor(sy / 50);
         for (let ox = -1; ox <= 1; ox++) {
           for (let oy = -1; oy <= 1; oy++) {
             for (const n of this.nodeGrid.get((gx + ox) * 4096 + gy + oy) ?? []) {
               const nd = this.nodes[n];
-              if (Math.abs(nd.z - j.z) <= LEVEL_GAP && Math.hypot(nd.x - sx, nd.y - sy) < nd.boxR + near) nd.sig = true;
+              if (Math.abs(nd.z - j.z) > LEVEL_GAP || Math.hypot(nd.x - sx, nd.y - sy) >= nd.boxR + near) continue;
+              nd.sig = true;
+              if (f) (nd.faces ??= []).push(f.x, f.y, f.fx, f.fy);
             }
           }
         }
@@ -1043,12 +1048,38 @@ export class CarTraffic {
     return signalsFor(this.data).junctionAt(nd.x - dirX * 10, nd.y - dirY * 10, dirX, dirY, nd.z);
   }
 
-  /** Signal state for a vehicle travelling (dirX, dirY) into junction `node`, or null if unsignalised. */
-  signalFor(node: number, dirX: number, dirY: number, time: number): 'green' | 'amber' | 'red' | null {
+  /**
+   * Signal state for a vehicle travelling (dirX, dirY) into junction `node`
+   * (and on out (outX, outY), if given), or null if unsignalised. A node
+   * signalised by a signal standing further on, that the movement turns away
+   * from before reaching it (a slip lane, a busway branching off before the
+   * stop line), has no light for it: the guide shows the player none there.
+   */
+  signalFor(node: number, dirX: number, dirY: number, time: number, outX?: number, outY?: number): 'green' | 'amber' | 'red' | null {
     const nd = this.nodes[node];
     if (!nd.sig || !this.world.signalStateAt) return null;
+    if (outX !== undefined && outY !== undefined && this.turnsOffBefore(nd, dirX, dirY, outX, outY)) return null;
     // Asked from a point on the approach, on the node's level (src/data/signals.ts).
     return this.world.signalStateAt(nd.x - dirX * 10, nd.y - dirY * 10, time, dirX, dirY, nd.z);
+  }
+
+  /** Do all the signals facing this movement into `nd` stand further on, off its way out? */
+  private turnsOffBefore(nd: Node, inX: number, inY: number, outX: number, outY: number): boolean {
+    const f = nd.faces;
+    if (!f) return false;
+    let facing = false;
+    for (let k = 0; k < f.length; k += 4) {
+      if (f[k + 2] * inX + f[k + 3] * inY <= 0.5) continue;
+      const rx = f[k] - nd.x;
+      const ry = f[k + 1] - nd.y;
+      // (one at or before the node is the light we stop for here)
+      if (rx * inX + ry * inY < nd.boxR) return false;
+      // (heading on past it: the node lies on our way out)
+      const on = rx * outX + ry * outY;
+      if (on > 0 && (Math.abs(rx * outY - ry * outX) < 5 || on > 0.9 * Math.hypot(rx, ry))) return false;
+      facing = true;
+    }
+    return facing;
   }
 
   /** Is the box clear of movements that conflict with this one? (Expired holders are dropped.) */
@@ -1419,7 +1450,7 @@ export class CarTraffic {
       // On a short link between two nodes of one junction we are already in it:
       // its light was ours at the first node (asked again here with the link's
       // direction it would be some other arm's).
-      const st = this.insideLane[lane] ? null : this.signalFor(N, inX, inY, time);
+      const st = this.insideLane[lane] ? null : this.signalFor(N, inX, inY, time, outX, outY);
       if (st === 'red') return Wait.Red;
       if (st === 'amber' && stopAt > (c.v * c.v) / (2 * 3.5)) return Wait.Red;
     } else {

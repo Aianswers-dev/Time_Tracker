@@ -264,7 +264,7 @@ function segmentDir(r: Road, x: number, y: number): [number, number] {
 }
 
 /** A directed signal node: where it stands and the way the traffic it faces heads (null if untagged). */
-interface Facing {
+export interface Facing {
   x: number;
   y: number;
   fx: number;
@@ -272,7 +272,7 @@ interface Facing {
 }
 
 /** The traffic a signal node faces: along its own road, the pipeline's direction (OSM traffic_signals:direction). */
-function nodeFacing(data: MapData, m: number): Facing | null {
+export function nodeFacing(data: MapData, m: number): Facing | null {
   const ri = data.signalRoad?.[m] ?? -1;
   const d = data.signalDir?.[m] ?? 0;
   if (ri < 0 || !d) return null;

@@ -1117,7 +1117,7 @@ export class Traffic {
     // (A second node of the junction we just entered keeps the first node's light.)
     if (j.sig && !j.inside) {
       const a = b.jAsk[k];
-      const st = a ? (this.world.signalStateAt?.(a.x, a.y, time, a.dx, a.dy, a.z) ?? null) : this.cars.signalFor(j.node, j.inX, j.inY, time);
+      const st = a ? (this.world.signalStateAt?.(a.x, a.y, time, a.dx, a.dy, a.z) ?? null) : this.cars.signalFor(j.node, j.inX, j.inY, time, j.outX, j.outY);
       if (st === 'red') return Wait.Red;
       if (st === 'amber' && stopAt > (b.v * b.v) / (2 * 3)) return Wait.Red;
     } else if (this.cars.giveWayBusy(j.node, j.minor, time)) return Wait.Junction;
