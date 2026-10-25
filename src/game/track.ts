@@ -60,6 +60,11 @@ const PULL_HOLD = 0.6;
  * body swinging out on bends.
  */
 const WALL_CLEAR = 2.1;
+/**
+ * Room kept between a Metro's sweep (front axle on the lane, the rest trailing it) and the walls: the
+ * driver's (or autopilot's) line and the body's sway are not exact.
+ */
+const SWEEP_MARGIN = Number((globalThis as { __SWEEP?: number }).__SWEEP ?? 0.45);
 /** The bus body's vertical span above the road (m; the collider's sections start 0.25 m up): walls outside it are not in the way. */
 const BUS_LO = 0.25;
 const BUS_HI = 3.4;
@@ -2236,15 +2241,14 @@ export class RouteTrack {
   }
 
   /**
-   * Drive an articulated bus (the longest the routes use) along the lane and,
-   * where a section sweeps into a wall (trailers cut the inside of tight
-   * corners), swing the lane out there a little at a time.
+   * Drive the buses the routes use (a Metro and a rigid bus) along the lane as they are driven, the front
+   * axle on the lane and the rest trailing it, and where a section sweeps into a wall (the rear and the
+   * trailers cut the inside of a bend, the overhangs swing out) ease the lane away there a little at a
+   * time, over a few samples either side. Walls on both sides of a sweep meet halfway.
    */
   private nudgeForTrailers(TW: TrackWalls, G: WallGrid): void {
     const n = this.n;
     const W = TW.walls;
-    const spec = specFor('metro');
-    const secs = spec.sections;
     const LIM = (50 * Math.PI) / 180;
     // Only near walls, with the chain driven in from WARM metres before (a chain started straight behind
     // on a curve is not where the trailers would be).
@@ -2257,24 +2261,30 @@ export class RouteTrack {
       for (let q = Math.max(0, i - WARM / TRACK_STEP); q <= i; q++) sim[q] = 1;
     }
     if (!near.includes(1)) return;
-    // How far behind the front axle each section's tail is (it is only placed once driven that far).
-    const tail = new Float64Array(secs.length);
-    for (let k = 0, back = 0; k < secs.length; k++) {
-      const sc = secs[k];
-      if (k > 0) back += secs[k - 1].rearHitchFromFront - secs[k - 1].axleFromFront + sc.axleFromFront - sc.hitchFromFront;
-      tail[k] = (k === 0 ? spec.wheelbase : back) + sc.length - sc.axleFromFront;
-    }
     const at = (s: number): [number, number] => {
       const f = Math.max(0, Math.min(n - 1.0001, s / TRACK_STEP));
       const i = Math.floor(f);
       const t = f - i;
       return [this.x[i] + (this.x[i + 1] - this.x[i]) * t, this.y[i] + (this.y[i + 1] - this.y[i]) * t];
     };
-    const sx = new Float64Array(secs.length);
-    const sy = new Float64Array(secs.length);
-    const sh = new Float64Array(secs.length);
-    for (let pass = 0; pass < 10; pass++) {
-      const push = new Float32Array(n);
+    // The push spreads over SPREAD samples either side (a smooth bump, so it bends the lane gently).
+    const SPREAD = 4;
+    const bump = new Float64Array(SPREAD + 1);
+    for (let d = 0; d <= SPREAD; d++) bump[d] = 0.5 * (1 + Math.cos((Math.PI * d) / (SPREAD + 1)));
+    const pushL = new Float32Array(n);
+    const pushR = new Float32Array(n);
+    const drive = (spec: ReturnType<typeof specFor>): void => {
+      const secs = spec.sections;
+      // How far behind the front axle each section's tail is (it is only placed once driven that far).
+      const tail = new Float64Array(secs.length);
+      for (let k = 0, back = 0; k < secs.length; k++) {
+        const sc = secs[k];
+        if (k > 0) back += secs[k - 1].rearHitchFromFront - secs[k - 1].axleFromFront + sc.axleFromFront - sc.hitchFromFront;
+        tail[k] = (k === 0 ? spec.wheelbase : back) + sc.length - sc.axleFromFront;
+      }
+      const sx = new Float64Array(secs.length);
+      const sy = new Float64Array(secs.length);
+      const sh = new Float64Array(secs.length);
       let fresh = true;
       let warm = 0;
       for (let s = 0; s < this.length - spec.wheelbase - 1; s += 1) {
@@ -2285,12 +2295,20 @@ export class RouteTrack {
           warm = 0;
           continue;
         }
-        const [rx, ry] = at(s);
         const [fx, fy] = at(s + spec.wheelbase);
-        const h0 = Math.atan2(fx - rx, fy - ry);
+        let [rx, ry] = at(s);
+        if (!fresh) {
+          // The front axle is on the lane (the autopilot steers it there) and the rear axle trails it:
+          // inside the lane on a bend by about wheelbase^2 / 2R, and each trailer further inside.
+          const dx = fx - sx[0];
+          const dy = fy - sy[0];
+          const dl = Math.hypot(dx, dy) || 1;
+          rx = fx - (dx / dl) * spec.wheelbase;
+          ry = fy - (dy / dl) * spec.wheelbase;
+        }
         sx[0] = rx;
         sy[0] = ry;
-        sh[0] = h0;
+        sh[0] = Math.atan2(fx - rx, fy - ry);
         for (let k = 1; k < secs.length; k++) {
           const sp = secs[k - 1];
           const sc = secs[k];
@@ -2315,7 +2333,7 @@ export class RouteTrack {
         if (s % 2 !== 0 || !near[ic]) continue;
         for (let k = 0; k < secs.length; k++) {
           const sc = secs[k];
-          if (k > 0 && warm < tail[k] + 4) continue;
+          if (warm < tail[k] + 4) continue;
           const hx = Math.sin(sh[k]);
           const hy = Math.cos(sh[k]);
           const lx = -hy;
@@ -2335,7 +2353,7 @@ export class RouteTrack {
             }
           }
           if (j < 0) continue;
-          const need = this.bodyPush(W, G, cx, cy, this.z[j], hx, hy, sc.length / 2, spec.width / 2 + 0.15);
+          const need = this.bodyPush(W, G, cx, cy, this.z[j], hx, hy, sc.length / 2, spec.width / 2 + SWEEP_MARGIN);
           if (!need) continue;
           // The section's sideways push, as the lane's sideways (+ = left of the lane).
           const a = Math.max(0, j - 1);
@@ -2344,33 +2362,54 @@ export class RouteTrack {
           const nlx = -(this.y[b] - this.y[a]) / tl;
           const nly = (this.x[b] - this.x[a]) / tl;
           const v = need * (lx * nlx + ly * nly);
-          if (Math.abs(v) > Math.abs(push[j])) push[j] = v;
+          if (v > pushL[j]) pushL[j] = v;
+          if (v < pushR[j]) pushR[j] = v;
+        }
+      }
+    };
+    const specs = [specFor('metro'), specFor('rigid')];
+    for (let pass = 0; pass < 10; pass++) {
+      pushL.fill(0);
+      pushR.fill(0);
+      for (const spec of specs) drive(spec);
+      // Each sample's push: from walls one side, or halfway between where both sides press.
+      const push = new Float32Array(n);
+      for (let j = 0; j < n; j++) {
+        const both = pushL[j] > 0 && pushR[j] < 0;
+        push[j] = both ? (pushL[j] + pushR[j]) / 2 : pushL[j] + pushR[j];
+      }
+      // Spread: each sample moves by the strongest bump-weighted push near it (signed sum where they differ).
+      const mvL = new Float32Array(n);
+      const mvR = new Float32Array(n);
+      for (let j = 0; j < n; j++) {
+        if (!push[j]) continue;
+        const step = Math.sign(push[j]) * Math.min(0.3, Math.abs(push[j]));
+        for (let k = Math.max(0, j - SPREAD); k <= Math.min(n - 1, j + SPREAD); k++) {
+          const v = step * bump[Math.abs(k - j)];
+          if (v > mvL[k]) mvL[k] = v;
+          if (v < mvR[k]) mvR[k] = v;
         }
       }
       let moved = false;
       const movedAt = new Uint8Array(n);
-      for (let j = 0; j < n; j++) {
-        if (!push[j]) continue;
-        const a = Math.max(0, j - 1);
-        const b = Math.min(n - 1, j + 1);
+      for (let k = 0; k < n; k++) {
+        const step = mvL[k] + mvR[k];
+        if (Math.abs(step) < 1e-3) continue;
+        const a = Math.max(0, k - 1);
+        const b = Math.min(n - 1, k + 1);
         const tl = Math.hypot(this.x[b] - this.x[a], this.y[b] - this.y[a]) || 1;
         const nlx = -(this.y[b] - this.y[a]) / tl;
         const nly = (this.x[b] - this.x[a]) / tl;
-        const step = Math.sign(push[j]) * Math.min(0.3, Math.abs(push[j]));
-        for (let k = j - 2; k <= j + 2; k++) {
-          if (k < 0 || k >= n) continue;
-          const f = k === j ? 1 : Math.abs(k - j) === 1 ? 0.7 : 0.35;
-          const qx = this.x[k] + nlx * step * f;
-          const qy = this.y[k] + nly * step * f;
-          // Into drivable space, and not closer to a wall than it was (or than a bus allows).
-          if (!TW.drivable(qx, qy, this.z[k])) continue;
-          const dNew = this.wallDist(W, G, qx, qy, this.z[k]);
-          if (dNew < WALL_CLEAR - 0.6 && dNew < this.wallDist(W, G, this.x[k], this.y[k], this.z[k])) continue;
-          this.x[k] = qx;
-          this.y[k] = qy;
-          moved = true;
-          movedAt[k] = 1;
-        }
+        const qx = this.x[k] + nlx * step;
+        const qy = this.y[k] + nly * step;
+        // Into drivable space, and not closer to a wall than it was (or than a bus allows).
+        if (!TW.drivable(qx, qy, this.z[k])) continue;
+        const dNew = this.wallDist(W, G, qx, qy, this.z[k]);
+        if (dNew < WALL_CLEAR - 0.6 && dNew < this.wallDist(W, G, this.x[k], this.y[k], this.z[k])) continue;
+        this.x[k] = qx;
+        this.y[k] = qy;
+        moved = true;
+        movedAt[k] = 1;
       }
       if (!moved) break;
       // Next pass: only around what moved (driven in from WARM metres before, through the chain's length).
