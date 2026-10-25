@@ -1904,7 +1904,9 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
     const zr = z - tp * (ss.length - ss.axleFromFront);
     const lo = Math.min(zf, zr) + 0.25;
     const hi = Math.max(zf, zr) + spec.height;
-    return { fx, fy, cx, cy, hl, hw, lo, hi };
+    // (Floor height at the box centre and its rise per metre forward, for the span along a piece of it.)
+    const zc = z + tp * co;
+    return { fx, fy, cx, cy, hl, hw, lo, hi, zc, tp };
   };
 
   const vertexContact = (vx: number, vy: number, cx: number, cy: number, fx: number, fy: number, rx: number, ry: number, hl: number, hw: number, s: number, wall: boolean) => {
@@ -1950,7 +1952,7 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
   const findContact = (pose: BusPose, spec: BusSpec): boolean => {
     best.depth = 0;
     for (let s = 0; s < spec.sections.length; s++) {
-      const { fx, fy, cx, cy, hl, hw, lo, hi } = sectionBox(pose, spec, s);
+      const { fx, fy, cx, cy, hl, hw, lo, hi, zc, tp } = sectionBox(pose, spec, s);
       const rx = fy;
       const ry = -fx;
       corners[0] = cx + fx * hl + rx * hw;
@@ -2040,6 +2042,11 @@ export function buildCollider(data: MapData, opts: ColliderOptions = {}): SimCol
           return true;
         };
         if (!(clip(-du, ua + hl) && clip(du, hl - ua) && clip(-dv, va + hw) && clip(dv, hw - va) && t0 <= t1)) continue;
+        // On a grade the body's span differs along its length: test the wall against the span where
+        // it cuts in (a soffit over the low end of a bus going down a ramp, a box under the high end).
+        const zu0 = zc + tp * (ua + du * t0);
+        const zu1 = zc + tp * (ua + du * t1);
+        if (walls.lo[w] >= Math.max(zu0, zu1) + spec.height || walls.hi[w] <= Math.min(zu0, zu1) + 0.25) continue;
         const tm = (t0 + t1) / 2;
         // Penetration along each axis; the shallowest is the way out.
         const dN = en - Math.abs(cn); // how far the box reaches across the wall line
