@@ -24,7 +24,7 @@ output road records (decimetre ints with "z"):
    PA Hospital, in the cuttings at Buranda and Mater Hill, in the tunnel
    hall at King George Square), tapering into the busway beyond the platform
    ends and split where the busway changes structure, so each piece carries
-   the busway's bridge / tunnel / layer flags.
+   the busway's bridge / tunnel / layer flags (and "tb", boxed end to end).
 3. Buildings. Station shelters duplicating a platform footprint are dropped
    (the platform is drawn covered instead); canopy roofs (kind 8) over a
    busway or platform get their base from the road under them, in sections
@@ -302,7 +302,7 @@ class Chain:
 
     def flags_at(self, s: float) -> tuple:
         r = self.roads[int(self.segr[int(self.seg_at(s))])]
-        return (int(r.get("b", 0)), int(r.get("t", 0)), int(r.get("y", 0)))
+        return (int(r.get("b", 0)), int(r.get("t", 0)), int(r.get("y", 0)), int(r.get("tb", 0)))
 
 
 # ---------------------------------------------------------------------------
@@ -866,7 +866,7 @@ def bays_for_kerb(P: np.ndarray, o: np.ndarray, pl: dict, net: BusNet, simplify3
             keep = simplify3d(pxy, pz, 0.05, 0.05)
             pxy, pz = pxy[keep], pz[keep]
             host = net.roads[int(ch.segr[int(ch.seg_at(float(sv[sl][a_])))])]
-            b_f, t_f, y_f = flags[a_]
+            b_f, t_f, y_f, tb_f = flags[a_]
             rec = {"k": 7, "w": round(Wk + 0.2, 1), "l": 1, "p": flat(pxy), "z": [q(v) for v in pz], "o": 1, "bus": 1, "bay": 1}
             if "n" in host:
                 rec["n"] = host["n"]
@@ -876,6 +876,9 @@ def bays_for_kerb(P: np.ndarray, o: np.ndarray, pl: dict, net: BusNet, simplify3
                 rec["b"] = 1
             if t_f:
                 rec["t"] = 1
+                # (in a tunnel boxed end to end, elevation.boxed_tunnels: so is the bay beside it, Mater Hill)
+                if tb_f:
+                    rec["tb"] = 1
             if y_f:
                 rec["y"] = y_f
             out.append(rec)

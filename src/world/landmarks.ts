@@ -472,57 +472,94 @@ export function buildVictoriaBridge(ctx: Ctx): void {
   const o = obb(outline);
   const vx = -o.uy;
   const vy = o.ux;
-  const paths: RoadPath[] = [];
+  const roads: Road[] = [];
   for (const r of ctx.data.roads) {
     if (!r.bridge || !r.bus || r.pts.length < 4) continue;
     let inside = false;
     for (let i = 0; i < r.pts.length && !inside; i += 2) inside = pointInRing(r.pts[i], r.pts[i + 1], outline);
-    if (inside) paths.push(new RoadPath(r));
+    if (inside) roads.push(r);
   }
-  if (!paths.length) return;
-  const hw = Math.max(...paths.map((p) => p.r.width)) / 2;
-  const e0 = hw + 0.45;
-  // samples across the bridge every 3 m: busway centre offset and deck height
-  const rows: { x: number; y: number; z: number; off: number; ep: number; em: number }[] = [];
-  for (let u = -o.hl; u <= o.hl + 0.01; u += 3) {
+  if (!roads.length) return;
+  // samples across the bridge every metre. Each busway carriageway crossing the row line covers it out to
+  // its deck's edge (hw + 0.45, its parapet's outer face, as roads.ts draws it), measured along the row;
+  // the path decks run from the outermost of those edges to the outline, at that carriageway's height.
+  // (Each carriageway's own width: the 10.9 m three-lane piece at the north end is not the 7.4 m busway
+  // across the span, which a single bridge-wide width left a 1.7 m slot of river beside.)
+  // (and a row at each carriageway vertex, so the decks' edges bend together)
+  const us: number[] = [];
+  for (let u = -o.hl; u <= o.hl + 0.01; u += 1) us.push(u);
+  for (const r of roads) {
+    for (let k = 0; k < r.pts.length; k += 2) {
+      const u = (r.pts[k] - o.cx) * o.ux + (r.pts[k + 1] - o.cy) * o.uy;
+      if (Math.abs(u) < o.hl && us.every((q) => Math.abs(q - u) > 0.3)) us.push(u);
+    }
+  }
+  us.sort((a, b) => a - b);
+  const rows: { x: number; y: number; zp: number; zm: number; ip: number; im: number; ep: number; em: number }[] = [];
+  for (const u of us) {
     const x = o.cx + o.ux * u;
     const y = o.cy + o.uy * u;
-    let best: { z: number; off: number; d: number } | null = null;
-    for (const p of paths) {
-      const q = p.project(x, y);
-      const c = p.at(q.u);
-      // distance from the bridge axis line to the busway, measured across the bridge
-      const off = (c.x - x) * vx + (c.y - y) * vy;
-      const along = (c.x - x) * o.ux + (c.y - y) * o.uy;
-      if (Math.abs(along) > 4) continue;
-      if (!best || q.d < best.d) best = { z: c.z, off, d: q.d };
+    let ip = -Infinity;
+    let im = Infinity;
+    let zp = NaN;
+    let zm = NaN;
+    for (const r of roads) {
+      const p = r.pts;
+      const edge = r.width / 2 + 0.45;
+      for (let k = 0; k + 3 < p.length; k += 2) {
+        const ax = p[k];
+        const ay = p[k + 1];
+        const dx = p[k + 2] - ax;
+        const dy = p[k + 3] - ay;
+        const den = vx * dy - vy * dx;
+        if (Math.abs(den) < 1e-9) continue;
+        const s = ((ax - x) * vy - (ay - y) * vx) / den;
+        if (s < 0 || s > 1) continue;
+        const cos = Math.abs(dx * o.ux + dy * o.uy) / Math.hypot(dx, dy);
+        if (cos < 0.5) continue;
+        const t = ((ax - x) * dy - (ay - y) * dx) / den;
+        const z = r.z[k >> 1] + (r.z[(k >> 1) + 1] - r.z[k >> 1]) * s;
+        if (t + edge / cos > ip) {
+          ip = t + edge / cos;
+          zp = z;
+        }
+        if (t - edge / cos < im) {
+          im = t - edge / cos;
+          zm = z;
+        }
+      }
     }
     // the outline's edges either side of the axis here
     const ep = rayRing(outline, x, y, vx, vy);
     const em = rayRing(outline, x, y, -vx, -vy);
-    const ok = best && best.d < o.hw + 4 && ep < 20 && em < 20;
-    rows.push(ok && best ? { x, y, z: best.z, off: best.off, ep, em } : { x, y, z: NaN, off: 0, ep: 0, em: 0 });
+    const ok = Number.isFinite(zp) && ep < 20 && em < 20;
+    rows.push(ok ? { x, y, zp, zm, ip, im, ep, em } : { x, y, zp: NaN, zm: NaN, ip: 0, im: 0, ep: 0, em: 0 });
   }
   const g = new MeshGeo(COLOR_SPEC);
   // the wider side carries the cycleway beside the busway
   let wide = 0;
-  for (const r of rows) if (Number.isFinite(r.z)) wide += r.ep - r.off - (r.em + r.off);
+  for (const r of rows) if (Number.isFinite(r.zp)) wide += r.ep - r.ip - (r.em + r.im);
   const cycleSide = wide >= 0 ? 1 : -1;
   for (const side of [1, -1]) {
-    let prev: { v: number[]; r: (typeof rows)[number] } | null = null;
+    let prev: { v: number[]; r: (typeof rows)[number]; z: number; outer: number } | null = null;
+    let post = Infinity;
     for (const r of rows) {
-      if (!Number.isFinite(r.z)) {
+      if (!Number.isFinite(r.zp)) {
         prev = null;
+        post = Infinity;
         continue;
       }
-      const inner = r.off + side * (e0 - 0.05);
+      // a little under the parapet's outer face, so no slot shows between them
+      const inner = (side > 0 ? r.ip : r.im) - side * 0.05;
       const outer = side > 0 ? r.ep : -r.em;
+      const z = side > 0 ? r.zp : r.zm;
       const width = (outer - inner) * side;
       if (width < 1) {
         prev = null;
+        post = Infinity;
         continue;
       }
-      const at = (l: number, h: number, col: number) => g.vert(r.x + vx * l, r.z + h, r.y + vy * l, ...rgb(col));
+      const at = (l: number, h: number, col: number) => g.vert(r.x + vx * l, z + h, r.y + vy * l, ...rgb(col));
       const cyc = side === cycleSide && width > 5 ? 3.0 : 0;
       const l1 = inner + side * cyc;
       const v = [
@@ -545,15 +582,20 @@ export function buildVictoriaBridge(ctx: Ctx): void {
         g.quad(p[6], v[6], v[7], p[7], 0, -1, 0);
         if (cyc) g.quad(p[8], v[8], v[9], p[9], -vx * side, 0, vy * side);
         // balustrade: a continuous rail on posts
-        const ax = prev.r.x + vx * (outer - side * 0.18);
-        const ay = prev.r.y + vy * (outer - side * 0.18);
+        const ax = prev.r.x + vx * (prev.outer - side * 0.18);
+        const ay = prev.r.y + vy * (prev.outer - side * 0.18);
         const bx = r.x + vx * (outer - side * 0.18);
         const by = r.y + vy * (outer - side * 0.18);
-        g.beam(ax, prev.r.z + 1.02, ay, bx, r.z + 1.02, by, 0.11, ...rgb(BALUSTRADE));
-        g.beam(ax, prev.r.z + 0.22, ay, bx, r.z + 0.22, by, 0.09, ...rgb(BALUSTRADE));
-        g.box(ax, ay, prev.r.z + 0.1, prev.r.z + 0.95, o.ux, o.uy, 0.12, 0.12, ...rgb(BALUSTRADE));
+        g.beam(ax, prev.z + 1.02, ay, bx, z + 1.02, by, 0.11, ...rgb(BALUSTRADE));
+        g.beam(ax, prev.z + 0.22, ay, bx, z + 0.22, by, 0.09, ...rgb(BALUSTRADE));
+        // its posts about every 3 m
+        if (post > 2.9) {
+          g.box(ax, ay, prev.z + 0.1, prev.z + 0.95, o.ux, o.uy, 0.12, 0.12, ...rgb(BALUSTRADE));
+          post = 0;
+        }
+        post += Math.hypot(bx - ax, by - ay);
       }
-      prev = { v, r };
+      prev = { v, r, z, outer };
     }
   }
   if (g.empty) return;

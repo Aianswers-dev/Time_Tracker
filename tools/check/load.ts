@@ -42,6 +42,7 @@ export function loadMapNode(): MapData {
       oneway: !!x.o,
       bridge: !!x.b,
       tunnel: !!x.t,
+      ...(x.tb ? { boxed: true } : {}),
       layer: x.y ?? 0,
       link: !!x.lk,
       bus: !!x.bus,

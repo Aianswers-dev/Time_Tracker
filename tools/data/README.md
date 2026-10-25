@@ -44,6 +44,12 @@ The Brisbane River and tidal creeks are at `waterLevel` (+0.5 m) in
   OSM node always have a vertex there with the same `z`; a crossing without
   a shared node is grade separated (5.5 m road over road, 7 m over rail,
   4.5 m over pedestrian streets and car-park lanes).
+* **`roads.json` road `"tb"`**: 1 on a tunnel way with the ground at least
+  3.4 m above it somewhere (`boxed_tunnels` in `elevation.py`). The game
+  boxes such a tunnel from one mapped end to the other, its portals at the
+  ends, instead of opening it where the 10 m ground grid reads less cover
+  than the tube is high (it does over the last 6-18 m before a portal).
+  A station bay in such a tunnel carries it too (`stations.py`).
 * **`buildings.json` `"z"`**: base height of the building in decimetres,
   the ground at the footprint centroid (building parts take the base of the
   outline they stand in). `h` and `m` stay heights above that base.

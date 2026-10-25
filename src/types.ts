@@ -44,6 +44,12 @@ export interface Road {
   oneway: boolean;
   bridge: boolean;
   tunnel: boolean;
+  /**
+   * Tunnel under ground somewhere along it (pipeline, tools/data/elevation.py
+   * boxed_tunnels): an enclosed tube from one end to the other, its portals
+   * at the mapped ends, however little ground the terrain grid shows over it.
+   */
+  boxed?: boolean;
   layer: number;
   link: boolean;
   /** Bus-only road (busway / bus-designated service road). */
