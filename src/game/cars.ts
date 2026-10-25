@@ -137,6 +137,8 @@ interface PlayerApproach {
 const ONCOMING_MARGIN = 1.5;
 /** A car whose lane ends at a node merges in front of the player's bus only this far (s) ahead of it. */
 const MERGE_MARGIN = 1;
+/** A route passes through a junction node within 7 m of it or inside its box, up to this far (m). */
+const JUNCTION_PICK_MAX = 9;
 /** Two ways out of a junction this far apart (rad) cross, for vehicles side by side going in. */
 const ACROSS = 0.3;
 /** Stop lines held back from a bus's swept path (holdBackFor): room left (m), farthest line (m), car size (m). */
@@ -1430,10 +1432,13 @@ export class CarTraffic {
     if (cached) return cached;
     const best = new Map<number, { i: number; d: number }>();
     for (let i = 0; i < track.n; i++) {
-      // Only junctions on the route's level (not the street under a busway viaduct).
-      const n = this.nearestJunction(track.x[i], track.y[i], 7, track.z[i]);
+      // Only junctions on the route's level (not the street under a busway viaduct). Within 7 m, or
+      // inside the node's box: a left turn round a wide junction's corner passes 7-8 m from its node
+      // and through the waiting cars' stop lines (199/0 s 8872 at Commercial Rd, Teneriffe).
+      const n = this.nearestJunction(track.x[i], track.y[i], JUNCTION_PICK_MAX, track.z[i]);
       if (n < 0) continue;
       const d = Math.hypot(this.nodes[n].x - track.x[i], this.nodes[n].y - track.y[i]);
+      if (d > 7 && (d > this.nodes[n].boxR || !this.passesThrough(n, track, i))) continue;
       const cur = best.get(n);
       if (!cur || d < cur.d) best.set(n, { i, d });
     }
@@ -1598,6 +1603,20 @@ export class CarTraffic {
       }
     }
     return moved;
+  }
+
+  /** Does `track` come in on one of `node`'s arms and leave on another, around its sample `i` (12 m either side)? */
+  private passesThrough(node: number, track: RouteTrack, i: number): boolean {
+    const ia = Math.max(0, i - 3);
+    const ib = Math.min(track.n - 1, i + 3);
+    let inArm = -1;
+    let outArm = -1;
+    for (const ei of this.nodes[node].edges) {
+      const [dx, dy] = this.armDir(ei, node, 10);
+      if (inArm < 0 && -(dx * track.tx[ia] + dy * track.ty[ia]) > 0.8) inArm = ei;
+      else if (outArm < 0 && dx * track.tx[ib] + dy * track.ty[ib] > 0.8) outArm = ei;
+    }
+    return inArm >= 0 && outArm >= 0;
   }
 
   /** Unit direction from `node` to the point `d` m out along edge `ei` (steadier than its first segment). */
