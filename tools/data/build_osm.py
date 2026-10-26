@@ -97,13 +97,13 @@ TAG_OVERRIDES: dict[int, dict[str, str | None]] = {
     29124538: {"width": "11"},  # Hoogley Street (-1946,-2136)..(-1969,-2270): 10.6 m at y -2175, 11.9 m at y -2150
     10384291: {"width": "11.5"},  # Ganges Street (-1743,-1996)..(-1913,-1977): 11.5 m at x -1775
     # Cultural Centre platform 3: the outbound carriageway is mapped as a stopping lane and a through lane
-    # 4.6-5.3 m apart (centre to centre) along the platform. With no lanes tag each took the two-lane
-    # 7.4 m default, so the stopping lane's ribbon covered 42 m2 of the platform (its centreline is 1.96 m
-    # off the platform edge). Imagery (z20) shows the red busway in single lanes, the stopping lane's kerb
-    # at the canopy edge and no gap between the lanes: the through lane is one lane, paved out to meet
-    # the stopping lane (3.9 m would leave a 1.3 m grass strip between them).
+    # (1237158495) 4.6-5.3 m apart (centre to centre) along the platform. With no lanes tag the stopping
+    # lane took the two-lane 7.4 m default, so its ribbon covered 42 m2 of the platform (its centreline
+    # is 1.96 m off the platform edge). Imagery (z20) shows it as one red lane, its kerb at the canopy
+    # edge. The through lane keeps its default: it overlaps the stopping lane, as the imagery's unbroken
+    # red surface needs (as one lane, 3.9 m, it left a 1.3 m grass strip between them), and buses for
+    # the tunnel portal 15 m on keep their line.
     234866807: {"lanes": "1"},  # South East Busway, platform 3 stopping lane (-506,-567)..(-572,-610)
-    1237158495: {"lanes": "1", "width": "6.8"},  # South East Busway, through lane beside it
 }
 
 NUM = re.compile(r"[-+]?\d*\.?\d+")
