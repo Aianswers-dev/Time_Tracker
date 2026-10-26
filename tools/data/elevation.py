@@ -87,7 +87,10 @@ FOOT_CONNECTED = 30.0  # m: ... unless the network joins them closer than this (
 FOOT_SHORT_PORTAL = 15.0  # m: and not near the portals of short underpasses (they start at grade)
 FOOT_PORTAL = 30.0  # m: near-parallel ways this close to a tube's portal run beside it, not over it
 STATION_CAP = 0.025  # bus roads alongside a bus platform: 1:40, an accessible platform's limit (sat review #7)
-STATION_REACH = 10.0  # m from the platform
+# m from the platform: out to the far carriageway beyond a stopping bay and the near carriageway (at
+# 10 m, Roma St's outbound carriageway, 10.5 m from platform 1, kept a 6 % pitch along it while the
+# inbound one beside it was held level, and stood 1.1 m over it)
+STATION_REACH = 12.0
 COUPLE = 6.0  # weight (x node length) tying adjacent parallel carriageways at grade together (M1 #7)
 SMALL_WATER_DECK = 3.5  # deck above creeks, ponds and bank-side river viaducts
 RIVER_SPAN = 80.0  # a tidal water crossing this long (m) ...
