@@ -1586,7 +1586,11 @@ export class Traffic {
    * Where lane `a` and the player's lane `p`, coming the other way on the same level, are too close
    * for a bus of `spec` and the player's to pass (see NARROW_W): a0 to a1 on `a` (a0 a sample short
    * of it, where the bus waits), p0 to p1 the same stretch on `p` (the player's way in and out).
-   * Where a0 is in a junction it manages, the bus waits at that junction's line; not at lights.
+   * Where a0 is in a junction, the bus waits at that junction's line. Inside the box of a junction with
+   * lights the junction's rules keep the two apart (turning paths cross there); just past it they do
+   * not, the two ways through having the green together (M2/1 s 7426, past the busway's lights at node
+   * 10055 by the tunnel portal south of Mater Hill: the lanes 3.5 m apart on a 60 m bend, an M1/0 metro
+   * coming north cleared the player's off-tracking rear section by 3 cm).
    */
   private narrowsOf(a: RouteTrack, p: RouteTrack, spec: BusSpec): Join[] {
     const hit = this.narrowCache.get(a);
@@ -1650,15 +1654,15 @@ export class Traffic {
       let k = i;
       for (let q = i + 1; q < n && q <= k + 2; q++) if (ok[q]) k = q;
       let a0 = Math.max(0, i - 1) * TRACK_STEP;
-      let sig = false;
+      let boxed = false;
       for (let q = 0; q < jl.length; q++) {
         const j = jl[q];
         if (a0 > j.stopS - 2 && a0 < j.s + j.boxR + 3) {
-          if (j.sig) sig = true;
+          if (j.sig && k * TRACK_STEP >= j.s - j.boxR && i * TRACK_STEP <= j.s + j.boxR) boxed = true;
           a0 = Math.min(a0, line[q]);
         }
       }
-      if (!sig) narrows.push({ a0, a1: k * TRACK_STEP, p0: ps[k], p1: ps[i] });
+      if (!boxed) narrows.push({ a0, a1: k * TRACK_STEP, p0: ps[k], p1: ps[i] });
       i = k;
     }
     return narrows;
