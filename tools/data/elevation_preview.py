@@ -68,7 +68,7 @@ def hillshade(h: np.ndarray, cell: float, water: float) -> np.ndarray:
 class Data:
     def __init__(self):
         self.inner, self.outer, self.head = build_terrain.read_terrain()
-        self.ground = build_terrain.ground_sampler(self.inner, self.outer)
+        self.ground = build_terrain.ground_sampler(self.inner, self.outer, self.head.get("cuts"))
         with open(os.path.join(OUT, "roads.json")) as f:
             r = json.load(f)
         with open(os.path.join(OUT, "routes.json")) as f:

@@ -130,8 +130,8 @@ def main():
 
     with open(os.path.join(OUT, "roads.json")) as f:
         heights = elevation.RoadHeights(json.load(f)["roads"])
-    inner, outer, _ = build_terrain.read_terrain()
-    ground = build_terrain.ground_sampler(inner, outer)
+    inner, outer, head = build_terrain.read_terrain()
+    ground = build_terrain.ground_sampler(inner, outer, head.get("cuts"))
     stop_z: dict[int, list[float]] = collections.defaultdict(list)
     off_road = []
     moved = []  # (route, dir, samples) moved off a wrong-way carriageway
