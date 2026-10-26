@@ -262,9 +262,21 @@ interface Car {
   /** Why it was held up last frame, and by whom (diagnostics). */
   why: Wait;
   ref: number;
+  /** Seconds it has stood in a wait cycle (see breakCycles), as of frame cycF; walk: the cycle search's mark. */
+  cycT: number;
+  cycF: number;
+  walk: number;
+  /** A wait cycle's release: it may enter node gridGo before its exit is clear, until gridUntil. */
+  gridGo: number;
+  gridUntil: number;
   visible: boolean;
   dead: boolean;
 }
+
+/** A wait cycle stood this long (s) has one car let go; it may go for CYCLE_GO s, if it has CYCLE_ROOM m to the car ahead. */
+const CYCLE_HOLD = 3;
+const CYCLE_GO = 15;
+const CYCLE_ROOM = 2.5;
 
 /** Links between two nodes of one signalised junction shorter than this are inside it (a big junction spans 70 m). */
 const INSIDE_LINK = 60;
@@ -298,6 +310,8 @@ export interface CarStats {
   waitingRed: number;
   waitingJunction: number;
   stationary: number;
+  /** Wait cycles (ring gridlocks) broken by letting one car go (breakCycles). */
+  cycleBreaks: number;
 }
 
 /**
@@ -530,6 +544,13 @@ export class CarTraffic {
   private iVL = 0.5;
   /** chooseNext's options and their weights. */
   private optL: number[] = [];
+  // Wait cycle search (breakCycles): the frame number, the last walk's mark, and a cycle's members.
+  private frameN = 0;
+  private walkN = 0;
+  private cycle: Car[] = [];
+  /** The exit lane of the car a wait cycle's breaker let go, for boxClear: holders already in it are ahead of it. */
+  private freedExit = -1;
+  private readonly inFreedExit = (holder: number): boolean => this.byId.get(holder)?.lane === this.freedExit;
   private optW: number[] = [];
   private lWhy: Wait = Wait.None;
   private lRef = 0;
@@ -605,7 +626,7 @@ export class CarTraffic {
   private hbLanes: number[] = [];
   private hbSame: boolean[] = [];
   private hbKs: number[] = [];
-  readonly stats: CarStats = { overlapDespawns: 0, stuckDespawns: 0, stallDespawns: 0, waitingRed: 0, waitingJunction: 0, stationary: 0 };
+  readonly stats: CarStats = { overlapDespawns: 0, stuckDespawns: 0, stallDespawns: 0, waitingRed: 0, waitingJunction: 0, stationary: 0, cycleBreaks: 0 };
   /** Id of the holder that made the last boxClear() fail. */
   private boxBy = 0;
   /** Film/test runs: fixed caps (no adaptation to CPU time), so runs are reproducible. */
@@ -2142,6 +2163,11 @@ export class CarTraffic {
       stall: 0,
       why: Wait.None,
       ref: 0,
+      cycT: 0,
+      cycF: -1,
+      walk: 0,
+      gridGo: -1,
+      gridUntil: 0,
       exempt: false,
       visible: false,
       dead: false,
@@ -2184,6 +2210,87 @@ export class CarTraffic {
     bl.length = w;
     bList.length = w;
     bN.length = w;
+  }
+
+  /**
+   * Wait cycles: stationary cars each held up by the next (as the car ahead, or as the car standing in
+   * the exit of the node it waits at), round a roundabout's ring or a block, back to the first. None of
+   * them is waiting for a good reason, so none is exempt (or the flag would keep itself up round the
+   * cycle, each car exempt for queueing behind the one before). Once a cycle has stood CYCLE_HOLD s, the
+   * one member with the clearest way out (waiting at a node for the car in its exit, or in the lane after
+   * it past a link too short to wait on, with the most room up to it) may enter the node anyway, though
+   * that car holds the box with its tail: it creeps in
+   * behind it, which leaves room on its own lane for the car behind it, and so on round. One at a time:
+   * the next once it is through, or once it has been held CYCLE_HOLD s more (by a car merging from
+   * another arm that holds the box, say). Not into a junction with lights (it would stand in the box when
+   * they change: the stuck despawn clears a cycle there) nor one the player's bus is heading into.
+   * (O'Keefe St roundabout, 61/1 s 2490: six cars round the ring, each waiting to enter the next link,
+   * held the player's bus for 91 s.)
+   */
+  private breakCycles(time: number, dt: number): void {
+    const frame = ++this.frameN;
+    const first = this.walkN + 1;
+    const cars = this.cars;
+    const cyc = this.cycle;
+    for (let ci = 0; ci < cars.length; ci++) {
+      const c0 = cars[ci];
+      if (c0.walk >= first) continue;
+      // Along the waits from c0, marking this walk, until a car that is not waiting on a car or was
+      // marked before (this walk: a cycle; an earlier one: nothing new).
+      const mark = ++this.walkN;
+      let x: Car | undefined = c0;
+      while (x && x.walk < first && !x.dead && x.v < 0.3 && x.ref > 0 && (x.why === Wait.Car || x.why === Wait.Junction)) {
+        x.walk = mark;
+        x = this.byId.get(x.ref);
+      }
+      if (!x || x.walk !== mark) continue;
+      cyc.length = 0;
+      let y: Car = x;
+      do {
+        cyc.push(y);
+        y = this.byId.get(y.ref)!;
+      } while (y !== x);
+      if (cyc.length < 2) continue;
+      let age = Infinity;
+      let released = false;
+      for (let k = 0; k < cyc.length; k++) {
+        const m = cyc[k];
+        m.exempt = false;
+        m.cycT = m.cycF === frame - 1 ? m.cycT + dt : dt;
+        m.cycF = frame;
+        age = Math.min(age, m.cycT);
+        // (One let go under CYCLE_HOLD s ago: it has yet to move.)
+        if (m.gridGo >= 0 && m.gridUntil > time + CYCLE_GO - CYCLE_HOLD) released = true;
+      }
+      if (released || age < CYCLE_HOLD) continue;
+      let best: Car | null = null;
+      let bestGap = CYCLE_ROOM;
+      for (let k = 0; k < cyc.length; k++) {
+        const m = cyc[k];
+        // (Not one let go already, still held: by a car from another arm in the box, say.)
+        if (m.why !== Wait.Junction || m.next < 0 || (m.gridGo >= 0 && m.gridUntil > time)) continue;
+        const nd = this.nodes[this.endNode(m.lane)];
+        if (nd.sig || (nd.pc && nd.pc.until > time)) continue;
+        const o = this.byId.get(m.ref)!;
+        let ahead = this.edges[m.lane >> 1].len - m.u;
+        if (o.lane !== m.next) {
+          // (Or in the one after, past a link too short to wait on, which canGo looks through: round
+          // O'Keefe St's ring the links are 8-18 m.)
+          if (o.lane !== m.next2 || !this.shortLink(m.next, nd, m)) continue;
+          ahead += this.edges[m.next >> 1].len;
+        }
+        const gap = ahead + o.u - (o.len + m.len) / 2;
+        if (gap > bestGap) {
+          bestGap = gap;
+          best = m;
+        }
+      }
+      if (!best) continue;
+      best.gridGo = this.endNode(best.lane);
+      best.gridUntil = time + CYCLE_GO;
+      this.stats.cycleBreaks++;
+      this.note(`wait cycle of ${cyc.length} cars (${cyc.map((m) => m.id).join(' ')}): car ${best.id} let into node ${best.gridGo}, ${bestGap.toFixed(1)} m to car ${best.ref}`);
+    }
   }
 
   private kill(c: Car): void {
@@ -2249,7 +2356,7 @@ export class CarTraffic {
       if (c.dead || Math.hypot(c.x - x, c.y - y) > r) continue;
       const n = this.endNode(c.lane);
       const e = this.edges[c.lane >> 1];
-      out.push({ id: c.id, x: +c.x.toFixed(1), y: +c.y.toFixed(1), v: +c.v.toFixed(1), why: c.why, ref: c.ref, exempt: c.exempt, idle: +c.idle.toFixed(0), stall: +c.stall.toFixed(0), lane: c.lane, u: +c.u.toFixed(1), len: +e.len.toFixed(1), node: n, sig: this.nodes[n].sig, holds: c.holds.map((h) => h.node), visible: c.visible });
+      out.push({ id: c.id, x: +c.x.toFixed(1), y: +c.y.toFixed(1), v: +c.v.toFixed(1), why: c.why, ref: c.ref, exempt: c.exempt, idle: +c.idle.toFixed(0), stall: +c.stall.toFixed(0), lane: c.lane, u: +c.u.toFixed(1), len: +e.len.toFixed(1), node: n, sig: this.nodes[n].sig, holds: c.holds.map((h) => h.node), visible: c.visible, next: c.next, gridGo: c.gridGo, gridUntil: +c.gridUntil.toFixed(1), pcUntil: +(this.nodes[n].pc?.until ?? 0).toFixed(1) });
     }
     return out;
   }
@@ -2336,17 +2443,20 @@ export class CarTraffic {
     }
     // The player's bus in (or about to enter) the box: waiting for it is legitimate.
     // (A car holding it from the queue in its exit, its tail still in the box, names the wait: as
-    // legitimate as that queue.)
-    if (!this.boxClear(N, c.id, inX, inY, outX, outY, cls, time)) {
+    // legitimate as that queue. One a wait cycle's breaker let go follows that car in: breakCycles.)
+    const freed = c.gridGo === N && c.gridUntil > time;
+    this.freedExit = next;
+    if (!this.boxClear(N, c.id, inX, inY, outX, outY, cls, time, freed ? this.inFreedExit : undefined)) {
       if (this.boxBy === PLAYER_HOLD) return Wait.Player;
       this.blockRef = Math.max(0, this.boxBy);
       return Wait.Junction;
     }
-    // The exit must have room for the whole car, so it never stops in the box.
+    // The exit must have room for the whole car, so it never stops in the box (unless a wait cycle's
+    // breaker lets it go: breakCycles).
     const idx = Math.min(c.laneIdx, this.lanesIn(next) - 1);
     const room = nd.boxR + c.len + 1.5;
     const nb = this.buckets.get(next);
-    if (nb) {
+    if (nb && !freed) {
       for (const o of nb) {
         if (o === c || o.dead) continue;
         if (this.lanesIn(next) > 1 && o.laneIdx !== idx) continue;
@@ -2367,8 +2477,9 @@ export class CarTraffic {
         return Wait.Bus;
       }
     }
-    // A link too short to stop on: the junction after it must be enterable too.
-    if (depth === 0 && this.shortLink(next, nd, c)) {
+    // A link too short to stop on: the junction after it must be enterable too (not for a car a wait
+    // cycle's breaker let go: it may stand in the box behind the car ahead).
+    if (depth === 0 && !freed && this.shortLink(next, nd, c)) {
       if (c.next2 < 0) c.next2 = this.chooseNext(next, Math.min(c.laneIdx, this.lanesIn(next) - 1));
       if (c.next2 >= 0) return this.canGo(c, next, c.next2, stopAt + ne.len, time, 1);
     }
@@ -2819,6 +2930,7 @@ export class CarTraffic {
         if (c.u <= end || guard++ >= 4) break;
         const over = c.u - end;
         const passed = this.endNode(c.lane);
+        if (c.gridGo === passed) c.gridGo = -1;
         if (c.next < 0) c.next = this.chooseNext(c.lane, c.laneIdx);
         if (c.next < 0) {
           this.kill(c);
@@ -2917,6 +3029,8 @@ export class CarTraffic {
         st.stallDespawns++;
       }
     }
+
+    this.breakCycles(time, dt);
 
     // Car grid (for buses, the probes above and overlap checks).
     const g = this.grid;

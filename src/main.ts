@@ -337,7 +337,15 @@ async function main() {
           .map((j) => ({ node: j.node, x: +j.x.toFixed(1), y: +j.y.toFixed(1), s: +j.s.toFixed(1), stopS: +j.stopS.toFixed(1), boxR: +j.boxR.toFixed(1), sig: j.sig, minor: j.minor, inside: j.inside, cls: j.cls }));
       },
       report() {
-        return { ...auto!.report(), summary: guide.state.summary, served: guide.state.stopsServed, missed: guide.state.stopsMissed, total: guide.state.stopsTotal, events: guide.state.events.map((e) => `${e.kind}: ${e.text}`) };
+        return {
+          ...auto!.report(),
+          summary: guide.state.summary,
+          served: guide.state.stopsServed,
+          missed: guide.state.stopsMissed,
+          total: guide.state.stopsTotal,
+          events: guide.state.events.map((e) => `${e.kind}: ${e.text}`),
+          traffic: { ...traffic.stats, cars: { ...traffic.cars.stats }, events: [...traffic.events, ...traffic.cars.events] },
+        };
       },
     };
     Object.assign(window, { __film: api });
