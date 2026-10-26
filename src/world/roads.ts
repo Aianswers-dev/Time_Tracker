@@ -521,6 +521,10 @@ const EW_TUNNEL = 0;
 const EW_PARAPET = 1;
 const EW_RETAINING = 2;
 
+/** A dual carriageway's two decks this far apart (edge to edge, m) are one deck with a median: medianOff(). */
+const MEDIAN_MIN = 0.4;
+const MEDIAN_MAX = 3;
+
 /** Collects the solid edges as they are drawn (see EdgeWalls). */
 class WallLog {
   private seg: number[] = [];
@@ -2393,6 +2397,8 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       const step = 3;
       const ss: number[] = [];
       const ok: boolean[] = [];
+      // (and a median barrier on one deck instead between the two carriageways of a dual carriageway)
+      const med: boolean[] = [];
       for (let s = 0; s <= ri.len + 0.01; s += step) {
         const c = roadAt(ri, Math.min(s, ri.len));
         const qx = c.x + c.nx * side * (hw + 0.25);
@@ -2400,8 +2406,17 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
         // no parapet between a stopping bay and its platform either
         const px = c.x + c.nx * side * (hw + 0.7);
         const py = c.y + c.ny * side * (hw + 0.7);
-        ok.push(otherAt(qx, qy, c.z, ri.i, 1.5) < -0.15 && !(heavy && onAnyPlatform(ctx.data.platforms, px, py)));
+        const m = r.bay ? NaN : medianOff(ri, c.x, c.y, c.z, c.nx, c.ny, side);
+        med.push(m === m);
+        ok.push(otherAt(qx, qy, c.z, ri.i, 1.5) < -0.15 && !(heavy && onAnyPlatform(ctx.data.platforms, px, py)) && m !== m);
         ss.push(Math.min(s, ri.len));
+      }
+      for (let k = 0; k < med.length; k++) {
+        if (!med[k]) continue;
+        let e = k;
+        while (e + 1 < med.length && med[e + 1]) e++;
+        if (ss[e] - ss[k] > 2) median(g, ri, Math.max(0, ss[k] - step / 2), Math.min(ri.len, ss[e] + step / 2), side, depth);
+        k = e;
       }
       let k = 0;
       while (k < ok.length) {
@@ -2568,6 +2583,141 @@ export async function buildRoads(ctx: Ctx, field: TerrainField, stripMat: THREE.
       }
       prev = v;
     });
+  }
+
+  /**
+   * The middle of a dual carriageway's median on one deck, as an offset from bridge road ri's centreline
+   * on `side` at (x, y, z) (unit left normal (nx, ny)): where another bridge carriageway at the same level
+   * runs alongside within 20 degrees of parallel, its edge MEDIAN_MIN..MEDIAN_MAX beyond this one's. NaN
+   * where there is none. The map draws a dual carriageway's two directions as two ways, and their decks
+   * with parapets back to back over a slot (Stones Corner, the Go Between Bridge, the Riverside Expressway,
+   * the Inner City Bypass, the Captain Cook Bridge approaches); imagery shows one deck with a median
+   * barrier wherever their edges are this close. Closer than MEDIAN_MIN they stay open to each other, as
+   * where a ramp joins.
+   */
+  function medianOff(ri: RI, x: number, y: number, z: number, nx: number, ny: number, side: number): number {
+    const gap = medianGap(ri, x, y, z, nx, ny, side);
+    return gap >= MEDIAN_MIN ? ri.hw + gap / 2 : NaN;
+  }
+
+  /**
+   * The gap (m, edge to edge; below zero where they overlap) between bridge road ri's edge on `side` and the
+   * parallel bridge carriageway alongside at the same level, as medianOff() finds it; NaN where there is
+   * none within MEDIAN_MAX, or a platform lies between them. -1 (closed) where a third road at that level
+   * covers the middle of the gap: past a bridge's end, where the dual carriageway goes on as one road.
+   */
+  function medianGap(ri: RI, x: number, y: number, z: number, nx: number, ny: number, side: number): number {
+    const hw = ri.hw;
+    for (let o = hw + 0.1; o <= hw + MEDIAN_MAX + 0.15; o += 0.25) {
+      const px = x + nx * side * o;
+      const py = y + ny * side * o;
+      // (a stopping bay alongside stays open to its busway)
+      const pen = index.cover(px, py, z, 0.6, ri.i, (q) => roads[q].bridge && !roads[q].bay);
+      if (pen <= 0) continue;
+      const q = index.coverRoad;
+      const nb = index.nearest(px, py, roads[q].width / 2 + 0.5, (k) => k === q);
+      // (the road's direction is (ny, -nx))
+      if (!nb || Math.abs(nb.dx * ny - nb.dy * nx) < 0.94) return NaN;
+      const gap = o - hw - pen;
+      if (gap > MEDIAN_MAX) return NaN;
+      const m = hw + Math.max(0, gap) / 2;
+      const mx = x + nx * side * m;
+      const my = y + ny * side * m;
+      // (nor is there one where a platform lies between them)
+      if (onAnyPlatform(ctx.data.platforms, mx, my)) return NaN;
+      return index.cover(mx, my, z, 0.6, ri.i, (k) => k !== q && !roads[k].bay) > 0.1 ? -1 : gap;
+    }
+    return NaN;
+  }
+
+  /**
+   * Bridge road ri's half of a median (medianOff()) from a to b on `side`: the deck out to the middle of
+   * the gap, closed at the bottom and in the middle, and half a concrete barrier 0.85 m high. It goes to
+   * the collider as a parapet. Sampled every 1.5 m or closer, the middle following the gap, and ended
+   * (with end faces) where the decks close in under MEDIAN_MIN, as where a ramp merges (Turbot Street).
+   */
+  function median(g: MeshGeo, ri: RI, a: number, b: number, side: number, depth: number): void {
+    const hw = ri.hw;
+    const H = 0.85;
+    const pts: { x: number; y: number; z: number; nx: number; ny: number; s: number }[] = [];
+    walkRun(ri, a, b, (x, y, z, nx, ny, s) => {
+      const p0 = pts[pts.length - 1];
+      const n = p0 ? Math.ceil((s - p0.s) / 1.5) : 0;
+      for (let j = 1; j < n; j++) {
+        const c = roadAt(ri, p0.s + ((s - p0.s) * j) / n);
+        pts.push({ x: c.x, y: c.y, z: c.z, nx: c.nx, ny: c.ny, s: p0.s + ((s - p0.s) * j) / n });
+      }
+      pts.push({ x, y, z, nx, ny, s });
+    });
+    // strips of samples with the middle m: where the decks close in to under MEDIAN_MIN (a ramp merging)
+    // the strip ends, so the barrier never stands in the other carriageway; past the other deck's end the
+    // last m carries on (to close the parapet's gap)
+    type Smp = { x: number; y: number; z: number; nx: number; ny: number; m: number };
+    const strips: Smp[][] = [];
+    let cur: Smp[] = [];
+    let last = NaN;
+    for (const p of pts) {
+      const gap = medianGap(ri, p.x, p.y, p.z, p.nx, p.ny, side);
+      if (gap === gap && gap < MEDIAN_MIN) {
+        if (cur.length > 1) strips.push(cur);
+        cur = [];
+        last = NaN;
+        continue;
+      }
+      const m = gap === gap ? hw + gap / 2 : last;
+      if (m !== m) continue;
+      last = m;
+      cur.push({ ...p, m });
+    }
+    if (cur.length > 1) strips.push(cur);
+    for (const strip of strips) {
+      let prev: number[] | null = null;
+      let pwx = NaN;
+      let pwy = NaN;
+      let pz = 0;
+      for (let i = 0; i < strip.length; i++) {
+        const { x, y: yy, z, nx: nx2, ny: ny2, m } = strip[i];
+        // half the barrier: 0.15..0.25 m of it on this side of the middle
+        const bw = clamp(m - hw, 0.15, 0.25);
+        const f = m - bw;
+        const ox = nx2 * side;
+        const oy = ny2 * side;
+        const top = z + ri.lift - 0.01;
+        const at = (o: number, h: number, col: number[]) => g.vert(x + ox * o, h, yy + oy * o, ...col);
+        const v = [
+          at(hw - 0.05, top, CONC), // 0-1 deck top
+          at(f, top, CONC),
+          at(f, top, CONC), // 2-3 barrier face, 4 its top
+          at(m - bw * 0.4, z + H, CONC),
+          at(m, z + H, CONC),
+          at(m, z - depth, CONC_DARK), // 5-6 underside
+          at(Math.min(hw + 0.45, m), z - depth, CONC_DARK),
+          at(m, z + H, CONC_DARK), // 7-8 the middle, down to the underside
+          at(m, z - depth, CONC_DARK),
+        ];
+        if (prev) {
+          g.up(prev[0], v[0], v[1], prev[1]);
+          g.quad(prev[2], v[2], v[3], prev[3], -ox, 0.4, oy);
+          g.up(prev[3], v[3], v[4], prev[4]);
+          g.quad(prev[5], v[5], v[6], prev[6], 0, -1, 0);
+          g.quad(prev[7], v[7], v[8], prev[8], ox, 0, -oy);
+        }
+        if (i === 0 || i === strip.length - 1) {
+          // the strip's end: the barrier's end face and the infill below the deck, facing along the road
+          const d = i === 0 ? -1 : 1;
+          const e = Math.min(hw + 0.45, m);
+          g.quad(at(f, top, CONC), at(m - bw * 0.4, z + H, CONC), at(m, z + H, CONC), at(m, top, CONC), d * ny2, 0, d * nx2);
+          if (e < m - 0.01) g.quad(at(e, top, CONC_DARK), at(m, top, CONC_DARK), at(m, z - depth, CONC_DARK), at(e, z - depth, CONC_DARK), d * ny2, 0, d * nx2);
+        }
+        prev = v;
+        const wx = x + ox * f;
+        const wy = yy + oy * f;
+        if (pwx === pwx) wallLog.ramp(pwx, pwy, wx, wy, pz - 0.4, pz + H, z - 0.4, z + H, EW_PARAPET, ri.i, false);
+        pwx = wx;
+        pwy = wy;
+        pz = z;
+      }
+    }
   }
 
   /** Railway tunnel mouths: headwall and a dark opening (trains only; no interior). */
