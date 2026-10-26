@@ -91,6 +91,19 @@ TAG_OVERRIDES: dict[int, dict[str, str | None]] = {
     44785112: {"building": None},  # RBWH station footprint (layer 2) over the open busway
     # Greenslopes station outline: its two arms are the platform canopies
     683341098: {"building": "roof", "height": "4.5"},
+    # Route 199's residential streets: lanes=2 with no width tag gave the 6.4 m default, but imagery
+    # (Esri, z20) measures 10.6-11.9 m kerb to kerb, with cars parked along both kerbs.
+    24404465: {"width": "11.5"},  # Hoogley Street (-1913,-1977)..(-1942,-2122): 11.7 m at y -2050
+    29124538: {"width": "11"},  # Hoogley Street (-1946,-2136)..(-1969,-2270): 10.6 m at y -2175, 11.9 m at y -2150
+    10384291: {"width": "11.5"},  # Ganges Street (-1743,-1996)..(-1913,-1977): 11.5 m at x -1775
+    # Cultural Centre platform 3: the outbound carriageway is mapped as a stopping lane and a through lane
+    # 4.6-5.3 m apart (centre to centre) along the platform. With no lanes tag each took the two-lane
+    # 7.4 m default, so the stopping lane's ribbon covered 42 m2 of the platform (its centreline is 1.96 m
+    # off the platform edge). Imagery (z20) shows the red busway in single lanes, the stopping lane's kerb
+    # at the canopy edge and no gap between the lanes: the through lane is one lane, paved out to meet
+    # the stopping lane (3.9 m would leave a 1.3 m grass strip between them).
+    234866807: {"lanes": "1"},  # South East Busway, platform 3 stopping lane (-506,-567)..(-572,-610)
+    1237158495: {"lanes": "1", "width": "6.8"},  # South East Busway, through lane beside it
 }
 
 NUM = re.compile(r"[-+]?\d*\.?\d+")
