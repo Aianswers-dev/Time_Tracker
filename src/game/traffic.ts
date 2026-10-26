@@ -270,6 +270,18 @@ export class Traffic {
   private narrowCache = new WeakMap<RouteTrack, { p: RouteTrack; narrows: Join[] }>();
   /** The player's lane samples by grid cell. */
   private pGrid: { p: RouteTrack; cells: Map<number, number[]> } | null = null;
+  // The spawn candidates' first-use caches (junctions, signal plan, and joins and narrows with the
+  // player's lane: tens of ms for a route on a slow machine) are filled in idle time, so the first
+  // bus spawned on a route does not pay for them in a frame. They are pure, so when they are filled
+  // makes no difference to what they hold. warmAt: the next candidate to look at; warmFor: the
+  // candidate list and player's lane a finished pass covered.
+  private warmPending = false;
+  private warmAt = 0;
+  private warmFor: [Candidate[] | null, RouteTrack | null] = [null, null];
+  private readonly warmRun = (d?: IdleDeadline): void => {
+    this.warmPending = false;
+    this.warmSome(d);
+  };
   /** The player's lane and its front's place on it (null off the route). */
   private pTrack: RouteTrack | null = null;
   /** The player's track the car stop lines were held back for (holdBackFor). */
@@ -397,7 +409,55 @@ export class Traffic {
       this.candNext = this.candidates;
       this.candidates = next;
       this.candN = this.candNextN;
+      this.warmAt = 0;
+      this.warmFor[0] = null;
     }
+  }
+
+  /** Ask for an idle-time warming pass unless one is due or the last one covered the candidates. */
+  private warmSoon(): void {
+    if (this.warmPending || !this.candN || (this.warmFor[0] === this.candidates && this.warmFor[1] === this.pTrack)) return;
+    this.warmPending = true;
+    if (typeof requestIdleCallback === 'function') requestIdleCallback(this.warmRun, { timeout: 3000 });
+    else setTimeout(this.warmRun, 200);
+  }
+
+  /** Warm candidates' caches while the idle period lasts (at least one cache a call). */
+  private warmSome(d?: IdleDeadline): void {
+    const P = this.pTrack;
+    const cands = this.candidates;
+    let jobs = 0;
+    while (this.warmAt < this.candN) {
+      if (jobs > 0 && (!d || d.didTimeout || d.timeRemaining() < 8)) {
+        this.warmSoon();
+        return;
+      }
+      const c = cands[this.warmAt];
+      if (this.warmOne(c.route, c.track, P)) jobs++;
+      else this.warmAt++;
+    }
+    this.warmAt = 0;
+    this.warmFor[0] = cands;
+    this.warmFor[1] = P;
+  }
+
+  /** Fill one missing first-use cache of route r's track a (false: none missing). */
+  private warmOne(r: Route, a: RouteTrack, P: RouteTrack | null): boolean {
+    if (!this.plans.has(a)) {
+      this.signalPlan(a);
+      return true;
+    }
+    // (As a bus on it would ask, in step, once the player's spec is known.)
+    if (!P || !this.playerSpec) return false;
+    if (this.joinCache.get(a)?.p !== P) {
+      this.joinsOf(a, P);
+      return true;
+    }
+    if (this.narrowCache.get(a)?.p !== P) {
+      this.narrowsOf(a, P, this.buses.specFor(busTypeForRoute(r)));
+      return true;
+    }
+    return false;
   }
 
   /** Pool key: meshes are interchangeable when type and livery match (mirrors bus/livery.ts). */
@@ -911,6 +971,7 @@ export class Traffic {
     bodies.length = nb;
     exempt.length = nb;
     this.cars.simulate(dt, time, player, this.playerBody, bodies, exempt, this.frustum);
+    this.warmSoon();
   }
 
   /**
