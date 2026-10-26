@@ -10,6 +10,7 @@ import { LEVEL_GAP, heightsOf } from './height';
 import { activeCollider } from '../sim/collider';
 import { specFor } from '../bus/spec';
 import { signalsFor } from '../data/signals';
+import { hypot2 } from './hypot';
 
 export const TRACK_STEP = 4;
 
@@ -2349,12 +2350,28 @@ export class RouteTrack {
 
   /** Interpolated lane sample at distance s, optionally shifted left. */
   sample(s: number, out: TrackSample, extraLeft = 0): TrackSample {
+    this.qs = s;
+    this.ql = extraLeft;
+    return this.sampleQ(out);
+  }
+
+  // sampleQ's distance and left shift (qs, ql) and the height there (qz, as zAt(qs)): a hot loop that
+  // sets them and calls sampleQ passes no doubles to a call (V8 boxes each, sample being too big to inline).
+  qs = 0.5;
+  ql = 0.5;
+  qz = 0.5;
+
+  /** sample(qs, out, ql), and zAt(qs) into qz. */
+  sampleQ(out: TrackSample): TrackSample {
+    const s = this.qs;
+    const extraLeft = this.ql;
     const f = Math.max(0, Math.min(this.n - 1.0001, s / TRACK_STEP));
     const i = Math.floor(f);
     const t = f - i;
+    this.qz = this.z[i] + (this.z[i + 1] - this.z[i]) * t;
     const tx = this.tx[i] + (this.tx[i + 1] - this.tx[i]) * t;
     const ty = this.ty[i] + (this.ty[i + 1] - this.ty[i]) * t;
-    const len = Math.hypot(tx, ty) || 1;
+    const len = hypot2(tx, ty) || 1;
     out.hx = tx / len;
     out.hy = ty / len;
     out.x = this.x[i] + (this.x[i + 1] - this.x[i]) * t - out.hy * extraLeft;

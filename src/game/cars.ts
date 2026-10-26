@@ -18,7 +18,14 @@ import { PointGrid, type Body } from './bodies';
 import { LEVEL_GAP, heightsOf } from './height';
 import { TRACK_STEP, type RouteTrack } from './track';
 import { rng } from './util';
+import { hypot2 } from './hypot';
 import { nodeFacing, signalsFor } from '../data/signals';
+
+/** Remove arr[k], keeping the order (splice without its result array). */
+export function removeAt<T>(arr: T[], k: number): void {
+  for (let i = k + 1; i < arr.length; i++) arr[i - 1] = arr[i];
+  arr.length--;
+}
 
 const VIEW = 600;
 /** Reservation id the player's bus holds junction boxes with (AI buses use -id, cars +id). */
@@ -186,6 +193,15 @@ function turnSpeed(turn: number): number {
   return 4.5 + 7 * (1 - Math.min(1, turn / 2));
 }
 
+/** A movement through a junction: the unit directions in and out, and its class. */
+export interface Movement {
+  inX: number;
+  inY: number;
+  outX: number;
+  outY: number;
+  cls: Turn;
+}
+
 interface Hold {
   node: number;
   /** Distance travelled past the node (-1 until reached). */
@@ -282,6 +298,22 @@ export interface CarStats {
   waitingRed: number;
   waitingJunction: number;
   stationary: number;
+}
+
+/**
+ * Sort a lane's cars by u, in place: a stable insertion sort, so the order is the one a stable sort
+ * (Array.prototype.sort) gives, without the comparator closure and work array it allocates.
+ */
+function sortByU(l: Car[]): void {
+  for (let i = 1; i < l.length; i++) {
+    const c = l[i];
+    let j = i - 1;
+    while (j >= 0 && l[j].u - c.u > 0) {
+      l[j + 1] = l[j];
+      j--;
+    }
+    l[j + 1] = c;
+  }
 }
 
 function classify(turn: number): Turn {
@@ -430,8 +462,10 @@ export class CarTraffic {
   private models: Model[] = [];
   private rand = rng(777);
   private nextId = 1;
+  /** Spawn edges and their weights: the first candN. */
   private candidates: number[] = [];
   private candW: number[] = [];
+  private candN = 0;
   private candSum = 0;
   private candTimer = 0;
   private initial = true;
@@ -480,6 +514,85 @@ export class CarTraffic {
   private blockRef = 0;
   private pt2: LanePt = { x: 0, y: 0, hx: 0, hy: 0, z: 0, g: 0 };
   private pt3: LanePt = { x: 0, y: 0, hx: 0, hy: 0, z: 0, g: 0 };
+  // simulate's per-car scratch (nothing is allocated per car or per frame): the binding acceleration and
+  // why/by whom (lim); a unit direction (laneEndDirTo / laneStartDirTo); a movement (conflictEta).
+  private lAcc = 0.5;
+  /** at()'s distance along the lane and offset, for atF. */
+  private atU = 0.5;
+  private atLat = 0.5;
+  /** laneOffsetTo's and turnAngleTo's results; sampleAhead's distance. */
+  private loV = 0.5;
+  private taV = 0.5;
+  private saD = 0.5;
+  /** idmLim's desired speed (the car's, set once per car), gap and leader's speed. */
+  private iV0 = 0.5;
+  private iGap = 0.5;
+  private iVL = 0.5;
+  /** chooseNext's options and their weights. */
+  private optL: number[] = [];
+  private optW: number[] = [];
+  private lWhy: Wait = Wait.None;
+  private lRef = 0;
+  private dX = 0.5;
+  private dY = 0.5;
+  private mv: Movement = { inX: 0.5, inY: 0.5, outX: 0.5, outY: 0.5, cls: Turn.Straight };
+  // The buckets' lanes, lists (the same arrays) and fill counts, by bucket index; bucketOf maps a lane
+  // to its index. Lists are refilled in place and then cut to length: an array emptied with
+  // `length = 0` loses its backing store in V8, so refilling it allocates a new one.
+  private bucketLanes: number[] = [];
+  private bucketList: Car[][] = [];
+  private bucketN: number[] = [];
+  private bucketOf = new Map<number, number>();
+  // Grid queries' arguments and results (their visitors are made once).
+  private qX = 0.5;
+  private qY = 0.5;
+  private qZ = 0.5;
+  private qHx = 0.5;
+  private qHy = 0.5;
+  private qD = 0.5;
+  private qSkip = 0;
+  private qBest = -1;
+  private qHit = false;
+  private qFound = -2;
+  private readonly carNearFn = (i: number): boolean => {
+    const g = this.grid;
+    if (g.pid[i] === this.qSkip || Math.abs(g.pz[i] - this.qZ) > LEVEL_GAP) return false;
+    const o = this.byId.get(g.pid[i]);
+    if (!o || o.dead) return false;
+    const d = (g.px[i] - this.qX) ** 2 + (g.py[i] - this.qY) ** 2;
+    if (d < this.qD) {
+      this.qD = d;
+      this.qBest = i;
+    }
+    return false;
+  };
+  private readonly touchFn = (i: number): boolean => {
+    const bg = this.busGrid;
+    if (bg.pid[i] !== -1 || Math.abs(bg.pz[i] - this.qZ) > LEVEL_GAP) return false;
+    this.qHit = (bg.px[i] - this.qX) * this.qHx + (bg.py[i] - this.qY) * this.qHy > 0;
+    return this.qHit;
+  };
+  private readonly alongsideFn = (i: number): boolean => {
+    const g = this.busGrid;
+    if (g.pid[i] !== -1 || Math.abs(g.pz[i] - this.qZ) > LEVEL_GAP) return false;
+    this.qHit = (g.px[i] - this.qX) * this.qHx + (g.py[i] - this.qY) * this.qHy > this.qD;
+    return this.qHit;
+  };
+  private readonly buswayFn = (i: number): boolean => {
+    const g = this.busGrid;
+    if (Math.abs(g.pz[i] - this.qZ) > LEVEL_GAP) return false;
+    const dx = g.px[i] - this.qX;
+    const dy = g.py[i] - this.qY;
+    const along = dx * this.qHx + dy * this.qHy;
+    const lat = Math.abs(dx * this.qHy - dy * this.qHx);
+    // On the crossing, or moving and close enough to reach it soon. (A bus
+    // standing at a nearby platform or light is not a reason to wait.)
+    if (lat < 4.5 && (Math.abs(along) < 7 || (g.pv[i] > 0.8 && Math.abs(along) < 25))) {
+      this.qFound = g.pid[i];
+      return true;
+    }
+    return false;
+  };
   // holdBackFor's scratch (sections' axles, headings and links; the rectangles, and those near one lane; lanes).
   private hbAx = new Float64Array(0);
   private hbAy = new Float64Array(0);
@@ -1029,6 +1142,17 @@ export class CarTraffic {
 
   /** Point on a directed lane at distance u, shifted `lat` to the left. */
   private at(lane: number, u: number, lat: number, out: LanePt): void {
+    // (Small enough to be inlined at every call, so u and lat reach atF unboxed: atF itself is too
+    // big to inline, and a call passing it doubles allocates a heap number for each.)
+    this.atU = u;
+    this.atLat = lat;
+    this.atF(lane, out);
+  }
+
+  /** at() with its distance and offset in atU and atLat. */
+  private atF(lane: number, out: LanePt): void {
+    const u = this.atU;
+    const lat = this.atLat;
     const e = this.edges[lane >> 1];
     const rev = (lane & 1) === 1;
     const s = Math.max(0, Math.min(e.len, rev ? e.len - u : u));
@@ -1044,7 +1168,7 @@ export class CarTraffic {
     const t = (s - c[lo]) / Math.max(1e-6, c[hi] - c[lo]);
     let hx = p[2 * hi] - p[2 * lo];
     let hy = p[2 * hi + 1] - p[2 * lo + 1];
-    const l = Math.hypot(hx, hy) || 1;
+    const l = hypot2(hx, hy) || 1;
     hx /= l;
     hy /= l;
     if (rev) {
@@ -1067,15 +1191,24 @@ export class CarTraffic {
    * never share an offset even where OSM claims more lanes than fit.
    */
   private laneOffset(lane: number, idx: number): number {
+    this.laneOffsetTo(lane, idx);
+    return this.loV;
+  }
+
+  /** laneOffset() into loV. */
+  private laneOffsetTo(lane: number, idx: number): void {
     const e = this.edges[lane >> 1];
     const half = e.width / 2;
     const n = this.lanesIn(lane);
     const k = Math.min(idx, n - 1);
     const outer = half - 1.6;
     const inner = e.oneway ? -outer : Math.min(outer, 1.55);
-    if (n <= 1) return e.oneway ? Math.max(0, outer) : Math.max(1.55, outer);
+    if (n <= 1) {
+      this.loV = e.oneway ? Math.max(0, outer) : Math.max(1.55, outer);
+      return;
+    }
     const step = Math.min(3.2, (outer - inner) / (n - 1));
-    return outer - k * step;
+    this.loV = outer - k * step;
   }
 
   /** Usable lanes in this direction (what fits at ~2.7 m spacing). */
@@ -1104,20 +1237,26 @@ export class CarTraffic {
     // Incoming heading at the node.
     const p = e.pts;
     const n = p.length;
-    const [hx, hy] = rev ? [p[0] - p[2], p[1] - p[3]] : [p[n - 2] - p[n - 4], p[n - 1] - p[n - 3]];
+    const hx = rev ? p[0] - p[2] : p[n - 2] - p[n - 4];
+    const hy = rev ? p[1] - p[3] : p[n - 1] - p[n - 3];
     const hIn = Math.atan2(hx, hy);
     const lanes = this.lanesIn(lane);
     let best = -1;
     let sum = 0;
-    const opts: [number, number][] = [];
-    for (let pass = 0; pass < 2 && !opts.length; pass++) {
-      for (const o of node.out) {
+    // The options and their weights, in two lists (lane numbers kept small integers).
+    const optL = this.optL;
+    const optW = this.optW;
+    let nOpt = 0;
+    for (let pass = 0; pass < 2 && !nOpt; pass++) {
+      for (let oi = 0; oi < node.out.length; oi++) {
+        const o = node.out[oi];
         if (o >> 1 === lane >> 1) continue;
         const oe = this.edges[o >> 1];
         if (oe.bus) continue;
         const op = oe.pts;
         const on = op.length;
-        const [ox, oy] = o & 1 ? [op[on - 4] - op[on - 2], op[on - 3] - op[on - 1]] : [op[2] - op[0], op[3] - op[1]];
+        const ox = o & 1 ? op[on - 4] - op[on - 2] : op[2] - op[0];
+        const oy = o & 1 ? op[on - 3] - op[on - 1] : op[3] - op[1];
         const signed = wrapAngle(Math.atan2(ox, oy) - hIn);
         if (pass === 0 && lanes > 1 && !this.onRing(lane)) {
           if (signed < -0.5 && idx > 0) continue;
@@ -1125,20 +1264,27 @@ export class CarTraffic {
         }
         const turn = Math.abs(signed);
         const w = (Math.cos(turn) + 1.25) * (CLASS_W[oe.kind] ?? 0.3) * (oe.len < 15 ? 0.6 : 1);
-        opts.push([o, w]);
+        if (nOpt < optL.length) {
+          optL[nOpt] = o;
+          optW[nOpt] = w;
+        } else {
+          optL.push(o);
+          optW.push(w);
+        }
+        nOpt++;
         sum += w;
       }
     }
-    if (!opts.length) return e.oneway ? -1 : lane ^ 1;
+    if (!nOpt) return e.oneway ? -1 : lane ^ 1;
     let r = this.rand() * sum;
-    for (const [o, w] of opts) {
-      r -= w;
+    for (let k = 0; k < nOpt; k++) {
+      r -= optW[k];
       if (r <= 0) {
-        best = o;
+        best = optL[k];
         break;
       }
     }
-    return best >= 0 ? best : opts[0][0];
+    return best >= 0 ? best : optL[0];
   }
 
   /**
@@ -1179,16 +1325,29 @@ export class CarTraffic {
   }
 
   private turnAngle(from: number, to: number): number {
-    if (to < 0) return 0;
+    this.turnAngleTo(from, to);
+    return this.taV;
+  }
+
+  /** turnAngle() into taV. */
+  private turnAngleTo(from: number, to: number): void {
+    if (to < 0) {
+      this.taV = 0;
+      return;
+    }
     const e = this.edges[from >> 1];
     const p = e.pts;
     const n = p.length;
-    const [hx, hy] = from & 1 ? [p[0] - p[2], p[1] - p[3]] : [p[n - 2] - p[n - 4], p[n - 1] - p[n - 3]];
+    const rf = (from & 1) !== 0;
+    const hx = rf ? p[0] - p[2] : p[n - 2] - p[n - 4];
+    const hy = rf ? p[1] - p[3] : p[n - 1] - p[n - 3];
     const oe = this.edges[to >> 1];
     const op = oe.pts;
     const on = op.length;
-    const [ox, oy] = to & 1 ? [op[on - 4] - op[on - 2], op[on - 3] - op[on - 1]] : [op[2] - op[0], op[3] - op[1]];
-    return wrapAngle(Math.atan2(ox, oy) - Math.atan2(hx, hy));
+    const rt = (to & 1) !== 0;
+    const ox = rt ? op[on - 4] - op[on - 2] : op[2] - op[0];
+    const oy = rt ? op[on - 3] - op[on - 1] : op[3] - op[1];
+    this.taV = wrapAngle(Math.atan2(ox, oy) - Math.atan2(hx, hy));
   }
 
   // -------------------------------------------------------------------------
@@ -1210,6 +1369,44 @@ export class CarTraffic {
     }
     const l = Math.hypot(dx, dy) || 1;
     return [dx / l, dy / l];
+  }
+
+  /** laneEndDir into (dX, dY), allocating nothing. */
+  private laneEndDirTo(lane: number): void {
+    const e = this.edges[lane >> 1];
+    const p = e.pts;
+    const n = p.length;
+    let dx: number;
+    let dy: number;
+    if (lane & 1) {
+      dx = p[0] - p[2];
+      dy = p[1] - p[3];
+    } else {
+      dx = p[n - 2] - p[n - 4];
+      dy = p[n - 1] - p[n - 3];
+    }
+    const l = hypot2(dx, dy) || 1;
+    this.dX = dx / l;
+    this.dY = dy / l;
+  }
+
+  /** laneStartDir into (dX, dY), allocating nothing. */
+  private laneStartDirTo(lane: number): void {
+    const e = this.edges[lane >> 1];
+    const p = e.pts;
+    const n = p.length;
+    let dx: number;
+    let dy: number;
+    if (lane & 1) {
+      dx = p[n - 4] - p[n - 2];
+      dy = p[n - 3] - p[n - 1];
+    } else {
+      dx = p[2] - p[0];
+      dy = p[3] - p[1];
+    }
+    const l = hypot2(dx, dy) || 1;
+    this.dX = dx / l;
+    this.dY = dy / l;
   }
 
   /** Unit direction of travel at the start of a lane (out of its start node). */
@@ -1362,18 +1559,44 @@ export class CarTraffic {
     return this.boxBy;
   }
 
+  /** Until when enterM reserves (set by its caller: a double passed to a call that is not inlined is boxed). */
+  enterUntil = 0.5;
+
+  /** enter(node, id, m's movement, enterUntil). */
+  enterM(node: number, id: number, m: Movement): void {
+    const until = this.enterUntil;
+    const occ = this.nodes[node].occ;
+    for (let i = 0; i < occ.length; i++) {
+      const o = occ[i];
+      if (o.id === id) {
+        o.until = Math.max(o.until, until);
+        return;
+      }
+    }
+    occ.push({ id, inX: m.inX, inY: m.inY, outX: m.outX, outY: m.outY, cls: m.cls, until });
+  }
+
   /** Reserve the box for a movement until `until` (refreshes an existing hold). */
   enter(node: number, id: number, inX: number, inY: number, outX: number, outY: number, cls: Turn, until: number): void {
-    const nd = this.nodes[node];
-    const o = nd.occ.find((x) => x.id === id);
-    if (o) o.until = Math.max(o.until, until);
-    else nd.occ.push({ id, inX, inY, outX, outY, cls, until });
+    const occ = this.nodes[node].occ;
+    for (let i = 0; i < occ.length; i++) {
+      const o = occ[i];
+      if (o.id === id) {
+        o.until = Math.max(o.until, until);
+        return;
+      }
+    }
+    occ.push({ id, inX, inY, outX, outY, cls, until });
   }
 
   leave(node: number, id: number): void {
     const occ = this.nodes[node].occ;
-    const i = occ.findIndex((o) => o.id === id);
-    if (i >= 0) occ.splice(i, 1);
+    for (let i = 0; i < occ.length; i++) {
+      if (occ[i].id === id) {
+        removeAt(occ, i);
+        return;
+      }
+    }
   }
 
   /** Unsignalised junction: a side-road vehicle must wait while main-road traffic is passing. */
@@ -1403,8 +1626,20 @@ export class CarTraffic {
     prio: boolean,
   ): void {
     const nd = this.nodes[node];
-    if (nd.pc) Object.assign(nd.pc, { until, x, y, inX, inY, outX, outY, cls, eta, near, prio });
-    else nd.pc = { until, x, y, inX, inY, outX, outY, cls, eta, near, prio };
+    const pc = nd.pc;
+    if (pc) {
+      pc.until = until;
+      pc.x = x;
+      pc.y = y;
+      pc.inX = inX;
+      pc.inY = inY;
+      pc.outX = outX;
+      pc.outY = outY;
+      pc.cls = cls;
+      pc.eta = eta;
+      pc.near = near;
+      pc.prio = prio;
+    } else nd.pc = { until, x, y, inX, inY, outX, outY, cls, eta, near, prio };
   }
 
   /**
@@ -1435,10 +1670,15 @@ export class CarTraffic {
       if (c.dead || c.v < 0.5 || c.next < 0 || c.why === Wait.Red || this.endNode(c.lane) !== node) continue;
       const eta = (this.edges[c.lane >> 1].len - c.u) / c.v;
       if (eta >= horizon || eta >= best) continue;
-      const [ix, iy] = this.laneEndDir(c.lane);
-      const [ox, oy] = this.laneStartDir(c.next);
-      const ccls = classify(wrapAngle(Math.atan2(ox, oy) - Math.atan2(ix, iy)));
-      if (movementsConflict(inX, inY, outX, outY, cls, { inX: ix, inY: iy, outX: ox, outY: oy, cls: ccls })) best = eta;
+      const m = this.mv;
+      this.laneEndDirTo(c.lane);
+      m.inX = this.dX;
+      m.inY = this.dY;
+      this.laneStartDirTo(c.next);
+      m.outX = this.dX;
+      m.outY = this.dY;
+      m.cls = classify(wrapAngle(Math.atan2(m.outX, m.outY) - Math.atan2(m.inX, m.inY)));
+      if (movementsConflict(inX, inY, outX, outY, cls, m)) best = eta;
     }
     return best;
   }
@@ -1793,8 +2033,7 @@ export class CarTraffic {
   // -------------------------------------------------------------------------
 
   private refreshCandidates(px: number, py: number): void {
-    this.candidates.length = 0;
-    this.candW.length = 0;
+    let n = 0;
     this.candSum = 0;
     const R2 = this.radius * this.radius;
     for (let i = 0; i < this.edges.length; i++) {
@@ -1803,10 +2042,17 @@ export class CarTraffic {
       const dx = e.mx - px;
       const dy = e.my - py;
       if (dx * dx + dy * dy > R2) continue;
-      this.candidates.push(i);
-      this.candW.push(e.weight);
+      if (n < this.candidates.length) {
+        this.candidates[n] = i;
+        this.candW[n] = e.weight;
+      } else {
+        this.candidates.push(i);
+        this.candW.push(e.weight);
+      }
+      n++;
       this.candSum += e.weight;
     }
+    this.candN = n;
   }
 
   private pickPaint(): THREE.Color {
@@ -1821,10 +2067,10 @@ export class CarTraffic {
   }
 
   private spawn(px: number, py: number, frustum: THREE.Frustum): boolean {
-    if (!this.candidates.length) return false;
+    if (!this.candN) return false;
     let r = this.rand() * this.candSum;
     let ei = this.candidates[0];
-    for (let i = 0; i < this.candidates.length; i++) {
+    for (let i = 0; i < this.candN; i++) {
       r -= this.candW[i];
       if (r <= 0) {
         ei = this.candidates[i];
@@ -1905,12 +2151,39 @@ export class CarTraffic {
     const xs = e.xs[lane & 1];
     while (c.xsI < xs.length && xs[c.xsI] < u) c.xsI++;
     this.cars.push(c);
+    this.byId.set(c.id, c);
     return true;
   }
 
   private note(msg: string): void {
     this.events.push(msg);
     if (this.events.length > 30) this.events.shift();
+  }
+
+  /** Drop the buckets of lanes without a car (they pile up as the player drives on). */
+  private pruneBuckets(): void {
+    const bl = this.bucketLanes;
+    const bList = this.bucketList;
+    const bN = this.bucketN;
+    const has = new Set<number>();
+    for (let ci = 0; ci < this.cars.length; ci++) has.add(this.cars[ci].lane);
+    let w = 0;
+    for (let k = 0; k < bl.length; k++) {
+      const lane = bl[k];
+      if (!has.has(lane)) {
+        this.buckets.delete(lane);
+        this.bucketOf.delete(lane);
+        continue;
+      }
+      bl[w] = lane;
+      bList[w] = bList[k];
+      bN[w] = bN[k];
+      this.bucketOf.set(lane, w);
+      w++;
+    }
+    bl.length = w;
+    bList.length = w;
+    bN.length = w;
   }
 
   private kill(c: Car): void {
@@ -1920,23 +2193,25 @@ export class CarTraffic {
     c.holds.length = 0;
   }
 
-  /** Grid index of the nearest other (live) car within r of (x, y) on the level of z, or -1. */
-  private carNear(x: number, y: number, r: number, skip: number, z: number): number {
+  /** Grid index of the nearest other (live) car within r of (qX, qY) on the level of qZ, or -1. */
+  private carNearQ(r: number, skip: number): number {
+    this.qSkip = skip;
+    this.qBest = -1;
+    this.qD = r * r;
     const g = this.grid;
-    let best = -1;
-    let bd = r * r;
-    g.query(x, y, r, (i) => {
-      if (g.pid[i] === skip || Math.abs(g.pz[i] - z) > LEVEL_GAP) return false;
-      const o = this.byId.get(g.pid[i]);
-      if (!o || o.dead) return false;
-      const d = (g.px[i] - x) ** 2 + (g.py[i] - y) ** 2;
-      if (d < bd) {
-        bd = d;
-        best = i;
-      }
-      return false;
-    });
-    return best;
+    g.qx = this.qX;
+    g.qy = this.qY;
+    g.queryQ(r, this.carNearFn);
+    return this.qBest;
+  }
+
+  /** Nearest bus grid point within r of p on its level, or -1. */
+  private busNearPt(p: LanePt, r: number): number {
+    const bg = this.busGrid;
+    bg.qx = p.x;
+    bg.qy = p.y;
+    bg.qz = p.z;
+    return bg.nearestQ(r);
   }
 
   /** Speed of a car within r of (x, y) (on the level of z, if given), or -1 if none. */
@@ -1994,8 +2269,12 @@ export class CarTraffic {
   private canGo(c: Car, lane: number, next: number, stopAt: number, time: number, depth: number): Wait {
     const N = this.endNode(lane);
     const nd = this.nodes[N];
-    const [inX, inY] = this.laneEndDir(lane);
-    const [outX, outY] = this.laneStartDir(next);
+    this.laneEndDirTo(lane);
+    const inX = this.dX;
+    const inY = this.dY;
+    this.laneStartDirTo(next);
+    const outX = this.dX;
+    const outY = this.dY;
     const cls = classify(wrapAngle(Math.atan2(outX, outY) - Math.atan2(inX, inY)));
     if (nd.sig) {
       // On a short link between two nodes of one junction we are already in it:
@@ -2038,7 +2317,7 @@ export class CarTraffic {
         // cut in across the bus's front.)
         let ends = c.laneIdx >= this.lanesIn(next);
         let extra = 0;
-        if (!ends && depth === 0 && this.shortLink(next, nd.boxR, c.len)) {
+        if (!ends && depth === 0 && this.shortLink(next, nd, c)) {
           if (c.next2 < 0) c.next2 = this.chooseNext(next, Math.min(c.laneIdx, this.lanesIn(next) - 1));
           ends = c.next2 >= 0 && c.laneIdx >= this.lanesIn(c.next2);
           extra = this.edges[next >> 1].len;
@@ -2081,7 +2360,7 @@ export class CarTraffic {
     // ...and of buses (and the player's bus) standing there.
     for (let q = 0; q < 2; q++) {
       this.at(next, Math.min(ne.len, nd.boxR + 2 + q * c.len), this.laneOffset(next, idx), this.pt2);
-      const hb = this.busGrid.nearest(this.pt2.x, this.pt2.y, 2.6, undefined, this.pt2.z);
+      const hb = this.busNearPt(this.pt2, 2.6);
       if (hb >= 0 && this.busGrid.pv[hb] < 2) {
         if (this.busGrid.pid[hb] === -1) return Wait.Player;
         this.blockRef = this.busGrid.pid[hb];
@@ -2089,7 +2368,7 @@ export class CarTraffic {
       }
     }
     // A link too short to stop on: the junction after it must be enterable too.
-    if (depth === 0 && this.shortLink(next, nd.boxR, c.len)) {
+    if (depth === 0 && this.shortLink(next, nd, c)) {
       if (c.next2 < 0) c.next2 = this.chooseNext(next, Math.min(c.laneIdx, this.lanesIn(next) - 1));
       if (c.next2 >= 0) return this.canGo(c, next, c.next2, stopAt + ne.len, time, 1);
     }
@@ -2114,54 +2393,95 @@ export class CarTraffic {
   private commit(c: Car, lane: number, next: number, stopAt: number, time: number, depth: number): void {
     const N = this.endNode(lane);
     const nd = this.nodes[N];
-    const [inX, inY] = this.laneEndDir(lane);
-    const [outX, outY] = this.laneStartDir(next);
+    this.laneEndDirTo(lane);
+    const inX = this.dX;
+    const inY = this.dY;
+    this.laneStartDirTo(next);
+    const outX = this.dX;
+    const outY = this.dY;
     const cls = classify(wrapAngle(Math.atan2(outX, outY) - Math.atan2(inX, inY)));
     const until = time + Math.min(16, (stopAt + 2 * nd.boxR + c.len) / Math.max(c.v, 3) + 2.5);
     this.enter(N, c.id, inX, inY, outX, outY, cls, until);
-    if (!c.holds.some((h) => h.node === N)) c.holds.push({ node: N, d: -1, inX, inY, outX, outY, cls });
+    if (!this.holdsNode(c, N)) c.holds.push({ node: N, d: -1, inX, inY, outX, outY, cls });
     const ne = this.edges[next >> 1];
-    if (depth === 0 && c.next2 >= 0 && this.shortLink(next, nd.boxR, c.len)) this.commit(c, next, c.next2, stopAt + ne.len, time, 1);
+    if (depth === 0 && c.next2 >= 0 && this.shortLink(next, nd, c)) this.commit(c, next, c.next2, stopAt + ne.len, time, 1);
+  }
+
+  /**
+   * The car being simulated is held to the IDM acceleration of car `c` (desired speed iV0) towards an
+   * obstacle iGap m ahead moving at iVL (why `w`, by `ref`), if that is the tightest so far. (Its
+   * inputs come in fields: a double passed to a call that is not inlined is boxed.)
+   */
+  private idmLim(c: Car, s0: number, w: Wait, ref: number): void {
+    const A = CAR_A;
+    const B = 2.6;
+    const T = 1.15;
+    const v0 = this.iV0;
+    const vLead = this.iVL;
+    const sStar = s0 + Math.max(0, c.v * T + (c.v * (c.v - vLead)) / (2 * Math.sqrt(A * B)));
+    const a = A * (1 - Math.pow(c.v / Math.max(1, v0), 4) - (sStar / Math.max(0.05, this.iGap)) ** 2);
+    if (a < this.lAcc) {
+      this.lAcc = a;
+      this.lWhy = w;
+      this.lRef = ref;
+    }
+  }
+
+  /** Is there another car in lane index `to` of `list` (car c's lane) within reach of c alongside? */
+  private laneTaken(list: Car[], c: Car, to: number): boolean {
+    for (let k = 0; k < list.length; k++) {
+      const o = list[k];
+      if (o !== c && !o.dead && o.laneIdx === to && Math.abs(o.u - c.u) < c.len + 6) return true;
+    }
+    return false;
+  }
+
+  /** Does car `c` hold (or has it committed to) junction node `n`? */
+  private holdsNode(c: Car, n: number): boolean {
+    const hs = c.holds;
+    for (let k = 0; k < hs.length; k++) if (hs[k].node === n) return true;
+    return false;
   }
 
   /** Is any of the player's bus level with or ahead of car `c`'s tail, going (dx, dy), on its level? */
   private playerAlongside(c: Car, dx: number, dy: number): boolean {
-    const g = this.busGrid;
-    let found = false;
-    g.query(c.x, c.y, 30, (i) => {
-      if (g.pid[i] !== -1 || Math.abs(g.pz[i] - c.z) > LEVEL_GAP) return false;
-      found = (g.px[i] - c.x) * dx + (g.py[i] - c.y) * dy > -c.len / 2;
-      return found;
-    });
-    return found;
+    this.qX = c.x;
+    this.qY = c.y;
+    this.qZ = c.z;
+    this.qHx = dx;
+    this.qHy = dy;
+    this.qD = -c.len / 2;
+    this.qHit = false;
+    const bg = this.busGrid;
+    bg.qx = c.x;
+    bg.qy = c.y;
+    bg.queryQ(30, this.alongsideFn);
+    return this.qHit;
   }
 
-  /** A lane too short to wait on between two junction boxes. */
-  private shortLink(lane: number, boxR: number, len: number): boolean {
+  /** A lane too short for car c to wait on between two junction boxes (`from`'s, at its start, and its end node's). */
+  private shortLink(lane: number, from: Node, c: Car): boolean {
     const e = this.edges[lane >> 1];
     const nd = this.nodes[this.endNode(lane)];
-    return nd.deg >= 3 && e.len - this.stopD[lane] < boxR + len;
+    return nd.deg >= 3 && e.len - this.stopD[lane] < from.boxR + c.len;
   }
 
-  /** Index of a bus (or -1 = player) on the busway near a crossing at (X, Y, Z) along (bx, by), else -2. */
-  private busOnBusway(X: number, Y: number, bx: number, by: number, Z: number): number {
-    const g = this.busGrid;
-    let found = -2;
-    g.query(X, Y, 26, (i) => {
-      if (Math.abs(g.pz[i] - Z) > LEVEL_GAP) return false;
-      const dx = g.px[i] - X;
-      const dy = g.py[i] - Y;
-      const along = dx * bx + dy * by;
-      const lat = Math.abs(dx * by - dy * bx);
-      // On the crossing, or moving and close enough to reach it soon. (A bus
-      // standing at a nearby platform or light is not a reason to wait.)
-      if (lat < 4.5 && (Math.abs(along) < 7 || (g.pv[i] > 0.8 && Math.abs(along) < 25))) {
-        found = g.pid[i];
-        return true;
-      }
-      return false;
-    });
-    return found;
+  /**
+   * Index of a bus (or -1 = player) on the busway near a crossing, else -2: the crossing at q[k..k+4]
+   * (X, Y, the busway's direction bx, by, and Z).
+   */
+  private busOnBusway(q: number[], k: number): number {
+    this.qX = q[k];
+    this.qY = q[k + 1];
+    this.qZ = q[k + 4];
+    this.qHx = q[k + 2];
+    this.qHy = q[k + 3];
+    this.qFound = -2;
+    const bg = this.busGrid;
+    bg.qx = this.qX;
+    bg.qy = this.qY;
+    bg.queryQ(26, this.buswayFn);
+    return this.qFound;
   }
 
   /**
@@ -2174,16 +2494,8 @@ export class CarTraffic {
     const py = player.y;
     const bg = this.busGrid;
     bg.clear();
-    // Body points and the midpoints between them (<= ~1.8 m apart), so a probe
-    // with the contact radius cannot slip between two points.
-    const addBody = (b: Body, v: number, id: number) => {
-      for (let k = 0; k < b.n; k++) {
-        bg.add(b.x[k], b.y[k], v, id, b.z[k]);
-        if (k + 1 < b.n) bg.add((b.x[k] + b.x[k + 1]) / 2, (b.y[k] + b.y[k + 1]) / 2, v, id, (b.z[k] + b.z[k + 1]) / 2);
-      }
-    };
-    addBody(playerBody, Math.max(0, Math.abs(playerBody.speed)), -1);
-    busBodies.forEach((b, i) => addBody(b, b.speed, i));
+    this.addBody(playerBody, Math.max(0, Math.abs(playerBody.speed)), -1);
+    for (let i = 0; i < busBodies.length; i++) this.addBody(busBodies[i], busBodies[i].speed, i);
 
     this.candTimer -= dt;
     if (this.candTimer <= 0) {
@@ -2191,11 +2503,16 @@ export class CarTraffic {
       this.refreshCandidates(px, py);
     }
     // Remove dead and far-away cars.
+    const R1 = this.radius + 150;
     for (let i = this.cars.length - 1; i >= 0; i--) {
       const c = this.cars[i];
-      const d = Math.hypot(c.x - px, c.y - py);
-      if (c.dead || d > this.radius + 150 || i >= this.maxCars + 6) {
+      const dx = c.x - px;
+      const dy = c.y - py;
+      // (Within R1 for sure, without the hypot, when |dx| + |dy| is well inside it.)
+      const far = Math.abs(dx) + Math.abs(dy) > R1 * 0.999 && hypot2(dx, dy) > R1;
+      if (c.dead || far || i >= this.maxCars + 6) {
         this.kill(c);
+        this.byId.delete(c.id);
         this.cars[i] = this.cars[this.cars.length - 1];
         this.cars.pop();
       }
@@ -2206,19 +2523,40 @@ export class CarTraffic {
       let tries = this.initial ? 400 : 8;
       let made = 0;
       while (this.cars.length < desired && tries-- > 0 && made < (this.initial ? this.capCars : 2)) if (this.spawn(px, py, frustum)) made++;
-      if (this.initial && this.candidates.length) this.initial = false;
+      if (this.initial && this.candN) this.initial = false;
     }
 
-    // Buckets per lane, sorted by u; id lookup (exempt flags are last frame's).
-    for (const list of this.buckets.values()) list.length = 0;
-    this.byId.clear();
-    for (const c of this.cars) {
-      this.byId.set(c.id, c);
-      let l = this.buckets.get(c.lane);
-      if (!l) this.buckets.set(c.lane, (l = []));
-      l.push(c);
+    // Buckets per lane, sorted by u (byId holds every car in the list: kept up as they come and go;
+    // exempt flags are last frame's).
+    // (A lane without cars reads as an empty bucket or none: the same to every reader.)
+    if (this.bucketLanes.length > 4 * this.cars.length + 256) this.pruneBuckets();
+    const bl = this.bucketLanes;
+    const bList = this.bucketList;
+    const bN = this.bucketN;
+    for (let k = 0; k < bl.length; k++) bN[k] = 0;
+    for (let ci = 0; ci < this.cars.length; ci++) {
+      const c = this.cars[ci];
+      let k = this.bucketOf.get(c.lane);
+      if (k === undefined) {
+        k = bl.length;
+        const l: Car[] = [];
+        this.bucketOf.set(c.lane, k);
+        this.buckets.set(c.lane, l);
+        bl.push(c.lane);
+        bList.push(l);
+        bN.push(0);
+      }
+      const l = bList[k];
+      const n = bN[k];
+      if (n < l.length) l[n] = c;
+      else l.push(c);
+      bN[k] = n + 1;
     }
-    for (const l of this.buckets.values()) if (l.length > 1) l.sort((a, b) => a.u - b.u);
+    for (let k = 0; k < bl.length; k++) {
+      const l = bList[k];
+      if (l.length !== bN[k]) l.length = bN[k];
+      if (l.length > 1) sortByU(l);
+    }
 
     const pt = this.pt;
     const signalAt = this.world.signalStateAt;
@@ -2226,29 +2564,22 @@ export class CarTraffic {
     st.waitingRed = 0;
     st.waitingJunction = 0;
     st.stationary = 0;
-    for (const c of this.cars) {
+    // (The junctions cars hold stay reserved for 3 s more.)
+    this.enterUntil = time + 3;
+    for (let ci = 0; ci < this.cars.length; ci++) {
+      const c = this.cars[ci];
       if (c.dead) continue;
       const e = this.edges[c.lane >> 1];
       const remain = e.len - c.u;
       if (c.next < 0 && remain < 70) c.next = this.chooseNext(c.lane, c.laneIdx);
       this.cutOf(c);
       const v0 = (e.limit / 3.6) * c.vWant;
+      this.iV0 = v0;
       const A = CAR_A;
-      const B = 2.6;
-      const T = 1.15;
-      const idm = (gap: number, vLead: number, s0: number) => {
-        const sStar = s0 + Math.max(0, c.v * T + (c.v * (c.v - vLead)) / (2 * Math.sqrt(A * B)));
-        return A * (1 - Math.pow(c.v / Math.max(1, v0), 4) - (sStar / Math.max(0.05, gap)) ** 2);
-      };
-      let acc = A * (1 - Math.pow(c.v / Math.max(1, v0), 4));
-      const wt: { why: Wait; ref: number } = { why: Wait.None, ref: 0 };
-      const lim = (a: number, w: Wait, ref = 0) => {
-        if (a < acc) {
-          acc = a;
-          wt.why = w;
-          wt.ref = ref;
-        }
-      };
+      // The binding acceleration and why (lim), with no closure or captured variable per car.
+      this.lAcc = A * (1 - Math.pow(c.v / Math.max(1, v0), 4));
+      this.lWhy = Wait.None;
+      this.lRef = 0;
       const commitDist = Math.max(2.5, (c.v * c.v) / (2 * 2.5)) + 1.5;
       // Slow for the turn at the end of the lane.
       if (c.next >= 0 && remain < 50) {
@@ -2256,7 +2587,7 @@ export class CarTraffic {
         if (turn > 0.5) {
           const vt = turnSpeed(turn);
           const need = (c.v * c.v - vt * vt) / (2 * Math.max(4, remain - 3));
-          if (need > 0) acc = Math.min(acc, -need * 1.1);
+          if (need > 0) this.lAcc = Math.min(this.lAcc, -need * 1.1);
         }
       }
       // Leader on the same lane (and lane index), or on the next lane.
@@ -2286,21 +2617,32 @@ export class CarTraffic {
           }
         }
       }
-      if (gap < 120) lim(idm(gap, vLead, 2.2), Wait.Car, leadId);
+      if (gap < 120) {
+        this.iGap = gap;
+        this.iVL = vLead;
+        this.idmLim(c, 2.2, Wait.Car, leadId);
+      }
       // Anything else in our path: crossing cars, buses, the player.
       let busBlock = false;
       const look = 5 + c.v * 2;
       for (let d = c.len / 2 + 1; d <= look; d += 2) {
         this.sampleAhead(c, d, pt);
-        const hc = this.carNear(pt.x, pt.y, 1.7, c.id, pt.z);
+        this.qX = pt.x;
+        this.qY = pt.y;
+        this.qZ = pt.z;
+        const hc = this.carNearQ(1.7, c.id);
         if (hc >= 0) {
-          lim(idm(d - c.len / 2 - 0.5, this.grid.pv[hc] * 0.6, 1.6), Wait.Car, this.grid.pid[hc]);
+          this.iGap = d - c.len / 2 - 0.5;
+          this.iVL = this.grid.pv[hc] * 0.6;
+          this.idmLim(c, 1.6, Wait.Car, this.grid.pid[hc]);
           break;
         }
         // A bus (1.25 m half width) touches a car (0.92) 2.2 m from its centreline: look wider than that.
-        const hb = bg.nearest(pt.x, pt.y, 2.5, undefined, pt.z);
+        const hb = this.busNearPt(pt, 2.5);
         if (hb >= 0) {
-          lim(idm(d - c.len / 2 - 0.6, bg.pv[hb] * 0.8, 1.5), bg.pid[hb] === -1 ? Wait.Player : Wait.Bus, bg.pid[hb]);
+          this.iGap = d - c.len / 2 - 0.6;
+          this.iVL = bg.pv[hb] * 0.8;
+          this.idmLim(c, 1.5, bg.pid[hb] === -1 ? Wait.Player : Wait.Bus, bg.pid[hb]);
           busBlock = bg.pv[hb] < 1;
           break;
         }
@@ -2311,11 +2653,11 @@ export class CarTraffic {
       if (c.busWait > 2.5 && this.lanesIn(c.lane) > 1) {
         const to = (c.laneIdx + 1) % this.lanesIn(c.lane);
         // Only into a gap.
-        if (!list.some((o) => o !== c && !o.dead && o.laneIdx === to && Math.abs(o.u - c.u) < c.len + 6)) {
+        if (!this.laneTaken(list, c, to)) {
           c.laneIdx = to;
           // (A turn chosen from the old lane is chosen again from the new one, unless we are committed to it,
           // or to the junction after it, looking through.)
-          if (c.next >= 0 && !c.holds.some((h) => h.node === this.endNode(c.lane) || h.node === this.endNode(c.next))) {
+          if (c.next >= 0 && !this.holdsNode(c, this.endNode(c.lane)) && !this.holdsNode(c, this.endNode(c.next))) {
             c.next = -1;
             c.next2 = -1;
           }
@@ -2353,10 +2695,12 @@ export class CarTraffic {
           for (let q = -c.len / 2 - 4; q <= c.len / 2 + 1 && !mergeBlocked; q += 2.5) {
             const u = Math.min(e.len, Math.max(0, c.u + q));
             this.at(c.lane, u, to, pt);
-            const hb = bg.nearest(pt.x, pt.y, 2.2, undefined, pt.z);
+            const hb = this.busNearPt(pt, 2.2);
             if (hb >= 0 && (bg.pv[hb] >= 1 || (bg.px[hb] - c.x) * chx + (bg.py[hb] - c.y) * chy > -c.len / 2)) {
               mergeBlocked = true;
-              lim(idm(Math.max(0.05, mEnd - c.len / 2 - 1 - hold), 0, 0.6), bg.pid[hb] === -1 ? Wait.Player : Wait.Bus, bg.pid[hb]);
+              this.iGap = Math.max(0.05, mEnd - c.len / 2 - 1 - hold);
+              this.iVL = 0;
+              this.idmLim(c, 0.6, bg.pid[hb] === -1 ? Wait.Player : Wait.Bus, bg.pid[hb]);
             }
           }
         }
@@ -2376,7 +2720,11 @@ export class CarTraffic {
             this.at(c.lane, sig[c.sigI], 0, this.pt2);
             c.sigState = signalAt.call(this.world, xy[2 * c.sigI], xy[2 * c.sigI + 1], time, this.pt2.hx, this.pt2.hy, this.pt2.z);
           }
-          if (c.sigState === 'red' || (c.sigState === 'amber' && sgap > (c.v * c.v) / (2 * 3) + 2)) lim(idm(sgap, 0, 0.8), Wait.Red);
+          if (c.sigState === 'red' || (c.sigState === 'amber' && sgap > (c.v * c.v) / (2 * 3) + 2)) {
+            this.iGap = sgap;
+            this.iVL = 0;
+            this.idmLim(c, 0.8, Wait.Red, 0);
+          }
         }
       }
       // Busway crossings: give way to any bus on the busway.
@@ -2385,10 +2733,12 @@ export class CarTraffic {
       if (c.xsI < xs.length && c.xsCommit !== c.xsI) {
         const xgap = xs[c.xsI] - c.u;
         if (xgap < 45 && xgap > -6) {
-          const q = e.xsXY[c.lane & 1];
-          const k = c.xsI * 5;
-          const bus = this.busOnBusway(q[k], q[k + 1], q[k + 2], q[k + 3], q[k + 4]);
-          if (bus !== -2) lim(idm(Math.max(0.05, xgap), 0, 0.5), bus === -1 ? Wait.Player : Wait.Crossing, bus);
+          const bus = this.busOnBusway(e.xsXY[c.lane & 1], c.xsI * 5);
+          if (bus !== -2) {
+            this.iGap = Math.max(0.05, xgap);
+            this.iVL = 0;
+            this.idmLim(c, 0.5, bus === -1 ? Wait.Player : Wait.Crossing, bus);
+          }
           else if (xgap < 2) c.xsCommit = c.xsI; // keep looking until we are on it
         }
       }
@@ -2398,14 +2748,18 @@ export class CarTraffic {
       const sd = this.stopD[c.lane];
       if (sd > 0 && nd.deg >= 3) {
         if (!nd.sig && !this.minorIn[c.lane] && remain < 25) this.markMajor(N, time, c.lane);
-        if (!c.holds.some((h) => h.node === N) && c.next >= 0) {
+        if (!this.holdsNode(c, N) && c.next >= 0) {
           // (To the stop line from our front, not our middle: waiting with the nose 2 m over it put
           // it in the near lane of a narrow road, the player's bus there passing a metre off it.)
           const stopAt = remain - sd - (c.len / 2 - 0.6);
           if (stopAt < commitDist + 30) {
             this.blockRef = 0;
             const res = this.canGo(c, c.lane, c.next, stopAt, time, 0);
-            if (res !== Wait.None) lim(idm(Math.max(0.05, stopAt), 0, 0.6), res, this.blockRef);
+            if (res !== Wait.None) {
+              this.iGap = Math.max(0.05, stopAt);
+              this.iVL = 0;
+              this.idmLim(c, 0.6, res, this.blockRef);
+            }
             else if (stopAt <= commitDist) this.commit(c, c.lane, c.next, stopAt, time, 0);
           }
         }
@@ -2417,7 +2771,7 @@ export class CarTraffic {
       // to the line of the next and stopped 2 m over it, its nose in an AI bus's way, the bus and then
       // the player's waiting on it for 45 s.) Through a link too short to stop on, canGo's look past it
       // covers it; and not when one follows that junction (canGo would look past it from the wrong lane).
-      if (c.next >= 0 && !(sd > 0 && nd.deg >= 3 && this.shortLink(c.next, nd.boxR, c.len))) {
+      if (c.next >= 0 && !(sd > 0 && nd.deg >= 3 && this.shortLink(c.next, nd, c))) {
         const L1 = c.next;
         const N1 = this.endNode(L1);
         const nd1 = this.nodes[N1];
@@ -2426,19 +2780,23 @@ export class CarTraffic {
         if (sd1 > 0 && nd1.deg >= 3 && N1 !== N && room < commitDist) {
           const stopAt = remain + room;
           if (!nd1.sig && !this.minorIn[L1] && stopAt + sd1 < 25) this.markMajor(N1, time, L1);
-          if (stopAt < commitDist + 30 && !c.holds.some((h) => h.node === N1)) {
+          if (stopAt < commitDist + 30 && !this.holdsNode(c, N1)) {
             if (c.next2 < 0) c.next2 = this.chooseNext(L1, Math.min(c.laneIdx, this.lanesIn(L1) - 1));
-            if (c.next2 >= 0 && !this.shortLink(c.next2, nd1.boxR, c.len)) {
+            if (c.next2 >= 0 && !this.shortLink(c.next2, nd1, c)) {
               this.blockRef = 0;
               const res = this.canGo(c, L1, c.next2, stopAt, time, 0);
-              if (res !== Wait.None) lim(idm(Math.max(0.05, stopAt), 0, 0.6), res, this.blockRef);
+              if (res !== Wait.None) {
+                this.iGap = Math.max(0.05, stopAt);
+                this.iVL = 0;
+                this.idmLim(c, 0.6, res, this.blockRef);
+              }
               // (Committing to it only once through, or sure of, this one.)
-              else if (stopAt <= commitDist && (sd <= 0 || nd.deg < 3 || c.holds.some((h) => h.node === N))) this.commit(c, L1, c.next2, stopAt, time, 0);
+              else if (stopAt <= commitDist && (sd <= 0 || nd.deg < 3 || this.holdsNode(c, N))) this.commit(c, L1, c.next2, stopAt, time, 0);
             }
           }
         }
       }
-      acc = Math.max(-7, Math.min(A, acc));
+      const acc = Math.max(-7, Math.min(A, this.lAcc));
       c.braking = acc < -0.6 || c.v < 0.2;
       c.v = Math.max(0, c.v + acc * dt);
       c.u += c.v * dt;
@@ -2450,8 +2808,8 @@ export class CarTraffic {
         const hn = this.nodes[h.node];
         if (h.d > hn.boxR + c.len) {
           this.leave(h.node, c.id);
-          c.holds.splice(k, 1);
-        } else this.enter(h.node, c.id, h.inX, h.inY, h.outX, h.outY, h.cls, time + 3);
+          removeAt(c.holds, k);
+        } else this.enterM(h.node, c.id, h);
       }
       // Advance onto the next lane (at a left turn's corner, short of the node).
       let guard = 0;
@@ -2468,7 +2826,10 @@ export class CarTraffic {
         }
         const cut = c.cutA > 0 && c.cutNext === c.next;
         const join = cut ? c.cutB : 0;
-        for (const h of c.holds) if (h.node === passed && h.d < 0) h.d = join;
+        for (let k = 0; k < c.holds.length; k++) {
+          const h = c.holds[k];
+          if (h.node === passed && h.d < 0) h.d = join;
+        }
         if (cut) c.lat = c.cutLat;
         c.lane = c.next;
         c.next = c.next2;
@@ -2506,11 +2867,11 @@ export class CarTraffic {
         // kerb at the node, and a car there moved 1.7 m into the side of the player's bus overtaking it
         // in the kerb lane (222/0 s 2484). We move over once it is by.
         this.at(c.lane, c.u, c.lat + Math.sign(dl) * 0.8, pt);
-        const hb = bg.nearest(pt.x, pt.y, 2.7, undefined, pt.z);
+        const hb = this.busNearPt(pt, 2.7);
         if (hb >= 0) {
-          const d1 = Math.hypot(bg.px[hb] - pt.x, bg.py[hb] - pt.y);
+          const d1 = hypot2(bg.px[hb] - pt.x, bg.py[hb] - pt.y);
           this.at(c.lane, c.u, c.lat, pt);
-          if (d1 < Math.hypot(bg.px[hb] - pt.x, bg.py[hb] - pt.y)) dl = 0;
+          if (d1 < hypot2(bg.px[hb] - pt.x, bg.py[hb] - pt.y)) dl = 0;
         }
       }
       c.lat += dl;
@@ -2523,15 +2884,16 @@ export class CarTraffic {
       // Grade pitch, eased so cars do not snap over polyline kinks.
       c.pitch += (Math.atan(pt.g) - c.pitch) * Math.min(1, dt * 5);
       // Waiting legitimately? (Red light, the player, or queued behind someone who is.)
-      const why = wt.why;
+      const why = this.lWhy as Wait;
+      const wref = this.lRef as number;
       c.why = why;
-      c.ref = wt.ref;
+      c.ref = wref;
       c.exempt =
         why === Wait.Red ||
         why === Wait.Player ||
         // Queued behind someone who is (also across a junction: its exit is full of such a queue).
-        ((why === Wait.Car || (why === Wait.Junction && wt.ref > 0)) && (this.byId.get(wt.ref)?.exempt ?? false)) ||
-        ((why === Wait.Bus || why === Wait.Crossing) && !!busExempt[wt.ref]);
+        ((why === Wait.Car || (why === Wait.Junction && wref > 0)) && (this.byId.get(wref)?.exempt ?? false)) ||
+        ((why === Wait.Bus || why === Wait.Crossing) && !!busExempt[wref]);
       if (why === Wait.Red) st.waitingRed++;
       if (why === Wait.Junction) st.waitingJunction++;
       if (c.v < 0.3) st.stationary++;
@@ -2539,7 +2901,7 @@ export class CarTraffic {
       if (c.v < 0.3 && !c.exempt && why !== Wait.None) c.idle += dt;
       else c.idle = 0;
       if (c.idle > (c.visible ? 45 : 25)) {
-        this.note(`stuck lane ${c.lane} u ${c.u.toFixed(1)}/${e.len.toFixed(1)} why ${wt.why} ref ${wt.ref} end ${N} sig ${nd.sig}`);
+        this.note(`stuck lane ${c.lane} u ${c.u.toFixed(1)}/${e.len.toFixed(1)} why ${why} ref ${wref} end ${N} sig ${nd.sig}`);
         this.kill(c);
         st.stuckDespawns++;
       }
@@ -2550,7 +2912,7 @@ export class CarTraffic {
         c.stall = 0;
       } else c.stall += dt;
       if (!c.dead && c.stall > (c.visible ? STALL_VISIBLE : STALL_HIDDEN)) {
-        this.note(`stall lane ${c.lane} u ${c.u.toFixed(1)} why ${wt.why} ref ${wt.ref} end ${N} sig ${nd.sig}`);
+        this.note(`stall lane ${c.lane} u ${c.u.toFixed(1)} why ${why} ref ${wref} end ${N} sig ${nd.sig}`);
         this.kill(c);
         st.stallDespawns++;
       }
@@ -2559,23 +2921,36 @@ export class CarTraffic {
     // Car grid (for buses, the probes above and overlap checks).
     const g = this.grid;
     g.clear();
-    for (const c of this.cars) {
+    for (let ci = 0; ci < this.cars.length; ci++) {
+      const c = this.cars[ci];
       if (c.dead) continue;
       const hx = Math.sin(c.heading);
       const hy = Math.cos(c.heading);
       const dz = Math.tan(c.pitch) * c.len * 0.3;
-      g.add(c.x + hx * c.len * 0.3, c.y + hy * c.len * 0.3, c.v, c.id, c.z + dz);
-      g.add(c.x - hx * c.len * 0.3, c.y - hy * c.len * 0.3, c.v, c.id, c.z - dz);
+      g.qv = c.v;
+      g.qx = c.x + hx * c.len * 0.3;
+      g.qy = c.y + hy * c.len * 0.3;
+      g.qz = c.z + dz;
+      g.addQ(c.id);
+      g.qx = c.x - hx * c.len * 0.3;
+      g.qy = c.y - hy * c.len * 0.3;
+      g.qz = c.z - dz;
+      g.addQ(c.id);
     }
     // Safety valve: vehicles that overlap are removed (the one behind; cars give way to buses).
-    for (const c of this.cars) {
+    for (let ci = 0; ci < this.cars.length; ci++) {
+      const c = this.cars[ci];
       if (c.dead) continue;
       const hx = Math.sin(c.heading);
       const hy = Math.cos(c.heading);
-      for (const f of [0.3, -0.3]) {
+      for (let fi = 0; fi < 2; fi++) {
+        const f = fi === 0 ? 0.3 : -0.3;
         const qx = c.x + hx * c.len * f;
         const qy = c.y + hy * c.len * f;
-        const oc = this.carNear(qx, qy, 1.2, c.id, c.z);
+        this.qX = qx;
+        this.qY = qy;
+        this.qZ = c.z;
+        const oc = this.carNearQ(1.2, c.id);
         if (oc >= 0) {
           const o = this.byId.get(g.pid[oc]);
           if (o && !o.dead) {
@@ -2586,7 +2961,10 @@ export class CarTraffic {
             break;
           }
         }
-        const ob = bg.nearest(qx, qy, 1.6, undefined, c.z);
+        bg.qx = qx;
+        bg.qy = qy;
+        bg.qz = c.z;
+        const ob = bg.nearestQ(1.6);
         // Inside an AI bus, or deep inside the player's bus (the player is never moved for it).
         if (ob >= 0 && (bg.pid[ob] >= 0 || (bg.px[ob] - qx) ** 2 + (bg.py[ob] - qy) ** 2 < 1.0)) {
           this.note(`car-bus lane ${c.lane} u ${c.u.toFixed(1)} v ${c.v.toFixed(1)} bus v ${bg.pv[ob].toFixed(1)} holds ${c.holds.map((h) => h.node)} end ${this.endNode(c.lane)}`);
@@ -2596,13 +2974,16 @@ export class CarTraffic {
         }
         // Touching the player's bus ahead: stop dead (it is never shoved out of the way).
         if (f > 0 && !c.dead) {
-          let touch = false;
-          bg.query(qx, qy, 2.3, (i) => {
-            if (bg.pid[i] !== -1 || Math.abs(bg.pz[i] - c.z) > LEVEL_GAP) return false;
-            touch = (bg.px[i] - c.x) * hx + (bg.py[i] - c.y) * hy > 0;
-            return touch;
-          });
-          if (touch) c.v = 0;
+          this.qX = c.x;
+          this.qY = c.y;
+          this.qZ = c.z;
+          this.qHx = hx;
+          this.qHy = hy;
+          this.qHit = false;
+          bg.qx = qx;
+          bg.qy = qy;
+          bg.queryQ(2.3, this.touchFn);
+          if (this.qHit) c.v = 0;
         }
       }
     }
@@ -2619,9 +3000,33 @@ export class CarTraffic {
     }
   }
 
+  /** A body's points and the midpoints between them (<= ~1.8 m apart) into the bus grid, so a probe with the contact radius cannot slip between two points. */
+  private addBody(b: Body, v: number, id: number): void {
+    const bg = this.busGrid;
+    bg.qv = v;
+    for (let k = 0; k < b.n; k++) {
+      bg.qx = b.x[k];
+      bg.qy = b.y[k];
+      bg.qz = b.z[k];
+      bg.addQ(id);
+      if (k + 1 < b.n) {
+        bg.qx = (b.x[k] + b.x[k + 1]) / 2;
+        bg.qy = (b.y[k] + b.y[k + 1]) / 2;
+        bg.qz = (b.z[k] + b.z[k + 1]) / 2;
+        bg.addQ(id);
+      }
+    }
+  }
+
   private sampleAhead(c: Car, d: number, out: LanePt): void {
+    this.saD = d;
+    this.sampleAheadF(c, out);
+  }
+
+  /** sampleAhead() with its distance in saD. */
+  private sampleAheadF(c: Car, out: LanePt): void {
     const e = this.edges[c.lane >> 1];
-    const u = c.u + d;
+    const u = c.u + this.saD;
     // (cutOf is current: the car's update has just called it)
     const end = e.len - c.cutA;
     if (u <= end || c.next < 0) this.at(c.lane, Math.min(u, e.len), c.lat, out);
