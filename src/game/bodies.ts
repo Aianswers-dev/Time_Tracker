@@ -130,4 +130,90 @@ export class PointGrid {
     }
     return best;
   }
+
+  // The Q variants take the position (and addQ's payload) from qx, qy, qz and qv instead of as
+  // arguments, so a hot loop whose call to them is not inlined passes no doubles (V8 boxes each).
+  // Same walk and results as add, query and nearest.
+  qx = 0.5;
+  qy = 0.5;
+  qz = 0.5;
+  qv = 0.5;
+
+  addQ(id: number): void {
+    if (this.count >= this.px.length) this.grow();
+    const x = this.qx;
+    const y = this.qy;
+    const i = this.count++;
+    this.px[i] = x;
+    this.py[i] = y;
+    this.pz[i] = this.qz;
+    this.pv[i] = this.qv;
+    this.pid[i] = id;
+    const k = this.key(Math.floor(x / this.cell), Math.floor(y / this.cell));
+    this.next[i] = this.head[k];
+    this.head[k] = i;
+  }
+
+  queryQ(r: number, fn: (i: number) => boolean): void {
+    const x = this.qx;
+    const y = this.qy;
+    const c0x = Math.floor((x - r) / this.cell);
+    const c1x = Math.floor((x + r) / this.cell);
+    const c0y = Math.floor((y - r) / this.cell);
+    const c1y = Math.floor((y + r) / this.cell);
+    const r2 = r * r;
+    for (let cy = c0y; cy <= c1y; cy++) {
+      for (let cx = c0x; cx <= c1x; cx++) {
+        for (let i = this.head[this.key(cx, cy)]; i >= 0; i = this.next[i]) {
+          const dx = this.px[i] - x;
+          const dy = this.py[i] - y;
+          if (dx * dx + dy * dy <= r2 && fn(i)) return;
+        }
+      }
+    }
+  }
+
+  /** nearest() about (qx, qy), on the level of qz (NaN: any level). */
+  nearestQ(r: number, skip = -2147483648, maxDz = 2.5): number {
+    const x = this.qx;
+    const y = this.qy;
+    const z = this.qz;
+    const lv = z === z;
+    const c0x = Math.floor((x - r) / this.cell);
+    const c1x = Math.floor((x + r) / this.cell);
+    const c0y = Math.floor((y - r) / this.cell);
+    const c1y = Math.floor((y + r) / this.cell);
+    let best = -1;
+    let bd = r * r;
+    for (let cy = c0y; cy <= c1y; cy++) {
+      for (let cx = c0x; cx <= c1x; cx++) {
+        for (let i = this.head[this.key(cx, cy)]; i >= 0; i = this.next[i]) {
+          if (this.pid[i] === skip || (lv && Math.abs(this.pz[i] - z) > maxDz)) continue;
+          const dx = this.px[i] - x;
+          const dy = this.py[i] - y;
+          const d = dx * dx + dy * dy;
+          if (d < bd) {
+            bd = d;
+            best = i;
+          }
+        }
+      }
+    }
+    return best;
+  }
+
+  private grow(): void {
+    const cap = this.px.length * 2;
+    const grow = <T extends Float32Array | Int32Array>(a: T, C: new (n: number) => T): T => {
+      const b = new C(cap);
+      b.set(a);
+      return b;
+    };
+    this.next = grow(this.next, Int32Array);
+    this.px = grow(this.px, Float32Array);
+    this.py = grow(this.py, Float32Array);
+    this.pz = grow(this.pz, Float32Array);
+    this.pv = grow(this.pv, Float32Array);
+    this.pid = grow(this.pid, Int32Array);
+  }
 }

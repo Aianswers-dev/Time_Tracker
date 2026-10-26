@@ -6,8 +6,15 @@
  * rail corridors (so the ground never covers a carriageway), and cells under
  * deep cuttings are removed (`hole`) so open cuttings are really open; the
  * corridor builder covers the hole edges with walls and cap strips.
+ *
+ * The walled station cuttings (MapData.terrain.cuts, src/data/cuts.ts) are
+ * carved out exactly along their outlines, with the floor inside them as the
+ * ground (natAt, renAt, settledAt); the grid vertices inside an outline keep
+ * the natural ground (see settle()), so the ground outside runs level up to
+ * the walls (src/world/roads.ts stands them on the outlines).
  */
 import * as THREE from 'three';
+import { type CutIndex, type CutPiece, cutIndexFor } from '../data/cuts';
 import { AreaKind, type MapData } from '../types';
 import type { Ctx } from './ctx';
 import { NOISE_GLSL, patch } from './shaders';
@@ -34,6 +41,15 @@ export class TerrainField {
   readonly ony: number;
   readonly oh: Float32Array;
   readonly waterLevel: number;
+  /** Walled station cuttings: the floor is the ground inside their outlines. */
+  readonly stationCuts: CutIndex;
+  /**
+   * Per vertex: the lowest height a clamp from outside every station cutting allows (cap counts the
+   * clamps of the roads inside one too); and 1 for the vertices inside a cutting's outline, which
+   * settle() lifts back to the natural ground (or that cap).
+   */
+  private readonly capOut: Float32Array;
+  private readonly cutVert: Uint8Array;
 
   constructor(data: MapData) {
     const t = data.terrain;
@@ -56,6 +72,33 @@ export class TerrainField {
     this.ony = outer.ny;
     this.oh = outer.h;
     this.waterLevel = t.waterLevel;
+    this.stationCuts = cutIndexFor(t);
+    this.capOut = new Float32Array(this.stationCuts.pieces.length ? this.nx * this.ny : 0).fill(Infinity);
+    this.cutVert = new Uint8Array(this.stationCuts.pieces.length ? this.nx * this.ny : 0);
+    for (const p of this.stationCuts.pieces) this.carveStationPiece(p);
+  }
+
+  /** Carve one convex piece of a station cutting's outline exactly (earth faces down to its floor), and mark the grid vertices inside it. */
+  private carveStationPiece(p: CutPiece): void {
+    const c = this.cell;
+    const f = this.stationCuts.cuts[p.cut].floor;
+    const cut = makePolyCut(p.pts, f);
+    this.cutList.push(cut);
+    const i0 = Math.max(0, Math.floor((p.x0 - this.x0) / c));
+    const i1 = Math.min(this.nx - 2, Math.floor((p.x1 - this.x0) / c));
+    const j0 = Math.max(0, Math.floor((p.y0 - this.y0) / c));
+    const j1 = Math.min(this.ny - 2, Math.floor((p.y1 - this.y0) / c));
+    for (let j = j0; j <= j1; j++) {
+      for (let i = i0; i <= i1; i++) {
+        if (!squareMeetsPoly(p.pts, this.x0 + (i + 0.5) * c, this.y0 + (j + 0.5) * c, c / 2)) continue;
+        const k = j * (this.nx - 1) + i;
+        this.hole[k] = 1;
+        let l = this.cuts.get(k);
+        if (!l) this.cuts.set(k, (l = []));
+        l.push(cut);
+      }
+    }
+    for (let j = j0; j <= j1 + 1; j++) for (let i = i0; i <= i1 + 1; i++) if (cutHas(cut, this.x0 + i * c, this.y0 + j * c)) this.cutVert[j * this.nx + i] = 1;
   }
 
   /** Inner grid extent [x0, y0, x1, y1]. */
@@ -81,8 +124,10 @@ export class TerrainField {
     return (h[k] * (1 - tx) + h[k + 1] * tx) * (1 - ty) + (h[k + this.onx] * (1 - tx) + h[k + this.onx + 1] * tx) * ty;
   }
 
-  /** Natural ground (bilinear, as Heights.ground). */
+  /** Natural ground (bilinear, as Heights.ground; a station cutting's floor inside its outline). */
   natAt(x: number, y: number): number {
+    const sf = this.stationCuts.floorAt(x, y);
+    if (sf === sf) return sf;
     const fx = (x - this.x0) / this.cell;
     const fy = (y - this.y0) / this.cell;
     if (fx < 0 || fy < 0 || fx > this.nx - 1 || fy > this.ny - 1) return this.outerAt(x, y);
@@ -95,8 +140,10 @@ export class TerrainField {
     return (h[k] * (1 - tx) + h[k + 1] * tx) * (1 - ty) + (h[k + this.nx] * (1 - tx) + h[k + this.nx + 1] * tx) * ty;
   }
 
-  /** Rendered ground height, exactly matching the mesh triangulation (diagonal a-c). */
+  /** Rendered ground height, exactly matching the mesh triangulation (diagonal a-c); a station cutting's floor inside its outline. */
   renAt(x: number, y: number): number {
+    const sf = this.stationCuts.floorAt(x, y);
+    if (sf === sf) return sf;
     const fx = (x - this.x0) / this.cell;
     const fy = (y - this.y0) / this.cell;
     if (fx < 0 || fy < 0 || fx > this.nx - 1 || fy > this.ny - 1) return this.outerAt(x, y);
@@ -113,6 +160,48 @@ export class TerrainField {
     // triangles (a, b, c) where tx >= ty, else (a, c, d)
     if (tx >= ty) return a + (b - a) * tx + (c - b) * ty;
     return a + (c - d) * tx + (d - a) * ty;
+  }
+
+  /**
+   * The ground as settle() will leave it, given the clamps and buried roofs
+   * recorded so far (later clamps can only lower it): never below the
+   * natural ground except where a road clamp holds it down. Inside a station
+   * cutting's outline, its floor.
+   */
+  settledAt(x: number, y: number): number {
+    const sf = this.stationCuts.floorAt(x, y);
+    if (sf === sf) return sf;
+    const fx = (x - this.x0) / this.cell;
+    const fy = (y - this.y0) / this.cell;
+    if (fx < 0 || fy < 0 || fx > this.nx - 1 || fy > this.ny - 1) return this.outerAt(x, y);
+    const i = Math.min(this.nx - 2, Math.floor(fx));
+    const j = Math.min(this.ny - 2, Math.floor(fy));
+    const tx = fx - i;
+    const ty = fy - j;
+    const k = j * this.nx + i;
+    const a = this.settledVert(k);
+    const b = this.settledVert(k + 1);
+    const c = this.settledVert(k + this.nx + 1);
+    const d = this.settledVert(k + this.nx);
+    if (tx >= ty) return a + (b - a) * tx + (c - b) * ty;
+    return a + (c - d) * tx + (d - a) * ty;
+  }
+
+  /** Grid vertex q as settle() will leave it (see settledAt). */
+  private settledVert(q: number): number {
+    const r = this.ren[q];
+    const f = this.floor[q] + 0.3;
+    let v = f > r ? Math.max(r, Math.min(f, this.cap[q])) : r;
+    // inside a station cutting's outline: the natural ground, unless a road outside holds it down
+    if (this.cutVert.length && this.cutVert[q]) v = Math.max(v, Math.min(this.nat[q], this.capOut[q]));
+    return v;
+  }
+
+  /** Record a clamp of grid vertex k to z: `outside` when what clamps it lies outside every station cutting. */
+  private clampVert(k: number, z: number, outside: boolean): void {
+    if (z < this.ren[k]) this.ren[k] = z;
+    if (z < this.cap[k]) this.cap[k] = z;
+    if (outside && this.capOut.length && z < this.capOut[k]) this.capOut[k] = z;
   }
 
   /** True if (x, y) falls in a carved-out cell. */
@@ -135,6 +224,8 @@ export class TerrainField {
     const j0 = Math.max(0, Math.ceil((Math.min(...ys) - this.y0) / this.cell));
     const j1 = Math.min(this.ny - 1, Math.floor((Math.max(...ys) - this.y0) / this.cell));
     if (i1 < i0 || j1 < j0) return;
+    // (a surface inside a station cutting holds the ground down only until settle(): see cutVert)
+    const outside = !this.stationCuts.has((xs[0] + xs[1] + xs[2] + xs[3]) / 4, (ys[0] + ys[1] + ys[2] + ys[3]) / 4);
     for (let j = j0; j <= j1; j++) {
       const y = this.y0 + j * this.cell;
       for (let i = i0; i <= i1; i++) {
@@ -142,10 +233,7 @@ export class TerrainField {
         let z = triZ(q, 0, 3, 6, x, y);
         if (z === null) z = triZ(q, 0, 6, 9, x, y);
         if (z === null) continue;
-        const k = j * this.nx + i;
-        const v = z - margin;
-        if (v < this.ren[k]) this.ren[k] = v;
-        if (v < this.cap[k]) this.cap[k] = v;
+        this.clampVert(j * this.nx + i, z - margin, outside);
       }
     }
   }
@@ -153,9 +241,10 @@ export class TerrainField {
   /**
    * Mark a buried structure (a tunnel roof segment, convex quad of x,y,z corners):
    * vertices within `expand` metres keep the ground, and terrain skirts, above
-   * its highest corner.
+   * its highest corner, except where `keep(x, y)` (ground that belongs to
+   * something else at its own level, such as a platform's slab).
    */
-  protectQuad(q: number[], expand: number): void {
+  protectQuad(q: number[], expand: number, keep?: (x: number, y: number) => boolean): void {
     const xs = [q[0], q[3], q[6], q[9]];
     const ys = [q[1], q[4], q[7], q[10]];
     const top = Math.max(q[2], q[5], q[8], q[11]);
@@ -168,7 +257,7 @@ export class TerrainField {
       for (let i = i0; i <= i1; i++) {
         const x = this.x0 + i * this.cell;
         const k = j * this.nx + i;
-        if (top > this.floor[k] && quadDist(q, x, y) <= expand) this.floor[k] = top;
+        if (top > this.floor[k] && quadDist(q, x, y) <= expand && !keep?.(x, y)) this.floor[k] = top;
       }
     }
   }
@@ -183,16 +272,72 @@ export class TerrainField {
     return Math.max(f[k], f[k + 1], f[k + this.nx], f[k + this.nx + 1]);
   }
 
-  /** After all earthworks: lift ground that sags into a shallow tunnel roof (never above a road clamp). */
-  settle(): void {
-    const { ren, floor, cap } = this;
-    for (let k = 0; k < ren.length; k++) {
-      if (floor[k] + 0.3 > ren[k]) ren[k] = Math.max(ren[k], Math.min(floor[k] + 0.3, cap[k]));
+  /** Total drop lowerAt() has given each grid vertex. */
+  private dropped: Float32Array | null = null;
+
+  /**
+   * Lower the three grid vertices of the ground triangle over (x, y) by `d`
+   * below their settled height, so the ground there drops by d. Refused
+   * (false, nothing changed) where a vertex holds ground over a buried roof,
+   * borders a cutting (whose walls and faces follow the ground as it is), or
+   * would drop more than `maxDrop` in all.
+   */
+  lowerAt(x: number, y: number, d: number, maxDrop = 0.35): boolean {
+    const fx = (x - this.x0) / this.cell;
+    const fy = (y - this.y0) / this.cell;
+    if (fx < 0 || fy < 0 || fx > this.nx - 1 || fy > this.ny - 1) return false;
+    const i = Math.min(this.nx - 2, Math.floor(fx));
+    const j = Math.min(this.ny - 2, Math.floor(fy));
+    const k = j * this.nx + i;
+    const vs = fx - i >= fy - j ? [k, k + 1, k + this.nx + 1] : [k, k + this.nx + 1, k + this.nx];
+    const t = vs.map((q) => this.settledVert(q) - d);
+    const dr = (this.dropped ??= new Float32Array(this.nx * this.ny));
+    const hw = this.nx - 1;
+    for (let m = 0; m < 3; m++) {
+      const q = vs[m];
+      if (this.floor[q] + 0.3 > t[m] || dr[q] + d > maxDrop) return false;
+      const vi = q % this.nx;
+      const vj = (q - vi) / this.nx;
+      for (let cj = Math.max(0, vj - 1); cj <= Math.min(this.ny - 2, vj); cj++)
+        for (let ci = Math.max(0, vi - 1); ci <= Math.min(hw - 1, vi); ci++) if (this.hole[cj * hw + ci] === 1) return false;
     }
+    const outside = !this.stationCuts.has(x, y);
+    for (let m = 0; m < 3; m++) {
+      const q = vs[m];
+      dr[q] += d;
+      this.clampVert(q, t[m], outside);
+    }
+    return true;
   }
 
-  /** Mark cells whose square overlaps the convex quad (x, y corners) grown by `expand` metres as holes. */
-  holeQuad(q: number[], expand: number): void {
+  /**
+   * After all earthworks: lift ground that sags into a shallow tunnel roof (never above a road clamp).
+   * The grid vertices inside a station cutting's outline go back up to the natural ground (unless a
+   * road outside the cutting holds one down): the roads inside clamped them, but the cutting is carved
+   * out exactly, and they only shape the ground outside the walls, which runs level up to them.
+   */
+  settle(): void {
+    const { ren } = this;
+    for (let k = 0; k < ren.length; k++) ren[k] = this.settledVert(k);
+  }
+
+  /**
+   * Carve the ground out of the convex quad q (corners in order, each [x, y, z]),
+   * grown by `expand` metres. The cut is exact: cells it touches are marked in
+   * `hole` and keep their ground outside the quad (see chunkGeometry), with an
+   * earth face hanging from the cut edge down to the quad's floor. The floor
+   * height is taken along the quad's first edge (corners 0 -> 1, the road
+   * centreline for cuttings). `roof`: a structure covers this cut (a tunnel
+   * box roof), so it is not open to the sky. `endExpand`: the margin across the
+   * quad's ends (edges 3-0 and 1-2), where the next sample's cut or surface
+   * takes over exactly. `minor`: only a sliver of ground over a road surface
+   * (no cutting): carved in the near detail level only, and not a hole for
+   * trees and houses.
+   */
+  holeQuad(q: number[], expand: number, roof = false, endExpand = expand, minor = false): void {
+    const cut = makeCut(q, expand, roof, endExpand, minor);
+    if (!cut) return;
+    this.cutList.push(cut);
     const xs = [q[0], q[3], q[6], q[9]];
     const ys = [q[1], q[4], q[7], q[10]];
     const c = this.cell;
@@ -204,10 +349,321 @@ export class TerrainField {
       const y = this.y0 + (j + 0.5) * c;
       for (let i = i0; i <= i1; i++) {
         const x = this.x0 + (i + 0.5) * c;
-        if (squareMeetsQuad(q, x, y, c / 2, expand)) this.hole[j * (this.nx - 1) + i] = 1;
+        if (!squareMeetsQuad(q, x, y, c / 2, expand)) continue;
+        const k = j * (this.nx - 1) + i;
+        this.hole[k] = minor && this.hole[k] !== 1 ? 2 : 1;
+        let l = this.cuts.get(k);
+        if (!l) this.cuts.set(k, (l = []));
+        l.push(cut);
       }
     }
   }
+
+  /** Carved regions per cell (index j * (nx - 1) + i). */
+  readonly cuts = new Map<number, Cut[]>();
+  /** Every carved region, in order. */
+  readonly cutList: Cut[] = [];
+
+  /** The carved regions over (x, y): open cuttings only, unless `roofed` too. */
+  cutsAt(x: number, y: number, roofed = false): Cut[] {
+    const i = Math.floor((x - this.x0) / this.cell);
+    const j = Math.floor((y - this.y0) / this.cell);
+    if (i < 0 || j < 0 || i >= this.nx - 1 || j >= this.ny - 1) return [];
+    const l = this.cuts.get(j * (this.nx - 1) + i);
+    if (!l) return [];
+    return l.filter((c) => (roofed || !c.roof) && cutHas(c, x, y));
+  }
+
+  /** Tunnel boxes (per cell): earth faces stop at their roofs, so a cut ending at a portal never closes the mouth. */
+  readonly roofs = new Map<number, Cut[]>();
+
+  /** Record a tunnel box's footprint (convex quad, x, y, z per corner) and the top of its roof. */
+  addRoof(q: number[], top: number): void {
+    const qq = [q[0], q[1], top, q[3], q[4], top, q[6], q[7], top, q[9], q[10], top];
+    const cut = makeCut(qq, 0, true, 0);
+    if (!cut) return;
+    const i0 = Math.max(0, Math.floor((cut.x0 - this.x0) / this.cell));
+    const i1 = Math.min(this.nx - 2, Math.floor((cut.x1 - this.x0) / this.cell));
+    const j0 = Math.max(0, Math.floor((cut.y0 - this.y0) / this.cell));
+    const j1 = Math.min(this.ny - 2, Math.floor((cut.y1 - this.y0) / this.cell));
+    for (let j = j0; j <= j1; j++)
+      for (let i = i0; i <= i1; i++) {
+        const k = j * (this.nx - 1) + i;
+        let l = this.roofs.get(k);
+        if (!l) this.roofs.set(k, (l = []));
+        l.push(cut);
+      }
+  }
+
+  /** Top of the highest tunnel box roof over (x, y), or -Infinity. */
+  roofAt(x: number, y: number): number {
+    const i = Math.floor((x - this.x0) / this.cell);
+    const j = Math.floor((y - this.y0) / this.cell);
+    if (i < 0 || j < 0 || i >= this.nx - 1 || j >= this.ny - 1) return -Infinity;
+    let top = -Infinity;
+    for (const c of this.roofs.get(j * (this.nx - 1) + i) ?? []) if (cutHas(c, x, y)) top = Math.max(top, c.za);
+    return top;
+  }
+
+  /** Every cut (open or roofed) recorded in the cells overlapping the box. */
+  cutsNear(x0: number, y0: number, x1: number, y1: number): Cut[] {
+    const i0 = Math.max(0, Math.floor((x0 - this.x0) / this.cell));
+    const i1 = Math.min(this.nx - 2, Math.floor((x1 - this.x0) / this.cell));
+    const j0 = Math.max(0, Math.floor((y0 - this.y0) / this.cell));
+    const j1 = Math.min(this.ny - 2, Math.floor((y1 - this.y0) / this.cell));
+    const out: Cut[] = [];
+    for (let j = j0; j <= j1; j++)
+      for (let i = i0; i <= i1; i++) for (const c of this.cuts.get(j * (this.nx - 1) + i) ?? []) if (!out.includes(c)) out.push(c);
+    return out;
+  }
+
+  /** True if (x, y) lies inside an open cutting (no ground over it, open to the sky). */
+  inCut(x: number, y: number): boolean {
+    return this.cutsAt(x, y).length > 0;
+  }
+}
+
+/**
+ * A carved region: a convex polygon as half-planes hx * x + hy * y <= hd
+ * (already grown by the expand margin), with the floor height along the
+ * quad's first edge (a -> b).
+ */
+export interface Cut {
+  hx: number[];
+  hy: number[];
+  hd: number[];
+  ax: number;
+  ay: number;
+  bx: number;
+  by: number;
+  za: number;
+  zb: number;
+  roof: boolean;
+  /** Carved in the near detail level only (see holeQuad). */
+  minor: boolean;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  /** The quad as given (x, y, z per corner). */
+  q: number[];
+  /** A station cutting's piece: its floor is this plane (z = a + b x + c y), not along a -> b. */
+  plane?: [number, number, number];
+}
+
+/** A convex piece (counter-clockwise corners, flat x, y) of a station cutting with floor plane f, as a Cut. */
+function makePolyCut(pts: number[], f: [number, number, number]): Cut {
+  const hx: number[] = [];
+  const hy: number[] = [];
+  const hd: number[] = [];
+  const n = pts.length / 2;
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  for (let k = 0; k < n; k++) {
+    const ax = pts[2 * k];
+    const ay = pts[2 * k + 1];
+    const ex = pts[(2 * k + 2) % pts.length] - ax;
+    const ey = pts[(2 * k + 3) % pts.length] - ay;
+    x0 = Math.min(x0, ax);
+    x1 = Math.max(x1, ax);
+    y0 = Math.min(y0, ay);
+    y1 = Math.max(y1, ay);
+    const l = Math.hypot(ex, ey);
+    if (l < 1e-6) continue;
+    hx.push(ey / l);
+    hy.push(-ex / l);
+    hd.push((ey * ax - ex * ay) / l);
+  }
+  const z = (x: number, y: number) => f[0] + f[1] * x + f[2] * y;
+  return { hx, hy, hd, ax: pts[0], ay: pts[1], bx: pts[2], by: pts[3], za: z(pts[0], pts[1]), zb: z(pts[2], pts[3]), roof: false, minor: false, x0: x0 - 0.01, y0: y0 - 0.01, x1: x1 + 0.01, y1: y1 + 0.01, q: [], plane: f };
+}
+
+/** Separating-axis test: does the axis-aligned square (centre, half size) overlap the convex polygon (flat x, y)? */
+function squareMeetsPoly(p: number[], cx: number, cy: number, half: number): boolean {
+  const axes: [number, number][] = [
+    [1, 0],
+    [0, 1],
+  ];
+  const n = p.length / 2;
+  for (let k = 0; k < n; k++) {
+    const ex = p[(2 * k + 2) % p.length] - p[2 * k];
+    const ey = p[(2 * k + 3) % p.length] - p[2 * k + 1];
+    const l = Math.hypot(ex, ey);
+    if (l > 1e-6) axes.push([-ey / l, ex / l]);
+  }
+  for (const [ax, ay] of axes) {
+    const c = cx * ax + cy * ay;
+    const r = half * (Math.abs(ax) + Math.abs(ay));
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let k = 0; k < p.length; k += 2) {
+      const v = p[k] * ax + p[k + 1] * ay;
+      lo = Math.min(lo, v);
+      hi = Math.max(hi, v);
+    }
+    if (c + r < lo || c - r > hi) return false;
+  }
+  return true;
+}
+
+function makeCut(q: number[], expand: number, roof: boolean, endExpand: number, minor = false): Cut | null {
+  // convex hull of the four corners (a sharp bend can fold a sample quad into a bow tie)
+  const pts: [number, number, number][] = [
+    [q[0], q[1], 0],
+    [q[3], q[4], 1],
+    [q[6], q[7], 2],
+    [q[9], q[10], 3],
+  ];
+  pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o: number[], a: number[], b: number[]) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower: [number, number, number][] = [];
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 1e-9) lower.pop();
+    lower.push(p);
+  }
+  const upper: [number, number, number][] = [];
+  for (let k = pts.length - 1; k >= 0; k--) {
+    const p = pts[k];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 1e-9) upper.pop();
+    upper.push(p);
+  }
+  const hull = lower.slice(0, -1).concat(upper.slice(0, -1)); // counter-clockwise
+  const hx: number[] = [];
+  const hy: number[] = [];
+  const hd: number[] = [];
+  const add = (nx: number, ny: number, px: number, py: number, e = expand) => {
+    hx.push(nx);
+    hy.push(ny);
+    hd.push(nx * px + ny * py + e);
+  };
+  if (hull.length >= 3) {
+    for (let k = 0; k < hull.length; k++) {
+      const a = hull[k];
+      const b = hull[(k + 1) % hull.length];
+      const ex = b[0] - a[0];
+      const ey = b[1] - a[1];
+      const l = Math.hypot(ex, ey);
+      if (l < 1e-6) continue;
+      const lo = Math.min(a[2], b[2]);
+      const hi = Math.max(a[2], b[2]);
+      const end = (lo === 0 && hi === 3) || (lo === 1 && hi === 2);
+      add(ey / l, -ex / l, a[0], a[1], end ? endExpand : expand);
+    }
+  } else {
+    // degenerate (a line): a thin slab around the segment
+    const a = pts[0];
+    const b = pts[pts.length - 1];
+    const ex = b[0] - a[0];
+    const ey = b[1] - a[1];
+    const l = Math.hypot(ex, ey);
+    if (l < 1e-6) return null;
+    add(ey / l, -ex / l, a[0], a[1]);
+    add(-ey / l, ex / l, a[0], a[1]);
+    add(ex / l, ey / l, b[0], b[1]);
+    add(-ex / l, -ey / l, a[0], a[1]);
+  }
+  const xs = [q[0], q[3], q[6], q[9]];
+  const ys = [q[1], q[4], q[7], q[10]];
+  const m = expand * 1.5 + 0.01;
+  return {
+    hx,
+    hy,
+    hd,
+    ax: q[0],
+    ay: q[1],
+    bx: q[3],
+    by: q[4],
+    za: q[2],
+    zb: q[5],
+    roof,
+    minor,
+    x0: Math.min(...xs) - m,
+    y0: Math.min(...ys) - m,
+    x1: Math.max(...xs) + m,
+    y1: Math.max(...ys) + m,
+    q: q.slice(0, 12),
+  };
+}
+
+function cutHas(c: Cut, x: number, y: number): boolean {
+  if (x < c.x0 || x > c.x1 || y < c.y0 || y > c.y1) return false;
+  for (let k = 0; k < c.hx.length; k++) if (c.hx[k] * x + c.hy[k] * y > c.hd[k]) return false;
+  return true;
+}
+
+/** Floor height of a cut at (x, y): along its first edge (a station cutting's: its plane). */
+function cutFloor(c: Cut, x: number, y: number): number {
+  if (c.plane) return c.plane[0] + c.plane[1] * x + c.plane[2] * y;
+  const dx = c.bx - c.ax;
+  const dy = c.by - c.ay;
+  const l2 = dx * dx + dy * dy;
+  let t = l2 > 1e-9 ? ((x - c.ax) * dx + (y - c.ay) * dy) / l2 : 0;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  return c.za + (c.zb - c.za) * t;
+}
+
+/** Keep the part of convex polygon p (flat x, y) inside (n . v <= d) or outside (>= d). */
+function clipHalf(p: number[], nx: number, ny: number, d: number, inside: boolean): number[] {
+  const out: number[] = [];
+  const n = p.length >> 1;
+  for (let k = 0; k < n; k++) {
+    const cx = p[2 * k];
+    const cy = p[2 * k + 1];
+    const k2 = (k + 1) % n;
+    const qx = p[2 * k2];
+    const qy = p[2 * k2 + 1];
+    let sc = nx * cx + ny * cy - d;
+    let sn = nx * qx + ny * qy - d;
+    if (!inside) {
+      sc = -sc;
+      sn = -sn;
+    }
+    if (sc <= 0) out.push(cx, cy);
+    if (sc <= 0 !== sn <= 0) {
+      const t = sc / (sc - sn);
+      out.push(cx + (qx - cx) * t, cy + (qy - cy) * t);
+    }
+  }
+  return out;
+}
+
+function polyArea(p: number[]): number {
+  let a = 0;
+  const n = p.length >> 1;
+  for (let k = 0; k < n; k++) {
+    const k2 = (k + 1) % n;
+    a += p[2 * k] * p[2 * k2 + 1] - p[2 * k2] * p[2 * k + 1];
+  }
+  return a / 2;
+}
+
+/** Convex polygon p minus a cut: up to one convex piece per half-plane. */
+function subtractCut(p: number[], c: Cut): number[][] | null {
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  for (let k = 0; k < p.length; k += 2) {
+    x0 = Math.min(x0, p[k]);
+    x1 = Math.max(x1, p[k]);
+    y0 = Math.min(y0, p[k + 1]);
+    y1 = Math.max(y1, p[k + 1]);
+  }
+  if (x1 < c.x0 || x0 > c.x1 || y1 < c.y0 || y0 > c.y1) return null;
+  const out: number[][] = [];
+  let rem = p;
+  for (let k = 0; k < c.hx.length; k++) {
+    const o = clipHalf(rem, c.hx[k], c.hy[k], c.hd[k], false);
+    if (o.length >= 6 && Math.abs(polyArea(o)) > 1e-4) out.push(o);
+    rem = clipHalf(rem, c.hx[k], c.hy[k], c.hd[k], true);
+    if (rem.length < 6 || Math.abs(polyArea(rem)) < 1e-6) {
+      // nothing of p lies inside the cut
+      return out.length === 1 && rem.length < 6 ? null : out;
+    }
+  }
+  return out;
 }
 
 /** Separating-axis test: does the axis-aligned square (centre, half size) overlap the convex quad grown by `margin`? */
@@ -439,10 +895,18 @@ vec3 terrainAlbedo() {
   c = mix(c, sport, smoothstep(0.2, 0.8, lc.b));
   c = mix(c, plaza, smoothstep(0.2, 0.8, lc.a));
 #endif
-  // steep banks and cuttings: bare earth; river margins: mud
-  float steep = 1.0 - smoothstep(0.72, 0.9, normalize(vGNrm).y);
-  vec3 earth = mix(vec3(0.42, 0.36, 0.27), vec3(0.33, 0.30, 0.25), n1.r) * (0.85 + 0.3 * n3.g);
-  c = mix(c, earth, steep * 0.75);
+  // steep banks and cuttings: bare earth; river margins: mud. A face steep in itself (cut faces, the
+  // earth faces at cutting edges) is bare earth whatever its vertex normals say, textured in its own
+  // plane (plan mapping would smear it into vertical streaks), with faint strata.
+  vec3 fn = normalize(cross(dFdx(vGPos), dFdy(vGPos)));
+  float steepF = 1.0 - smoothstep(0.5, 0.8, abs(fn.y));
+  float steep = max(1.0 - smoothstep(0.72, 0.9, normalize(vGNrm).y), steepF);
+  vec2 ep = steepF > 0.5 ? (abs(fn.x) > abs(fn.z) ? vec2(-vGPos.z, vGPos.y) : vec2(vGPos.x, vGPos.y)) : p;
+  vec4 e1 = texture2D(uNoise, ep / 23.0);
+  vec4 e3 = texture2D(uNoise, ep / vec2(4.3, 2.2));
+  vec3 earth = mix(vec3(0.42, 0.36, 0.27), vec3(0.33, 0.30, 0.25), e1.r) * (0.85 + 0.3 * e3.g);
+  earth *= 1.0 - 0.07 * steepF * smoothstep(0.3, 0.7, fract(vGPos.y * 1.3 + e1.g * 1.7));
+  c = mix(c, earth, max(steep * 0.75, steepF));
   float bank = 1.0 - smoothstep(uWaterLevel + 0.3, uWaterLevel + 1.6, vGPos.y + (n1.g - 0.5) * 0.6);
   vec3 mud = mix(vec3(0.33, 0.29, 0.22), vec3(0.20, 0.18, 0.15), smoothstep(uWaterLevel + 0.2, uWaterLevel - 1.5, vGPos.y));
   c = mix(c, mud, bank);
@@ -497,7 +961,15 @@ interface LodChunk {
   y1: number;
 }
 
-function chunkGeometry(f: TerrainField, ci0: number, cj0: number, ci1: number, cj1: number, s: number): THREE.BufferGeometry | null {
+/**
+ * Mesh one terrain chunk at grid step `s`. Carved cells are clipped exactly
+ * against the cuts recorded in them (the ground outside a cutting stays), and
+ * every cut edge gets an earth face down to the cutting's floor, so there is
+ * never a see-through gap at the edge of a cutting. At a coarse LOD, blocks
+ * holding a carved cell are meshed at full resolution, with their edge
+ * vertices on the coarse neighbours' straight edges so the seam stays closed.
+ */
+export function chunkGeometry(f: TerrainField, ci0: number, cj0: number, ci1: number, cj1: number, s: number): THREE.BufferGeometry | null {
   const xsI: number[] = [];
   for (let i = ci0; i < ci1; i += s) xsI.push(i);
   xsI.push(ci1);
@@ -506,53 +978,311 @@ function chunkGeometry(f: TerrainField, ci0: number, cj0: number, ci1: number, c
   ysJ.push(cj1);
   const w = xsI.length;
   const h = ysJ.length;
-  const nv = w * h + 2 * (w + h) * 2;
-  const pos = new Float32Array(nv * 3);
-  const nrm = new Int8Array(nv * 3);
   const nx = f.nx;
+  const ny = f.ny;
   const H = f.ren;
-  let v = 0;
-  const put = (i: number, j: number, dz: number) => {
-    const k = j * nx + i;
-    pos[v * 3] = f.x0 + i * f.cell;
-    pos[v * 3 + 1] = H[k] + dz;
-    pos[v * 3 + 2] = -(f.y0 + j * f.cell);
-    const il = Math.max(0, i - s);
-    const ir = Math.min(nx - 1, i + s);
-    const jd = Math.max(0, j - s);
-    const ju = Math.min(f.ny - 1, j + s);
+  const hw = nx - 1;
+  const P: number[] = [];
+  const N: number[] = [];
+  const idx: number[] = [];
+  const put = (x: number, z: number, y: number, n0: number, n1: number, n2: number): number => {
+    const l = Math.hypot(n0, n1, n2) || 1;
+    P.push(x, z, -y);
+    N.push(n0 / l, n1 / l, n2 / l);
+    return P.length / 3 - 1;
+  };
+  const gradN = (i: number, j: number, st: number): [number, number, number] => {
+    const il = Math.max(0, i - st);
+    const ir = Math.min(nx - 1, i + st);
+    const jd = Math.max(0, j - st);
+    const ju = Math.min(ny - 1, j + st);
     const gx = (H[j * nx + ir] - H[j * nx + il]) / ((ir - il) * f.cell);
     const gy = (H[ju * nx + i] - H[jd * nx + i]) / ((ju - jd) * f.cell);
     // normal of z = h(x, y): (-gx, 1, gy) in three space (z = -y)
-    const l = Math.hypot(gx, 1, gy);
-    nrm[v * 3] = Math.round((-gx / l) * 127);
-    nrm[v * 3 + 1] = Math.round((1 / l) * 127);
-    nrm[v * 3 + 2] = Math.round((gy / l) * 127);
-    return v++;
+    return [-gx, 1, gy];
   };
-  for (let b = 0; b < h; b++) for (let a = 0; a < w; a++) put(xsI[a], ysJ[b], 0);
-  const idx: number[] = [];
-  const hw = f.nx - 1;
+  const X = (i: number) => f.x0 + i * f.cell;
+  const Y = (j: number) => f.y0 + j * f.cell;
+  const grid = new Int32Array(w * h);
+  for (let b = 0; b < h; b++) {
+    for (let a = 0; a < w; a++) {
+      const i = xsI[a];
+      const j = ysJ[b];
+      grid[b * w + a] = put(X(i), H[j * nx + i], Y(j), ...gradN(i, j, s));
+    }
+  }
+  /** Triangle a-b-c (vertex indices) facing (fx, fy, fz) in three space. */
+  const tri = (a: number, b: number, c: number, fx: number, fy: number, fz: number) => {
+    const ux = P[3 * b] - P[3 * a];
+    const uy = P[3 * b + 1] - P[3 * a + 1];
+    const uz = P[3 * b + 2] - P[3 * a + 2];
+    const vx = P[3 * c] - P[3 * a];
+    const vy = P[3 * c + 1] - P[3 * a + 1];
+    const vz = P[3 * c + 2] - P[3 * a + 2];
+    const d = (uy * vz - uz * vy) * fx + (uz * vx - ux * vz) * fy + (ux * vy - uy * vx) * fz;
+    if (d >= 0) idx.push(a, b, c);
+    else idx.push(a, c, b);
+  };
+  const colOf = (i: number) => (i === ci1 ? w - 1 : (i - ci0) % s === 0 ? (i - ci0) / s : -1);
+  const rowOf = (j: number) => (j === cj1 ? h - 1 : (j - cj0) % s === 0 ? (j - cj0) / s : -1);
+  // minor cuts (slivers over road surfaces) only in the near detail level
+  const isCarved = (i: number, j: number) => {
+    if (i < 0 || j < 0 || i >= hw || j >= ny - 1) return false;
+    const v = f.hole[j * hw + i];
+    return v === 1 || (v === 2 && s === 1);
+  };
+  // Blocks meshed at full resolution: those holding a carved cell, and at the middle LOD (700-2200 m, where
+  // roads still show several pixels wide) those whose coarse surface would rise through a road or other
+  // surface the ground is held under (a vertex with a clamp cap, which lies ~0.25 m under the surface):
+  // over a road on a cross-slope the coarse plane, spanning the lowered vertices, covers it with grass.
+  // (Not at the far LOD: it would cost the far ring ~0.9 M triangles for sub-pixel strips.)
+  const fineBlk = new Uint8Array(Math.max(0, (w - 1) * (h - 1)));
+  const cap = f.cap;
   for (let b = 0; b + 1 < h; b++) {
     for (let a = 0; a + 1 < w; a++) {
-      // skip carved cells (at coarse LOD, judge by the block centre)
-      const ci = s === 1 ? xsI[a] : Math.min(f.nx - 2, Math.floor((xsI[a] + xsI[a + 1]) / 2));
-      const cj = s === 1 ? ysJ[b] : Math.min(f.ny - 2, Math.floor((ysJ[b] + ysJ[b + 1]) / 2));
-      if (f.hole[cj * hw + ci]) continue;
-      const p00 = b * w + a;
-      const p10 = p00 + 1;
-      const p01 = p00 + w;
-      const p11 = p01 + 1;
-      // diagonal p00-p11 (matches renAt), counter-clockwise from above
-      idx.push(p00, p10, p11, p00, p11, p01);
+      const ia = xsI[a];
+      const ib = xsI[a + 1];
+      const ja = ysJ[b];
+      const jb = ysJ[b + 1];
+      let fin = false;
+      for (let j = ja; j < jb && !fin; j++) for (let i = ia; i < ib; i++) if (isCarved(i, j)) fin = true;
+      if (!fin && s === 2) {
+        const h00 = H[ja * nx + ia];
+        const h10 = H[ja * nx + ib];
+        const h01 = H[jb * nx + ia];
+        const h11 = H[jb * nx + ib];
+        for (let j = ja; j <= jb && !fin; j++) {
+          for (let i = ia; i <= ib; i++) {
+            const c = cap[j * nx + i];
+            if (c === Infinity) continue;
+            const u = (i - ia) / (ib - ia);
+            const v = (j - ja) / (jb - ja);
+            // the coarse block's two triangles, diagonal p00-p11 (as meshed below)
+            const z = u >= v ? h00 + u * (h10 - h00) + v * (h11 - h10) : h00 + v * (h01 - h00) + u * (h11 - h01);
+            if (z > c + 0.25) {
+              fin = true;
+              break;
+            }
+          }
+        }
+      }
+      fineBlk[b * (w - 1) + a] = fin ? 1 : 0;
+    }
+  }
+  const blkFine = (a: number, b: number) => a >= 0 && b >= 0 && a + 1 < w && b + 1 < h && fineBlk[b * (w - 1) + a] === 1;
+  const fine = new Map<number, number>();
+  /** Vertex (i, j) of block (a, b), [ia, ib] x [ja, jb], meshed at full resolution. */
+  const fineVert = (i: number, j: number, a: number, b: number, ia: number, ja: number, ib: number, jb: number): number => {
+    const ca = colOf(i);
+    const rb = rowOf(j);
+    if (ca >= 0 && rb >= 0) return grid[rb * w + ca];
+    const key = j * nx + i;
+    const got = fine.get(key);
+    if (got !== undefined) return got;
+    let z = H[key];
+    // on the block's edge: on the coarse neighbour's straight edge (its own height when the block across
+    // is meshed at full resolution too)
+    if (i === ia || i === ib) {
+      if (!blkFine(i === ia ? a - 1 : a + 1, b)) z = H[ja * nx + i] + ((H[jb * nx + i] - H[ja * nx + i]) * (j - ja)) / (jb - ja);
+    } else if (j === ja || j === jb) {
+      if (!blkFine(a, j === ja ? b - 1 : b + 1)) z = H[j * nx + ia] + ((H[j * nx + ib] - H[j * nx + ia]) * (i - ia)) / (ib - ia);
+    }
+    const v = put(X(i), z, Y(j), ...gradN(i, j, 1));
+    fine.set(key, v);
+    return v;
+  };
+
+  /** Ground triangle a-b-c minus the cuts, with earth faces along the cut edges. */
+  const clipTri = (va: number, vb: number, vc: number, cuts: Cut[]) => {
+    const ax = P[3 * va];
+    const ay = -P[3 * va + 2];
+    const bx = P[3 * vb];
+    const by = -P[3 * vb + 2];
+    const cx = P[3 * vc];
+    const cy = -P[3 * vc + 2];
+    let pieces: number[][] = [[ax, ay, bx, by, cx, cy]];
+    let touched = false;
+    for (const c of cuts) {
+      const next: number[][] = [];
+      for (const p of pieces) {
+        const r = subtractCut(p, c);
+        if (r === null) next.push(p);
+        else {
+          touched = true;
+          for (const q of r) next.push(q);
+        }
+      }
+      pieces = next;
+      if (!pieces.length) break;
+    }
+    if (!touched) {
+      idx.push(va, vb, vc);
+      return;
+    }
+    const det = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+    if (Math.abs(det) < 1e-9) return;
+    const bary = (x: number, y: number): [number, number, number] => {
+      const l1 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / det;
+      const l2 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / det;
+      return [l1, l2, 1 - l1 - l2];
+    };
+    const V = [va, vb, vc];
+    for (const p of pieces) {
+      const area = polyArea(p);
+      if (Math.abs(area) < 1e-3) continue;
+      const n = p.length >> 1;
+      const vs: number[] = [];
+      const zs: number[] = [];
+      for (let k = 0; k < n; k++) {
+        const x = p[2 * k];
+        const y = p[2 * k + 1];
+        const l = bary(x, y);
+        let z = 0;
+        let n0 = 0;
+        let n1 = 0;
+        let n2 = 0;
+        for (let m = 0; m < 3; m++) {
+          const v = V[m];
+          z += l[m] * P[3 * v + 1];
+          n0 += l[m] * N[3 * v];
+          n1 += l[m] * N[3 * v + 1];
+          n2 += l[m] * N[3 * v + 2];
+        }
+        vs.push(put(x, z, y, n0, n1, n2));
+        zs.push(z);
+      }
+      for (let k = 1; k + 1 < n; k++) {
+        if (area > 0) idx.push(vs[0], vs[k], vs[k + 1]);
+        else idx.push(vs[0], vs[k + 1], vs[k]);
+      }
+      // earth faces down the cut edges
+      for (let k = 0; k < n; k++) {
+        const k2 = (k + 1) % n;
+        const x1 = p[2 * k];
+        const y1 = p[2 * k + 1];
+        const x2 = p[2 * k2];
+        const y2 = p[2 * k2 + 1];
+        const el = Math.hypot(x2 - x1, y2 - y1);
+        if (el < 0.02) continue;
+        let ox = (y2 - y1) / el;
+        let oy = -(x2 - x1) / el;
+        if (area < 0) {
+          ox = -ox;
+          oy = -oy;
+        }
+        // the stretches of this edge with a cut just beyond it (the point beyond may lie in the next cell
+        // when the edge is the triangle's own side; one piece edge can run on past the cut's end)
+        const e = 0.03;
+        const bx0 = x1 + ox * e;
+        const by0 = y1 + oy * e;
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        const spans: [number, number, Cut][] = [];
+        for (const c of f.cutsNear(Math.min(x1, x2) + ox * e, Math.min(y1, y2) + oy * e, Math.max(x1, x2) + ox * e, Math.max(y1, y2) + oy * e)) {
+          if (c.minor && s > 1) continue;
+          let lo = 0;
+          let hi = 1;
+          for (let h = 0; h < c.hx.length && lo < hi; h++) {
+            const a0 = c.hx[h] * bx0 + c.hy[h] * by0 - c.hd[h];
+            const b0 = c.hx[h] * dx + c.hy[h] * dy;
+            if (Math.abs(b0) < 1e-12) {
+              if (a0 > 0) hi = -1;
+            } else if (b0 > 0) hi = Math.min(hi, -a0 / b0);
+            else lo = Math.max(lo, -a0 / b0);
+          }
+          if ((hi - lo) * el > 0.01) spans.push([lo, hi, c]);
+        }
+        if (!spans.length) continue; // ground lies beyond
+        const ts = [0, 1];
+        for (const [lo, hi] of spans) ts.push(lo, hi);
+        ts.sort((u, v) => u - v);
+        const z1 = zs[k];
+        const z2 = zs[k2];
+        for (let q = 0; q + 1 < ts.length; q++) {
+          const ta = ts[q];
+          const tb = ts[q + 1];
+          if ((tb - ta) * el < 0.01) continue;
+          const tm = (ta + tb) / 2;
+          let fa = -Infinity;
+          let fb = -Infinity;
+          const ax2 = x1 + dx * ta;
+          const ay2 = y1 + dy * ta;
+          const bx2 = x1 + dx * tb;
+          const by2 = y1 + dy * tb;
+          for (const [lo, hi, c] of spans) {
+            if (tm < lo || tm > hi) continue;
+            fa = Math.max(fa, cutFloor(c, ax2, ay2));
+            fb = Math.max(fb, cutFloor(c, bx2, by2));
+          }
+          if (fa === -Infinity) continue;
+          const za = z1 + (z2 - z1) * ta;
+          const zb = z1 + (z2 - z1) * tb;
+          // a sliver cleared from over a road surface: where the ground beside it lies below the surface,
+          // close the gap under the surface's edge with a face back onto the ground
+          if (Math.min(za - fa, zb - fb) < -0.05 && spans.every(([lo, hi, c]) => tm < lo || tm > hi || c.minor)) {
+            const g1 = put(ax2, za, ay2, -ox, 0, oy);
+            const g2 = put(bx2, zb, by2, -ox, 0, oy);
+            const h2 = put(bx2, Math.max(zb, fb - 0.03), by2, -ox, 0, oy);
+            const h1 = put(ax2, Math.max(za, fa - 0.03), ay2, -ox, 0, oy);
+            tri(h1, h2, g2, -ox, 0, oy);
+            tri(h1, g2, g1, -ox, 0, oy);
+          }
+          if (Math.max(za, zb) < Math.max(fa, fb) + 0.05) continue;
+          // the ground behind sits on a tunnel box (a cut that ends at a portal): the face stops at its roof
+          const roof = f.roofAt(x1 + dx * tm - ox * 0.3, y1 + dy * tm - oy * 0.3);
+          const ba = Math.max(Math.min(za - 0.02, fa - 0.25), Math.min(roof, za - 0.02));
+          const bb = Math.max(Math.min(zb - 0.02, fb - 0.25), Math.min(roof, zb - 0.02));
+          const t1 = put(ax2, za, ay2, ox, 0, -oy);
+          const t2 = put(bx2, zb, by2, ox, 0, -oy);
+          const u2 = put(bx2, bb, by2, ox, 0, -oy);
+          const u1 = put(ax2, ba, ay2, ox, 0, -oy);
+          tri(t1, t2, u2, ox, 0, -oy);
+          tri(t1, u2, u1, ox, 0, -oy);
+        }
+      }
+    }
+  };
+
+  for (let b = 0; b + 1 < h; b++) {
+    for (let a = 0; a + 1 < w; a++) {
+      const ia = xsI[a];
+      const ib = xsI[a + 1];
+      const ja = ysJ[b];
+      const jb = ysJ[b + 1];
+      if (!blkFine(a, b)) {
+        // diagonal p00-p11 (matches renAt), counter-clockwise from above
+        const p00 = grid[b * w + a];
+        const p10 = grid[b * w + a + 1];
+        const p01 = grid[(b + 1) * w + a];
+        const p11 = grid[(b + 1) * w + a + 1];
+        idx.push(p00, p10, p11, p00, p11, p01);
+        continue;
+      }
+      for (let j = ja; j < jb; j++) {
+        for (let i = ia; i < ib; i++) {
+          const v00 = fineVert(i, j, a, b, ia, ja, ib, jb);
+          const v10 = fineVert(i + 1, j, a, b, ia, ja, ib, jb);
+          const v11 = fineVert(i + 1, j + 1, a, b, ia, ja, ib, jb);
+          const v01 = fineVert(i, j + 1, a, b, ia, ja, ib, jb);
+          if (!isCarved(i, j)) {
+            idx.push(v00, v10, v11, v00, v11, v01);
+            continue;
+          }
+          const all = f.cuts.get(j * hw + i);
+          const cuts = s > 1 && all ? all.filter((c) => !c.minor) : all;
+          if (!cuts || !cuts.length) continue;
+          clipTri(v00, v10, v11, cuts);
+          clipTri(v00, v11, v01, cuts);
+        }
+      }
     }
   }
   if (!idx.length) return null;
   // Skirts along the four edges hide cracks against neighbours at another LOD.
   // They hang only as deep as such a crack can be (twice the profile's
-  // deviation from 4-cell chords), never into a tunnel roof, and not across
-  // carved cells; the inner grid's outer boundary keeps the full depth to
-  // cover the seam with the horizon grid.
+  // deviation from 4-cell chords), never into a tunnel roof, and not where a
+  // cutting meets the chunk edge (on either side); the inner grid's outer
+  // boundary keeps the full depth to cover the seam with the horizon grid.
   const chordDev = (k0: number, step: number, n: number): number => {
     const a0 = H[k0];
     const b0 = H[k0 + n * step];
@@ -563,55 +1293,165 @@ function chunkGeometry(f: TerrainField, ci0: number, cj0: number, ci1: number, c
   const skirtDepth = (i: number, j: number, alongX: boolean, boundary: boolean): number => {
     if (boundary) return SKIRT;
     const u = alongX ? i : j;
-    const N = alongX ? nx - 1 : f.ny - 1;
+    const NN = alongX ? nx - 1 : ny - 1;
     const step = alongX ? 1 : nx;
     const rowK = alongX ? j * nx : i;
     let m = 0;
     const w0 = Math.floor(u / 4) * 4;
     for (const s0 of u % 4 === 0 ? [w0 - 4, w0] : [w0]) {
       const a0 = Math.max(0, s0);
-      const b0 = Math.min(N, s0 + 4);
+      const b0 = Math.min(NN, s0 + 4);
       if (b0 - a0 >= 2) m = Math.max(m, chordDev(rowK + a0 * step, step, b0 - a0));
     }
     return Math.min(SKIRT, 2 * m + 0.3);
   };
-  const edge = (list: [number, number, number][], alongX: boolean, boundary: boolean, inI: number, inJ: number) => {
+  const edge = (list: [number, number, number][], alongX: boolean, boundary: boolean) => {
     const drop = list.map(([vi, i, j]) => {
       const k = j * nx + i;
       const bottom = Math.max(H[k] - skirtDepth(i, j, alongX, boundary), Math.min(H[k], f.floor[k]));
-      return pos[vi * 3 + 1] - bottom;
+      return P[vi * 3 + 1] - bottom;
     });
     for (let e = 0; e + 1 < list.length; e++) {
       const [a, ia, ja] = list[e];
       const [b, ib, jb] = list[e + 1];
-      // the cell on the inside of this edge segment (block centre at coarse LOD)
-      const ci = Math.min(f.nx - 2, Math.floor((ia + ib) / 2) + (alongX ? 0 : inI));
-      const cj = Math.min(f.ny - 2, Math.floor((ja + jb) / 2) + (alongX ? inJ : 0));
-      if (f.hole[cj * hw + ci]) continue;
+      // no skirt where a cutting meets the chunk edge (it would hang into the cutting)
+      let carved = false;
+      if (alongX) for (let i = Math.min(ia, ib); i < Math.max(ia, ib) && !carved; i++) carved = isCarved(i, ja) || isCarved(i, ja - 1);
+      else for (let j = Math.min(ja, jb); j < Math.max(ja, jb) && !carved; j++) carved = isCarved(ia, j) || isCarved(ia - 1, j);
+      if (carved) continue;
       if (drop[e] < 0.05 && drop[e + 1] < 0.05) continue;
-      const a2 = v;
-      pos.set([pos[a * 3], pos[a * 3 + 1] - drop[e], pos[a * 3 + 2]], v * 3);
-      nrm.set([nrm[a * 3], nrm[a * 3 + 1], nrm[a * 3 + 2]], v * 3);
-      v++;
-      const b2 = v;
-      pos.set([pos[b * 3], pos[b * 3 + 1] - drop[e + 1], pos[b * 3 + 2]], v * 3);
-      nrm.set([nrm[b * 3], nrm[b * 3 + 1], nrm[b * 3 + 2]], v * 3);
-      v++;
+      const a2 = put(P[a * 3], P[a * 3 + 1] - drop[e], -P[a * 3 + 2], N[a * 3], N[a * 3 + 1], N[a * 3 + 2]);
+      const b2 = put(P[b * 3], P[b * 3 + 1] - drop[e + 1], -P[b * 3 + 2], N[b * 3], N[b * 3 + 1], N[b * 3 + 2]);
       idx.push(a, b, b2, a, b2, a2);
     }
   };
   const iLast = xsI[w - 1];
   const jLast = ysJ[h - 1];
-  edge(xsI.map((i, a) => [a, i, ysJ[0]]), true, ysJ[0] === 0, 0, 0);
-  edge(xsI.map((i, a) => [(h - 1) * w + a, i, jLast]), true, jLast === f.ny - 1, 0, -1);
-  edge(ysJ.map((j, b) => [b * w, xsI[0], j]), false, xsI[0] === 0, 0, 0);
-  edge(ysJ.map((j, b) => [b * w + w - 1, iLast, j]), false, iLast === nx - 1, -1, 0);
+  edge(
+    xsI.map((i, a) => [grid[a], i, ysJ[0]]),
+    true,
+    ysJ[0] === 0,
+  );
+  edge(
+    xsI.map((i, a) => [grid[(h - 1) * w + a], i, jLast]),
+    true,
+    jLast === ny - 1,
+  );
+  edge(
+    ysJ.map((j, b) => [grid[b * w], xsI[0], j]),
+    false,
+    xsI[0] === 0,
+  );
+  edge(
+    ysJ.map((j, b) => [grid[b * w + w - 1], iLast, j]),
+    false,
+    iLast === nx - 1,
+  );
+  const nv = P.length / 3;
+  const nrm = new Int8Array(N.length);
+  for (let k = 0; k < N.length; k++) nrm[k] = Math.round(Math.max(-1, Math.min(1, N[k])) * 127);
   const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.BufferAttribute(pos.subarray(0, v * 3), 3));
-  g.setAttribute('normal', new THREE.BufferAttribute(nrm.subarray(0, v * 3), 3, true));
-  g.setIndex(v < 65535 ? new THREE.BufferAttribute(Uint16Array.from(idx), 1) : new THREE.BufferAttribute(Uint32Array.from(idx), 1));
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(P), 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3, true));
+  g.setIndex(nv < 65535 ? new THREE.BufferAttribute(Uint16Array.from(idx), 1) : new THREE.BufferAttribute(Uint32Array.from(idx), 1));
   g.computeBoundingSphere();
   return g;
+}
+
+/** Shadow bins per chunk side (240 m). */
+const SB = 8;
+
+/** Position of cell (x, y) along a Hilbert curve over an n x n grid (n a power of two): nearby cells are near on the curve. */
+function hilbert(n: number, x: number, y: number): number {
+  let d = 0;
+  for (let s = n >> 1; s > 0; s >>= 1) {
+    const rx = (x & s) > 0 ? 1 : 0;
+    const ry = (y & s) > 0 ? 1 : 0;
+    d += s * s * ((3 * rx) ^ ry);
+    if (ry === 0) {
+      if (rx === 1) {
+        x = n - 1 - x;
+        y = n - 1 - y;
+      }
+      const t = x;
+      x = y;
+      y = t;
+    }
+  }
+  return d;
+}
+
+/**
+ * The full-detail chunk (~2 km across) casts shadows only from the triangles
+ * near the sun's shadow box (~220-500 m across): its triangles are sorted into
+ * 240 m bins along a Hilbert curve, and the shadow pass draws only the run of
+ * bins from the first to the last one that meets the shadow camera's frustum.
+ * Same triangles, same draw call; the main pass still draws them all.
+ */
+function shadowByBin(mesh: THREE.Mesh): void {
+  const g = mesh.geometry;
+  const P = g.getAttribute('position').array as Float32Array;
+  const I = g.getIndex()!.array as Uint16Array | Uint32Array;
+  const nt = I.length / 3;
+  if (!g.boundingBox) g.computeBoundingBox();
+  const bb = g.boundingBox!;
+  const sx = SB / Math.max(1, bb.max.x - bb.min.x);
+  const sz = SB / Math.max(1, bb.max.z - bb.min.z);
+  const binOf = new Uint8Array(nt);
+  const cnt = new Int32Array(SB * SB);
+  const lo = new Float32Array(SB * SB * 3).fill(Infinity);
+  const hi = new Float32Array(SB * SB * 3).fill(-Infinity);
+  for (let t = 0; t < nt; t++) {
+    let cx = 0;
+    let cz = 0;
+    for (let k = 0; k < 3; k++) {
+      cx += P[3 * I[3 * t + k]];
+      cz += P[3 * I[3 * t + k] + 2];
+    }
+    const bi = Math.min(SB - 1, Math.max(0, Math.floor((cx / 3 - bb.min.x) * sx)));
+    const bj = Math.min(SB - 1, Math.max(0, Math.floor((cz / 3 - bb.min.z) * sz)));
+    const b = hilbert(SB, bi, bj);
+    binOf[t] = b;
+    cnt[b]++;
+    for (let k = 0; k < 3; k++) {
+      const v = I[3 * t + k];
+      for (let a = 0; a < 3; a++) {
+        lo[3 * b + a] = Math.min(lo[3 * b + a], P[3 * v + a]);
+        hi[3 * b + a] = Math.max(hi[3 * b + a], P[3 * v + a]);
+      }
+    }
+  }
+  const start = new Int32Array(SB * SB + 1);
+  for (let b = 0; b < SB * SB; b++) start[b + 1] = start[b] + cnt[b];
+  const fill = start.slice(0, SB * SB);
+  const J = new (I.constructor as Uint16ArrayConstructor | Uint32ArrayConstructor)(I.length);
+  for (let t = 0; t < nt; t++) {
+    const o = 3 * fill[binOf[t]]++;
+    J[o] = I[3 * t];
+    J[o + 1] = I[3 * t + 1];
+    J[o + 2] = I[3 * t + 2];
+  }
+  g.setIndex(new THREE.BufferAttribute(J, 1));
+  const fr = new THREE.Frustum();
+  const pm = new THREE.Matrix4();
+  const box = new THREE.Box3();
+  mesh.onBeforeShadow = (_r, _o, _c, shadowCamera, geometry) => {
+    pm.multiplyMatrices(shadowCamera.projectionMatrix, shadowCamera.matrixWorldInverse);
+    fr.setFromProjectionMatrix(pm);
+    let first = -1;
+    let last = -1;
+    for (let b = 0; b < SB * SB; b++) {
+      if (!cnt[b]) continue;
+      box.min.set(lo[3 * b], lo[3 * b + 1], lo[3 * b + 2]);
+      box.max.set(hi[3 * b], hi[3 * b + 1], hi[3 * b + 2]);
+      if (!fr.intersectsBox(box)) continue;
+      if (first < 0) first = b;
+      last = b;
+    }
+    if (first < 0) geometry.setDrawRange(0, 0);
+    else geometry.setDrawRange(3 * start[first], 3 * (start[last + 1] - start[first]));
+  };
+  mesh.onAfterShadow = (_r, _o, _c, _sc, geometry) => geometry.setDrawRange(0, Infinity);
 }
 
 export async function buildTerrain(ctx: Ctx, f: TerrainField, mat: THREE.Material, outerMat: THREE.Material): Promise<void> {
@@ -627,6 +1467,7 @@ export async function buildTerrain(ctx: Ctx, f: TerrainField, mat: THREE.Materia
         const m = new THREE.Mesh(g, mat);
         m.receiveShadow = true;
         m.castShadow = s === 1;
+        if (s === 1) shadowByBin(m);
         m.name = `terrain-${ci}-${cj}-${s}`;
         m.visible = false;
         ctx.root.add(m);

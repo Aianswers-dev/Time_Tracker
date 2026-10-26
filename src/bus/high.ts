@@ -11,13 +11,14 @@ import { atlasLayout, buildShell, frontZ } from './shell';
 import { paintSection } from './paint';
 import { liveryFor, makeLivery, type Livery } from './livery';
 import { lampGeometry, type LampKind } from './lamps';
-import { Bellows, buildDark, buildSignGeometry, buildTrim, leafGeometry, leafMatrix, leafSlots, wheelGeometry, wheelSlots, type LeafSlot, type WheelSlot } from './parts';
+import { Bellows, jointInFrame, buildDark, buildSignGeometry, buildTrim, leafGeometry, leafMatrix, leafSlots, wheelGeometry, wheelSlots, type LeafSlot, type WheelSlot } from './parts';
 import { doorTexture, envMap, wheelTexture } from './materials';
 import { blankSignMaterial, signMaterial } from './sign';
 import { buildSaloon, type Saloon } from './saloon';
 import { playerSign } from './state';
 import { canvasTexture } from './util';
 import { haloGeometry, haloMaterial } from './halo';
+import { mirrorGlassGeometry, mirrorTexture } from './mirror';
 
 type LampGroup = 'drl' | 'night' | 'brake' | 'indL' | 'indR' | 'reverse';
 const LAMP_GROUPS: Record<LampGroup, LampKind[]> = {
@@ -75,6 +76,8 @@ export function createHighBus(spec: BusSpec, route: Route | undefined): BusMesh 
     new THREE.MeshStandardMaterial({ map: doorTexture(spec.type === 'metro'), transparent: true, roughness: 0.15, metalness: 0.0, envMap: env, envMapIntensity: 0.45, side: THREE.DoubleSide }),
   );
   const glowMat = own(new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false }));
+  // wing mirror glass shows the cab's painted reflections (mirror.ts)
+  const mirrorMat = own(new THREE.MeshBasicMaterial({ map: mirrorTexture(), color: 0xe6eaee }));
   const bellowsMat = own(new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, metalness: 0.35, envMap: env, envMapIntensity: 0.7, side: THREE.DoubleSide }));
   const wheelGeo = own(wheelGeometry(B.tyreR, 0.28, 28));
   const leafGeo = own(leafGeometry());
@@ -128,6 +131,12 @@ export function createHighBus(spec: BusSpec, route: Route | undefined): BusMesh 
     const trim = new THREE.Mesh(own(buildTrim(B, L, lv)), trimMat);
     trim.name = 'trim';
     inner.add(trim);
+    const mg = mirrorGlassGeometry(B, L);
+    if (mg) {
+      const glassMesh = new THREE.Mesh(own(mg), mirrorMat);
+      glassMesh.name = 'mirrorGlass';
+      inner.add(glassMesh);
+    }
 
     const slots = wheelSlots(B, L);
     const wheels = new THREE.InstancedMesh(wheelGeo, wheelMat, slots.length);
@@ -260,13 +269,8 @@ export function createHighBus(spec: BusSpec, route: Route | undefined): BusMesh 
         const pc = pose.sections[i];
         if (!s.bellows || !pp || !pc) continue;
         const zRear = prev.L.bodyRear - prev.L.axleFromFront;
-        const fx = Math.sin(pp.heading), fy = Math.cos(pp.heading);
-        const mx = pp.x - fx * zRear, my = pp.y - fy * zRear;
-        const dx = mx - pc.x, dy = my - pc.y;
-        const cf = Math.sin(pc.heading), cy = Math.cos(pc.heading);
-        const fwd = dx * cf + dy * cy;
-        const right = dx * cy - dy * cf;
-        _a.set(right, 0, -fwd);
+        // the previous section's rear face in this section's frame (x, height, z)
+        jointInFrame(prev.root, s.root, zRear, _a);
         let ang = pp.heading - pc.heading;
         ang = Math.atan2(Math.sin(ang), Math.cos(ang));
         _b.set(0, 0, s.L.bodyFront - s.L.axleFromFront);

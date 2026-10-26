@@ -1,7 +1,8 @@
 // Shared per-session state so the game pieces work together even when
 // main.ts only wires the minimum (explicit options always take precedence).
-import type { WorldHandle } from '../types';
+import type { Route, WorldHandle } from '../types';
 import type { MapMarker } from './minimap';
+import type { RouteTrack } from './track';
 import type { TrafficLevel } from './trafficLevel';
 
 export interface TrafficLike {
@@ -9,6 +10,10 @@ export interface TrafficLike {
 }
 export interface GuideLike {
   toggleRibbon(on?: boolean): void;
+  /** The player's route, its lane and the bus's place on it (the AI keeps clear of it, the player claims junctions on it). */
+  readonly route?: Route;
+  readonly track?: RouteTrack;
+  readonly state?: { readonly s: number; readonly offRoute: boolean };
 }
 
 export const session: {

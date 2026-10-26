@@ -10,7 +10,7 @@ import { buildHouses } from './houses';
 import { buildTrees } from './trees';
 import type { Ctx, Extras } from './ctx';
 import { INNER_PAD, buildPools } from './ground';
-import { buildStoryBridge } from './landmarks';
+import { buildGreenBridge, buildStoryBridge, buildVictoriaBridge } from './landmarks';
 import { buildRoads } from './roads';
 import { TerrainField, buildTerrain, makeLandcover, makeTerrainMaterial } from './terrain';
 import { U } from './shaders';
@@ -150,6 +150,8 @@ export async function buildWorld(
   buildWater(ctx);
   buildPools(ctx, field);
   buildStoryBridge(ctx);
+  buildGreenBridge(ctx);
+  buildVictoriaBridge(ctx);
 
   await step(0.4, 'Raising buildings…');
   const bidx = await buildBuildings(ctx, roads, (f) => onProgress(0.4 + f * 0.3, 'Raising buildings…'));
@@ -197,10 +199,13 @@ export async function buildWorld(
   let sigClock = 0;
   let sigOffset = 0;
   const debug = location.search.includes('world=debug');
-  const dbgWin = window as unknown as { __worldCam?: number[]; __worldHours?: number; __worldInfo?: () => string; __worldRoot?: THREE.Group };
+  const dbgWin = window as unknown as { __worldCam?: number[]; __worldHours?: number; __worldInfo?: () => string; __worldRoot?: THREE.Group; __worldTicks?: Ctx['tick'] };
   if (debug) dbgWin.__worldRoot = root;
+  // the per-frame callbacks, so a harness can time each subsystem's CPU work without rendering
+  if (debug) dbgWin.__worldTicks = ctx.tick;
   if (debug) dbgWin.__worldInfo = () => `calls ${renderer.info.render.calls} tris ${renderer.info.render.triangles} geos ${renderer.info.memory.geometries} tex ${renderer.info.memory.textures}${underground ? ` underground (${hidden.length} hidden)` : ''}`;
   return {
+    walls: roads.walls,
     update(dt: number, camera: THREE.Camera, hours: number) {
       if (debug && dbgWin.__worldCam) {
         // debug camera: [x, y, h, lookX, lookY, lookH] in map coordinates
@@ -218,9 +223,19 @@ export async function buildWorld(
       const mx = camPos.x;
       const my = -camPos.z;
       const groundH = field.renAt(mx, my);
-      const depth = field.isHole(mx, my) ? 0 : groundH - camPos.y;
+      const inCut = field.inCut(mx, my);
+      const depth = inCut ? 0 : groundH - camPos.y;
       const under = Math.min(1, Math.max(0, (depth - 1.5) / 3));
       U.uUnder.value = under;
+      if (under > 0) {
+        // daylight glare beyond the nearest portal (see FRAG_FOG)
+        let best = 1e6;
+        for (const p of portals) {
+          const d = Math.hypot(p.x - mx, p.y - my, p.z - camPos.y);
+          if (d < best) best = d;
+        }
+        U.uPortalDist.value = best;
+      }
       U.uInTunnel.value = under > 0.5 ? 1 : 0;
       sky.update(camera, hours, Math.min(groundH, camPos.y));
       if (under > 0) {
@@ -231,13 +246,15 @@ export async function buildWorld(
       for (const o of hidden) o.visible = true;
       hidden.length = 0;
       for (const c of ctx.cull) {
-        const dx = c.x - camPos.x;
-        const dz = c.z - camPos.z;
-        c.obj.visible = dx * dx + dz * dz < c.range * c.range;
+        const b = c.box;
+        const dx = b ? Math.max(b[0] - camPos.x, 0, camPos.x - b[2]) : c.x - camPos.x;
+        const dz = b ? Math.max(b[1] - camPos.z, 0, camPos.z - b[3]) : c.z - camPos.z;
+        const d2 = dx * dx + dz * dz;
+        c.obj.visible = d2 < c.range * c.range && !(c.min && d2 < c.min * c.min);
       }
       for (const t of ctx.tick) t(dt, camera);
       // underground culling (last frame's hidden meshes were restored above)
-      underground = !field.isHole(mx, my) && camPos.y < field.floorAt(mx, my) - 0.3 && depth > 0.5;
+      underground = !inCut && camPos.y < field.floorAt(mx, my) - 0.3 && depth > 0.5;
       if (underground) {
         let pd = Infinity;
         let px = 0;
@@ -266,9 +283,9 @@ export async function buildWorld(
         console.info(`[world] calls ${renderer.info.render.calls} tris ${renderer.info.render.triangles}`);
       }
     },
-    signalStateAt(x: number, y: number, timeSeconds: number, dirX?: number, dirY?: number) {
+    signalStateAt(x: number, y: number, timeSeconds: number, dirX?: number, dirY?: number, z?: number) {
       sigOffset = timeSeconds - sigClock;
-      return signals.stateAt(x, y, timeSeconds, dirX, dirY);
+      return signals.stateAt(x, y, timeSeconds, dirX, dirY, z);
     },
   };
 }

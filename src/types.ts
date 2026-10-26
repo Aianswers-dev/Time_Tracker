@@ -44,10 +44,26 @@ export interface Road {
   oneway: boolean;
   bridge: boolean;
   tunnel: boolean;
+  /**
+   * Tunnel under ground somewhere along it (pipeline, tools/data/elevation.py
+   * boxed_tunnels): an enclosed tube from one end to the other, its portals
+   * at the mapped ends, however little ground the terrain grid shows over it.
+   */
+  boxed?: boolean;
   layer: number;
   link: boolean;
   /** Bus-only road (busway / bus-designated service road). */
   bus: boolean;
+  /**
+   * Station stopping bay: a synthetic one-way bus carriageway (pipeline,
+   * tools/data/stations.py) that fills the space between a busway and a
+   * platform kerb, at the busway's height, tapering into the busway beyond
+   * the platform ends. The platform is on its left (direction of travel);
+   * its left edge runs 0.3 m under the platform slab. Draw it as station
+   * pavement (concrete), with no parapet, wall or footpath on its left and
+   * no gap to the busway on its right.
+   */
+  bay?: boolean;
   name?: string;
   /** Posted speed limit in km/h when tagged in OSM. */
   maxspeed?: number;
@@ -178,8 +194,27 @@ export interface MapData {
   rail: Rail[];
   /** Traffic signal node positions, flat [x, y, ...]. */
   signals: Float32Array;
+  /**
+   * Per signal: index into `roads` of the road the signal stands on, or -1 for
+   * signals mapped on paths and cycleways only (bike and pedestrian crossings
+   * of a street, e.g. over a busway tunnel), which control no road traffic.
+   */
+  signalRoad?: Int32Array;
+  /**
+   * Per signal: the traffic it faces along its road's polyline (OSM
+   * traffic_signals:direction): 1 forward (vertex order), -1 backward, 0 both
+   * or not tagged.
+   */
+  signalDir?: Int8Array;
+  /** Per signal: height (m AHD) of its road at the signal (ground for road -1). */
+  signalZ?: Float32Array;
   /** Marked pedestrian crossings, flat [x, y, ...]. */
   crossings: Float32Array;
+  /**
+   * Mapped retaining walls (OSM barrier=retaining_wall), each a polyline [x, y, ...]: where a road in a
+   * cutting has its wall when the map says so (src/world/roads.ts).
+   */
+  retainingWalls?: Float32Array[];
   buildings: Building[];
   areas: Area[];
   water: Area[];
@@ -199,6 +234,21 @@ export interface TerrainGrids {
   /** Fine grid over the map first, then a coarse horizon grid. */
   grids: { name: string; x0: number; y0: number; cell: number; nx: number; ny: number; h: Float32Array }[];
   attribution: string;
+  /**
+   * Walled station cuttings (Buranda, Mater Hill busway stations): inside each outline the ground is
+   * the cutting's floor, outside it the grids (which keep the streets' level up to the walls). Read
+   * through src/data/cuts.ts (Heights.ground, TerrainField); the walls stand on the outlines
+   * (src/world/roads.ts).
+   */
+  cuts?: StationCut[];
+}
+
+export interface StationCut {
+  name: string;
+  /** Outline, flat [x, y, ...] counter-clockwise (map metres). */
+  pts: Float32Array;
+  /** Floor plane: z = floor[0] + floor[1] * x + floor[2] * y (m AHD). */
+  floor: [number, number, number];
 }
 
 // ---------------------------------------------------------------------------
@@ -373,14 +423,44 @@ export interface Collider {
 // ---------------------------------------------------------------------------
 // World
 
+/**
+ * The solid edges the world draws along roads, for the driving collider, so a bus collides with exactly
+ * what is on screen: tunnel tube walls, nose and end walls, portal pilasters, cutting retaining walls,
+ * fill-wall and bridge parapets. Each piece is a line in plan (the face toward the road) with a vertical span.
+ */
+export interface EdgeWalls {
+  /** ax, ay, bx, by per piece (map metres). */
+  seg: Float32Array;
+  /** Vertical span per piece (m AHD). */
+  lo: Float32Array;
+  hi: Float32Array;
+  /** 0 tunnel structure, 1 parapet (bridge, fill wall), 2 retaining wall (cutting): the sim's WallKind. */
+  kind: Uint8Array;
+  /** Road each piece belongs to (-1: a railway's). */
+  road: Int32Array;
+  /** 1 where the piece belongs to a tunnel road (its tube, or the open cutting of its approach). */
+  tunnel: Uint8Array;
+  count: number;
+  /**
+   * Covered tube stretches (for cameras), 9 numbers each: ax, ay, bx, by, road height at a and b, reach
+   * left and right of the centreline (to the walls, or across a platform hall), clear height inside.
+   */
+  ceilings: Float32Array;
+}
+
 export interface WorldHandle {
+  /** The solid edges drawn along the roads (pass to the driving collider). */
+  walls?: EdgeWalls;
   /** Call every frame. `hours` is local time of day 0..24. */
   update(dt: number, camera: THREE.Camera, hours: number): void;
   /**
    * Current state of the traffic signal nearest to a point, for AI and HUD.
    * Pass the approaching vehicle's travel direction (dirX, dirY, unit, map
    * coords) to get the phase for that approach; without it the approach is
-   * guessed from the point's bearing from the junction centre.
+   * guessed from the point's bearing from the junction centre. `z` (the
+   * vehicle's road height) picks the level where junctions stack (a street
+   * over a motorway). Null where no signal controls the approach. Junctions,
+   * arms and phases: src/data/signals.ts.
    */
-  signalStateAt?(x: number, y: number, timeSeconds: number, dirX?: number, dirY?: number): 'green' | 'amber' | 'red' | null;
+  signalStateAt?(x: number, y: number, timeSeconds: number, dirX?: number, dirY?: number, z?: number): 'green' | 'amber' | 'red' | null;
 }

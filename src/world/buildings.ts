@@ -1,17 +1,29 @@
 /**
  * OSM buildings: footprints extruded into walls with procedural facades,
- * flat or pitched roofs, merged into 600 m chunks (one draw call each).
+ * flat or pitched roofs, merged into 800 m chunks (one draw call each, two
+ * levels of detail).
  */
 import * as THREE from 'three';
 import { BuildingKind, RoadKind, type Building } from '../types';
+import { stationOwnsBuilding } from '../data/stations';
 import { type Ctx, densityAt } from './ctx';
 import { F_HIGHSET, F_PITCHED, F_ROOF, F_SOFFIT, F_TILE, Style, makeBuildingMaterial } from './facade';
 import { triangulate } from './ground';
 import type { RoadIndex } from './roadindex';
-import type { RI } from './roads';
+import { type RI, roadAt } from './roads';
 import { IdGrid, centroid, f32, hash1, i8, obb, oriented, pointInRing, ringBounds, signedArea, smoothstep, u32, u8, yieldFrame } from './util';
 
 export const CHUNK = 800;
+/**
+ * Level of detail by chunk: within this distance of the camera (to the nearest
+ * point of the chunk) everything shows; further out only the buildings that
+ * still read at that distance (FAR_H tall or FAR_AREA in plan: the skyline,
+ * mid-rise blocks, sheds and shopping centres), out to FAR_RANGE.
+ */
+export const NEAR_RANGE = 1800;
+const FAR_H = 9;
+const FAR_AREA = 1200;
+const FAR_RANGE = 7000;
 
 const GLASS = [0x5d7f99, 0x4f7f7a, 0x6a7884, 0x7a8a8f, 0x41617a, 0x6b6455, 0x56708a, 0x8a9aa4];
 const OFFICE = [0xc8c2b4, 0xa9a9a4, 0xd6d1c4, 0x8f9496, 0xbdb3a0, 0xe0dcd2];
@@ -58,6 +70,19 @@ export class BGeo {
     g.computeBoundingSphere();
     g.computeBoundingBox();
     return g;
+  }
+  /** Append what `src` gained since it had `v0` vertices and `i0` indices. */
+  appendFrom(src: BGeo, v0: number, i0: number): void {
+    const off = this.count - v0;
+    const cp = (d: { push(a: number): void }, s: { arr: ArrayLike<number>; len: number }, from: number) => {
+      for (let k = from; k < s.len; k++) d.push(s.arr[k]);
+    };
+    cp(this.pos, src.pos, v0 * 3);
+    cp(this.nrm, src.nrm, v0 * 3);
+    cp(this.uv, src.uv, v0 * 2);
+    cp(this.col, src.col, v0 * 3);
+    cp(this.sty, src.sty, v0 * 4);
+    for (let k = i0; k < src.idx.len; k++) this.idx.push(src.idx.arr[k] + off);
   }
   /** Set the normal (three.js space, unit) of vertices a..b inclusive. */
   setNormal(a: number, b: number, nx: number, ny: number, nz: number): void {
@@ -340,7 +365,7 @@ export interface BuildingIndex {
   big: Uint8Array;
 }
 
-export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: RoadIndex }, progress: (f: number) => void): Promise<BuildingIndex> {
+export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: RoadIndex; tunnels: RoadIndex }, progress: (f: number) => void): Promise<BuildingIndex> {
   const { data, R } = ctx;
   const traffic = (ri: number) => {
     const k = roads.infos[ri].r.kind;
@@ -349,12 +374,15 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
   /**
    * Height a building's walls must keep clear above a road that runs through
    * its outline in the open (a busway under a station building or hospital
-   * wing): road height + 5.2 m, or -Infinity when nothing passes. Walls only
-   * stand on the outline, so it is sampled along the outline's edges.
+   * wing): road height + 5.2 m, or -Infinity when nothing passes. A tunnel
+   * (open cut or tube, at any depth) keeps its tube's height + 0.3 m clear.
+   * Walls only stand on the outline, so it is sampled along the outline's edges.
    */
-  const clearanceOver = (ring: ArrayLike<number>, x0: number, y0: number, x1: number, y1: number, base: number): Float32Array | null => {
+  const clearanceOver = (ring: ArrayLike<number>, x0: number, y0: number, x1: number, y1: number, base: number, bottom: number): Float32Array | null => {
     const r = Math.hypot(x1 - x0, y1 - y0) / 2;
-    if (roads.index.clearance((x0 + x1) / 2, (y0 + y1) / 2, r, traffic) > r) return null;
+    const cx = (x0 + x1) / 2;
+    const cy = (y0 + y1) / 2;
+    if (roads.index.clearance(cx, cy, r, traffic) > r && roads.tunnels.clearance(cx, cy, r) > r) return null;
     const nv = ring.length >> 1;
     const need = new Float32Array(nv).fill(-Infinity);
     let any = false;
@@ -368,17 +396,65 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
         const x = ax + ((bx - ax) * (q + 0.5)) / n;
         const y = ay + ((by - ay) * (q + 0.5)) / n;
         const nr = roads.index.nearest(x, y, 10, traffic);
-        if (!nr || nr.dist > roads.infos[nr.road].hw + 0.3) continue;
-        if (nr.z > base + 2 || ctx.field.natAt(x, y) - nr.z > 4.6) continue;
-        need[v] = Math.max(need[v], nr.z + 5.2);
-        any = true;
+        if (nr && nr.dist <= roads.infos[nr.road].hw + 0.3 && nr.z <= base + 2 && ctx.field.natAt(x, y) - nr.z <= 4.6) {
+          need[v] = Math.max(need[v], nr.z + 5.2);
+          any = true;
+        }
+        // tunnels: the walls of the tube or cutting stand 0.9 m beyond the carriageway
+        const nt = roads.tunnels.nearest(x, y, 12);
+        const top = nt ? nt.z + (roads.infos[nt.road].r.kind === RoadKind.Motorway ? 6.4 : 5.8) + 0.3 : -Infinity;
+        if (nt && nt.dist <= roads.infos[nt.road].hw + 1.2 && nt.z <= base + 2 && top > bottom) {
+          need[v] = Math.max(need[v], top);
+          any = true;
+        }
       }
     }
     return any ? need : null;
   };
+  /**
+   * Columns under a building lifted over a road in the open (Normanby's sports centre, the Convention
+   * Centre over the busway): a square concrete pier every ~9 m along each edge of every carriageway that
+   * passes under the outline, standing beside it (never on another carriageway or a platform), from the
+   * ground to the soffit at `top`.
+   */
+  const PIER: Look = { style: Style.Canopy, wall: 0xc4beb2, roof: 0xc4beb2, flags: 0, storey: 3.4, pitched: false, wallTop: 0, roofH: 0 };
+  const piers = (g: BGeo, ring: ArrayLike<number>, x0: number, y0: number, x1: number, y1: number, base: number, top: (x: number, y: number) => number, seed: number): void => {
+    const r = Math.hypot(x1 - x0, y1 - y0) / 2;
+    const near = new Set<number>();
+    roads.index.roadsNear((x0 + x1) / 2, (y0 + y1) / 2, r + 10, (road) => {
+      if (traffic(road)) near.add(road);
+    });
+    const placed: number[] = [];
+    for (const road of near) {
+      const ri = roads.infos[road];
+      for (let s = 4; s < ri.len - 2; s += 9) {
+        const c = roadAt(ri, s);
+        if (c.z > base + 2 || ctx.field.natAt(c.x, c.y) - c.z > 4.6) continue;
+        for (const side of [1, -1]) {
+          const o = ri.hw + 0.9;
+          const px = c.x + c.nx * side * o;
+          const py = c.y + c.ny * side * o;
+          if (!pointInRing(px, py, ring) || roads.index.penetration(px, py) > -0.6) continue;
+          if (data.platforms.some((p) => p.area && pointInRing(px, py, p.pts))) continue;
+          if (placed.some((_, q) => q % 2 === 0 && Math.hypot(placed[q] - px, placed[q + 1] - py) < 4)) continue;
+          const t = top(px, py);
+          const b = Math.min(c.z, ctx.field.natAt(px, py)) - 0.3;
+          if (t < b + 2.5) continue;
+          placed.push(px, py);
+          const tx = -c.ny;
+          const ty = c.nx;
+          const h = 0.35;
+          const sq = [px - tx * h - c.nx * h, py - ty * h - c.ny * h, px + tx * h - c.nx * h, py + ty * h - c.ny * h, px + tx * h + c.nx * h, py + ty * h + c.ny * h, px - tx * h + c.nx * h, py - ty * h + c.ny * h];
+          walls(g, oriented(sq, true), b, t, PIER, seed, 0);
+        }
+      }
+    }
+  };
   const nx = Math.ceil((R[2] - R[0]) / CHUNK);
   const ny = Math.ceil((R[3] - R[1]) / CHUNK);
   const chunks = new Map<number, BGeo>();
+  /** The far level of detail: the same chunks with only the buildings that read from afar. */
+  const farChunks = new Map<number, BGeo>();
   const mat = makeBuildingMaterial(ctx.tex.noise);
   const n = data.buildings.length;
   const box = new Float32Array(n * 4);
@@ -392,6 +468,8 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
     const [x0, y0, x1, y1] = ringBounds(ring);
     box.set([x0, y0, x1, y1], bi * 4);
     grid.addBox(bi, x0, y0, x1, y1);
+    // canopy roofs, vaults and pavilions the station models replace (src/game/stations.ts)
+    if (stationOwnsBuilding(b, data.platforms)) continue;
     const area = Math.abs(signedArea(ring));
     // masts and spires mapped as tiny tall buildings read as white needles: skip them
     if (area < 30 && b.height > 25) continue;
@@ -408,6 +486,8 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
       g = new BGeo();
       chunks.set(key, g);
     }
+    const v0 = g.count;
+    const i0 = g.idx.len;
     let m = b.minHeight;
     // base at the footprint centroid; walls reach down to the lowest ground under the footprint
     const base = b.z;
@@ -416,7 +496,7 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
     const bottom = minG - 0.4;
     // ...but never down across a road that runs through underneath: those
     // edges stop above the road, with a soffit over the passage
-    const need = clearanceOver(ring, x0, y0, x1, y1, base);
+    const need = clearanceOver(ring, x0, y0, x1, y1, base, bottom);
     let foot: number | ((edge: number) => number) = bottom;
     let soffit = -Infinity;
     if (need) {
@@ -425,6 +505,8 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
       else foot = (e: number) => Math.max(bottom, need[e]);
     }
     gBase = base;
+    // the underside over a road is light concrete (it only sees the ground's bounce light)
+    const soffitCol = need ? 0xd8d2c6 : 0x4a4a4a;
     if (L.style === Style.Canopy) {
       const top = base + b.height;
       const bot = Math.max(base + m, top - 0.6);
@@ -436,7 +518,7 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
       const nv = ring.length >> 1;
       const eave = base + Math.max(m + 1, L.wallTop);
       walls(g, ring, m > 0.4 ? base + m : foot, eave, L, seed, seed);
-      if (m <= 0.4 && soffit > -Infinity) flatCap(g, ring, soffit, 0x4a4a4a, L, seed, false, F_SOFFIT);
+      if (m <= 0.4 && soffit > -Infinity) flatCap(g, ring, soffit, soffitCol, L, seed, false, F_SOFFIT);
       if (o.fill > 0.78 && nv <= 10) {
         boxRoof(g, o, eave, L.roofH, b.roof === 'g' || (L.style !== Style.House && b.roof !== 'h' && b.roof !== 'p'), L, seed);
       } else if (!(nv <= 14 && polyRoof(g, ring, eave, Math.min(L.roofH, 1.6), L, seed))) {
@@ -445,8 +527,20 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
     } else {
       walls(g, ring, m > 0.4 ? base + m : foot, base + b.height, L, seed, seed);
       flatCap(g, ring, base + b.height, L.roof, L, seed, true, 0);
-      if (m > 0.4) flatCap(g, ring, base + m, 0x4a4a4a, L, seed, false, F_SOFFIT);
-      else if (soffit > -Infinity) flatCap(g, ring, soffit, 0x4a4a4a, L, seed, false, F_SOFFIT);
+      if (m > 0.4) flatCap(g, ring, base + m, soffitCol, L, seed, false, F_SOFFIT);
+      else if (soffit > -Infinity) flatCap(g, ring, soffit, soffitCol, L, seed, false, F_SOFFIT);
+    }
+    if (need && L.style !== Style.Canopy) {
+      const top = m > 0.4 ? base + m : soffit;
+      if (top > -Infinity) piers(g, ring, x0, y0, x1, y1, base, () => top, seed);
+    }
+    if (b.height >= FAR_H || area >= FAR_AREA) {
+      let f = farChunks.get(key);
+      if (!f) {
+        f = new BGeo();
+        farChunks.set(key, f);
+      }
+      f.appendFrom(g, v0, i0);
     }
     if (bi % 4000 === 0) {
       progress(bi / n);
@@ -462,7 +556,17 @@ export async function buildBuildings(ctx: Ctx, roads: { infos: RI[]; index: Road
     mesh.name = `buildings-${key}`;
     ctx.root.add(mesh);
     const c = geo.boundingSphere!.center;
-    ctx.cull.push({ obj: mesh, x: c.x, z: c.z, range: 7500 });
+    const bb = geo.boundingBox!;
+    const box: [number, number, number, number] = [bb.min.x, bb.min.z, bb.max.x, bb.max.z];
+    const far = farChunks.get(key);
+    ctx.cull.push({ obj: mesh, x: c.x, z: c.z, range: NEAR_RANGE, box });
+    if (!far) continue;
+    // beyond the shadow box (at most +-700 m around the camera): no shadow pass
+    const fm = new THREE.Mesh(far.build(), mat);
+    fm.receiveShadow = true;
+    fm.name = `buildings-far-${key}`;
+    ctx.root.add(fm);
+    ctx.cull.push({ obj: fm, x: c.x, z: c.z, range: FAR_RANGE, min: NEAR_RANGE, box });
   }
   return { grid, box, big };
 }

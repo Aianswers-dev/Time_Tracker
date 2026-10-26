@@ -2,12 +2,12 @@
 // chevrons, next-stop highlight) and runs the shift logic: serving stops,
 // timetable adherence, off-route detection, turn hints and the end summary.
 import * as THREE from 'three';
-import type { MapData, Road, Route } from '../types';
+import type { BusType, MapData, Road, Route } from '../types';
 import { pointAlong, projectOnto } from '../data/coords';
 import { drivable, roadIndexFor, speedLimitOf } from './roadIndex';
-import { trackFor, useTrackWalls, type RouteTrack, type TrackSample, type TrackWalls } from './track';
+import { TRACK_STEP, trackFor, useTrackWalls, type RouteTrack, type TrackSample, type TrackWalls } from './track';
 import { computeTurns, shortStreet, type TurnHint } from './turns';
-import { isStationStop, stopDisplayName, stopNumber } from './routeMeta';
+import { busTypeForRoute, isStationStop, stopDisplayName, stopNumber } from './routeMeta';
 import { flagAtlas, partsGroup, plateGeometry, poleParts, signMaterial, SIGN_H, SIGN_W } from './stops3d';
 import { buildPlatforms, type PlatformZone } from './platforms';
 import { NextStopMarker, Ribbon } from './ribbon';
@@ -15,6 +15,8 @@ import { brighten } from './util';
 import { session } from './session';
 import { LEVEL_GAP, heightAt, heightsOf } from './height';
 import type { Heights } from '../data/height';
+import { signalsFor } from '../data/signals';
+import { Passengers, type DwellState } from './passengers';
 
 export const enum StopStatus {
   Pending = 0,
@@ -23,7 +25,7 @@ export const enum StopStatus {
   Skipped = 3,
 }
 
-export type GuideEventKind = 'served' | 'missed' | 'depart' | 'offroute' | 'onroute' | 'finished' | 'collision' | 'info';
+export type GuideEventKind = 'served' | 'missed' | 'depart' | 'offroute' | 'onroute' | 'finished' | 'collision' | 'leftbehind' | 'full' | 'info';
 
 export interface GuideEvent {
   id: number;
@@ -51,6 +53,14 @@ export interface RouteSummary {
   distance: number;
   time: number;
   speedingSeconds: number;
+  /** Boardings over the shift. */
+  passengersCarried: number;
+  /** Left at a stop or carried past it by closing the doors early. */
+  passengersLeft: number;
+  /** Could not board because the bus was full. */
+  passengersFull: number;
+  /** Passenger time beyond the timetable's allowance, excused from punctuality (s). */
+  passengerDelay: number;
   score: number;
   grade: string;
 }
@@ -115,6 +125,26 @@ export interface GuideState {
   ribbonVisible: boolean;
   /** Next traffic signal on the route within ~150 m (needs world.signalStateAt), or null. */
   signal: { distance: number; state: 'green' | 'amber' | 'red' } | null;
+  /** Passengers on board, and what the bus holds (seated + standing). */
+  load: number;
+  capacity: number;
+  /** Passengers getting off and on at the stop being served (doors open), or null. */
+  dwell: DwellState | null;
+  /** Stopped at the departure stop with passengers waiting: open the doors to board them. */
+  canBoard: boolean;
+  passengersCarried: number;
+  /** Left behind by closing the doors early (see DwellState). */
+  passengersLeft: number;
+}
+
+/** Door and kneel state from the cab controls (BusControls fits). */
+export interface GuideCab {
+  /** Door opening 0..1. */
+  doorOpen: number;
+  /** The driver's door switch (false once they press close). */
+  doorsWanted: boolean;
+  /** Kneel 0..1. */
+  kneel: number;
 }
 
 export interface RouteGuideOptions {
@@ -126,6 +156,8 @@ export interface RouteGuideOptions {
    * this map, if any.
    */
   walls?: TrackWalls;
+  /** The player's bus type, for passenger capacity and door times (default: the route's usual type). */
+  busType?: BusType;
 }
 
 interface StopPlace {
@@ -179,6 +211,13 @@ export class RouteGuide {
   private sigIdx = 0;
   private sigTimer = 0;
   private sigState: 'green' | 'amber' | 'red' | null = null;
+  /** How the upcoming signal is asked for (approach point, direction and level; src/data/signals.ts). */
+  private sigAsk: { i: number; x: number; y: number; dx: number; dy: number; z: number } | null = null;
+  private readonly pax: Passengers;
+  /** The doors were opened at the departure stop before the shift. */
+  private departBoarded = false;
+  /** Route distance where the current dwell started (the bus is held there while the doors are open). */
+  private paxS = 0;
   private readonly onKey: (e: KeyboardEvent) => void;
 
   constructor(
@@ -193,6 +232,7 @@ export class RouteGuide {
     this.track = trackFor(route, data);
     this.turns = computeTurns(data, route);
     this.color = brighten(route.color, 0.32);
+    this.pax = new Passengers(data, route, opts.busType ?? busTypeForRoute(route), (k, t) => this.emit(k, t));
     const n = route.stops.length;
     this.state = {
       s: 0,
@@ -233,6 +273,12 @@ export class RouteGuide {
       summary: null,
       ribbonVisible: true,
       signal: null,
+      load: 0,
+      capacity: this.pax.capacity,
+      dwell: null,
+      canBoard: false,
+      passengersCarried: 0,
+      passengersLeft: 0,
     };
     // The flag stands a few metres ahead of the stop (the world puts a shelter at the stop itself).
     this.places = this.track.stops.map((ts) => {
@@ -309,18 +355,18 @@ export class RouteGuide {
     return { x: this.tmp.x, y: this.tmp.y, heading: this.tmp.heading, z: this.track.zAt(ss) };
   }
 
-  /** Start of the stretch where the front of the bus counts as being at stop i. */
+  /** Start of the stretch where the front of the bus counts as being at stop i (at a platform: the front door alongside it). */
   private zoneFrom(i: number): number {
     const z = this.places[i]?.zone;
     const s = this.route.stops[i].s;
-    return z ? Math.min(z.s0, s) - 2 : s - 15;
+    return z ? z.s0 + 1.5 : s - 15;
   }
 
-  /** End of the stretch where the front of the bus counts as being at stop i. */
+  /** End of the stretch where the front of the bus counts as being at stop i (the front door still about at the platform). */
   private zoneTo(i: number): number {
     const z = this.places[i]?.zone;
     const s = this.route.stops[i].s;
-    return z ? Math.max(z.s1, s) + 4 : s + 18;
+    return z ? z.s1 + 3 : s + 18;
   }
 
   /** Route distance of the front of the bus at the start (first stop; front bay of a platform). */
@@ -365,6 +411,11 @@ export class RouteGuide {
       t = a.t + ((b.t - a.t) * (s - a.s)) / Math.max(1, b.s - a.s);
     }
     return t - this.departT;
+  }
+
+  /** Shift time for the timetable: passenger time beyond the usual allowance at a stop is not the driver's. */
+  private shiftClock(): number {
+    return this.state.shiftTime - this.pax.excused;
   }
 
   private project(x: number, y: number): { s: number; dist: number } {
@@ -428,8 +479,10 @@ export class RouteGuide {
   /**
    * Advance the shift. `frontZ` (optional) is the road height under the front
    * of the bus; it picks the level where roads stack (tunnel under a street).
+   * `cab` (optional) gives the door opening and kneel for the passengers; without
+   * it they move whenever the doors are open.
    */
-  update(dt: number, frontX: number, frontY: number, doorsOpen: boolean, speed: number, heading?: number, hours = 12, frontZ?: number): GuideState {
+  update(dt: number, frontX: number, frontY: number, doorsOpen: boolean, speed: number, heading?: number, hours = 12, frontZ?: number, cab?: GuideCab): GuideState {
     const st = this.state;
     this.time += dt;
     // Motion heading for limit lookup and rejoin checks.
@@ -457,17 +510,37 @@ export class RouteGuide {
     st.routeDistance = pr.dist;
     st.progress = Math.min(1, st.s / Math.max(1, this.route.length));
     const stops = this.route.stops;
+    // Where the front is for stop i: at a platform on the lane (it can run well off the GTFS line through a
+    // station hall), and alongside it within `near`; at a kerbside stop on the route line.
+    let lane: { s: number; dist: number } | null = null;
+    const at = (i: number): { s: number; dist: number; near: number } => {
+      if (!this.places[i]?.zone) return { s: st.s, dist: pr.dist, near: 14 };
+      if (!lane) {
+        lane = this.track.project(frontX, frontY, st.s - 40, st.s + 40);
+        // (Fallen off a viaduct platform onto the street below is not alongside it.)
+        const dz = frontZ === undefined ? 0 : Math.abs(frontZ - this.track.zAt(lane.s));
+        if (dz > LEVEL_GAP) lane.dist = Math.max(lane.dist, 35 + dz);
+      }
+      return { s: lane.s, dist: lane.dist, near: 3.5 };
+    };
 
     if (!this.initialised) {
       this.initialised = true;
-      // Stops behind the start are skipped; the stop we start at is the departure stop.
+      // Stops behind the start are skipped; the stop we start at is the departure stop. At the start
+      // pose that is the first stop, even where the bus has to stand past it to have all of its length
+      // on the route (a Metro at a busway platform the route's shape starts at the end of).
+      const atStart = Math.abs(st.s - this.startS()) < 3;
       for (let i = 0; i < stops.length; i++) {
-        if ((Math.abs(stops[i].s - st.s) < 20 || (st.s >= this.zoneFrom(i) && st.s <= this.zoneTo(i))) && this.departIndex < 0) {
+        if (((i === 0 && atStart) || Math.abs(stops[i].s - st.s) < 20 || (st.s >= this.zoneFrom(i) && st.s <= this.zoneTo(i))) && this.departIndex < 0) {
           this.departIndex = i;
           break;
         }
         if (stops[i].s < st.s - 20) st.stopStatus[i] = StopStatus.Skipped;
       }
+      // Riders already aboard from the stops behind the start.
+      let first = 0;
+      while (first < stops.length && st.stopStatus[first] === StopStatus.Skipped) first++;
+      this.pax.startAt(this.departIndex >= 0 ? this.departIndex : first, hours);
       this.departS = st.s;
       if (this.departIndex >= 0) this.departT = stops[this.departIndex].t;
       else this.departT = this.expectedAt(st.s) + this.departT;
@@ -482,10 +555,23 @@ export class RouteGuide {
         st.stopsServed++;
         this.servedDeltas.push(0);
       }
+      // Pulled out without opening the doors: whoever was waiting is still at the stop.
+      if (this.departIndex >= 0 && !this.departBoarded) {
+        this.departBoarded = true;
+        this.pax.leaveAll(this.departIndex, hours);
+      }
       this.emit('depart', 'Departed — have a good shift!');
     }
     if (st.shiftStarted && !st.finished) st.shiftTime += dt;
     if (session.hours !== null) hours = session.hours;
+    // Departure stop: passengers board before the shift clock starts.
+    st.canBoard = this.departIndex >= 0 && !this.departBoarded && !st.shiftStarted && !st.finished && Math.abs(speed) < 0.5;
+    if (st.canBoard && doorsOpen) {
+      this.departBoarded = true;
+      st.canBoard = false;
+      this.pax.start(this.departIndex, hours);
+      this.paxS = at(this.departIndex).s;
+    }
 
     // Off-route with hysteresis.
     const wasOff = st.offRoute;
@@ -520,7 +606,7 @@ export class RouteGuide {
     if (this.dwellIndex >= 0) {
       const ds = stops[this.dwellIndex];
       if (st.s > this.zoneTo(this.dwellIndex) || (Math.abs(speed) > 2 && !doorsOpen)) {
-        const delta = st.shiftTime - (ds.t - this.departT);
+        const delta = this.shiftClock() - (ds.t - this.departT);
         this.servedDeltas.push(delta);
         this.dwellIndex = -1;
       }
@@ -530,18 +616,36 @@ export class RouteGuide {
     if (next >= 0) {
       const ns = stops[next];
       // Kerbside: front within ~15 m of the flag. Platform: alongside any bay.
-      st.atStop = st.s >= this.zoneFrom(next) && st.s <= this.zoneTo(next) && pr.dist < 14;
+      const a = at(next);
+      st.atStop = a.s >= this.zoneFrom(next) && a.s <= this.zoneTo(next) && a.dist < a.near;
       st.canServe = st.atStop && Math.abs(speed) < 0.5;
-      if (st.canServe && doorsOpen && st.shiftStarted) {
+      // (A stop at the same spot as the one just served waits for its passengers to finish.)
+      if (st.canServe && doorsOpen && st.shiftStarted && !this.pax.busy) {
         st.stopStatus[next] = StopStatus.Served;
         st.stopsServed++;
-        const delta = st.shiftTime - (ns.t - this.departT);
+        const delta = this.shiftClock() - (ns.t - this.departT);
         this.dwellIndex = next;
         this.emit('served', `Served ${stopDisplayName(this.data.stops[ns.stop].name)}`, delta);
-        const last = next === stops.length - 1;
-        if (last) this.finishTimer = 2.5;
+        this.pax.start(next, hours);
+        this.paxS = a.s;
       }
     }
+    // Passengers move while the doors are fully open and the bus is held at the stop.
+    const pi = this.pax.stopIndex;
+    if (pi >= 0) {
+      const a = at(pi);
+      if (Math.abs(a.s - this.paxS) > 4 || a.dist > 14) this.pax.depart();
+      else {
+        const doors = !doorsOpen ? 'shut' : !cab ? 'open' : !cab.doorsWanted ? 'closing' : cab.doorOpen > 0.98 ? 'open' : 'opening';
+        this.pax.update(dt, doors, Math.abs(speed) < 0.3, cab?.kneel ?? 0, st.shiftStarted);
+      }
+      // End of the line: finish once everyone is off (or the doors close on them).
+      if (pi === stops.length - 1 && !this.pax.busy && this.finishTimer <= 0 && !st.finished) this.finishTimer = 2.5;
+    }
+    st.dwell = this.pax.view;
+    st.load = this.pax.load;
+    st.passengersCarried = this.pax.carried;
+    st.passengersLeft = this.pax.left;
     if (next !== st.nextStopIndex || !st.nextStopName) {
       st.nextStopIndex = next;
       if (next >= 0) {
@@ -566,8 +670,8 @@ export class RouteGuide {
 
     // Timetable delta.
     if (st.shiftStarted) {
-      if (this.dwellIndex >= 0) st.scheduleDelta = st.shiftTime - (stops[this.dwellIndex].t - this.departT);
-      else st.scheduleDelta = st.shiftTime - this.expectedAt(Math.max(st.s, prevS - 1));
+      if (this.dwellIndex >= 0) st.scheduleDelta = this.shiftClock() - (stops[this.dwellIndex].t - this.departT);
+      else st.scheduleDelta = this.shiftClock() - this.expectedAt(Math.max(st.s, prevS - 1));
     } else st.scheduleDelta = 0;
 
     // Finish: all stops resolved and near the end, or the end of the line reached.
@@ -576,7 +680,7 @@ export class RouteGuide {
       if (this.finishTimer > 0) {
         this.finishTimer -= dt;
         if (this.finishTimer <= 0) this.finish();
-      } else {
+      } else if (!this.pax.busy) {
         const L = this.route.length;
         const atEnd = st.s > L - 6;
         const lastPendingNear = next >= 0 && Math.abs(stops[next].s - st.s) < 25;
@@ -608,8 +712,16 @@ export class RouteGuide {
       this.sigTimer -= dt;
       if (this.sigTimer <= 0 || this.sigState === null) {
         this.sigTimer = 0.2;
-        this.track.sample(sg.s, this.tmp);
-        this.sigState = world.signalStateAt(sg.x, sg.y, this.time, this.tmp.hx, this.tmp.hy);
+        // Ask like the AI does: from the approach, with the direction we arrive in
+        // (not the lane's direction at the stop line, which can be past a turn).
+        if (this.sigAsk?.i !== this.sigIdx) {
+          const z = this.track.zAt(sg.s);
+          const ad = signalsFor(this.data).approachDir(sg.x, sg.y, z, (q, o) => Object.assign(o, this.track.sample(q, this.tmp)), sg.s);
+          this.track.sample(sg.s, this.tmp);
+          this.sigAsk = ad ? { i: this.sigIdx, x: ad.x, y: ad.y, dx: ad.dx, dy: ad.dy, z } : { i: this.sigIdx, x: sg.x, y: sg.y, dx: this.tmp.hx, dy: this.tmp.hy, z };
+        }
+        const q = this.sigAsk;
+        this.sigState = world.signalStateAt(q.x, q.y, this.time, q.dx, q.dy, q.z);
       }
       st.signal = this.sigState ? { distance: Math.max(0, sg.s - st.s), state: this.sigState } : null;
     } else st.signal = null;
@@ -626,12 +738,17 @@ export class RouteGuide {
       const z = surf.road < 0 && Math.abs(surf.z - hint) > LEVEL_GAP ? hint : surf.z;
       this.lastZ = z;
       session.playerZ = z;
-      const hit = idx.nearest(frontX, frontY, 14, this.motionHeading, 0.6, drivable, z) ?? idx.nearest(frontX, frontY, 10, undefined, 0, drivable, z);
-      const ri = hit ? hit.road : surf.road;
+      // On the route: the road its lane is matched to (not a side street at a junction, nor the road under a
+      // bridge or over a tunnel); off it, the nearest road at our level.
+      const onRoad = st.offRoute ? -1 : this.track.road[Math.max(0, Math.min(this.track.n - 1, Math.round(st.s / TRACK_STEP)))];
+      const hit = onRoad >= 0 ? null : (idx.nearest(frontX, frontY, 14, this.motionHeading, 0.6, drivable, z) ?? idx.nearest(frontX, frontY, 10, undefined, 0, drivable, z));
+      const ri = onRoad >= 0 ? onRoad : hit ? hit.road : surf.road;
       if (ri >= 0) {
         const road = this.data.roads[ri];
-        st.speedLimit = speedLimitOf(road);
-        st.roadName = road.name ? shortStreet(road.name) : road.bus ? 'Busway' : '';
+        st.speedLimit = onRoad >= 0 ? this.track.limitAt(st.s) : speedLimitOf(road);
+        // (Route numbers tagged as the name are not street names; an unnamed link on the route keeps the street.)
+        const name = road.name && !/^[\d;\s]+$/.test(road.name) ? shortStreet(road.name) : '';
+        st.roadName = name || (road.bus ? 'Busway' : onRoad >= 0 ? st.roadName : '');
         st.roadLevel = road.tunnel ? 'tunnel' : road.bridge ? elevatedKind(road, this.heights) : null;
       } else {
         st.roadLevel = null;
@@ -666,10 +783,12 @@ export class RouteGuide {
       }
     }
     if (this.dwellIndex >= 0) {
-      this.servedDeltas.push(st.shiftTime - (this.route.stops[this.dwellIndex].t - this.departT));
+      this.servedDeltas.push(this.shiftClock() - (this.route.stops[this.dwellIndex].t - this.departT));
       this.dwellIndex = -1;
     }
     this.marker.setStop(null, 0, 0);
+    this.pax.depart();
+    st.dwell = null;
     const d = this.servedDeltas;
     const onTime = d.filter((x) => x >= -60 && x < 240).length;
     const skipped = Array.from(st.stopStatus).filter((x) => x === StopStatus.Skipped).length;
@@ -678,6 +797,8 @@ export class RouteGuide {
     const served = st.stopsServed / counted;
     let score = 100 * (0.55 * served + 0.35 * (punctuality / 100) + 0.1);
     score -= st.collisions * 6 + Math.min(20, st.speedingSeconds / 6);
+    // A point for every passenger the doors closed on (or left at the departure stop).
+    score -= Math.min(25, this.pax.left);
     score = Math.max(0, Math.min(100, Math.round(score)));
     const grade = score >= 90 ? 'A' : score >= 78 ? 'B' : score >= 64 ? 'C' : score >= 50 ? 'D' : 'F';
     st.summary = {
@@ -696,6 +817,10 @@ export class RouteGuide {
       distance: st.distanceDriven,
       time: st.shiftTime,
       speedingSeconds: st.speedingSeconds,
+      passengersCarried: this.pax.carried,
+      passengersLeft: this.pax.left,
+      passengersFull: this.pax.full,
+      passengerDelay: this.pax.excused,
       score,
       grade,
     };

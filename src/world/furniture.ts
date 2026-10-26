@@ -8,46 +8,20 @@ import * as THREE from 'three';
 import { RoadKind } from '../types';
 import { type Ctx, densityAt } from './ctx';
 import { MeshGeo } from './geo';
+import { cellInstances } from './instcells';
 import type { RoadIndex } from './roadindex';
 import { type RI, markMaterial, roadAt, structMaterial } from './roads';
 import { U, patch } from './shaders';
-import { IdGrid, MASK_WATER, hash1, hash2, walk, yieldFrame } from './util';
+import { IdGrid, MASK_WATER, hash1, walk, yieldFrame } from './util';
+import { SIGNAL_AMBER, signalsFor, type Light, type SignalJunction } from '../data/signals';
 
 // ---------------------------------------------------------------------------
-// Signal timing (keep in sync with SIGNAL_GLSL)
+// Signal timing: junctions, arms and phases come from the shared signal model
+// (src/data/signals.ts). Each head carries its phase's window (offset, cycle,
+// green start, green length) so the lamp shader and signalStateAt agree.
 
-const AMBER = 3.5;
-const ALL_RED = 2;
-
-export interface Junction {
-  x: number;
-  y: number;
-  /** Main approach axis (unit, map coords). */
-  ax: number;
-  ay: number;
-  cycle: number;
-  gA: number;
-  gB: number;
-  offset: number;
-  /** Arms (unit vectors pointing out of the junction) and their phase group. */
-  arms?: { ux: number; uy: number; g: number }[];
-}
-
-export type Light = 'green' | 'amber' | 'red';
-
-export function phaseState(j: Junction, group: number, t: number): Light {
-  const tau = (((t + j.offset) % j.cycle) + j.cycle) % j.cycle;
-  if (group === 0) {
-    if (tau < j.gA) return 'green';
-    if (tau < j.gA + AMBER) return 'amber';
-    return 'red';
-  }
-  const s = j.gA + AMBER + ALL_RED;
-  if (j.gB <= 0) return 'red';
-  if (tau >= s && tau < s + j.gB) return 'green';
-  if (tau >= s + j.gB && tau < s + j.gB + AMBER) return 'amber';
-  return 'red';
-}
+export type Junction = SignalJunction;
+export type { Light };
 
 const SIGNAL_GLSL = /* glsl */ `
 uniform float uSignalTime;
@@ -55,18 +29,11 @@ varying float vLamp;
 varying vec4 vSig;
 varying float vGroup;
 float sigState(vec4 sg, float group, float t) {
-  // returns 0 red, 1 amber, 2 green
+  // sg = (offset, cycle, green start, green length); returns 0 red, 1 amber, 2 green
   float cyc = sg.y;
-  float tau = mod(t + sg.x, cyc);
-  if (group < 0.5) {
-    if (tau < sg.z) return 2.0;
-    if (tau < sg.z + ${AMBER.toFixed(1)}) return 1.0;
-    return 0.0;
-  }
-  float s = sg.z + ${(AMBER + ALL_RED).toFixed(1)};
-  if (sg.w <= 0.0) return 0.0;
-  if (tau >= s && tau < s + sg.w) return 2.0;
-  if (tau >= s + sg.w && tau < s + sg.w + ${AMBER.toFixed(1)}) return 1.0;
+  float d = mod(mod(t + sg.x, cyc) - sg.z, cyc);
+  if (d < sg.w) return 2.0;
+  if (d < sg.w + ${SIGNAL_AMBER.toFixed(1)}) return 1.0;
   return 0.0;
 }
 `;
@@ -149,29 +116,16 @@ function shelterTemplate(): THREE.BufferGeometry {
 
 // ---------------------------------------------------------------------------
 
-interface Arm {
-  /** Road surface height at the junction, and the road's rank lift. */
-  z: number;
-  lift: number;
-  ux: number;
-  uy: number;
-  hw: number;
-  lanes: number;
-  oneway: boolean;
-  kind: RoadKind;
-  incoming: boolean;
-}
-
 export interface Signals {
   junctions: Junction[];
   grid: IdGrid;
   /**
-   * State for the junction nearest (x, y). With a travel direction (dirX, dirY)
-   * the approach group comes from the direction of travel, which is exact;
-   * otherwise it is guessed from the bearing of (x, y) from the junction centre
-   * (ambiguous for points at the centre or on a corner).
+   * Light for a vehicle at (x, y) travelling (dirX, dirY) (unit, map coords) on
+   * level z, from the shared signal model: the junction on that level whose
+   * arms fit the travel direction, and the arm pointing back along it. Null
+   * where no signal controls the approach.
    */
-  stateAt(x: number, y: number, t: number, dirX?: number, dirY?: number): Light | null;
+  stateAt(x: number, y: number, t: number, dirX?: number, dirY?: number, z?: number): Light | null;
 }
 
 export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: RoadIndex }, progress: (f: number) => void): Promise<Signals> {
@@ -180,39 +134,9 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
   const infos = roads.infos;
   const marks = new MeshGeo([{ name: 'aMark', size: 3, type: 'f32' }]);
 
-  // ---- cluster signal nodes into junctions
-  const sig = data.signals;
-  const ns = sig.length >> 1;
-  const parent = new Int32Array(ns).map((_, i) => i);
-  const find = (i: number): number => {
-    while (parent[i] !== i) {
-      parent[i] = parent[parent[i]];
-      i = parent[i];
-    }
-    return i;
-  };
-  const sg = new IdGrid(R[0], R[1], R[2], R[3], 30);
-  for (let i = 0; i < ns; i++) sg.addPoint(i, sig[2 * i], sig[2 * i + 1]);
-  for (let i = 0; i < ns; i++) {
-    const x = sig[2 * i];
-    const y = sig[2 * i + 1];
-    sg.query(x - 28, y - 28, x + 28, y + 28, (j) => {
-      if (j <= i) return;
-      if (Math.hypot(sig[2 * j] - x, sig[2 * j + 1] - y) < 28) parent[find(j)] = find(i);
-    });
-  }
-  const groups = new Map<number, number[]>();
-  for (let i = 0; i < ns; i++) {
-    const r = find(i);
-    let g = groups.get(r);
-    if (!g) {
-      g = [];
-      groups.set(r, g);
-    }
-    g.push(i);
-  }
-
-  const junctions: Junction[] = [];
+  // ---- junctions, arms and phases from the shared signal model
+  const model = signalsFor(data);
+  const junctions: Junction[] = model.junctions;
   interface Head {
     x: number;
     y: number;
@@ -238,105 +162,26 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
     marks.up(a, b, c, d);
   };
 
-  for (const members of groups.values()) {
-    let cx = 0;
-    let cy = 0;
-    for (const m of members) {
-      cx += sig[2 * m];
-      cy += sig[2 * m + 1];
-    }
-    cx /= members.length;
-    cy /= members.length;
-    // approaches
-    const found: Arm[] = [];
-    const seen = new Set<number>();
-    // the junction's level: the road nearest to the signal nodes (skip viaducts passing over)
-    const near0 = index.nearest(cx, cy, 30, (ri) => !infos[ri].r.tunnel);
-    const zLevel = near0 ? near0.z : ctx.field.natAt(cx, cy);
-    index.roadsNear(cx, cy, 24, (road) => {
-      if (seen.has(road)) return;
-      seen.add(road);
-      const ri = infos[road];
-      const rd = ri.r;
-      if (rd.tunnel || rd.kind === RoadKind.Pedestrian) return;
-      // project centre onto road
-      let best = Infinity;
-      let s0 = 0;
-      const p = rd.pts;
-      for (let k = 0; k + 1 < ri.n; k++) {
-        const ax = p[2 * k];
-        const ay = p[2 * k + 1];
-        const dx = p[2 * k + 2] - ax;
-        const dy = p[2 * k + 3] - ay;
-        const l2 = dx * dx + dy * dy || 1;
-        let t = ((cx - ax) * dx + (cy - ay) * dy) / l2;
-        t = t < 0 ? 0 : t > 1 ? 1 : t;
-        const d = Math.hypot(ax + dx * t - cx, ay + dy * t - cy);
-        if (d < best) {
-          best = d;
-          s0 = ri.cum[k] + t * Math.sqrt(l2);
-        }
-      }
-      const zr = roadAt(ri, s0).z;
-      if (Math.abs(zr - zLevel) > 3) return;
-      for (const dir of [1, -1]) {
-        const s = s0 + dir * 16;
-        if (s < 0 || s > ri.len) continue;
-        const q = roadAt(ri, s);
-        let ux = q.x - cx;
-        let uy = q.y - cy;
-        const l = Math.hypot(ux, uy);
-        if (l < 4) continue;
-        ux /= l;
-        uy /= l;
-        const incoming = !rd.oneway || dir === -1;
-        found.push({ z: zr, lift: ri.lift, ux, uy, hw: ri.hw, lanes: rd.lanes, oneway: rd.oneway, kind: rd.kind, incoming });
-      }
-    });
-    if (!found.length) continue;
-    // merge arms pointing the same way
-    const armsJ: Arm[] = [];
-    for (const a of found.sort((p, q) => q.hw - p.hw)) {
-      const m = armsJ.find((b) => a.ux * b.ux + a.uy * b.uy > 0.9);
-      if (m) m.incoming = m.incoming || a.incoming;
-      else armsJ.push({ ...a });
-    }
-    const main = [...armsJ].sort((p, q) => p.kind - q.kind || q.hw - p.hw)[0];
-    const groupOf = (a: Arm) => (Math.abs(a.ux * main.ux + a.uy * main.uy) > 0.7 ? 0 : 1);
-    const hasB = armsJ.some((a) => groupOf(a) === 1);
-    const majorish = main.kind <= RoadKind.Secondary;
-    const cycle = hasB ? (majorish ? 90 : 70) : 60;
-    const usable = cycle - 2 * (AMBER + ALL_RED);
-    const gA = hasB ? usable * (main.kind <= RoadKind.Primary ? 0.62 : 0.55) : cycle - 20;
-    const gB = hasB ? usable - gA : 0;
-    const jn: Junction = {
-      x: cx,
-      y: cy,
-      ax: main.ux,
-      ay: main.uy,
-      cycle,
-      gA,
-      gB,
-      offset: hash2(cx, cy, 71) * cycle,
-      arms: armsJ.map((a) => ({ ux: a.ux, uy: a.uy, g: groupOf(a) })),
-    };
-    const ji = junctions.length;
-    junctions.push(jn);
-
-    for (const a of armsJ) {
-      if (!a.incoming) continue;
-      let ds = 6;
-      for (const b of armsJ) if (b !== a) ds = Math.max(ds, b.hw + 2.5);
-      ds = Math.min(ds, 22);
-      const sx = cx + a.ux * ds;
-      const sy = cy + a.uy * ds;
+  junctions.forEach((jn, ji) => {
+    if (!jn.phases.length) return;
+    for (const a of jn.arms) {
+      // (an approach no signal faces has no light: src/data/signals.ts)
+      if (!a.incoming || a.phase < 0) continue;
+      // Stop line clear of the widest other road, in the open (not inside a tunnel portal: on an arm that
+      // goes into a tunnel at its o, src/data/signals.ts already keeps it at o at the furthest), and out of
+      // the junction: at least 4 m from the centre along the arm.
+      const ds = a.mouth ? a.stop : Math.min(a.stop, a.open - 1);
+      if (a.mouth + ds < 4) continue;
+      const lift = infos[a.road].lift;
+      const sx = a.ox + a.ux * ds;
+      const sy = a.oy + a.uy * ds;
       const tx = -a.ux;
       const ty = -a.uy;
       const lx = -ty;
       const ly = tx;
-      const group = groupOf(a);
+      const group = a.phase;
       // stop line across the incoming lanes (left half for two-way roads)
-      if (a.kind !== RoadKind.Service) stopLine(sx, sy, tx, ty, a.oneway ? -a.hw + 0.3 : 0.2, a.hw - 0.3, a.z + a.lift + 0.005);
+      if (a.kind !== RoadKind.Service) stopLine(sx, sy, tx, ty, a.oneway ? -a.hw + 0.3 : 0.2, a.hw - 0.3, a.z + lift + 0.005);
       // primary pole on the left kerb
       const px = sx + lx * (a.hw + 0.9);
       const py = sy + ly * (a.hw + 0.9);
@@ -353,15 +198,18 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       }
       // far-side right pole (across the junction) for major roads
       if (a.kind <= RoadKind.Secondary) {
-        const fx = cx - a.ux * ds - lx * (a.oneway ? a.hw + 0.9 : 1.5);
-        const fy = cy - a.uy * ds - ly * (a.oneway ? a.hw + 0.9 : 1.5);
+        // (across the box, not as far out as a set-back stop line; mirrored about the centre from a
+        // tunnel mouth's line)
+        const df = a.mouth + Math.min(a.mouth + ds, 22);
+        const fx = a.ox - a.ux * df - lx * (a.oneway ? a.hw + 0.9 : 1.5);
+        const fy = a.oy - a.uy * df - ly * (a.oneway ? a.hw + 0.9 : 1.5);
         if (index.penetrationZ(fx, fy, a.z, 3) < -0.3) {
           poles.push({ x: fx, y: fy, z: base, h: 4.6 });
           heads.push({ x: fx, y: fy, h: base + 3.4, fx: a.ux, fy: a.uy, j: ji, group });
         }
       }
     }
-  }
+  });
   progress(0.25);
   await yieldFrame();
 
@@ -374,19 +222,19 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
   const struct = structMaterial(ctx, 'furn');
   {
     const poleMat = patch(new THREE.MeshLambertMaterial({ color: 0x8c9294 }), { key: 'pole' });
-    const pm = new THREE.InstancedMesh(poleTemplate(), poleMat, poles.length);
+    const pmM = new Float32Array(poles.length * 16);
     poles.forEach((p, i) => {
       m4.makeScale(0.2, p.h, 0.2).setPosition(p.x, p.z, -p.y);
-      pm.setMatrixAt(i, m4);
+      m4.toArray(pmM, i * 16);
     });
-    const am = new THREE.InstancedMesh(boxTemplate(), poleMat, arms.length);
+    const amM = new Float32Array(arms.length * 16);
     arms.forEach((a, i) => {
       const ang = Math.atan2(a.dy, a.dx); // local +x -> map direction (dx, dy)
       q.setFromAxisAngle(yAxis, ang);
       v.set(a.x + (a.dx * a.len) / 2, a.h, -(a.y + (a.dy * a.len) / 2));
       sc.set(a.len, 0.16, 0.16);
       m4.compose(v, q, sc);
-      am.setMatrixAt(i, m4);
+      m4.toArray(amM, i * 16);
     });
     const headMat = patch(new THREE.MeshLambertMaterial({ color: 0x1a1c1e }), {
       key: 'sighead',
@@ -413,7 +261,7 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       ],
     });
     const hgeo = headTemplate();
-    const hm = new THREE.InstancedMesh(hgeo, headMat, heads.length);
+    const hmM = new Float32Array(heads.length * 16);
     const sigAttr = new Float32Array(heads.length * 4);
     const grpAttr = new Float32Array(heads.length);
     heads.forEach((h, i) => {
@@ -423,23 +271,27 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       v.set(h.x, h.h, -h.y);
       sc.set(1, 1, 1);
       m4.compose(v, q, sc);
-      hm.setMatrixAt(i, m4);
+      m4.toArray(hmM, i * 16);
       const j = junctions[h.j];
-      sigAttr.set([j.offset, j.cycle, j.gA, j.gB], i * 4);
+      const ph = j.phases[h.group];
+      sigAttr.set([j.offset, j.cycle, ph.start, ph.green], i * 4);
       grpAttr[i] = h.group;
     });
-    hgeo.setAttribute('iSig', new THREE.InstancedBufferAttribute(sigAttr, 4));
-    hgeo.setAttribute('iGroup', new THREE.InstancedBufferAttribute(grpAttr, 1));
-    for (const m of [pm, am, hm]) {
-      m.castShadow = true;
-      m.receiveShadow = true;
-      m.computeBoundingSphere();
-      m.frustumCulled = false;
-      ctx.root.add(m);
-    }
-    pm.name = 'signal-poles';
-    am.name = 'signal-arms';
-    hm.name = 'signal-heads';
+    // within 1.2 km (a signal head is under a pixel beyond), shadows from those near the shadow box
+    const sig = { range: 1200, castShadow: true, receiveShadow: true };
+    cellInstances(ctx, poleTemplate(), poleMat, pmM, [], { ...sig, name: 'signal-poles' });
+    cellInstances(ctx, boxTemplate(), poleMat, amM, [], { ...sig, name: 'signal-arms' });
+    cellInstances(
+      ctx,
+      hgeo,
+      headMat,
+      hmM,
+      [
+        { name: 'iSig', size: 4, data: sigAttr },
+        { name: 'iGroup', size: 1, data: grpAttr },
+      ],
+      { ...sig, name: 'signal-heads' },
+    );
   }
   progress(0.35);
   await yieldFrame();
@@ -582,18 +434,22 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       }
       a.push(l);
     }
+    // the poles (a hairline beyond 1.5 km), shadows from those near the shadow box; glows and pools by 1.5 km chunk
+    const poleM = new Float32Array(lights.length * 16);
+    lights.forEach((l, i) => {
+      q.setFromAxisAngle(yAxis, l.ang);
+      v.set(l.x, l.z, -l.y);
+      m4.compose(v, q, sc.set(1, 1, 1));
+      m4.toArray(poleM, i * 16);
+    });
+    cellInstances(ctx, tpl, poleMat, poleM, [], { name: 'streetlights', range: 1500, castShadow: true, receiveShadow: true });
     for (const [key, ls] of byChunk) {
       const n = ls.length;
-      const pm = new THREE.InstancedMesh(tpl, poleMat, n);
       const gm = new THREE.InstancedMesh(quadGeo, glowMat, n);
       const om = new THREE.InstancedMesh(poolGeo, poolMat, n);
       let cx = 0;
       let cz = 0;
       ls.forEach((l, i) => {
-        q.setFromAxisAngle(yAxis, l.ang);
-        v.set(l.x, l.z, -l.y);
-        m4.compose(v, q, sc.set(1, 1, 1));
-        pm.setMatrixAt(i, m4);
         const hx = l.x + Math.cos(l.ang) * 2.55;
         const hz = -l.y - Math.sin(l.ang) * 2.55;
         m4.makeScale(3.2, 3.2, 3.2).setPosition(hx, l.z + 9.0, hz);
@@ -603,9 +459,7 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
         cx += l.x;
         cz -= l.y;
       });
-      pm.castShadow = true;
-      pm.receiveShadow = true;
-      for (const m of [pm, gm, om]) {
+      for (const m of [gm, om]) {
         m.computeBoundingSphere();
         m.name = `streetlights-${key}`;
         ctx.root.add(m);
@@ -614,7 +468,6 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       om.renderOrder = 4;
       cx /= n;
       cz /= n;
-      ctx.cull.push({ obj: pm, x: cx, z: cz, range: 2600 });
       ctx.cull.push({ obj: gm, x: cx, z: cz, range: 6000 });
       ctx.cull.push({ obj: om, x: cx, z: cz, range: 2600 });
       nightOnly.push(gm, om);
@@ -659,17 +512,13 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
     mg.beam(0, 6.6, 0, 3.6, 6.6, 0, 0.05, 120, 124, 126);
     mg.beam(0, 7.1, 0, 3.6, 6.65, 0, 0.03, 120, 124, 126);
     const mastGeo = mg.build();
-    const mm = new THREE.InstancedMesh(mastGeo, struct, masts.length);
+    const mastM = new Float32Array(masts.length * 16);
     masts.forEach((m, i) => {
       q.setFromAxisAngle(yAxis, m.ang);
       m4.compose(v.set(m.x, m.z, -m.y), q, sc.set(1, 1, 1));
-      mm.setMatrixAt(i, m4);
+      m4.toArray(mastM, i * 16);
     });
-    mm.castShadow = true;
-    mm.computeBoundingSphere();
-    mm.name = 'rail-masts';
-    mm.frustumCulled = false;
-    ctx.root.add(mm);
+    cellInstances(ctx, mastGeo, struct, mastM, [], { name: 'rail-masts', range: 1500, castShadow: true });
   }
   progress(0.8);
   await yieldFrame();
@@ -708,18 +557,13 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
       const by = ly * side;
       items.push({ x, y, z: nr.z + 0.15, ang: Math.atan2(-bx, by) });
     }
-    const sm = new THREE.InstancedMesh(tpl, struct, items.length);
+    const shM = new Float32Array(items.length * 16);
     items.forEach((it, i) => {
       q.setFromAxisAngle(yAxis, it.ang);
       m4.compose(v.set(it.x, it.z, -it.y), q, sc.set(1, 1, 1));
-      sm.setMatrixAt(i, m4);
+      m4.toArray(shM, i * 16);
     });
-    sm.castShadow = true;
-    sm.receiveShadow = true;
-    sm.computeBoundingSphere();
-    sm.frustumCulled = false;
-    sm.name = 'shelters';
-    ctx.root.add(sm);
+    cellInstances(ctx, tpl, struct, shM, [], { name: 'shelters', range: 1500, castShadow: true, receiveShadow: true });
   }
   progress(1);
 
@@ -728,40 +572,8 @@ export async function buildFurniture(ctx: Ctx, roads: { infos: RI[]; index: Road
   return {
     junctions,
     grid,
-    stateAt(x: number, y: number, t: number, dirX?: number, dirY?: number): Light | null {
-      let best = -1;
-      let bd = 40;
-      grid.query(x - 40, y - 40, x + 40, y + 40, (i) => {
-        const d = Math.hypot(junctions[i].x - x, junctions[i].y - y);
-        if (d < bd) {
-          bd = d;
-          best = i;
-        }
-      });
-      if (best < 0) return null;
-      const j = junctions[best];
-      let dx = x - j.x;
-      let dy = y - j.y;
-      if (dirX !== undefined && dirY !== undefined && (dirX !== 0 || dirY !== 0)) {
-        // The approach arm is the one pointing back along the travel direction:
-        // use that arm's group so the answer matches its signal heads exactly.
-        let bestDot = 0.5;
-        let g = -1;
-        for (const a of j.arms ?? []) {
-          const d = -(a.ux * dirX + a.uy * dirY);
-          if (d > bestDot) {
-            bestDot = d;
-            g = a.g;
-          }
-        }
-        if (g >= 0) return phaseState(j, g, t);
-        dx = -dirX;
-        dy = -dirY;
-      }
-      const l = Math.hypot(dx, dy) || 1;
-      // Same rule as the heads: arms within ~45° of the main axis are group 0.
-      const group = Math.abs((dx * j.ax + dy * j.ay) / l) > 0.7 ? 0 : 1;
-      return phaseState(j, group, t);
+    stateAt(x: number, y: number, t: number, dirX?: number, dirY?: number, z?: number): Light | null {
+      return model.stateAt(x, y, t, dirX, dirY, z);
     },
   };
 }

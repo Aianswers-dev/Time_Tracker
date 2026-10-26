@@ -4,10 +4,13 @@
 import './hud.css';
 import type { BusLights, BusPose, MapData, Route } from '../types';
 import type { GuideState, RouteSummary } from './guide';
+import type { DwellState } from './passengers';
 import { StopStatus } from './guide';
 import { Minimap, type MapMarker } from './minimap';
 import { FullMap } from './fullmap';
 import {
+  ICON_ALIGHT,
+  ICON_BOARD,
   ICON_CLOCK,
   ICON_DOORS,
   ICON_HAZARD,
@@ -16,6 +19,7 @@ import {
   ICON_INDICATOR_R,
   ICON_MAP,
   ICON_PARK,
+  ICON_PAX,
   ICON_RIBBON,
   turnArrow,
 } from './icons';
@@ -51,6 +55,47 @@ export interface HudOptions {
 
 type ToastKind = 'info' | 'good' | 'bad' | 'warn';
 
+interface LiveToast {
+  el: HTMLDivElement;
+  key: string;
+  n: number;
+  timer: number;
+  badge: HTMLElement | null;
+}
+
+/** A displayed value that only changes once a new value has held for `hold` seconds of sim time. */
+class Steady<T> {
+  private pend: T;
+  private since = 0;
+  private fresh = true;
+  constructor(
+    public shown: T,
+    readonly hold: number,
+  ) {
+    this.pend = shown;
+  }
+  update(v: T, t: number): T {
+    if (this.fresh) {
+      this.fresh = false;
+      this.shown = this.pend = v;
+    }
+    if (v === this.shown) {
+      this.pend = v;
+      return v;
+    }
+    if (v !== this.pend) {
+      this.pend = v;
+      this.since = t;
+    }
+    if (t - this.since >= this.hold) this.shown = v;
+    return this.shown;
+  }
+}
+
+/** OSM `ref`s used as a name when a way has none ('22;95', '5'): not a street name. */
+const REF_ONLY = /^[A-Z]{0,2}\d+[A-Z]?(\s*[;,/]\s*[A-Z]{0,2}\d+[A-Z]?)*$/;
+const TOAST_MS = 3200;
+
 export class Hud {
   private root: HTMLDivElement;
   private mini: Minimap | null = null;
@@ -73,7 +118,20 @@ export class Hud {
   private offAngle = NaN;
   private gradeShown = false;
   private gradeText = '';
+  private dwellKey = '';
+  private dwellStop = -1;
+  private loadKey = '';
   private readonly toasts: HTMLDivElement;
+  private live: LiveToast[] = [];
+  /** Sim time (s) from the frames' clock, for debouncing what the guide reports. */
+  private simT = 0;
+  private lastHours = NaN;
+  // 2 s: a branch joining the road (Eastern Busway onto the SEB, 222 #15) wins the lookup for
+  // up to ~2 s; a real turn onto a new street still shows within a couple of seconds.
+  private road = new Steady('', 2);
+  private limit = new Steady(50, 1.2);
+  private offStartT = -1e9;
+  private lastOnToastT = -1e9;
 
   // Slots
   private s: Record<string, TextSlot> = {};
@@ -101,7 +159,7 @@ export class Hud {
         <div class="bbh-stopping" data-t="stopping">BUS STOPPING</div>
         <div class="bbh-sched"><span><span class="bbh-cap">Timetable</span> <span data-t="due"></span></span><span class="bbh-pill idle" data-e="pill"></span></div>
       </div>
-      <div class="bbh-panel bbh-clock">${ICON_CLOCK}<span data-t="clock"></span><span class="bbh-shift" data-t="shift"></span></div>
+      <div class="bbh-panel bbh-clock">${ICON_CLOCK}<span data-t="clock"></span><span class="bbh-shift" data-t="shift"></span><span class="bbh-load" data-e="load" title="Passengers on board / capacity">${ICON_PAX}<b data-t="load">0</b><small data-t="cap"></small></span></div>
       <div class="bbh-mini" data-e="mini" title="Tap to zoom"><div class="bbh-n" data-e="north">N</div><span class="bbh-zoom" data-t="zoom">600 m</span></div>
       <button class="bbh-ribbon" data-e="ribbonBtn" title="Guidance chevrons (V)">${ICON_RIBBON}</button>
       <button class="bbh-ribbon bbh-mapbtn" data-e="mapBtn" title="Route map (M)">${ICON_MAP}</button>
@@ -120,6 +178,11 @@ export class Hud {
         </div>
       </div>
       <div class="bbh-panel bbh-off" data-e="off"><div class="bbh-oarrow" data-e="oarrow">${turnArrow('straight')}</div><div><div class="t1">Off route</div><div class="t2" data-t="offd"></div></div></div>
+      <div class="bbh-panel bbh-dwell" data-e="dwell" aria-live="polite">
+        <div class="bbh-dhead"><span class="bbh-dname" data-t="dname"></span><span class="bbh-dstat" data-e="dstat"></span></div>
+        <div class="bbh-drow off" data-e="drOff"><span class="bbh-dlbl">${ICON_ALIGHT}<span>Alighting</span></span><span class="bbh-dbar"><b data-e="dbOff"></b></span><span class="bbh-dnum"><b data-t="dnOff"></b><small data-t="dtOff"></small></span></div>
+        <div class="bbh-drow on" data-e="drOn"><span class="bbh-dlbl">${ICON_BOARD}<span>Boarding</span></span><span class="bbh-dbar"><b data-e="dbOn"></b></span><span class="bbh-dnum"><b data-t="dnOn"></b><small data-t="dtOn"></small></span></div>
+      </div>
       <div class="bbh-panel bbh-prompt" data-e="prompt"></div>
       <div class="bbh-toasts"></div>
       <div class="bbh-map" data-e="map"><div class="bbh-panel bbh-mhead" data-e="mhead"></div>
@@ -138,7 +201,15 @@ export class Hud {
     this.f.over = new FlagSlot(e.cluster, 'over');
     this.f.off = new FlagSlot(e.off, 'show');
     this.f.prompt = new FlagSlot(e.prompt, 'show');
+    this.f.dwell = new FlagSlot(e.dwell, 'show');
+    this.f.dwellDone = new FlagSlot(e.dwell, 'done');
+    this.f.dwellFull = new FlagSlot(e.dwell, 'full');
+    this.f.offNone = new FlagSlot(e.drOff, 'none');
+    this.f.onNone = new FlagSlot(e.drOn, 'none');
+    this.f.loadBusy = new FlagSlot(e.load, 'busy');
+    this.f.loadFull = new FlagSlot(e.load, 'full');
     this.f.night = new FlagSlot(root, 'night');
+    this.f.cab = new FlagSlot(root, 'cab');
     this.f.map = new FlagSlot(e.map, 'show');
     this.f.ribbonOff = new FlagSlot(e.ribbonBtn, 'off');
     this.f.sig = new FlagSlot(e.sig, 'show');
@@ -193,9 +264,20 @@ export class Hud {
     const g = f.guide;
     const s = this.s;
     const fl = this.f;
+    // Sim seconds since the last frame (the time-of-day key jumps the clock by hours: not elapsed time).
+    if (Number.isFinite(this.lastHours)) {
+      const dh = ((((f.hours - this.lastHours) % 24) + 24) % 24) * 3600;
+      if (dh < 60) this.simT += dh;
+    }
+    this.lastHours = f.hours;
+    // In the cab the dashboard has the speedo, gear and lamps: the HUD keeps only the limit.
+    fl.cab.set(f.cameraMode === 'cab');
 
-    // Route card.
-    s.road.set(g.roadName ? `on ${g.roadName}` : '');
+    // Route card. Names that flick to a side street or the road below for a moment at a
+    // junction are held back until they have lasted a moment; route refs are not names.
+    const name = REF_ONLY.test(g.roadName.trim()) ? '' : g.roadName;
+    const road = this.road.update(name, this.simT);
+    s.road.set(road ? `on ${road}` : '');
     s.lvl.set(g.roadLevel === 'tunnel' ? 'Tunnel' : g.roadLevel === 'viaduct' ? 'Viaduct' : g.roadLevel === 'bridge' ? 'Bridge' : '');
     // Gradient over 4 % (with a little hysteresis so it does not flicker).
     const pct = Math.abs(g.grade) * 100;
@@ -287,12 +369,26 @@ export class Hud {
     s.clock.set(fmtClock(f.hours));
     s.shift.set(g.shiftStarted ? fmtDuration(g.shiftTime) : '');
     fl.night.set(f.hours < 6.5 || f.hours > 18.2);
+    // Load on board.
+    const loadKey = `${g.load}/${g.capacity}`;
+    if (loadKey !== this.loadKey) {
+      this.loadKey = loadKey;
+      s.load.set(String(g.load));
+      s.cap.set(`/${g.capacity}`);
+      const p = g.capacity > 0 ? g.load / g.capacity : 0;
+      this.els.load.style.setProperty('--p', `${Math.round(Math.min(1, p) * 100)}%`);
+      fl.loadBusy.set(p >= 0.8 && p < 1);
+      fl.loadFull.set(p >= 1);
+    }
+    this.updateDwell(g.finished ? null : g.dwell);
 
     // Cluster.
     const kmh = Math.round(f.speedKmh);
     s.speed.set(String(kmh));
-    s.limit.set(String(g.speedLimit));
-    fl.over.set(g.speeding);
+    // A limit seen for a moment (a slip lane's 10 km/h beside us) does not flash up.
+    const limit = this.limit.update(g.speedLimit, this.simT);
+    s.limit.set(String(limit));
+    fl.over.set(g.speeding && f.speedKmh > limit + 5);
     fl.gR.set(f.gear === 'R');
     fl.gN.set(f.gear === 'N');
     fl.gD.set(f.gear === 'D');
@@ -332,7 +428,10 @@ export class Hud {
     // Contextual prompt.
     let prompt = '';
     if (!g.finished && !this.mapOpen) {
-      if (!g.shiftStarted && Math.abs(f.speedKmh) < 1.5) prompt = f.parkBrake ? 'Ready to depart · release the park brake <kbd>F</kbd> and pull out' : 'Ready to depart · indicate <kbd>E</kbd> and pull out when clear';
+      if (g.dwell) prompt = dwellPrompt(g.dwell, g);
+      else if (g.canBoard && !f.doorsOpen) prompt = 'Passengers waiting · open the doors <kbd>O</kbd> to let them board';
+      else if (!g.shiftStarted && Math.abs(f.speedKmh) < 1.5 && f.doorsOpen) prompt = 'Close the doors <kbd>O</kbd> when ready';
+      else if (!g.shiftStarted && Math.abs(f.speedKmh) < 1.5) prompt = f.parkBrake ? 'Ready to depart · release the park brake <kbd>F</kbd> and pull out' : 'Ready to depart · indicate <kbd>E</kbd> and pull out when clear';
       else if (hasNext && g.canServe && !f.doorsOpen) prompt = `Open the doors <kbd>O</kbd> to serve ${escapeHtml(g.nextStopName)}`;
       else if (hasNext && g.atStop && !f.doorsOpen && f.speedKmh > 2) prompt = 'Stop at the flag to serve this stop';
       else if (f.doorsOpen && f.speedKmh < 1 && g.shiftStarted && !g.atStop && g.scheduleDelta < -59)
@@ -357,13 +456,22 @@ export class Hud {
         }
         case 'missed':
         case 'collision':
+        case 'leftbehind':
           this.toast(ev.text, 'bad');
           break;
-        case 'offroute':
+        case 'full':
           this.toast(ev.text, 'warn');
           break;
+        case 'offroute':
+          // The Off route card says it (and points the way back).
+          this.offStartT = this.simT;
+          break;
         case 'onroute':
-          this.toast(ev.text, 'good');
+          // Only after a real spell off the route, and not every time the line is grazed.
+          if (this.simT - this.offStartT >= 3 && this.simT - this.lastOnToastT >= 10) {
+            this.lastOnToastT = this.simT;
+            this.toast(ev.text, 'good');
+          }
           break;
         case 'finished':
           this.summaryTimer = 1.4;
@@ -401,11 +509,77 @@ export class Hud {
     if (s.fps) s.fps.set(`${Math.round(f.fps)} fps · ${f.cameraMode}`);
   }
 
+  /** Passenger panel: alighting bar empties, boarding bar fills. */
+  private updateDwell(d: DwellState | null): void {
+    const fl = this.f;
+    fl.dwell.set(!!d);
+    if (!d) {
+      this.dwellKey = '';
+      this.dwellStop = -1;
+      return;
+    }
+    const key = `${d.stop}|${d.alighting}|${d.boarding}|${d.done}|${d.full}|${d.doors}|${d.flowing}`;
+    if (key === this.dwellKey) return;
+    this.dwellKey = key;
+    const s = this.s;
+    const e = this.els;
+    s.dname.set(d.stopName);
+    s.dnOff.set(d.alightTotal ? String(d.alighting) : '–');
+    s.dtOff.set(d.alightTotal ? ` of ${d.alightTotal}` : '');
+    s.dnOn.set(d.boardTotal ? String(d.boarding) : '–');
+    s.dtOn.set(d.boardTotal ? ` of ${d.boardTotal}` : '');
+    e.dbOff.style.width = `${d.alightTotal ? ((100 * d.alighting) / d.alightTotal).toFixed(1) : 0}%`;
+    e.dbOn.style.width = `${d.boardTotal ? ((100 * d.boarding) / d.boardTotal).toFixed(1) : 0}%`;
+    if (d.stop !== this.dwellStop) {
+      // A new stop: one notch per passenger when there are few enough to count.
+      this.dwellStop = d.stop;
+      for (const [b, n] of [[e.dbOff, d.alightTotal], [e.dbOn, d.boardTotal]] as const) {
+        const bar = b.parentElement!;
+        bar.classList.toggle('ticks', n > 1 && n <= 24);
+        bar.style.setProperty('--n', String(Math.max(1, n)));
+      }
+    }
+    fl.offNone.set(!d.alightTotal);
+    fl.onNone.set(!d.boardTotal);
+    fl.dwellDone.set(d.done);
+    fl.dwellFull.set(d.full > 0);
+    const [txt, cls] = d.done
+      ? d.full > 0
+        ? [`Bus full · ${d.full} left`, 'bad']
+        : d.last
+          ? ['All off', 'ok']
+          : ['All aboard', 'ok']
+      : d.doors === 'closing'
+        ? ['Doors closing', 'bad']
+        : d.doors === 'opening'
+          ? ['Doors opening', '']
+          : d.alighting > 0
+            ? ['Getting off', 'off']
+            : ['Boarding', 'on'];
+    if (e.dstat.textContent !== txt) e.dstat.textContent = txt;
+    const c = `bbh-dstat ${cls}`;
+    if (e.dstat.className !== c) e.dstat.className = c;
+  }
+
   private busCentre(p: BusPose): [number, number] {
     return [p.x + Math.sin(p.heading) * 3, p.y + Math.cos(p.heading) * 3];
   }
 
   toast(msg: string, kind: ToastKind = 'info', html = false): void {
+    // The same message again while it is still up: count it instead of stacking a copy.
+    const key = `${kind}|${msg}`;
+    const same = this.live.find((x) => x.key === key);
+    if (same) {
+      same.n++;
+      if (!same.badge) {
+        same.badge = el('b', 'bbh-tn');
+        same.el.appendChild(same.badge);
+      }
+      same.badge.textContent = `×${same.n}`;
+      clearTimeout(same.timer);
+      same.timer = this.expire(same);
+      return;
+    }
     const t = el('div', `bbh-panel bbh-toast ${kind}`);
     const i = el('i');
     const span = el('span');
@@ -413,11 +587,24 @@ export class Hud {
     else span.textContent = msg;
     t.append(i, span);
     this.toasts.appendChild(t);
-    while (this.toasts.children.length > 3) this.toasts.firstElementChild?.remove();
-    setTimeout(() => {
-      t.classList.add('out');
-      setTimeout(() => t.remove(), 360);
-    }, 3200);
+    const lt: LiveToast = { el: t, key, n: 1, timer: 0, badge: null };
+    lt.timer = this.expire(lt);
+    this.live.push(lt);
+    // Small screens keep two, so the stack never reaches the cards below it.
+    const max = matchMedia('(max-height: 560px), (max-width: 760px)').matches ? 2 : 3;
+    while (this.live.length > max) {
+      const old = this.live.shift()!;
+      clearTimeout(old.timer);
+      old.el.remove();
+    }
+  }
+
+  private expire(lt: LiveToast): number {
+    return window.setTimeout(() => {
+      this.live = this.live.filter((x) => x !== lt);
+      lt.el.classList.add('out');
+      setTimeout(() => lt.el.remove(), 360);
+    }, TOAST_MS);
   }
 
   toggleMap(): void {
@@ -459,6 +646,9 @@ export class Hud {
         <div><div class="k">Distance</div><div class="v">${(sum.distance / 1000).toFixed(1)}<small> km</small></div></div>
         <div><div class="k">Shift time</div><div class="v">${fmtDuration(sum.time)}</div></div>
         <div><div class="k">Worst late</div><div class="v">${fmtDelta(sum.worstLate).replace('+', '')}</div></div>
+        <div><div class="k">Passengers</div><div class="v">${sum.passengersCarried}<small> carried</small></div></div>
+        <div><div class="k">Left behind</div><div class="v">${sum.passengersLeft}${sum.passengersFull ? `<small> +${sum.passengersFull} bus full</small>` : ''}</div></div>
+        <div title="Boarding time beyond the timetable's allowance is not counted against you"><div class="k">Crowd delay</div><div class="v">${fmtDuration(sum.passengerDelay)}<small> excused</small></div></div>
       </div>
       <div class="bbh-sbtns"><button data-a="keep">Keep driving</button><button class="primary" data-a="again">Drive another route</button></div>
     </div>`;
@@ -474,4 +664,17 @@ export class Hud {
   dispose(): void {
     this.root.remove();
   }
+}
+
+/** The prompt while passengers get off and on: kneel requests, then when to close the doors. */
+function dwellPrompt(d: DwellState, g: GuideState): string {
+  if (!d.done) {
+    const n = d.alighting + d.boardTotal - d.boarding;
+    if (d.doors === 'closing') return `Doors closing on ${n} passenger${n === 1 ? '' : 's'} · <kbd>O</kbd> to reopen`;
+    return d.kneelFor ? `Kneel the bus <kbd>K</kbd> for a passenger ${escapeHtml(d.kneelFor)}` : '';
+  }
+  if (d.last) return 'End of the line · all passengers off';
+  if (g.shiftStarted && g.scheduleDelta < -59) return `All aboard · running early, hold for ${fmtDelta(-g.scheduleDelta).replace('+', '')}`;
+  if (d.doors === 'closing') return '';
+  return d.full > 0 ? 'Bus full · close the doors <kbd>O</kbd>' : 'All aboard — close the doors <kbd>O</kbd>';
 }

@@ -130,10 +130,11 @@ def main():
 
     with open(os.path.join(OUT, "roads.json")) as f:
         heights = elevation.RoadHeights(json.load(f)["roads"])
-    inner, outer, _ = build_terrain.read_terrain()
-    ground = build_terrain.ground_sampler(inner, outer)
+    inner, outer, head = build_terrain.read_terrain()
+    ground = build_terrain.ground_sampler(inner, outer, head.get("cuts"))
     stop_z: dict[int, list[float]] = collections.defaultdict(list)
     off_road = []
+    moved = []  # (route, dir, samples) moved off a wrong-way carriageway
 
     out = []
     for (short, direction), (sid, freq) in sorted(chosen.items(), key=lambda kv: (kv[0][0].zfill(6), kv[0][1])):
@@ -165,8 +166,12 @@ def main():
             for st in stops:
                 st[2] -= t0
         dense = elevation.densify(np.asarray(line.coords), 4.0)
-        z, off = heights.match(dense, ground)
+        seg = np.full(len(dense), -1, np.int64)
+        z, off = heights.match(dense, ground, seg_out=seg)
         off_road.append(off)
+        dense, nmoved = heights.snap_wrong_way(dense, z, seg)
+        if nmoved:
+            moved.append((short, int(direction or 0), nmoved))
         cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(dense, axis=0).T))])
         for st in stops:
             stop_z[st[0]].append(float(np.interp(st[1] * 0.1, cum, z)))
@@ -193,6 +198,8 @@ def main():
     for k, zs in stop_z.items():
         stops_out[k]["z"] = q(float(np.median(zs)))
     print(f"route heights: {100 * float(np.mean(off_road)):.1f}% of samples off the mapped roads", file=sys.stderr)
+    print(f"route plans: {len(moved)} route directions moved into the tunnel tube their heights came from "
+          f"({sum(m[2] for m in moved)} samples): {', '.join(f'{r}/{d} {k}' for r, d, k in moved[:40])}", file=sys.stderr)
 
     os.makedirs(OUT, exist_ok=True)
     path = os.path.join(OUT, "routes.json")

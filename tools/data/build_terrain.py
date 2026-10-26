@@ -32,6 +32,11 @@ terrain.bin holds two grids of little-endian uint16 samples, one after the
 other; height = sample * scale + offset. Each grid is row-major from the
 south-west corner: sample (i, j) sits at world x = x0 + i * cell,
 y = y0 + j * cell (x east, y north, metres, see common.py). See README.md.
+
+terrain.json "cuts" lists the walled station cuttings (stations.station_cuts):
+an outline and a floor plane each. The grid keeps the natural ground there
+(their carriageways are not burned in); inside an outline the ground is the
+floor (cut_floor, ground_sampler; src/data/cuts.ts in the game).
 """
 
 import concurrent.futures
@@ -493,13 +498,47 @@ def read_terrain() -> tuple[Grid, Grid, dict]:
     return grids[0], grids[1], head
 
 
-def ground_sampler(inner: Grid, outer: Grid):
-    """Vectorised (x, y) -> height using the inner grid where it exists, else the outer one."""
+def cut_floor(cuts: list[dict] | None, x, y) -> np.ndarray:
+    """Per point: the floor of the station cutting whose outline holds it (terrain.json "cuts":
+    ring "p" in dm, floor z = a + b x + c y for "f" = [a, b, c]), NaN outside every cutting."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    x, y = np.broadcast_arrays(x, y)
+    out = np.full(x.shape, np.nan)
+    for c in cuts or []:
+        ring = np.asarray(c["p"], dtype=np.float64).reshape(-1, 2) * 0.1
+        m = (x >= ring[:, 0].min()) & (x <= ring[:, 0].max()) & (y >= ring[:, 1].min()) & (y <= ring[:, 1].max())
+        if not m.any():
+            continue
+        px, py = x[m], y[m]
+        inside = np.zeros(px.shape, bool)
+        for k in range(len(ring)):
+            ax, ay = ring[k - 1]
+            bx, by = ring[k]
+            if ay == by:
+                continue
+            cross = (ay > py) != (by > py)
+            xi = ax + (py - ay) * (bx - ax) / (by - ay)
+            inside ^= cross & (px < xi)
+        a, b, cc = c["f"]
+        sub = out[m]
+        sub[inside] = a + b * px[inside] + cc * py[inside]
+        out[m] = sub
+    return out
+
+
+def ground_sampler(inner: Grid, outer: Grid, cuts: list[dict] | None = None):
+    """Vectorised (x, y) -> height using the inner grid where it exists, else the outer one; the
+    floor inside a station cutting's outline (terrain.json "cuts")."""
 
     def f(x, y):
         x = np.asarray(x, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64)
-        return np.where(inner.contains(x, y), inner.sample(x, y), outer.sample(x, y))
+        g = np.where(inner.contains(x, y), inner.sample(x, y), outer.sample(x, y))
+        if cuts:
+            fz = cut_floor(cuts, x, y)
+            g = np.where(np.isfinite(fz), fz, g)
+        return g
 
     return f
 
