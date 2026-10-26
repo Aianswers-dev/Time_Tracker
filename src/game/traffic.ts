@@ -8,7 +8,7 @@ import * as THREE from 'three';
 import type { BusFactory, BusLights, BusMesh, BusPose, BusSpec, BusType, Collider, MapData, Route, WorldHandle } from '../types';
 import { wrapAngle } from '../data/coords';
 import { busTypeForRoute, stopUsage } from './routeMeta';
-import { TRACK_STEP, hasTrack, trackFor, type RouteTrack, type TrackSample, type TrackSignal, type TrackStop } from './track';
+import { TRACK_STEP, TrackBuild, hasTrack, trackFor, type RouteTrack, type TrackSample, type TrackSignal, type TrackStop } from './track';
 import type { MapMarker } from './minimap';
 import { brighten, rng } from './util';
 import { CarTraffic, GAP_ACROSS, GAP_LEFT, PLAYER_HOLD, STALL_HIDDEN, STALL_VISIBLE, Turn, Wait, clearTime, removeAt, type BusJunction } from './cars';
@@ -196,6 +196,14 @@ const NARROW_W = 2.9;
 const NARROW_BEND = 0.2;
 const NARROW_K = 0.01;
 
+/**
+ * Background track building: slices of BUILD_SLICE ms, in idle time and at least one every BUILD_WAIT ms
+ * (about a frame); the routes near the player first, as of every BUILD_PRIO s.
+ */
+const BUILD_SLICE = 2;
+const BUILD_WAIT = 20;
+const BUILD_PRIO = 5;
+
 /** How far past a route's stop line a signalised junction's first node may lie and still be on that line's light (m). */
 const FAR_LINE = 70;
 
@@ -217,7 +225,23 @@ export class Traffic {
   private nextId = 1;
   private rand = rng(20240607);
   private buildQueue: Route[];
-  private building = false;
+  // Route tracks are built in the background a BUILD_SLICE at a time (a track takes 0.1-1 s), in idle
+  // time between frames and at least a slice every BUILD_WAIT ms: building, the one under way (near: one
+  // of the routes near the player); buildDue, a slice asked for; buildNear, how many of the queue's first
+  // routes are near the player (prioritise, every BUILD_PRIO s while there are tracks to build).
+  private building: TrackBuild | null = null;
+  private buildingNear = false;
+  private buildDue = false;
+  private buildNear = 0;
+  private buildPrio = 0;
+  /** When the builder started, and how many tracks it built (for the log line when it is done). */
+  private buildT0 = performance.now();
+  private builtN = 0;
+  private readonly buildRun = (d?: IdleDeadline): void => {
+    this.buildDue = false;
+    this.buildSome(d);
+    this.scheduleBuild();
+  };
   private initial = true;
   private frustum = new THREE.Frustum();
   private projScreen = new THREE.Matrix4();
@@ -343,15 +367,44 @@ export class Traffic {
   }
 
   private scheduleBuild(): void {
-    // (Film runs build a few tracks per sim step instead: see simulate.)
-    if (this.film || this.building || !this.buildQueue.length) return;
-    this.building = true;
-    setTimeout(() => {
-      this.building = false;
-      const t0 = performance.now();
-      while (this.buildQueue.length && performance.now() - t0 < 6) trackFor(this.buildQueue.shift()!, this.data);
-      this.scheduleBuild();
-    }, 4);
+    // (Film runs build a few whole tracks per sim step instead: see simulate.)
+    if (this.film || this.buildDue || !this.buildsLeft()) return;
+    this.buildDue = true;
+    if (typeof requestIdleCallback === 'function') requestIdleCallback(this.buildRun, { timeout: BUILD_WAIT });
+    else setTimeout(this.buildRun, 4);
+  }
+
+  /** Tracks still to build (the queue's, and the one under way). */
+  private buildsLeft(): boolean {
+    return this.building !== null || this.buildQueue.length > 0;
+  }
+
+  /** Has the builder caught up: all tracks built (film runs), or those of the routes near the player? */
+  private caughtUp(): boolean {
+    return this.film ? !this.buildsLeft() : this.buildNear === 0 && !(this.building && this.buildingNear);
+  }
+
+  /** Build slices of the queue's tracks, first first: one, and more while the idle period lasts. */
+  private buildSome(d?: IdleDeadline): void {
+    for (let slices = 0; ; slices++) {
+      if (slices > 0 && (!d || d.didTimeout || d.timeRemaining() < BUILD_SLICE + 1)) return;
+      let b = this.building;
+      while (!b) {
+        const r = this.buildQueue.shift();
+        if (!r) return;
+        this.buildingNear = this.buildNear > 0;
+        if (this.buildingNear) this.buildNear--;
+        // (Not one built already: the player's own route, by its guide.)
+        if (!hasTrack(r)) b = this.building = new TrackBuild(r, this.data);
+      }
+      // (A build that throws is dropped, not retried every slice.)
+      this.building = null;
+      if (!b.step(BUILD_SLICE)) this.building = b;
+      else {
+        this.builtN++;
+        if (!this.buildsLeft()) console.info(`[traffic] ${this.builtN} route tracks built in the background in ${((performance.now() - this.buildT0) / 1000).toFixed(0)} s`);
+      }
+    }
   }
 
   /** Prioritise building tracks for routes near (x, y). */
@@ -360,6 +413,7 @@ export class Traffic {
     const far: Route[] = [];
     for (const r of this.buildQueue) (this.routeNear(r, x, y, this.radius + 300) ? near : far).push(r);
     this.buildQueue = [...near, ...far];
+    this.buildNear = near.length;
   }
 
   private routeNear(r: Route, x: number, y: number, R: number): boolean {
@@ -812,7 +866,7 @@ export class Traffic {
       else if (this.costEma < 0.9 && this.maxActive < this.capBuses) this.maxActive++;
       if (this.maxActive > this.capBuses) this.maxActive = this.capBuses;
     }
-    if (this.buildQueue.length) this.scheduleBuild();
+    this.scheduleBuild();
   }
 
   /** One simulation step of the buses and cars (no drawing). */
@@ -823,6 +877,11 @@ export class Traffic {
     this.updatePlayerBody(player);
 
     if (this.initial && !this.candN) this.prioritise(px, py);
+    // (Building in the background, a slice at a time, takes minutes: the routes near the player first.)
+    else if (!this.film && this.buildsLeft() && (this.buildPrio -= dt) <= 0) {
+      this.buildPrio = BUILD_PRIO;
+      this.prioritise(px, py);
+    }
     // Film runs: tracks are built per sim step (not per wall-clock slice), so what exists when is reproducible.
     if (this.film) for (let k = 0; k < 3 && this.buildQueue.length; k++) trackFor(this.buildQueue.shift()!, this.data);
     this.candTimer -= dt;
@@ -899,8 +958,8 @@ export class Traffic {
         if (this.spawn(c, px, py)) made++;
       }
       // Populate freely (even in view) until the background track builder has caught up.
-      if (this.initial && !this.buildQueue.length && (this.active.length >= desired || tries <= 0)) this.initial = false;
-    } else if (this.capBuses === 0 && this.initial && !this.buildQueue.length) this.initial = false;
+      if (this.initial && this.caughtUp() && (this.active.length >= desired || tries <= 0)) this.initial = false;
+    } else if (this.capBuses === 0 && this.initial && this.caughtUp()) this.initial = false;
 
     // (byId holds every bus in the list: set in spawn, deleted in removeBus.)
     const g = session.guide;
@@ -1493,9 +1552,25 @@ export class Traffic {
     this.sAcc = Math.min(this.sAcc, this.iA);
   }
 
-  /** Bus b's stop line for junction q of its route (where it waits), unless it is already past that (spawned there): the box edge. */
+  /**
+   * Bus b's stop line for junction q of its route (where it waits), unless it is already past that
+   * (spawned there): the box edge. A line that would have it stand in a narrow with the player's lane
+   * is moved back to the narrow's start, so that a bus that went on into one, sure to be through before
+   * the player's got there, does not stop at a red light in it (61/0 s 7577, the busway tunnel's north
+   * portal by the Cultural Centre: a 150/0 waiting at node 10193 stood across the player's way out of
+   * the bend, too far from the player's lane to count as a lead).
+   */
   private lineOf(b: AiBus, q: number): number {
-    return b.s <= b.jLine[q] + 1 ? b.jLine[q] : b.jl[q].stopS;
+    let line = b.jLine[q];
+    if (b.s > line + 1) return b.jl[q].stopS;
+    if (b.joinFor === this.pTrack) {
+      const nrs = b.narrows;
+      for (let k = b.narrowNext; k < nrs.length && nrs[k].a0 < line; k++) {
+        const N = nrs[k];
+        if (b.s <= N.a0 + 1 && line - b.len < N.a1) line = N.a0;
+      }
+    }
+    return line;
   }
 
   /** The bus being stepped is held to acceleration `a` (why `w`, by `ref`) if that is the tightest so far. */

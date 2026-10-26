@@ -219,12 +219,27 @@ function smooth01(t: number): number {
 function median7(src: Float32Array): Float32Array {
   const n = src.length;
   const out = new Float32Array(n);
-  const w: number[] = [];
+  const w = new Float64Array(7);
   for (let i = 0; i < n; i++) {
-    w.length = 0;
-    for (let k = -3; k <= 3; k++) w.push(src[Math.max(0, Math.min(n - 1, i + k))]);
-    w.sort((a, b) => a - b);
-    out[i] = w[3];
+    // A stable insertion sort, as Array.prototype.sort with (a, b) => a - b is: the same order, -0 and 0
+    // included, for finite values (for others that comparator is inconsistent: sorted as it was).
+    let odd = false;
+    for (let k = 0; k < 7; k++) {
+      const v = src[Math.max(0, Math.min(n - 1, i + k - 3))];
+      if (!Number.isFinite(v)) odd = true;
+      let j = k;
+      while (j > 0 && w[j - 1] - v > 0) {
+        w[j] = w[j - 1];
+        j--;
+      }
+      w[j] = v;
+    }
+    if (odd) {
+      const a: number[] = [];
+      for (let k = -3; k <= 3; k++) a.push(src[Math.max(0, Math.min(n - 1, i + k))]);
+      a.sort((p, q) => p - q);
+      out[i] = a[3];
+    } else out[i] = w[3];
   }
   return out;
 }
@@ -440,7 +455,7 @@ function connected(data: MapData, a: number, b: number): boolean {
  * its way, and staying on connected roads (carrying straight on is cheap,
  * turning off costs). Samples without candidates break the chain.
  */
-function matchRoads(data: MapData, cands: RoadCand[][]): (RoadCand | null)[] {
+function* matchRoads(data: MapData, cands: RoadCand[][]): Build<(RoadCand | null)[]> {
   const m = cands.length;
   const out: (RoadCand | null)[] = new Array(m).fill(null);
   let k0 = 0;
@@ -452,6 +467,7 @@ function matchRoads(data: MapData, cands: RoadCand[][]): (RoadCand | null)[] {
     const score: Float64Array[] = [];
     const back: Int32Array[] = [];
     for (let k = k0; k <= k1; k++) {
+      if (due()) yield;
       const L = cands[k];
       const sc = new Float64Array(L.length).fill(Infinity);
       const bk = new Int32Array(L.length).fill(-1);
@@ -796,7 +812,7 @@ function midlineAcross(data: MapData, nodes: RoadNodes, ri: number, x: number, y
  * (x, y, dx, dy each; NaN where none) and how far left of them it keeps (by the turn the lane makes through
  * the box: from just before it to just after it).
  */
-function turnLines(data: MapData, road: Int32Array, own: Int32Array, free: Uint8Array, X: ArrayLike<number>, Y: ArrayLike<number>, reach = 10): Float32Array {
+function* turnLines(data: MapData, road: Int32Array, own: Int32Array, free: Uint8Array, X: ArrayLike<number>, Y: ArrayLike<number>, reach = 10): Build<Float32Array> {
   const n = road.length;
   const out = new Float32Array(10 * n).fill(NaN);
   const put = (k: number, slot: number, j: number): void => {
@@ -853,6 +869,7 @@ function turnLines(data: MapData, road: Int32Array, own: Int32Array, free: Uint8
     k0 = k1 + 1;
   }
   for (let k = 0; k < n; k++) {
+    if (due()) yield;
     if (!free[k] || Number.isNaN(need[k])) continue;
     out[10 * k + 8] = need[k];
     out[10 * k + 9] = along[k];
@@ -1172,7 +1189,8 @@ function halfWidthLeft(r: Road): number {
  * rows' w * (sum of cx * x + cy * y over the row's samples - c)^2, where a row names samples by their
  * index in the window and samples not in `free` stay where they are (X, Y). The free points' solved
  * coordinates come back interleaved (x0, y0, x1, y1, ...). Rows span at most three neighbouring
- * samples, so the system is banded and solved directly.
+ * samples, so the system is banded and solved directly, stored as its band (SOLVE_BW either side of the
+ * diagonal: an entry outside it is never read).
  */
 interface LsqRow {
   w: number;
@@ -1186,7 +1204,10 @@ function solveRows(X: Float32Array, Y: Float32Array, a: number, m: number, free:
   const N = 2 * f;
   const at = new Int32Array(m).fill(-1);
   free.forEach((k, j) => (at[k] = j));
-  const M = new Float64Array(N * N);
+  const BW = SOLVE_BW;
+  const W = 2 * BW + 1;
+  // (Row i's entry in column j is M[i * W + j - i + BW].)
+  const M = new Float64Array(N * W);
   const r = new Float64Array(N);
   const idx: number[] = [];
   const co: number[] = [];
@@ -1212,30 +1233,37 @@ function solveRows(X: Float32Array, Y: Float32Array, a: number, m: number, free:
     }
     for (let p = 0; p < idx.length; p++) {
       r[idx[p]] += row.w * co[p] * c0;
-      for (let q = 0; q < idx.length; q++) M[idx[p] * N + idx[q]] += row.w * co[p] * co[q];
+      for (let q = 0; q < idx.length; q++) {
+        const o = idx[q] - idx[p];
+        if (o >= -BW && o <= BW) M[idx[p] * W + o + BW] += row.w * co[p] * co[q];
+      }
     }
   }
   // Gaussian elimination within the band (symmetric positive definite: no pivoting, no fill outside it).
-  const BW = 7;
   for (let c = 0; c < N; c++) {
-    const d = M[c * N + c] || 1e-9;
+    const cr = c * W + BW - c;
+    const d = M[cr + c] || 1e-9;
     const e = Math.min(N - 1, c + BW);
     for (let row = c + 1; row <= e; row++) {
-      const g = M[row * N + c] / d;
+      const rr = row * W + BW - row;
+      const g = M[rr + c] / d;
       if (!g) continue;
-      for (let k = c; k <= e; k++) M[row * N + k] -= g * M[c * N + k];
+      for (let k = c; k <= e; k++) M[rr + k] -= g * M[cr + k];
       r[row] -= g * r[c];
     }
   }
   const x = new Float64Array(N);
   for (let c = N - 1; c >= 0; c--) {
+    const cr = c * W + BW - c;
     let v = r[c];
     const e = Math.min(N - 1, c + BW);
-    for (let k = c + 1; k <= e; k++) v -= M[c * N + k] * x[k];
-    x[c] = v / (M[c * N + c] || 1e-9);
+    for (let k = c + 1; k <= e; k++) v -= M[cr + k] * x[k];
+    x[c] = v / (M[cr + c] || 1e-9);
   }
   return x;
 }
+/** solveRows' band either side of the diagonal (a row spans three samples: five unknowns). */
+const SOLVE_BW = 7;
 
 /** Signals spatial hash shared by all tracks. */
 const signalGrids = new WeakMap<MapData, Map<number, number[]>>();
@@ -1329,12 +1357,8 @@ function signalJunctions(data: MapData): SignalJunctions {
 /** Road ends (rounded to 0.1 m) and the roads ending there, per map. */
 const roadEnds = new WeakMap<MapData, Map<number, number[]>>();
 const endKey = (x: number, y: number) => Math.round(x * 10) * 1048576 + Math.round(y * 10);
-/**
- * How far from road ri's start (end = 0) or end (end = 1) the nearest junction
- * (three or more roads meeting) is, following plain continuations (two roads
- * meeting) up to `max` metres; Infinity if none.
- */
-function junctionBeyond(data: MapData, ri: number, end: 0 | 1, max: number): number {
+/** The roads ending at each end point (by endKey). */
+function roadEndsOf(data: MapData): Map<number, number[]> {
   let m = roadEnds.get(data);
   if (!m) {
     m = new Map();
@@ -1349,6 +1373,15 @@ function junctionBeyond(data: MapData, ri: number, end: 0 | 1, max: number): num
     });
     roadEnds.set(data, m);
   }
+  return m;
+}
+/**
+ * How far from road ri's start (end = 0) or end (end = 1) the nearest junction
+ * (three or more roads meeting) is, following plain continuations (two roads
+ * meeting) up to `max` metres; Infinity if none.
+ */
+function junctionBeyond(data: MapData, ri: number, end: 0 | 1, max: number): number {
+  const m = roadEndsOf(data);
   let dist = 0;
   let r = ri;
   let e = end;
@@ -1394,48 +1427,107 @@ function junctionStop(data: MapData, J: SignalJunctions, j: number): number {
   return J.ds[j];
 }
 
+// A track is built by a generator that now and then (`due`) yields if the slice it runs in is past its
+// deadline. `new RouteTrack` runs it to the end at once, with no deadline, so it never yields; a
+// TrackBuild runs it a slice at a time. It is the same code either way, so the track is the same bit for bit.
+
+/**
+ * The map's caches a build may come to (each built on first use, and the same whichever build first
+ * needs it): all at the start of the first build, the player's own track's, built at once at load, so
+ * that none takes a slice of a background build (roadEndsOf: 60 ms on first use).
+ */
+function warmCaches(data: MapData): void {
+  if (warmed.has(data)) return;
+  warmed.add(data);
+  heightsOf(data);
+  roadIndexFor(data);
+  roadNodes(data);
+  roadEndsOf(data);
+  vertexRoads(data);
+  turnBoxes(data);
+  signalGrid(data);
+  signalJunctions(data);
+  signalsFor(data);
+  platformGeoms(data);
+}
+const warmed = new WeakSet<MapData>();
+
+/** The deadline (performance.now() ms) of the slice a TrackBuild is running; Infinity otherwise. */
+let buildDeadline = Infinity;
+let buildTicks = 0;
+/** Is the slice being run past its deadline? (The clock is read every 8th call; never in a synchronous build.) */
+function due(): boolean {
+  return buildDeadline !== Infinity && (++buildTicks & 7) === 0 && performance.now() > buildDeadline;
+}
+/** `due`, reading the clock every call: between pieces of work that can take a tenth of a millisecond or more. */
+function dueNow(): boolean {
+  return buildDeadline !== Infinity && performance.now() > buildDeadline;
+}
+/** Constructs a RouteTrack without building it (a TrackBuild runs the build). */
+const UNBUILT: unique symbol = Symbol('unbuilt');
+type Writable<T> = { -readonly [K in keyof T]: T[K] };
+type Build<R = void> = Generator<void, R, void>;
+
 export class RouteTrack {
-  readonly n: number;
-  readonly length: number;
+  declare readonly n: number;
+  declare readonly length: number;
   /** Lane centre. */
-  readonly x: Float32Array;
-  readonly y: Float32Array;
+  declare readonly x: Float32Array;
+  declare readonly y: Float32Array;
   /** Unit tangent. */
-  readonly tx: Float32Array;
-  readonly ty: Float32Array;
+  declare readonly tx: Float32Array;
+  declare readonly ty: Float32Array;
   /** Lane centre -> left kerb distance. */
-  readonly kerb: Float32Array;
+  declare readonly kerb: Float32Array;
   /** Lateral offset of the lane from the GTFS line (+ = left). */
-  readonly offset: Float32Array;
+  declare readonly offset: Float32Array;
   /** Comfortable AI speed (m/s) including braking for curves ahead. */
-  readonly vmax: Float32Array;
+  declare readonly vmax: Float32Array;
   /** Posted limit km/h at each sample. */
-  readonly limit: Uint8Array;
+  declare readonly limit: Uint8Array;
   /** Index of the road under each sample, or -1. */
-  readonly road: Int32Array;
+  declare readonly road: Int32Array;
   /** Road surface height (m AHD) at each sample, from the route's own heights (tunnels, viaducts). */
-  readonly z: Float32Array;
+  declare readonly z: Float32Array;
   /** Lane-offset bounds that keep the bus off walls (-/+Infinity where unwalled); diagnostics. */
-  readonly bandLo: Float32Array;
-  readonly bandHi: Float32Array;
+  declare readonly bandLo: Float32Array;
+  declare readonly bandHi: Float32Array;
   /** The walls this track was fitted to (null: none were available). */
-  readonly walls: TrackWalls | null;
-  readonly stops: TrackStop[];
-  readonly signals: TrackSignal[];
+  declare readonly walls: TrackWalls | null;
+  declare readonly stops: TrackStop[];
+  declare readonly signals: TrackSignal[];
   /** Every 40 m: [s, x, y] triples, for quick "is this route near me" tests. */
-  readonly coarse: Float32Array;
+  declare readonly coarse: Float32Array;
   /** Samples held in a turn lane, and on past its node into the lane turned into (the corner solve keeps them there). */
-  private turnHeld: Uint8Array;
+  declare private turnHeld: Uint8Array;
 
   constructor(
     readonly route: Route,
     readonly data: MapData,
+    unbuilt?: typeof UNBUILT,
   ) {
+    if (unbuilt === UNBUILT) return;
+    const b = this.build();
+    while (!b.next().done);
+  }
+
+  /** A track not built yet, and its build (run a slice at a time by a TrackBuild). */
+  static unbuilt(route: Route, data: MapData): [RouteTrack, Build] {
+    const t = new RouteTrack(route, data, UNBUILT);
+    return [t, t.build()];
+  }
+
+  /** The build: from the route's shape and the map to the lane, its speeds, stops and signals. */
+  private *build(): Build {
+    const route = this.route;
+    const data = this.data;
+    warmCaches(data);
+    const w = this as Writable<RouteTrack>;
     const H = heightsOf(data);
     const L = route.length;
     const n = Math.max(2, Math.floor(L / TRACK_STEP) + 2);
-    this.n = n;
-    this.length = L;
+    w.n = n;
+    w.length = L;
     const bx = new Float32Array(n);
     const by = new Float32Array(n);
     const nx = new Float32Array(n);
@@ -1452,7 +1544,7 @@ export class RouteTrack {
     const known = new Uint8Array(n);
     // Walls beside each sample (lateral positions along its normal, + = left), for keeping the lane off them.
     const TW = wallsFor(data);
-    this.walls = TW;
+    w.walls = TW;
     const W = TW?.walls;
     const WG = W ? wallGrid(W) : null;
     const wallStart = new Int32Array(n + 1);
@@ -1472,15 +1564,17 @@ export class RouteTrack {
       };
       const span = Math.round(SHAPE_SHARP_SPAN / TRACK_STEP);
       for (let i = 0; i < n; i++) {
+        if (due()) yield;
         const s = Math.min(L, i * TRACK_STEP);
         if (Math.abs(wrapAngle(hd(s + 5, s + 25) - hd(s - 25, s - 5))) < SHAPE_SHARP) continue;
         for (let k = Math.max(0, i - span); k <= Math.min(n - 1, i + span); k++) rampNear[k] = 1;
       }
     }
-    this.limit = new Uint8Array(n);
-    this.road = new Int32Array(n).fill(-1);
-    this.z = new Float32Array(n);
+    w.limit = new Uint8Array(n);
+    w.road = new Int32Array(n).fill(-1);
+    w.z = new Float32Array(n);
     for (let i = 0; i < n; i++) {
+      if (due()) yield;
       const s = Math.min(L, i * TRACK_STEP);
       const p = pointAlong(route.pts, route.cum, s);
       const a = pointAlong(route.pts, route.cum, s - 5);
@@ -1510,8 +1604,13 @@ export class RouteTrack {
     }
     // The road at each sample, matched along the whole route.
     // (Alongside a platform: the road along its edge.)
-    const zones = route.stops.map((_, k) => matchStopPlatform(data, route, k));
+    const zones: (PlatformZone | null)[] = [];
+    for (let k = 0; k < route.stops.length; k++) {
+      if (dueNow()) yield;
+      zones.push(matchStopPlatform(data, route, k));
+    }
     for (const z of zones) {
+      if (dueNow()) yield;
       if (!z) continue;
       for (let i = Math.max(0, Math.ceil(z.s0 / TRACK_STEP)); i <= Math.min(n - 1, Math.floor(z.s1 / TRACK_STEP)); i++) {
         const list = cands[i];
@@ -1528,7 +1627,7 @@ export class RouteTrack {
         });
       }
     }
-    const picks = matchRoads(data, cands);
+    const picks = yield* matchRoads(data, cands);
     // The lane's height: the matched road's own (the GTFS line's heights can be the median's or a
     // neighbouring carriageway's, up to ~0.7 m off), kept within a metre of the route's level.
     {
@@ -1541,6 +1640,7 @@ export class RouteTrack {
       for (let i = 0; i < n; i++) this.z[i] += dzS[i];
     }
     for (let i = 0; i < n; i++) {
+      if (due()) yield;
       const p = { x: bx[i], y: by[i] };
       const dx = ny[i];
       const dy = -nx[i];
@@ -1625,6 +1725,7 @@ export class RouteTrack {
       this.limit[i] = speedLimitOf(road);
       this.road[i] = c.road;
     }
+    if (dueNow()) yield;
     /** The last sample of each turn lane held to its turn's node. */
     const heldTo: number[] = [];
     this.turnHeld = new Uint8Array(n);
@@ -1642,6 +1743,7 @@ export class RouteTrack {
       const target = new Float32Array(n).fill(NaN);
       const weight = new Float32Array(n);
       for (let j = 1; j < n; j++) {
+        if (due()) yield;
         const a = picks[j - 1];
         const b = picks[j];
         if (!a || !b || a.road === b.road) continue;
@@ -1696,6 +1798,7 @@ export class RouteTrack {
       for (let i = 0; i < n; i++) if (weight[i] === 1 && known[i]) this.turnHeld[i] = 1;
       for (let j = 1; j < n; j++) if (weight[j - 1] === 1 && known[j - 1] && !(weight[j] === 1 && known[j])) heldTo.push(j - 1);
     }
+    if (dueNow()) yield;
     // Fill unknown samples by interpolating between known neighbours.
     let lastKnown = -1;
     for (let i = 0; i <= n; i++) {
@@ -1722,6 +1825,7 @@ export class RouteTrack {
     // meets the lane of the road turned into, where that starts left of it (a road mapped from the centreline
     // between carriageways, a busway link off a dual carriageway's offside lane): turning back towards the
     // centreline first, the lane would swing across the lanes beside it before turning.
+    if (dueNow()) yield;
     const unsmoothed = new Uint8Array(n);
     for (const k0 of heldTo) {
       const c = picks[k0];
@@ -1751,6 +1855,7 @@ export class RouteTrack {
     // 10 m off a curving tunnel must not drag the lane across the centreline), plus the road's lane
     // offset, eased where that changes (a one-way ramp off a two-way busway). Only jumps in where the
     // road is (onto a carriageway that does not continue the last one, gaps in the match) are eased.
+    if (dueNow()) yield;
     const fS = boxSmooth(median7(fromC), 3);
     const cS = Float32Array.from(roadC);
     {
@@ -1768,10 +1873,11 @@ export class RouteTrack {
     }
     for (let i = 0; i < n; i++) if (unsmoothed[i]) fS[i] = roadC[i] + fromC[i] - cS[i];
     const kS = boxSmooth(median7(kerbBase), 3);
-    this.x = new Float32Array(n);
-    this.y = new Float32Array(n);
-    this.offset = new Float32Array(n);
-    this.kerb = new Float32Array(n);
+    if (dueNow()) yield;
+    w.x = new Float32Array(n);
+    w.y = new Float32Array(n);
+    w.offset = new Float32Array(n);
+    w.kerb = new Float32Array(n);
     // Samples matched to a road (or between matched ones) follow it however far the GTFS line is off;
     // elsewhere the lane keeps near the line.
     const near = new Uint8Array(n);
@@ -1788,6 +1894,7 @@ export class RouteTrack {
     const hi = new Float32Array(n).fill(Infinity);
     // Busway platforms: the lane hugs the platform edge so buses pull right alongside.
     for (const z of zones) {
+      if (due()) yield;
       if (!z) continue;
       // The nearest edge within a couple of samples: a platform's end can kink towards the lane, and the
       // first and last samples can reach past the end to its far corners.
@@ -1874,6 +1981,7 @@ export class RouteTrack {
         }
       }
       for (let i = i0; i <= i1; i++) {
+        if (due()) yield;
         const s = i * TRACK_STEP;
         const w = s < inS + inL ? smooth01((s - inS) / inL) : s > z.s1 ? 1 - smooth01((s - z.s1) / tail) : 1;
         const f = from && i > ih && i - ih - 1 < from.length ? from[i - ih - 1] : NaN;
@@ -1908,6 +2016,7 @@ export class RouteTrack {
       };
       const shift = new Float32Array(n).fill(NaN);
       for (let i = 0; i < n; i++) {
+        if (due()) yield;
         if (skew[i] & 14) continue;
         const o = this.offset[i];
         const px = bx[i] + nx[i] * o;
@@ -1966,9 +2075,11 @@ export class RouteTrack {
     // and across the normal bounds the lane by its nearest end. The lane keeps the first, with room to
     // spare where the shape is skewed, but may use the second to keep its own half.)
     const spans: [number, number][] = [];
-    const band = (skewed: boolean, lo: Float32Array, hi: Float32Array): void => {
+    const zs = this.z;
+    const band = function* (skewed: boolean, lo: Float32Array, hi: Float32Array): Build {
       let prev = NaN;
       for (let i = 0; i < n; i++) {
+        if (due()) yield;
         const h = home[i];
         // Sideways spans blocked by walls here, merged where they overlap.
         const ia = Math.max(0, i - 1);
@@ -1995,7 +2106,7 @@ export class RouteTrack {
             obHi.push(b);
           }
         }
-        const z = this.z[i];
+        const z = zs[i];
         const at = (t: number) => TW.drivable(bx[i] + nx[i] * t, by[i] + ny[i] * t, z);
         // Gap g lies between blocked span g - 1 and span g.
         const gapLo = (g: number) => (g > 0 ? obHi[g - 1] + clear : -Infinity);
@@ -2052,10 +2163,10 @@ export class RouteTrack {
         prev = Math.max(lo[i], Math.min(hi[i], h));
       }
     };
-    band(false, lo, hi);
+    yield* band(false, lo, hi);
     const loS = new Float32Array(n).fill(-Infinity);
     const hiS = new Float32Array(n).fill(Infinity);
-    band(true, loS, hiS);
+    yield* band(true, loS, hiS);
     // On a two-way road (or a one-way carriageway beside the other direction's) the walls may narrow the
     // lane's room but not push it over the centre line while they leave room on its own side (outside
     // junction boxes and platform lead-ins).
@@ -2063,6 +2174,7 @@ export class RouteTrack {
     if (TW) {
       const nodes = roadNodes(data);
       for (let i = 0; i < n; i++) {
+        if (due()) yield;
         const ri = this.road[i];
         if (!known[i] || ri < 0 || skew[i] & 14) continue;
         const r = data.roads[ri];
@@ -2081,18 +2193,21 @@ export class RouteTrack {
         }
       }
     }
-    this.keepInside(lo, hi, home, skew, floor, hiS);
-    this.bandLo = lo;
-    this.bandHi = hi;
+    if (dueNow()) yield;
+    yield* this.keepInside(lo, hi, home, skew, floor, hiS);
+    if (dueNow()) yield;
+    w.bandLo = lo;
+    w.bandHi = hi;
     for (let i = 0; i < n; i++) {
       this.x[i] = bx[i] + nx[i] * this.offset[i];
       this.y[i] = by[i] + ny[i] * this.offset[i];
     }
+    if (dueNow()) yield;
     if (TW && WG) {
-      this.fitToRoads(TW, WG, roadC, skew, picks);
-      this.nudgeOffBuildings(TW);
-      this.nudgeOffWalls(TW, WG);
-      this.nudgeForTrailers(TW, WG);
+      yield* this.fitToRoads(TW, WG, roadC, skew, picks);
+      yield* this.nudgeOffBuildings(TW);
+      yield* this.nudgeOffWalls(TW, WG);
+      yield* this.nudgeForTrailers(TW, WG);
     }
     // Sweep corners a bus can drive. Alongside a platform the lane stays on the platform line, except at
     // its ends, where it may ease in later and out sooner.
@@ -2104,16 +2219,17 @@ export class RouteTrack {
       for (let k = i + 2; k <= b - 2; k++) fixed[k] = 1;
       i = b;
     }
-    this.regularize(TW, WG, fixed, data, skew);
+    yield* this.regularize(TW, WG, fixed, data, skew);
     if (TW && WG) {
       // (Smoothing can bring a trailer's sweep back to a wall at a tunnel throat.)
-      this.nudgeOffWalls(TW, WG);
-      this.nudgeForTrailers(TW, WG);
+      yield* this.nudgeOffWalls(TW, WG);
+      yield* this.nudgeForTrailers(TW, WG);
     }
     // Tangents from the lane itself.
-    this.tx = new Float32Array(n);
-    this.ty = new Float32Array(n);
+    w.tx = new Float32Array(n);
+    w.ty = new Float32Array(n);
     for (let i = 0; i < n; i++) {
+      if (due()) yield;
       const a = Math.max(0, i - 1);
       const b = Math.min(n - 1, i + 1);
       let dx = this.x[b] - this.x[a];
@@ -2130,8 +2246,9 @@ export class RouteTrack {
       this.ty[i] = dy;
     }
     // The kerb from the lane as it finally runs, and the platform zones trimmed to where it runs alongside.
-    this.fitKerb(data, zones);
-    this.fillLimits(data, zones);
+    yield* this.fitKerb(data, zones);
+    yield* this.fillLimits(data, zones);
+    if (dueNow()) yield;
     // Speed profile: curvature, posted limits, then braking pass.
     // (Over the lane's own length: through a station hall or round the outside of a bend a sample's 4 m of
     // route can be twice that of lane, and on the inside much less.)
@@ -2141,6 +2258,7 @@ export class RouteTrack {
     // (And over 8 m, so a short bend is taken no faster than a long one as tight rather than averaged away.)
     const kappa8 = new Float32Array(n);
     for (let i = 1; i < n - 1; i++) {
+      if (due()) yield;
       if (i >= 2 && i < n - 2) {
         const h0 = Math.atan2(this.tx[i - 2], this.ty[i - 2]);
         const h1 = Math.atan2(this.tx[i + 2], this.ty[i + 2]);
@@ -2153,13 +2271,15 @@ export class RouteTrack {
     }
     const kSm = boxSmooth(kappa, 1);
     const k8Sm = boxSmooth(kappa8, 1);
+    if (dueNow()) yield;
     // Not faster than the bus can steer round the bend: the physics scales the lock by
     // 1 / (1 + ((v - 1.5) / 6.5)^2), and a front axle on radius R needs asin(wheelbase / R) of it. STEER_SPARE
     // of the lock is left for the autopilot's (or a driver's) corrections.
     const spec = specFor(busTypeForRoute(this.route));
     const lock = spec.maxSteer * (1 - STEER_SPARE);
-    this.vmax = new Float32Array(n);
+    w.vmax = new Float32Array(n);
     for (let i = 0; i < n; i++) {
+      if (due()) yield;
       const vCurve = Math.sqrt(1.7 / Math.max(kSm[i], k8Sm[i], 1e-4));
       const kPeak = Math.max(kappa8[Math.max(0, i - 1)], kappa8[i], kappa8[Math.min(n - 1, i + 1)]);
       const q = Math.asin(Math.min(1, spec.wheelbase * kPeak)) / lock;
@@ -2172,7 +2292,7 @@ export class RouteTrack {
       this.vmax[i] = Math.min(this.vmax[i], Math.sqrt(this.vmax[i + 1] ** 2 + 2 * 1.1 * Math.max(chord[i], 0.5)));
     }
     const nc = Math.max(1, Math.floor((L - 70) / 40));
-    this.coarse = new Float32Array(nc * 3);
+    w.coarse = new Float32Array(nc * 3);
     for (let k = 0; k < nc; k++) {
       const s = 10 + k * 40;
       const i = Math.min(n - 1, Math.round(s / TRACK_STEP));
@@ -2180,8 +2300,9 @@ export class RouteTrack {
       this.coarse[k * 3 + 1] = this.x[i];
       this.coarse[k * 3 + 2] = this.y[i];
     }
+    if (dueNow()) yield;
     // Stops.
-    this.stops = route.stops.map((st, index) => {
+    w.stops = route.stops.map((st, index) => {
       const i = Math.max(0, Math.min(n - 1, Math.round(st.s / TRACK_STEP)));
       const zone = zones[index];
       const target = zone ? zone.s1 - 1.5 : st.s;
@@ -2189,8 +2310,9 @@ export class RouteTrack {
       const pull = Math.max(0, Math.min(zone ? 2.5 : 3, kerbT - PLATFORM_LANE));
       return { index, s: st.s, station: !!zone || isStationStop(data.stops[st.stop].name), kerb: this.kerb[i], zone, target, pull };
     });
+    if (dueNow()) yield;
     // Signals: one stop line per signalised junction the lane passes through, before the junction.
-    this.signals = this.findSignals(data, H);
+    w.signals = yield* this.findSignals(data, H);
   }
 
   /**
@@ -2207,7 +2329,7 @@ export class RouteTrack {
    * the lane meets, whichever comes first. (x, y) is the junction centre, for
    * `signalStateAt`.
    */
-  private findSignals(data: MapData, H: ReturnType<typeof heightsOf>): TrackSignal[] {
+  private *findSignals(data: MapData, H: ReturnType<typeof heightsOf>): Build<TrackSignal[]> {
     const n = this.n;
     const X = this.x;
     const Y = this.y;
@@ -2222,6 +2344,7 @@ export class RouteTrack {
     /** Per node, the sample it was last looked at (a route can pass a node again, as a loop back to its start does). */
     const seen = new Map<number, number>();
     for (let i = 0; i < n; i++) {
+      if (due()) yield;
       const gx = Math.floor(X[i] / 40) + 1000;
       const gy = Math.floor(Y[i] / 40) + 1000;
       for (let oy = -1; oy <= 1; oy++) {
@@ -2238,6 +2361,7 @@ export class RouteTrack {
             const gap = Math.max(TRACK_STEP, Math.hypot(X[Math.min(n - 1, i + 1)] - X[i], Y[Math.min(n - 1, i + 1)] - Y[i]), Math.hypot(X[i] - X[Math.max(0, i - 1)], Y[i] - Y[Math.max(0, i - 1)]));
             if (Math.abs(along) > gap * 0.75) continue;
             seen.set(k, i);
+            if (dueNow()) yield;
             const z = this.z[i];
             // The roads the node is on (streets first: a busway tunnel may pass right under it).
             let level = false;
@@ -2292,6 +2416,7 @@ export class RouteTrack {
     const out: TrackSignal[] = [];
     let lastMj = -1;
     for (let h = 0; h < hits.length; h++) {
+      if (dueNow()) yield;
       const j = hits[h].j;
       const mj = hits[h].mj;
       // The nodes of this junction on this pass.
@@ -2392,7 +2517,7 @@ export class RouteTrack {
    * Clamp the lane offsets into [lo, hi] (walled stretches), smoothing the
    * steps that creates without leaving the bounds; kerb distances follow.
    */
-  private keepInside(lo: Float32Array, hi: Float32Array, home: Float32Array, skew: Uint8Array, floor: Float32Array, hiS: Float32Array): void {
+  private *keepInside(lo: Float32Array, hi: Float32Array, home: Float32Array, skew: Uint8Array, floor: Float32Array, hiS: Float32Array): Build {
     const n = this.n;
     const off = this.offset;
     let any = false;
@@ -2406,6 +2531,7 @@ export class RouteTrack {
     const hi0 = Float32Array.from(hi);
     const hiS0 = Float32Array.from(hiS);
     for (let i = 0; i < n; i++) {
+      if (due()) yield;
       for (let j = Math.max(0, i - D); j <= Math.min(n - 1, i + D); j++) {
         // In the lane's own road frame (home), like the slope below.
         lo[i] = Math.max(lo[i], lo0[j] - home[j] + home[i]);
@@ -2420,12 +2546,14 @@ export class RouteTrack {
     // (Pulling in to a platform just past a tunnel mouth may swerve harder, as a driver would.)
     const stepAt = (i: number) => (skew[i] & 12 ? PULL_SLOPE : WALL_SLOPE) * TRACK_STEP;
     for (let i = 1; i < n; i++) {
+      if (due()) yield;
       const step = stepAt(i);
       hi[i] = Math.min(hi[i], hi[i - 1] - home[i - 1] + home[i] + step);
       lo[i] = Math.max(lo[i], lo[i - 1] - home[i - 1] + home[i] - step);
       hiS[i] = Math.min(hiS[i], hiS[i - 1] - home[i - 1] + home[i] + step);
     }
     for (let i = n - 2; i >= 0; i--) {
+      if (due()) yield;
       const step = stepAt(i);
       hi[i] = Math.min(hi[i], hi[i + 1] - home[i + 1] + home[i] + step);
       lo[i] = Math.max(lo[i], lo[i + 1] - home[i + 1] + home[i] - step);
@@ -2457,6 +2585,7 @@ export class RouteTrack {
     // offsets would cut the bend.)
     const shift = new Float32Array(n);
     for (let k = 0; k < 4; k++) {
+      if (dueNow()) yield;
       for (let i = 0; i < n; i++) shift[i] = off[i] - before[i];
       const sm = boxSmooth(shift, 2);
       // (Not alongside a platform: smoothing would round the lane off the platform edge.)
@@ -2502,7 +2631,7 @@ export class RouteTrack {
    * stretch onto the roads at this level (staying on connected roads) and put
    * the lane on the matched carriageway.
    */
-  private fitToRoads(TW: TrackWalls, G: WallGrid, roadC: Float32Array, skew: Uint8Array, picks: (RoadCand | null)[]): void {
+  private *fitToRoads(TW: TrackWalls, G: WallGrid, roadC: Float32Array, skew: Uint8Array, picks: (RoadCand | null)[]): Build {
     const n = this.n;
     const data = this.data;
     const W = TW.walls;
@@ -2518,6 +2647,7 @@ export class RouteTrack {
       return ax * bx + ay * by < Math.cos((40 * Math.PI) / 180) * Math.hypot(ax, ay) * Math.hypot(bx, by);
     };
     for (let i = 0; i < n; i++) {
+      if (due()) yield;
       const z = this.z[i];
       const x = this.x[i];
       const y = this.y[i];
@@ -2552,6 +2682,7 @@ export class RouteTrack {
       return r.oneway ? Math.max(0, w / 2 - 1.75) : Math.min(6, Math.max(1.6, w / 2 - 1.75));
     };
     for (const [a, b] of runs) {
+      if (due()) yield;
       // The roads matched along the whole route (connected, running the route's way).
       const m = b - a + 1;
       const pick = picks.slice(a, b + 1);
@@ -2634,7 +2765,7 @@ export class RouteTrack {
    * wide along that chord would touch a wall, ease the lane away from it a
    * little at a time (only into drivable space).
    */
-  private nudgeOffWalls(TW: TrackWalls, G: WallGrid): void {
+  private *nudgeOffWalls(TW: TrackWalls, G: WallGrid): Build {
     const n = this.n;
     const W = TW.walls;
     const HALF = 1.5;
@@ -2644,6 +2775,7 @@ export class RouteTrack {
       let moved = false;
       const next = new Uint8Array(n);
       for (let i = 1; i + 1 < n; i++) {
+        if (due()) yield;
         if (!look[i]) continue;
         const z = this.z[i];
         const x0 = this.x[i - 1];
@@ -2739,12 +2871,13 @@ export class RouteTrack {
    * most any busway in the map is tagged) with none in reach, never above the default; and through a
    * station at most 50, as nearly all tagged station ways are.
    */
-  private fillLimits(data: MapData, zones: (PlatformZone | null)[]): void {
+  private *fillLimits(data: MapData, zones: (PlatformZone | null)[]): Build {
     const n = this.n;
     // Tagged busway limit per sample: > 0 tagged, 0 untagged busway, -1 not a busway.
     // (Unmatched samples carry their limit from the matched one before them: on a busway, untagged.)
     const tag = new Int16Array(n).fill(-1);
     for (let i = 0; i < n; i++) {
+      if (due()) yield;
       const ri = this.road[i];
       if (ri < 0) {
         if (i > 0 && tag[i - 1] >= 0) tag[i] = 0;
@@ -2767,6 +2900,7 @@ export class RouteTrack {
     last = 0;
     lastI = Infinity;
     for (let i = n - 1; i >= 0; i--) {
+      if (due()) yield;
       if (tag[i] > 0) {
         last = tag[i];
         lastI = i;
@@ -2790,12 +2924,13 @@ export class RouteTrack {
    * the longest stretch where the lane really runs alongside the edge (walls at a tunnel mouth can
    * hold it off the platform's end), so the front bay a bus is sent to is one it can pull up at.
    */
-  private fitKerb(data: MapData, zones: (PlatformZone | null)[]): void {
+  private *fitKerb(data: MapData, zones: (PlatformZone | null)[]): Build {
     const n = this.n;
     const X = this.x;
     const Y = this.y;
     const kerb = Float32Array.from(this.kerb);
     for (let i = 0; i < n; i++) {
+      if (due()) yield;
       const ri = this.road[i];
       if (ri < 0) continue;
       const r = data.roads[ri];
@@ -2818,13 +2953,15 @@ export class RouteTrack {
     }
     const km = median7(kerb);
     for (let i = 0; i < n; i++) if (this.road[i] >= 0) this.kerb[i] = Math.max(1.3, Math.min(6, km[i]));
-    zones.forEach((z, k) => {
-      if (!z) return;
+    for (let k = 0; k < zones.length; k++) {
+      const z = zones[k];
+      if (!z) continue;
       const i0 = Math.max(0, Math.ceil(z.s0 / TRACK_STEP));
       const i1 = Math.min(n - 1, Math.floor(z.s1 / TRACK_STEP));
-      if (i1 < i0) return;
+      if (i1 < i0) continue;
       const ok = new Uint8Array(i1 - i0 + 1);
       for (let i = i0; i <= i1; i++) {
+        if (dueNow()) yield;
         const d = platformEdgeAt(data, z.platform, X[i], Y[i], -this.ty[i], this.tx[i], 12);
         if (Number.isFinite(d)) this.kerb[i] = Math.max(1.3, Math.min(6, d));
         ok[i - i0] = d <= PLATFORM_LANE + 0.7 ? 1 : 0;
@@ -2847,11 +2984,11 @@ export class RouteTrack {
       // Within the lane too: a terminus platform can reach past the route's end, where there is no lane.
       const s0 = Math.max(0, trim ? Math.max(z.s0, (i0 + ba) * TRACK_STEP - TRACK_STEP / 2) : z.s0);
       const s1 = Math.min(this.length - 1, trim ? Math.min(z.s1, (i0 + bb) * TRACK_STEP + TRACK_STEP / 2) : z.s1);
-      if ((s0 === z.s0 && s1 === z.s1) || s1 - s0 < 8) return;
+      if ((s0 === z.s0 && s1 === z.s1) || s1 - s0 < 8) continue;
       const e0 = Math.max(0, Math.round((s0 - z.s0) / z.step));
       const e1 = Math.min(z.edge.length, e0 + Math.floor((s1 - s0) / z.step) + 1);
       zones[k] = { ...z, s0, s1, edge: z.edge.slice(e0, e1) };
-    });
+    }
   }
 
   /**
@@ -2862,7 +2999,7 @@ export class RouteTrack {
    * body itself, its front axle on the lane and its rear a wheelbase back: the
    * front overhang swings out of a bend over the kerb, the rear cuts in.)
    */
-  private nudgeOffBuildings(TW: TrackWalls): void {
+  private *nudgeOffBuildings(TW: TrackWalls): Build {
     const inB = TW.pointInBuilding;
     if (!inB) return;
     const n = this.n;
@@ -2889,6 +3026,7 @@ export class RouteTrack {
       return 0;
     };
     for (let i = 0; i < n; i++) {
+      if (due()) yield;
       const a = Math.max(0, i - 1);
       const b = Math.min(n - 1, i + 1);
       const dx = X[b] - X[a];
@@ -2906,6 +3044,7 @@ export class RouteTrack {
       }
     }
     for (let i = 0; i + 1 < n; i++) {
+      if (due()) yield;
       const dx = X[i + 1] - X[i];
       const dy = Y[i + 1] - Y[i];
       const dl = Math.hypot(dx, dy) || 1;
@@ -2944,6 +3083,7 @@ export class RouteTrack {
         return false;
       };
       for (let i = 1; i < n; i++) {
+        if (due()) yield;
         // The rear axle: a wheelbase back along the lane's chords.
         let j = i;
         let left = wb;
@@ -3008,7 +3148,8 @@ export class RouteTrack {
    * trailers cut the inside of a bend, the overhangs swing out) ease the lane away there a little at a
    * time, over a few samples either side. Walls on both sides of a sweep meet halfway.
    */
-  private nudgeForTrailers(TW: TrackWalls, G: WallGrid): void {
+  private *nudgeForTrailers(TW: TrackWalls, G: WallGrid): Build {
+    const self = this;
     const n = this.n;
     const W = TW.walls;
     const LIM = (50 * Math.PI) / 180;
@@ -3018,6 +3159,7 @@ export class RouteTrack {
     const near = new Uint8Array(n);
     const sim = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
+      if (due()) yield;
       if (this.wallDist(W, G, this.x[i], this.y[i], this.z[i], 14) === Infinity) continue;
       near[i] = 1;
       for (let q = Math.max(0, i - WARM / TRACK_STEP); q <= i; q++) sim[q] = 1;
@@ -3038,7 +3180,7 @@ export class RouteTrack {
     // How far each sample's buses are into a wall (the lane may give up as much of its own half there, at
     // most OWN_GIVE).
     const hard = new Float32Array(n);
-    const drive = (spec: ReturnType<typeof specFor>): void => {
+    const drive = function* (spec: ReturnType<typeof specFor>): Build {
       const secs = spec.sections;
       // How far behind the front axle each section's tail is (it is only placed once driven that far).
       const tail = new Float64Array(secs.length);
@@ -3052,7 +3194,8 @@ export class RouteTrack {
       const sh = new Float64Array(secs.length);
       let fresh = true;
       let warm = 0;
-      for (let s = 0; s < this.length - spec.wheelbase - 1; s += 1) {
+      for (let s = 0; s < self.length - spec.wheelbase - 1; s += 1) {
+        if (due()) yield;
         const i0 = Math.round(s / TRACK_STEP);
         const ic = Math.max(0, Math.min(n - 1, i0));
         if (!sim[ic]) {
@@ -3111,22 +3254,22 @@ export class RouteTrack {
           let j = -1;
           let bd = Infinity;
           for (let q = Math.max(0, i0 - 8); q <= Math.min(n - 1, i0 + 4); q++) {
-            const dd = (this.x[q] - cx) ** 2 + (this.y[q] - cy) ** 2;
+            const dd = (self.x[q] - cx) ** 2 + (self.y[q] - cy) ** 2;
             if (dd < bd) {
               bd = dd;
               j = q;
             }
           }
           if (j < 0) continue;
-          const need = this.bodyPush(W, G, cx, cy, this.z[j], hx, hy, sc.length / 2, spec.width / 2 + SWEEP_MARGIN);
+          const need = self.bodyPush(W, G, cx, cy, self.z[j], hx, hy, sc.length / 2, spec.width / 2 + SWEEP_MARGIN);
           if (!need) continue;
           if (Math.abs(need) - SWEEP_MARGIN > hard[j]) hard[j] = Math.abs(need) - SWEEP_MARGIN;
           // The section's sideways push, as the lane's sideways (+ = left of the lane).
           const a = Math.max(0, j - 1);
           const b = Math.min(n - 1, j + 1);
-          const tl = Math.hypot(this.x[b] - this.x[a], this.y[b] - this.y[a]) || 1;
-          const nlx = -(this.y[b] - this.y[a]) / tl;
-          const nly = (this.x[b] - this.x[a]) / tl;
+          const tl = Math.hypot(self.x[b] - self.x[a], self.y[b] - self.y[a]) || 1;
+          const nlx = -(self.y[b] - self.y[a]) / tl;
+          const nly = (self.x[b] - self.x[a]) / tl;
           const v = need * (lx * nlx + ly * nly);
           if (v > pushL[j]) pushL[j] = v;
           if (v < pushR[j]) pushR[j] = v;
@@ -3186,6 +3329,7 @@ export class RouteTrack {
       return t > 1e-4 ? (0.5 * (b - a) * TRACK_STEP) / t : Infinity;
     };
     for (let k = 0; k < n; k++) {
+      if (due()) yield;
       const ri = this.road[k];
       if (ri < 0) continue;
       let tight = false;
@@ -3217,17 +3361,19 @@ export class RouteTrack {
     {
       const boxed = new Uint8Array(n);
       for (let k = 0; k < n; k++) {
+        if (due()) yield;
         const ri = this.road[k];
         if (ri < 0 || !ownHalfFree(nodes, ri, projectOnRoad(data.roads[ri], nodes.cum[ri], X0[k], Y0[k]), true)) continue;
         for (let q = Math.max(0, k - 4); q <= Math.min(n - 1, k + 4); q++) boxed[q] = 1;
       }
       for (let k = 0; k < n; k++) {
+        if (due()) yield;
         if (!boxed[k] || !Number.isNaN(vMid[k])) continue;
         const ri = this.road[k];
         tFree[k] = own[k] < 0 || ri < 0 || ownHalfFree(nodes, ri, projectOnRoad(data.roads[ri], nodes.cum[ri], X0[k], Y0[k])) ? 1 : 0;
       }
     }
-    const tLines = turnLines(data, this.road, own, tFree, X0, Y0);
+    const tLines = yield* turnLines(data, this.road, own, tFree, X0, Y0);
     const sideOf = (k: number, x: number, y: number): number => {
       const ri = this.road[k];
       const p = data.roads[ri].pts;
@@ -3286,9 +3432,11 @@ export class RouteTrack {
       pushL.fill(0);
       pushR.fill(0);
       hard.fill(0);
-      for (const spec of specs) drive(spec);
+      for (const spec of specs) yield* drive(spec);
       if (!need0) need0 = needNow();
+      if (dueNow()) yield;
       for (let k = 0; k < n; k++) {
+        if (due()) yield;
         let g = 0;
         for (let j = Math.max(0, k - SPREAD); j <= Math.min(n - 1, k + SPREAD); j++) g = Math.max(g, hard[j]);
         give[k] = Math.min(OWN_GIVE, g);
@@ -3303,6 +3451,7 @@ export class RouteTrack {
       const mvL = new Float32Array(n);
       const mvR = new Float32Array(n);
       for (let j = 0; j < n; j++) {
+        if (due()) yield;
         if (!push[j]) continue;
         const step = Math.sign(push[j]) * Math.min(0.3, Math.abs(push[j]));
         for (let k = Math.max(0, j - SPREAD); k <= Math.min(n - 1, j + SPREAD); k++) {
@@ -3311,6 +3460,7 @@ export class RouteTrack {
           if (v < mvR[k]) mvR[k] = v;
         }
       }
+      if (dueNow()) yield;
       const Dn = Float64Array.from(D);
       let any = false;
       for (let k = 0; k < n; k++) {
@@ -3322,8 +3472,9 @@ export class RouteTrack {
       if (!any) break;
       // Where two neighbours differ by more than SLOPE, the one that moves further this pass gives way
       // (D itself is within the limit, so this ends at worst at D).
-      const ease = (): void => {
+      const ease = function* (): Build {
         for (let sweep = 0; sweep < 40; sweep++) {
+          if (dueNow()) yield;
           let changed = false;
           for (let k = 0; k + 1 < n; k++) {
             const gap = Dn[k + 1] - Dn[k];
@@ -3345,9 +3496,10 @@ export class RouteTrack {
         }
       };
       for (let round = 0; round < 6; round++) {
-        ease();
+        yield* ease();
         let held = false;
         for (let k = 0; k < n; k++) {
+          if (due()) yield;
           if (Math.abs(Dn[k] - D[k]) < 1e-3) continue;
           const bendsOk = (): boolean => {
             for (let q = Math.max(1, k - 1); q <= Math.min(n - 2, k + 1); q++) if (radius(q, Dn) < Math.min(R_OK, radius(q, D)) - 1e-6) return false;
@@ -3372,6 +3524,7 @@ export class RouteTrack {
       let moved = false;
       const movedAt = new Uint8Array(n);
       for (let k = 0; k < n; k++) {
+        if (due()) yield;
         if (Math.abs(Dn[k] - D[k]) < 1e-3 || !fits(k, Dn[k])) continue;
         D[k] = Dn[k];
         this.x[k] = X0[k] + nx0[k] * D[k];
@@ -3394,7 +3547,7 @@ export class RouteTrack {
     sim.set(sim0);
     pushL.fill(0);
     pushR.fill(0);
-    for (const spec of specs) drive(spec);
+    for (const spec of specs) yield* drive(spec);
     const need1 = needNow();
     for (let k = 0; k < n; ) {
       if (D[k] === 0) {
@@ -3447,7 +3600,8 @@ export class RouteTrack {
    * clear of walls and buildings), then space the stretch's samples evenly.
    * `fixed` samples (alongside a platform) do not move.
    */
-  private regularize(TW: TrackWalls | null, G: WallGrid | null, fixed: Uint8Array, data: MapData, skew: Uint8Array): void {
+  private *regularize(TW: TrackWalls | null, G: WallGrid | null, fixed: Uint8Array, data: MapData, skew: Uint8Array): Build {
+    const self = this;
     const n = this.n;
     if (n < 6) return;
     const X = this.x;
@@ -3461,6 +3615,7 @@ export class RouteTrack {
     const own = new Int32Array(n).fill(-1);
     const nodes = roadNodes(data);
     for (let i = 0; i < n; i++) {
+      if (due()) yield;
       const ri = this.road[i];
       if (ri < 0 || skew[i] & 2) continue;
       const r = data.roads[ri];
@@ -3491,6 +3646,7 @@ export class RouteTrack {
       const idx = roadIndexFor(data);
       const TB = turnBoxes(data);
       for (let i = 0; i < n; i++) {
+        if (due()) yield;
         oppStart[i] = oppSeg.length;
         boxStart[i] = boxNear.length;
         const a = Math.max(0, i - 1);
@@ -3521,10 +3677,11 @@ export class RouteTrack {
     // (In a junction box, the turn's included: the roads it turns from and into, TURN_ALONG.)
     const tFree = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
+      if (due()) yield;
       const ri = this.road[i];
       if (ri >= 0 && ownHalfFree(nodes, ri, projectOnRoad(data.roads[ri], nodes.cum[ri], X[i], Y[i]), true)) tFree[i] = 1;
     }
-    const tLines = turnLines(data, this.road, own, tFree, X, Y);
+    const tLines = yield* turnLines(data, this.road, own, tFree, X, Y);
     /** The left-turn guard's hold at each sample (TURN_GUARD_STEPS). */
     const hold = new Float32Array(n).fill(TURN_LEFT_HOLD);
     /** Whether the stretch being solved may use the junction box its turn needs. */
@@ -3612,13 +3769,14 @@ export class RouteTrack {
       return [dx / l, dy / l];
     };
     /** Regularize the stretch A..B (both ends locked) towards the least bent lane a bus fits. */
-    const solveWindow = (A: number, B: number): void => {
+    const solveWindow = function* (A: number, B: number): Build {
       const m = B - A + 1;
       const X0 = X.slice(A, B + 1);
       const Y0 = Y.slice(A, B + 1);
       const lock = (i: number) => i <= A + 1 || i >= B - 1 || fixed[i] === 1;
       const cur = new Float32Array(m);
       for (let i = A; i <= B; i++) {
+        if (due()) yield;
         const [ux, uy] = dirAt(i);
         cur[i - A] = badness(i, X[i], Y[i], ux, uy);
       }
@@ -3661,7 +3819,7 @@ export class RouteTrack {
         return [dx / dl, dy / dl];
       };
       /** The solve from the old lane (into PX, PY); how many samples it leaves where a bus does not fit. */
-      const solve = (): number => {
+      const solve = function* (): Build<number> {
         PX.set(X0);
         PY.set(Y0);
         wt.fill(LAM);
@@ -3669,6 +3827,7 @@ export class RouteTrack {
         cw.fill(0);
         let left = 0;
         for (let it = 0; it < 30; it++) {
+          if (due()) yield;
           // Rows: bending (second differences, which measure curvature only while samples stay evenly
           // spaced, so also: each chord, along its present direction, as long as the stretch's mean), the
           // pull back to the old lane, and the half planes.
@@ -3697,12 +3856,14 @@ export class RouteTrack {
             rows.push({ w: wt[k], k: [k], cx: [0], cy: [1], c: S0Y[k] });
             if (cw[k] > 0) rows.push({ w: cw[k], k: [k], cx: [cnx[k]], cy: [cny[k]], c: cc[k] });
             // (A turn lane's held sample, sideways.)
-            if (this.turnHeld[A + k]) {
+            if (self.turnHeld[A + k]) {
               const [hx, hy] = tangent(S0X, S0Y, k);
               rows.push({ w: TURN_HOLD_W, k: [k], cx: [-hy], cy: [hx], c: -hy * S0X[k] + hx * S0Y[k] });
             }
           }
+          if (dueNow()) yield;
           const sol = solveRows(X, Y, A, m, free, rows);
+          if (dueNow()) yield;
           free.forEach((k, f) => {
             PX[k] = sol[2 * f];
             PY[k] = sol[2 * f + 1];
@@ -3731,6 +3892,7 @@ export class RouteTrack {
             }
           }
           for (const k of free) {
+            if (dueNow()) yield;
             const [ux, uy] = tangent(PX, PY, k);
             const isBad = bad(k, PX[k], PY[k], ux, uy);
             if (!isBad) {
@@ -3789,7 +3951,7 @@ export class RouteTrack {
       };
       const tightest = (): number => {
         let r = Infinity;
-        for (let i = A + 1; i < B; i++) r = Math.min(r, this.radiusAt(i));
+        for (let i = A + 1; i < B; i++) r = Math.min(r, self.radiusAt(i));
         return r;
       };
       const before = tightest();
@@ -3797,7 +3959,8 @@ export class RouteTrack {
       const keepX = new Float64Array(m);
       const keepY = new Float64Array(m);
       for (let attempt = 0; ; attempt++) {
-        const left = solve();
+        const left = yield* solve();
+        if (dueNow()) yield;
         const t = left ? partWay() : 1;
         for (const k of free) {
           X[A + k] = S0X[k] + (PX[k] - S0X[k]) * t;
@@ -3835,6 +3998,7 @@ export class RouteTrack {
         }
       }
       for (let i = A; i <= B; i++) {
+        if (due()) yield;
         const [ux, uy] = dirAt(i);
         cur[i - A] = badness(i, X[i], Y[i], ux, uy);
       }
@@ -3842,7 +4006,8 @@ export class RouteTrack {
       let k0 = A;
       for (let k = A + 1; k <= B; k++) {
         if (!(k === B || fixed[k] === 1)) continue;
-        this.respace(k0, k, badness, dirAt);
+        if (dueNow()) yield;
+        self.respace(k0, k, badness, dirAt);
         k0 = k;
       }
     };
@@ -3851,6 +4016,7 @@ export class RouteTrack {
       // either side of the apex) plus room to ease in.
       const wins: [number, number][] = [];
       for (let i = 1; i + 1 < n; i++) {
+        if (due()) yield;
         if (!(this.radiusAt(i) < RMIN)) continue;
         let b = i;
         while (b + 2 < n && this.radiusAt(b + 1) < RMIN) b++;
@@ -3874,7 +4040,7 @@ export class RouteTrack {
       for (const [A, B] of wins) {
         if (B - A < 4) continue;
         relax = false;
-        solveWindow(A, B);
+        yield* solveWindow(A, B);
         let tight = Infinity;
         for (let i = A + 1; i < B; i++) tight = Math.min(tight, this.radiusAt(i));
         if (tight < R_OK) {
@@ -3884,7 +4050,7 @@ export class RouteTrack {
             for (let i = A; i <= B; i++) hold[i] = Math.min(hold[i], TURN_GUARD_STEPS[q]);
             for (let k = 0; k < TURN_SOLVES; k++) {
               const was = tight;
-              solveWindow(A, B);
+              yield* solveWindow(A, B);
               tight = Infinity;
               for (let i = A + 1; i < B; i++) tight = Math.min(tight, this.radiusAt(i));
               if (!(tight < TURN_GUARD_R) || !(tight > was + TURN_EASED)) break;
@@ -3896,8 +4062,8 @@ export class RouteTrack {
     }
     // Even out the tightest spots: in the lane's own half up to R_EASY, then using the turn's
     // junction box where still under R_OK.
-    this.evenCorners(fixed, badness, dirAt, R_EASY, () => (relax = false));
-    this.evenCorners(fixed, badness, dirAt, R_OK, () => (relax = true));
+    yield* this.evenCorners(fixed, badness, dirAt, R_EASY, () => (relax = false));
+    yield* this.evenCorners(fixed, badness, dirAt, R_OK, () => (relax = true));
     relax = false;
   }
 
@@ -3907,13 +4073,13 @@ export class RouteTrack {
    * every point moved no worse off (the junction box of a sharp turn counting as road), a little at a time.
    * The least-bending solve spreads a turn by its total bending; this evens out its tightest spot.
    */
-  private evenCorners(
+  private *evenCorners(
     fixed: Uint8Array,
     badness: (i: number, x: number, y: number, ux: number, uy: number) => number,
     dirAt: (i: number) => [number, number],
     target: number,
     setMode: () => void,
-  ): void {
+  ): Build {
     const n = this.n;
     const X = this.x;
     const Y = this.y;
@@ -3933,8 +4099,10 @@ export class RouteTrack {
     };
     const dense = 24;
     for (let i = 2; i + 2 < n; i++) {
+      if (due()) yield;
       const r = this.radiusAt(i);
       if (!(r < target) || r > local(i)) continue;
+      if (dueNow()) yield;
       let best = span(i - 3, i + 3);
       let bestPts: Float64Array | null = null;
       let bestA = 0;
@@ -3958,6 +4126,7 @@ export class RouteTrack {
           was[k - a] = badness(k, X[k], Y[k], vx, vy);
         }
         for (const lam of [0.5, 0.75, 1, 1.25, 1.5]) {
+          if (dueNow()) yield;
           const m0 = (lam * chord) / l0;
           const m1 = (lam * chord) / l1;
           // The curve, densely, then its length along it.
@@ -4057,10 +4226,12 @@ export class RouteTrack {
     for (let pass = 0; pass < 40; pass++) {
       let moved = false;
       for (let i = 2; i + 2 < n; i++) {
+        if (due()) yield;
         const r = this.radiusAt(i);
         if (!(r < target) || fixed[i]) continue;
         const base = local(i);
         if (r > base) continue;
+        if (dueNow()) yield;
         const [ux, uy] = dirAt(i);
         let best = base;
         let bestStep = 0;
@@ -4068,6 +4239,7 @@ export class RouteTrack {
         for (let pi = 0; pi < PATTERNS.length; pi++) {
           const pat = PATTERNS[pi];
           if (pat.some(([o]) => i + o < 1 || i + o > n - 2 || fixed[i + o])) continue;
+          if (dueNow()) yield;
           for (const step of [0.4, -0.4, 0.15, -0.15]) {
             const old = pat.map(([o]) => [X[i + o], Y[i + o]]);
             const was = pat.map(([o]) => {
@@ -4247,6 +4419,43 @@ export function trackFor(route: Route, data: MapData): RouteTrack {
   }
   return t;
 }
+/**
+ * A route's track built a slice at a time: the track trackFor would build, bit for bit. Once built it is
+ * trackFor's too (unless trackFor built one for the route meanwhile: then that one).
+ */
+export class TrackBuild {
+  private readonly track: RouteTrack;
+  private readonly gen: Build;
+  private done: RouteTrack | null = null;
+
+  constructor(
+    readonly route: Route,
+    data: MapData,
+  ) {
+    [this.track, this.gen] = RouteTrack.unbuilt(route, data);
+  }
+
+  /** Build for about `ms` more milliseconds: the track once it is built, else null. */
+  step(ms: number): RouteTrack | null {
+    if (this.done) return this.done;
+    buildDeadline = performance.now() + ms;
+    let end = false;
+    try {
+      end = !!this.gen.next().done;
+    } finally {
+      buildDeadline = Infinity;
+    }
+    if (!end) return null;
+    const have = tracks.get(this.route);
+    if (have && have.walls === this.track.walls) this.done = have;
+    else {
+      tracks.set(this.route, this.track);
+      this.done = this.track;
+    }
+    return this.done;
+  }
+}
+
 export function hasTrack(route: Route): boolean {
   return tracks.has(route);
 }
